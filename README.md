@@ -12,6 +12,7 @@ published on its own and documented in its own README.
 | `@todd/webserver-base` | TypeScript | [JSR](https://jsr.io/@todd/webserver-base) | [`typescript/README.md`](typescript/README.md) |
 | `flyball` | Rust | [crates.io](https://crates.io/crates/flyball) | [`rust/flyball/README.md`](rust/flyball/README.md) |
 | `toddstack-accounts` | Rust | [crates.io](https://crates.io/crates/toddstack-accounts) | [`rust/toddstack_accounts/README.md`](rust/toddstack_accounts/README.md) |
+| `toddstack-accounts` | TypeScript | [JSR](https://jsr.io/@todd/toddstack-accounts) `@todd/toddstack-accounts`, [npm](https://www.npmjs.com/package/toddstack-accounts) `toddstack-accounts` | [`typescript/accounts/README.md`](typescript/accounts/README.md) |
 | `template-web-server` | Rust | not published; Docker image for several sites | [`rust/template_web_server/`](rust/template_web_server/) |
 
 ## Layout
@@ -24,7 +25,15 @@ rust/              Cargo workspace: every Rust crate
   toddstack_accounts/    client for the shared accounts: sign-in, tokens, webhooks, friends
 typescript/        JSR packages (deno.jsonc is the package config)
   webserver-base/        the browser/build-side half of webserver-base
+  accounts/              toddstack-accounts for TypeScript (own deno.jsonc + package.json: JSR and npm)
 ```
+
+## Parity across languages
+
+A package that exists in more than one language has **the same features in every language**, so every project
+behaves the same whatever it is written in. Each one is written idiomatically for its language (names, errors,
+async style and internals follow that language), but no language gets a feature the others lack. A change to
+one adds the feature to the others in the same change, or names the gap in both READMEs.
 
 New languages (Swift, Kotlin, ...) get their own top-level directory when the
 first project needs one.

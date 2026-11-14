@@ -14,3 +14,6 @@ docs/
 # stale committed copy could silently feed the JS build.
 cache-buster.json
 **/static/script/generated/
+
+# npm build output of typescript/accounts (built by make test / the publish workflow)
+typescript/accounts/dist/

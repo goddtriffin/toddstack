@@ -1,0 +1,21 @@
+{
+  "name": "toddstack-accounts",
+  "version": "0.1.0",
+  "description": "Client for Todd Griffin's Projects accounts: OIDC sign-in, token checks, signed webhooks, friends and events.",
+  "license": "MIT",
+  "author": "Todd Everett Griffin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/goddtriffin/toddstack.git",
+    "directory": "typescript/accounts"
+  },
+  "homepage": "https://github.com/goddtriffin/toddstack/tree/main/typescript/accounts",
+  "keywords": ["oidc", "accounts", "friends", "toddstack"],
+  "type": "module",
+  "exports": { ".": { "types": "./dist/mod.d.ts", "default": "./dist/mod.js" } },
+  "main": "./dist/mod.js",
+  "types": "./dist/mod.d.ts",
+  "files": ["dist", "README.md", "LICENSE"],
+  "sideEffects": false,
+  "engines": { "node": ">=20" }
+}
