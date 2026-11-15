@@ -510,3 +510,58 @@ async fn two_pages_differing_only_by_a_trailing_slash_are_refused_at_boot() {
         "{error}"
     );
 }
+
+fn cache_router() -> Router {
+    use axum::http::HeaderValue;
+    use axum::response::IntoResponse;
+    use axum::routing::get as get_route;
+
+    let routes: Router<WebServerState> = Router::new()
+        .route("/plain", get_route(|| async { "plain" }))
+        .route(
+            "/chosen",
+            get_route(|| async {
+                (
+                    [(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=300"),
+                    )],
+                    "chosen",
+                )
+                    .into_response()
+            }),
+        );
+    WebServer::new("127.0.0.1", 0, Environment::Local)
+        .merge(routes)
+        .into_router(Shutdown::manual())
+        .expect("a router with no frontend always boots")
+}
+
+fn cache_control(response: &Response) -> &str {
+    response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_route_that_sets_no_cache_policy_is_never_cached() {
+    let response: Response = get(&cache_router(), "/plain").await;
+    assert_eq!(StatusCode::OK, response.status());
+    assert!(
+        cache_control(&response).contains("no-store"),
+        "{}",
+        cache_control(&response)
+    );
+}
+
+#[tokio::test]
+async fn a_route_that_sets_its_own_cache_policy_keeps_it() {
+    // A short-lived redirect or a relayed script chooses its own lifetime; the
+    // never-cache layer used to stamp over it.
+    let response: Response = get(&cache_router(), "/chosen").await;
+    assert_eq!(StatusCode::OK, response.status());
+    assert_eq!("public, max-age=300", cache_control(&response));
+    assert!(!response.headers().contains_key(header::PRAGMA));
+}

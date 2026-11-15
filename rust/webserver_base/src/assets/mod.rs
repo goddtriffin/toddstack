@@ -3,7 +3,8 @@
 //! Hashing happens at **build time**, in [`generate`], not when the server
 //! starts. At runtime this module only reads the manifest that build produced
 //! and applies the two cache-control policies: hashed URLs are immutable for a
-//! year, everything else is never cached.
+//! year, everything else is never cached unless its handler set
+//! `Cache-Control` itself.
 
 mod cache_buster;
 mod error;
