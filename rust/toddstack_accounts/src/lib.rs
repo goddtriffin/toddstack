@@ -12,6 +12,8 @@
 //! - [`report`]: reporting someone to Todd's review queue, for people and guests.
 //! - [`logout`]: signing out (revoke, then the end-session URL) in one call.
 //! - [`return_to`]: keeping post-sign-in redirects on your own site.
+//! - [`Config::account_url`]: links to the accounts site, tagged with your
+//!   client id (every link there carries it).
 //!
 //! It holds no secrets of its own and never logs tokens. Your app's client
 //! secret and webhook secret come from your environment.
@@ -39,6 +41,7 @@
 mod error;
 pub mod friends;
 mod jwks;
+mod links;
 pub mod login;
 pub mod logout;
 pub mod report;

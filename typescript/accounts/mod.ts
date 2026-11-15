@@ -44,6 +44,7 @@ export {
   startLogin,
 } from "./login.ts";
 export { endSessionUrl, type LogoutOptions, postLogoutTarget, type SignOut } from "./logout.ts";
+export { accountUrl } from "./links.ts";
 export { safeReturnTo } from "./return-to.ts";
 export {
   type AccessClaims,
