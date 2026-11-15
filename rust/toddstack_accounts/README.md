@@ -46,6 +46,7 @@ checks), so rotation never rejects a valid token.
 | `accounts.verify_access_token(token)` | For your API: checks `typ`, issuer, audience = your client id, expiry |
 | `accounts.userinfo(token)` | The profile JSON |
 | `return_to::safe(path)` | Keeps redirects on your site |
+| `config.account_url("/account")` | A link to the accounts site tagged `?client=<your id>`: use it for every link there ("Edit profile and account", "Account settings"), so the page shows "Back to <your project>" and Todd sees where people came from |
 
 ## Sign out (one route)
 

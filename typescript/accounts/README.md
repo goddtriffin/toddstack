@@ -51,15 +51,16 @@ Signing keys rotate on a schedule, and a new key is published two days before it
 an hour, and a token whose `kid` isn't in it triggers a refetch (at most once a minute, shared by concurrent checks), so
 rotation never rejects a valid token.
 
-| Call                                        | What                                                                                         |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `startLogin({ prompt, loginHint, maxAge })` | `prompt: "login"` forces a fresh sign-in, `"none"` checks silently, `"create"` opens sign-up |
-| `accounts.refresh(token)`                   | New tokens; an `AccountsError` with `kind: "token_refused"` means sign in again              |
-| `accounts.revoke(token)`                    | Revokes a refresh token (and its family); `signOut` does this for you                        |
-| `accounts.verifyAccessToken(token)`         | For your API: checks `typ`, issuer, audience = your client id, expiry                        |
-| `accounts.verifyIdToken(token, nonce?)`     | ID token checks on their own                                                                 |
-| `accounts.userinfo(token)`                  | The profile JSON                                                                             |
-| `safeReturnTo(path)`                        | Keeps redirects on your site                                                                 |
+| Call                                        | What                                                                                                                                                                 |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `startLogin({ prompt, loginHint, maxAge })` | `prompt: "login"` forces a fresh sign-in, `"none"` checks silently, `"create"` opens sign-up                                                                         |
+| `accounts.refresh(token)`                   | New tokens; an `AccountsError` with `kind: "token_refused"` means sign in again                                                                                      |
+| `accounts.revoke(token)`                    | Revokes a refresh token (and its family); `signOut` does this for you                                                                                                |
+| `accounts.verifyAccessToken(token)`         | For your API: checks `typ`, issuer, audience = your client id, expiry                                                                                                |
+| `accounts.verifyIdToken(token, nonce?)`     | ID token checks on their own                                                                                                                                         |
+| `accounts.userinfo(token)`                  | The profile JSON                                                                                                                                                     |
+| `safeReturnTo(path)`                        | Keeps redirects on your site                                                                                                                                         |
+| `accountUrl(config, "/account")`            | A link to the accounts site tagged `?client=<your id>`: use it for every link there, so the page shows "Back to <your project>" and Todd sees where people came from |
 
 Errors are `AccountsError` with a `kind`: `state_mismatch`, `authorization` (the person cancelled, or `login_required`
 after `prompt: "none"`), `missing_code`, `token_refused`, `invalid_token`, `invalid_webhook`, `api` (with `status`),

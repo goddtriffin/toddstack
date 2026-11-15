@@ -2,6 +2,7 @@ import { assert, assertEquals, assertNotEquals, assertRejects } from "@std/asser
 import {
   Accounts,
   AccountsError,
+  accountUrl,
   endSessionUrl,
   hasScope,
   isKnownWebhookEventType,
@@ -519,4 +520,19 @@ Deno.test("a public client can't report for guests", async () => {
   const accounts = new Accounts({ ...config, clientSecret: null }, { keys: jwks, fetch: () => Promise.reject() });
   const e = await assertRejects(() => accounts.reportAsGuest({ sub: "u2", reason: "name" }), AccountsError);
   assertEquals(e.kind, "config");
+});
+
+Deno.test("accountUrl tags links with the client", () => {
+  const c = toddgriffin("boggledygook", null, "https://www.boggledygook.com/auth/callback");
+  assertEquals(accountUrl(c), "https://accounts.toddgriffin.me/account?client=boggledygook");
+  assertEquals(
+    accountUrl(c, "account/sessions"),
+    "https://accounts.toddgriffin.me/account/sessions?client=boggledygook",
+  );
+  assertEquals(
+    accountUrl(c, "/account?tab=1#top"),
+    "https://accounts.toddgriffin.me/account?tab=1&client=boggledygook#top",
+  );
+  const local = { issuer: "http://localhost:8790/oidc/", clientId: "a b", clientSecret: null, redirectUri: "" };
+  assertEquals(accountUrl(local, "/account"), "http://localhost:8790/account?client=a%20b");
 });
