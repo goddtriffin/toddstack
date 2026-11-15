@@ -59,8 +59,9 @@ fixes, and wait. Do not quietly harden it and do not quietly ship it.
   right order, picks a stable per-project port, and serves.
 
 **Do not reach for Docker while developing.** `make docker_build` is a
-`linux/amd64` cross-build that runs under emulation and recompiles the whole
-dependency tree. It belongs to the rollout smoke test and nowhere else.
+`linux/amd64` image: the binary is cross-compiled natively, but a cold build
+still compiles the whole dependency tree, and the asset stage runs under
+emulation. It belongs to the rollout smoke test and nowhere else.
 
 ## Two rules that outrank convenience
 
