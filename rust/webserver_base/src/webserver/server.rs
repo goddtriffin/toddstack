@@ -576,10 +576,35 @@ where
                     cache_buster.root().join(crate::assets::STATIC_DIRECTORY),
                 ),
             )
+            .layer(axum::middleware::from_fn(reject_unservable_static_path))
             .layer(axum::middleware::from_fn(
                 crate::assets::CacheBuster::forever_cache_middleware,
             )),
     )
+}
+
+/// Linux's longest file name (`NAME_MAX`), in bytes.
+const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// True when a segment of the (still percent-encoded) path is longer than any
+/// file name can be. Decoding only shortens a segment, so a raw segment within
+/// the limit always decodes within it too.
+fn has_overlong_segment(path: &str) -> bool {
+    path.split('/')
+        .any(|segment: &str| segment.len() > MAX_FILE_NAME_BYTES)
+}
+
+/// A plain 404 for a `/static` path no file can have, before `ServeDir` tries
+/// it: the file system answers such a name with ENAMETOOLONG, which `ServeDir`
+/// logs as an error and turns into a 500. Only scanners send these.
+async fn reject_unservable_static_path(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if has_overlong_segment(request.uri().path()) {
+        return plain_not_found_response();
+    }
+    next.run(request).await
 }
 
 /// `GET /api/v1/health`. Always routed: every deployment target expects one,
@@ -1027,6 +1052,31 @@ fn strip_api_prefix(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    mod static_paths {
+        use crate::webserver::server::has_overlong_segment;
+
+        #[test]
+        fn a_hashed_asset_name_is_servable() {
+            let expected: bool = false;
+            let actual: bool = has_overlong_segment("/css/main.0123456789abcdef.css");
+            assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn a_segment_at_the_file_name_limit_is_still_tried() {
+            let expected: bool = false;
+            let actual: bool = has_overlong_segment(&format!("/js/{}", "a".repeat(255)));
+            assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn a_segment_past_the_file_name_limit_is_a_404() {
+            let expected: bool = true;
+            let actual: bool = has_overlong_segment(&format!("/js/{}", "a".repeat(256)));
+            assert_eq!(expected, actual);
+        }
+    }
 
     #[cfg(feature = "pages")]
     mod conditional_get {
