@@ -2,17 +2,22 @@ import { assert, assertEquals, assertNotEquals, assertRejects } from "@std/asser
 import {
   Accounts,
   AccountsError,
+  endSessionUrl,
   hasScope,
+  isKnownWebhookEventType,
   type JwkSet,
   parseCallback,
   pkceChallenge,
+  postLogoutTarget,
   safeReturnTo,
   startLogin,
   toddgriffin,
   verifyWebhook,
   VERSION,
+  WEBHOOK_EVENT_TYPES,
 } from "./mod.ts";
 import { base64url, utf8 } from "./encoding.ts";
+import { Keys } from "./jwks.ts";
 
 const config = toddgriffin("boggledygook", "s3cret", "https://www.boggledygook.com/auth/callback");
 
@@ -95,6 +100,32 @@ Deno.test("tampering, wrong secret and age are refused", async () => {
     const e = await assertRejects(p, AccountsError);
     assertEquals(e.kind, "invalid_webhook");
   }
+});
+
+Deno.test("friendship events name both people", async () => {
+  for (const type of ["friendship.created", "friendship.removed"]) {
+    const body = `{"id":"e2","type":"${type}","created_at":1700000000,"data":{"sub":"u1","friend_sub":"u2"}}`;
+    const event = await verifyWebhook("secret", await sign("secret", 1_700_000_000, body), body, 1_700_000_000);
+    assertEquals(event, { id: "e2", type, createdAt: 1_700_000_000, data: { sub: "u1", friend_sub: "u2" } });
+    assert(isKnownWebhookEventType(event.type));
+  }
+});
+
+Deno.test("every event type the service sends is known, and newer ones still verify", async () => {
+  assertEquals([...WEBHOOK_EVENT_TYPES], [
+    "user.updated",
+    "user.deleted",
+    "user.suspended",
+    "user.reactivated",
+    "user.signed_out",
+    "grant.revoked",
+    "friendship.created",
+    "friendship.removed",
+  ]);
+  const body = '{"id":"e3","type":"something.new","created_at":1700000000,"data":{"sub":"u1"}}';
+  const event = await verifyWebhook("secret", await sign("secret", 1_700_000_000, body), body, 1_700_000_000);
+  assertEquals(event.type, "something.new");
+  assert(!isKnownWebhookEventType(event.type));
 });
 
 // A signing key, its JWKS, and a fake accounts service.
@@ -264,4 +295,144 @@ Deno.test("versions agree", async () => {
   const deno = JSON.parse((await Deno.readTextFile(new URL("./deno.jsonc", import.meta.url))).replace(/\/\/.*$/gm, ""));
   const npm = JSON.parse(await Deno.readTextFile(new URL("./package.json", import.meta.url)));
   assertEquals([deno.version, npm.version], [VERSION, VERSION]);
+});
+
+Deno.test("the end-session URL carries every parameter the service reads", () => {
+  const url = new URL(
+    endSessionUrl(config, { idTokenHint: "id.token.here", postLogoutRedirectUri: "/goodbye", state: "s1" }),
+  );
+  assertEquals(`${url.origin}${url.pathname}`, "https://accounts.toddgriffin.me/oidc/session/end");
+  assertEquals(Object.fromEntries(url.searchParams), {
+    client_id: "boggledygook",
+    id_token_hint: "id.token.here",
+    post_logout_redirect_uri: "https://www.boggledygook.com/goodbye",
+    state: "s1",
+  });
+  assertEquals(Object.fromEntries(new URL(endSessionUrl(config)).searchParams), { client_id: "boggledygook" });
+  const offSite = new URL(endSessionUrl(config, { postLogoutRedirectUri: "https://evil.example/" }));
+  assertEquals(offSite.searchParams.has("post_logout_redirect_uri"), false);
+});
+
+Deno.test("post-logout targets stay on your site", () => {
+  assertEquals(postLogoutTarget(config, "/"), "https://www.boggledygook.com/");
+  assertEquals(
+    postLogoutTarget(config, "https://www.boggledygook.com/bye?x=1"),
+    "https://www.boggledygook.com/bye?x=1",
+  );
+  for (
+    const bad of [
+      "//evil.example/",
+      "https://evil.example/",
+      "http://www.boggledygook.com/",
+      "https://www.boggledygook.com.evil.example/",
+      "https://user@www.boggledygook.com/",
+      "/\\evil.example",
+      "goodbye",
+      "",
+    ]
+  ) {
+    assertEquals(postLogoutTarget(config, bad), null, JSON.stringify(bad));
+  }
+});
+
+Deno.test("signOut revokes the refresh token and returns the end-session URL", async () => {
+  const seen: string[] = [];
+  let status = 200;
+  const accounts = new Accounts(config, {
+    keys: jwks,
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push(`${req.method} ${new URL(req.url).pathname} ${await req.text()}`);
+      return new Response(null, { status });
+    },
+  });
+  const ok = await accounts.signOut("rt1", { postLogoutRedirectUri: "/" });
+  assertEquals(ok, {
+    url: endSessionUrl(config, { postLogoutRedirectUri: "/" }),
+    revokeError: null,
+  });
+  assertEquals(seen, ["POST /oidc/token/revocation token=rt1&token_type_hint=refresh_token"]);
+
+  status = 503;
+  const failed = await accounts.signOut("rt1");
+  assertEquals([failed.url, failed.revokeError?.kind, failed.revokeError?.status], [
+    endSessionUrl(config),
+    "api",
+    503,
+  ]);
+
+  seen.length = 0;
+  assertEquals((await accounts.signOut(null)).revokeError, null);
+  assertEquals(seen, []);
+});
+
+// A JWKS endpoint whose keys and status the test controls, behind a clock the test moves.
+async function rotatingKeys() {
+  const second = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const newKey = { ...(await crypto.subtle.exportKey("jwk", second.publicKey)), kid: "k2", alg: "ES256", use: "sig" };
+  const state = { published: { keys: [...jwks.keys] } as JwkSet, status: 200, hits: 0, clock: 0 };
+  const fetcher = async () => {
+    state.hits++;
+    await new Promise((resolve) => setTimeout(resolve, 10)); // slow enough that concurrent lookups overlap
+    return state.status === 200 ? Response.json(state.published) : new Response("down", { status: state.status });
+  };
+  const keys = Keys.remote("https://accounts.example/oidc/jwks", fetcher, () => state.clock);
+  return { keys, state, publishNew: () => state.published.keys.push(newKey) };
+}
+
+Deno.test("a key published after the last fetch is found by refetching", async () => {
+  const { keys, state, publishNew } = await rotatingKeys();
+  await keys.get("k1");
+  publishNew();
+  state.clock += 61_000;
+  await keys.get("k2");
+  assertEquals(state.hits, 2);
+});
+
+Deno.test("unknown kids refetch at most once a minute", async () => {
+  const { keys, state, publishNew } = await rotatingKeys();
+  await keys.get("k1");
+  // Within a minute of the last fetch: no refetch, even for a key that now exists.
+  publishNew();
+  await assertRejects(() => keys.get("k2"), AccountsError);
+  assertEquals(state.hits, 1);
+  state.clock += 61_000;
+  for (const kid of ["made-up-1", "made-up-2", "made-up-3"]) {
+    assertEquals((await assertRejects(() => keys.get(kid), AccountsError)).kind, "invalid_token");
+  }
+  assertEquals(state.hits, 2);
+  await keys.get("k2"); // fetched by the made-up-1 refetch
+  assertEquals(state.hits, 2);
+});
+
+Deno.test("a failed refetch still counts against the minute", async () => {
+  const { keys, state } = await rotatingKeys();
+  await keys.get("k1");
+  state.clock += 61_000;
+  state.status = 503;
+  assertEquals((await assertRejects(() => keys.get("k2"), AccountsError)).kind, "http");
+  assertEquals((await assertRejects(() => keys.get("k2"), AccountsError)).kind, "invalid_token");
+  assertEquals(state.hits, 2);
+  await keys.get("k1");
+});
+
+Deno.test("a stale cache is refreshed even for a known kid", async () => {
+  const { keys, state } = await rotatingKeys();
+  await keys.get("k1");
+  state.published = { keys: [] }; // k1 retired
+  state.clock += 3600_001;
+  await assertRejects(() => keys.get("k1"), AccountsError);
+  assertEquals(state.hits, 2);
+});
+
+Deno.test("concurrent lookups share one fetch, and its failure", async () => {
+  const ok = await rotatingKeys();
+  await Promise.all(Array.from({ length: 8 }, () => ok.keys.get("k1")));
+  assertEquals(ok.state.hits, 1);
+
+  const down = await rotatingKeys();
+  down.state.status = 503;
+  const results = await Promise.allSettled(Array.from({ length: 8 }, () => down.keys.get("k1")));
+  assertEquals(results.map((r) => r.status), Array(8).fill("rejected"));
+  assertEquals(down.state.hits, 1);
 });

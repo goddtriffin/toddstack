@@ -34,26 +34,58 @@ let signed_in = accounts.finish_login(&pending, raw_query).await?;
 `finish_login` checks `state` and `iss`, exchanges the code with PKCE, and verifies the ID token (ES256 signature
 against the published keys, issuer, audience, expiry, nonce).
 
+Signing keys rotate on a schedule, and a new key is published two days before it signs. The client keeps the key set
+for an hour, and a token whose `kid` isn't in it triggers a refetch (at most once a minute, shared by concurrent
+checks), so rotation never rejects a valid token.
+
 | Call | What |
 |---|---|
 | `login::start_with(.., &Options { prompt, login_hint, max_age })` | `prompt=login` forces a fresh sign-in, `none` checks silently, `create` opens sign-up |
 | `accounts.refresh(token)` | New tokens; `Error::TokenRefused` means sign in again (expired, reused, or the person removed your app) |
-| `accounts.revoke(token)` | On sign-out |
+| `accounts.revoke(token)` | Revokes a refresh token (and its family); `sign_out` does this for you |
 | `accounts.verify_access_token(token)` | For your API: checks `typ`, issuer, audience = your client id, expiry |
 | `accounts.userinfo(token)` | The profile JSON |
 | `return_to::safe(path)` | Keeps redirects on your site |
 
+## Sign out (one route)
+
+```rust
+use toddstack_accounts::logout;
+
+// GET /logout: end your own session first, then:
+let signed_out = accounts.sign_out(refresh_token.as_deref(), &logout::Options {
+    id_token_hint: Some(&id_token),               // optional, expired is fine
+    post_logout_redirect_uri: Some("/"),          // a path, or an absolute URL on your redirect URI's origin
+    state: None,                                  // echoed back as ?state=
+}).await;
+if let Some(error) = signed_out.revoke_error { /* log it; sign-out still goes ahead */ }
+// Redirect to signed_out.url to also sign out of accounts.
+```
+
+`sign_out` revokes the refresh token (pass `None` if you don't keep one) and builds the end-session URL
+(`logout::end_session_url`, with your `client_id`). Redirecting there signs the person out of **every** project in that
+browser, after the accounts service asks "Sign out?". To sign out of your app alone, use `accounts.revoke` and skip
+the redirect. The post-logout URL must be registered for your app exactly (ask Todd); an unregistered or off-site one
+is dropped and the person stays on the accounts "You're signed out" page.
+
 ## Webhooks
 
 ```rust
-let event = toddstack_accounts::webhook::verify(webhook_secret, signature_header, &raw_body, now_unix)?;
-match event.kind.as_str() {
-    "user.deleted" => { /* delete or anonymize event.sub()'s rows */ }
-    "user.updated" => { /* refresh cached username / picture */ }
-    "user.signed_out" | "user.suspended" | "grant.revoked" => { /* end event.sub()'s sessions */ }
-    _ => {}
+use toddstack_accounts::webhook::{self, EventKind};
+
+let event = webhook::verify(webhook_secret, signature_header, &raw_body, now_unix)?;
+match event.kind {
+    EventKind::UserDeleted => { /* delete or anonymize event.sub()'s rows */ }
+    EventKind::UserUpdated => { /* refresh cached username / picture */ }
+    EventKind::UserSignedOut | EventKind::UserSuspended | EventKind::GrantRevoked => { /* end event.sub()'s sessions */ }
+    EventKind::FriendshipCreated => { /* event.sub() and event.friend_sub() are now friends */ }
+    EventKind::FriendshipRemoved => { /* drop friend-only state between them */ }
+    _ => {} // EventKind::Other(type) for types newer than this crate
 }
 ```
+
+`event.kind.as_str()` gives the wire name (`"user.deleted"`). Friendship events are sent once per side: each person
+gets one with themselves as `sub`, so handle only `sub`'s view.
 
 Your sessions are your own: accounts can't end them. On `user.signed_out` (the person signed out everywhere,
 changed or reset their password, or an admin signed them or everyone out), `user.suspended` and
