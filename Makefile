@@ -116,6 +116,7 @@ lint: ## lints the codebase
 	cd $(TS) && deno lint webserver-base/
 	cd $(TS) && deno doc --lint webserver-base/
 	cd $(TS) && deno fmt webserver-base/
+	cd $(TS)/accounts && deno lint && deno doc --lint mod.ts && deno fmt
 
 	cd $(RUST) && cargo fmt
 
@@ -123,7 +124,11 @@ lint: ## lints the codebase
 test: assets ## runs tests; the template's tests serve the bin/ that assets builds
 	cd $(TS) && deno check webserver-base/
 	# --allow-net: free-port's tests bind real sockets to verify port detection
-	cd $(TS) && deno test --allow-net
+	cd $(TS) && deno test --allow-net webserver-base/
+	cd $(TS)/accounts && deno check mod.ts && deno fmt --check && deno test --allow-read
+	# the npm build of toddstack-accounts must compile and load on Node
+	cd $(TS)/accounts && rm -rf dist && npx -y -p typescript@5.9.3 tsc -p tsconfig.npm.json \
+		&& node -e 'import("./dist/mod.js").then((m) => { if (!m.Accounts) process.exit(1) })'
 
 	cd $(RUST) && cargo fmt --check
 	cd $(RUST) && cargo check --all-features
@@ -147,6 +152,8 @@ publish_dry_run: ## dry run of publishing libraries to crates.io and JSR
 
 	echo "\033[1;35m[Packaging Typescript]\033[0m"
 	cd $(TS) && deno publish --dry-run --allow-dirty
+	cd $(TS)/accounts && deno publish --dry-run --allow-dirty
+	cd $(TS)/accounts && rm -rf dist && npx -y -p typescript@5.9.3 tsc -p tsconfig.npm.json && npm pack --dry-run
 
 	echo "\033[1;35m[Finished Dry-Run Publish]\033[0m"
 
