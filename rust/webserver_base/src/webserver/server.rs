@@ -550,8 +550,9 @@ where
     }
 }
 
-/// The two cache policies: nothing outside `/static` may be cached, and
-/// everything inside it is immutable because its URL carries a content hash.
+/// The two cache policies: nothing outside `/static` is cached unless its
+/// handler set `Cache-Control` itself, and everything inside it is immutable
+/// because its URL carries a content hash.
 fn apply_cache_policy<S>(
     router: Router<WebServerState<S>>,
     cache_buster: &crate::assets::CacheBuster,

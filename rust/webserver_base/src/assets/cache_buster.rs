@@ -131,11 +131,15 @@ impl CacheBuster {
         self.manifest.is_empty()
     }
 
-    /// Marks a response as never cacheable.
+    /// Marks a response as never cacheable, unless its handler chose a policy.
     ///
     /// For everything whose URL does *not* carry a content hash: pages, API
     /// responses, `robots.txt`. Conditional-request headers are stripped as
     /// well, so an intermediary cannot revalidate its way back to a stale copy.
+    ///
+    /// A response that already carries `Cache-Control` is left exactly as its
+    /// handler built it: setting the header is a deliberate choice (a short-lived
+    /// redirect, a relayed script), and stamping over it silently undid that.
     ///
     /// # Errors
     ///
@@ -146,7 +150,9 @@ impl CacheBuster {
         next: Next,
     ) -> Result<Response, StatusCode> {
         let mut response: Response<Body> = next.run(request).await;
-        mark_never_cached(response.headers_mut());
+        if !response.headers().contains_key(CACHE_CONTROL) {
+            mark_never_cached(response.headers_mut());
+        }
 
         Ok(response)
     }
