@@ -106,8 +106,12 @@ generator.
 
 ## 3. Build the image
 
-`make docker_build`. Slow, because it is an emulated `linux/amd64` cross-build.
-That is expected.
+`make docker_build`. The binary is cross-compiled natively to a static
+`x86_64-unknown-linux-musl` executable (zig as the C compiler, rust-lld as the
+linker), and cargo-chef caches the dependency build in its own layer, so a
+rebuild after a source change recompiles only the workspace crates. Only the
+static asset stage runs under `linux/amd64` emulation, because it runs the
+binary.
 
 ## 4. E2E smoke test
 
