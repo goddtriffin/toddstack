@@ -26,7 +26,7 @@ Diff against `main` and classify:
 |---|---|
 | `rust/webserver_base/**` (the Rust lib) | Cargo bump, tag, release, crates.io publish — **and** the image steps, because the binary embeds the library |
 | `typescript/webserver-base/**` (the TS lib) | `typescript/deno.jsonc` PATCH bump, JSR publish |
-| `typescript/accounts/**` (TS `toddstack-accounts`) | PATCH bump of `deno.jsonc`, `package.json` and `version.ts` together (a test checks they agree), then JSR (`cd typescript/accounts && deno publish`) and npm (`npm publish` after `make test` built `dist/`). Check the Rust crate has the same features (parity, see `contribution-guide`) |
+| `typescript/accounts/**` (TS `toddstack-accounts`) | PATCH bump of `deno.jsonc`, `package.json` and `version.ts` together (a test checks they agree), CI then publishes to JSR and npm on merge. Check the Rust crate has the same features (parity, see `contribution-guide`) |
 | `rust/template_web_server/**` (the crate, its `html/`, `static/`, `Dockerfile`), `rust/Cargo.lock`, `Makefile` | the image steps: build, smoke test, push |
 | any `README.md`, `AGENTS.md`, `CLAUDE.md`, `.claude/**`, other docs | nothing but the pull request |
 
@@ -67,11 +67,9 @@ still holds the old image — production runs stale code, with no error anywhere
 | 6 | **Push the image** | `make docker_push` |
 | 7 | **Open the PR** | commit on a branch, `git push -u`, `gh pr create` |
 | 8 | **Merge the PR** | `gh pr merge --merge` |
-| 9 | Tag | `git tag webserver-base-vX.Y.Z` + `git push origin webserver-base-vX.Y.Z` |
-| 10 | GitHub release | `gh release create` |
-| 11 | Dry-run both libs | `make publish_dry_run` |
-| 12 | Publish Rust | `cd rust && cargo publish --package webserver-base` |
-| 13 | Publish TypeScript | **the user runs** `cd typescript && deno publish` |
+| 9 | **CI publishes** | nothing to run: `.github/workflows/publish.yml` tags, releases and publishes on merge |
+| 10 | Release notes | edit the release CI made (`gh release edit`) when there are breaking changes |
+| 11 | Verify | see "Verify what actually landed" |
 
 Every change ships through a pull request. Todd has authorized agents to merge
 it themselves once steps 2–6 are done (and to commit straight to `main` when a
@@ -167,59 +165,36 @@ step 2: the pushed image no longer matches the PR.
 Once merged, `git switch main && git pull` before tagging, so the tag names the
 merge commit.
 
-## 9. Tag
+## 9. CI publishes
 
-Tags are **lightweight** (`git tag webserver-base-vX.Y.Z`, no `-a`) and take the
-version from the **Rust** workspace — never the deno one. Push explicitly:
-`git push origin webserver-base-vX.Y.Z`.
+Merging to `main` runs `.github/workflows/publish.yml`, which calls `scripts/publish.sh`. For every library
+whose version is not on its registry yet it publishes it (crates.io, JSR, npm), then creates the tag and a
+GitHub release with notes generated from the merged PRs. A version already published is skipped, so a
+merge without a bump publishes nothing. Pull requests run `scripts/publish.sh check`, which fails when a
+library's files changed but its version was not bumped.
 
-toddstack holds several packages, so every tag names its package
-(`webserver-base-vX.Y.Z`, `toddstack-accounts-vX.Y.Z`). Tags up to `v0.3.0` predate
-the rename and use the bare form. Bare `X.Y.Z` tags are reserved: Swift Package
-Manager reads a repo's plain semver tags as its versions, so they belong to a
-future Swift package.
+No tokens: each registry trusts that workflow file through trusted publishing (set up once per package on
+crates.io, npm and JSR). Todd has approved every publish in advance. Publishing is **irreversible**:
+crates.io and npm allow yanking or deprecating, never reuse of a version.
 
-## 10. GitHub release
+Tags name their package (`webserver-base-vX.Y.Z`, `flyball-vX.Y.Z`, `toddstack-accounts-vX.Y.Z`) and follow
+the **Rust** version; `@todd/webserver-base` alone (TS) gets no tag. Tags up to `v0.3.0` predate the rename.
+Bare `X.Y.Z` tags are reserved: Swift Package Manager reads a repo's plain semver tags as its versions.
 
-`gh release create webserver-base-vX.Y.Z --title "webserver-base vX.Y.Z" --verify-tag`. The body is a bullet
-changelog grouped by area, with a **Breaking changes** section whenever a
-consuming project must edit something to upgrade, closing with:
+If a publish fails, fix the cause and re-run the workflow (`gh workflow run publish.yml`): it skips what is
+already out. crates.io **requires** trusted publishing for these crates (Todd's setting), so a crate can only
+be published by this workflow, never from a laptop token. npm and JSR can still be published locally in an
+emergency, with the user's browser approval (`! scripts/publish.sh`).
 
-```
-**Full Changelog**: https://github.com/goddtriffin/toddstack/compare/PREV...webserver-base-vX.Y.Z
-```
+## 10. Release notes
 
-`PREV` is the previous webserver-base **tag** (`v0.3.0` for the first release after the rename), which is not always the previous release — tags
-and releases have drifted here before. Check both, and when a tag was never
-released, cover its contents in this changelog so nothing goes undocumented.
+The generated notes list the merged PRs. When a consuming project must edit something to upgrade, add a
+**Breaking changes** section with `gh release edit <tag> --notes-file ...`.
 
-## 11. Dry-run both libraries
+## 11. Dry run
 
-`make publish_dry_run`. It runs `cargo publish --dry-run`, which **refuses a
-dirty working tree** — which is precisely why this step sits after the commit.
-Run it earlier for a packaging sanity check if you like, but expect that refusal
-until step 8 has landed.
-
-Confirm the embedded assets are in the packaged crate:
-
-```sh
-(cd rust && cargo package --list -p webserver-base | grep '^assets/')
-```
-
-Two lines of output. Empty output is the dirty-tree refusal on stderr, not a
-missing asset — do not misread one as the other. Why their absence matters is
-the `assets/**` invariant in contribution-guide's `architecture.md`.
-
-## 12. Publish Rust
-
-`cd rust && cargo publish --package webserver-base`. **Irreversible** — crates.io allows
-yanking, never deletion.
-
-## 13. Publish TypeScript — the user's step
-
-`deno publish` needs interactive browser auth and fails in an agent shell with
-`error: No means to authenticate`. Do not work around this and do not handle a
-token. Ask the user to run `! cd typescript && deno publish` themselves.
+`make publish_dry_run` still works for a packaging check before merging. Confirm the embedded assets are
+in the crate: `(cd rust && cargo package --list -p webserver-base | grep '^assets/')` prints two lines.
 
 ---
 
