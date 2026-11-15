@@ -25,7 +25,9 @@ export {
   type FriendEvent,
   Friends,
   type InboxItem,
+  MAX_RELATIONSHIPS_PER_CALL,
   type Person,
+  type Relationship,
   type Requests,
   type Sent,
 } from "./friends.ts";

@@ -80,12 +80,16 @@ match event.kind {
     EventKind::UserSignedOut | EventKind::UserSuspended | EventKind::GrantRevoked => { /* end event.sub()'s sessions */ }
     EventKind::FriendshipCreated => { /* event.sub() and event.friend_sub() are now friends */ }
     EventKind::FriendshipRemoved => { /* drop friend-only state between them */ }
+    EventKind::FriendRequestCreated | EventKind::FriendRequestCancelled | EventKind::FriendRequestDeclined => {
+        /* event.from_sub() asked event.to_sub(), took it back, or was turned down: refresh friend buttons */
+    }
     _ => {} // EventKind::Other(type) for types newer than this crate
 }
 ```
 
-`event.kind.as_str()` gives the wire name (`"user.deleted"`). Friendship events are sent once per side: each person
-gets one with themselves as `sub`, so handle only `sub`'s view.
+`event.kind.as_str()` gives the wire name (`"user.deleted"`). Friendship and friend request events are sent once
+per side: each person gets one with themselves as `sub`, so handle only `sub`'s view. An accepted request sends
+only `friendship.created`.
 
 Your sessions are your own: accounts can't end them. On `user.signed_out` (the person signed out everywhere,
 changed or reset their password, or an admin signed them or everyone out), `user.suspended` and
@@ -116,6 +120,27 @@ The person can mute your app's events, one kind or all (`friends.mute("daily_com
 
 A block overrides everything (no requests, no events either way). Events go to friends' inboxes (`inbox()`),
 and will also go out as push notifications once the native apps exist.
+
+## Friend buttons
+
+`relationships` says where the person stands with each person you show, so a button can read the right thing:
+
+```rust
+use toddstack_accounts::friends::Relationship;
+
+let found = friends.relationships(&[&alex_sub, &sam_sub]).await?; // any number; sent 100 per call
+let label = match friends.relationship(&alex_sub).await? {
+    Relationship::Friends => "Friends",
+    Relationship::RequestSent => "Requested",       // friends.cancel(sub) takes it back
+    Relationship::RequestReceived => "Accept",      // friends.accept(sub)
+    Relationship::Blocked => "Unblock",             // the person blocked them
+    _ => "Add friend",
+};
+```
+
+`None` also covers the person themselves, unknown or suspended accounts, people who don't use your app, and
+someone who blocked the person, so a block can't be probed. Keep buttons current with the `friend_request.*`
+and `friendship.*` webhooks.
 
 ## Not in this crate
 

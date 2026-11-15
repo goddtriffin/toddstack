@@ -29,6 +29,18 @@ export interface Requests {
 /** What sending a request did: `accepted` means they had already asked, so you're friends now. */
 export type Sent = "requested" | "accepted" | "already_friends";
 
+/**
+ * Where the person stands with someone: what a friend button should say. `friends` is "Friends",
+ * `request_sent` is "Requested" (`cancel` takes it back), `request_received` is "Accept" (`accept`),
+ * `blocked` (the person blocked them) is "Unblock", and `none` is "Add friend". `none` also covers the
+ * person themselves, unknown or suspended accounts, people who don't use your app, and someone who blocked
+ * the person, so a block can't be probed.
+ */
+export type Relationship = "friends" | "request_sent" | "request_received" | "blocked" | "none";
+
+/** The service answers at most this many people per call; `relationships` splits longer lists. */
+export const MAX_RELATIONSHIPS_PER_CALL = 100;
+
 /** An event for friends' inboxes ("Alex beat your high score"). */
 export interface FriendEvent {
   /** 1-40 of `a-z`, `0-9`, `_`. People can mute a kind. */
@@ -116,6 +128,22 @@ export class Friends {
   async requests(): Promise<Requests> {
     const value = await this.#call("GET", "/friends/requests");
     return { incoming: field(value, "incoming"), outgoing: field(value, "outgoing") };
+  }
+
+  /** Where the person stands with each of `subs`, keyed by sub. Any number: longer lists go out as several calls. */
+  async relationships(subs: string[]): Promise<Record<string, Relationship>> {
+    const found: Record<string, Relationship> = {};
+    for (let i = 0; i < subs.length; i += MAX_RELATIONSHIPS_PER_CALL) {
+      const chunk = subs.slice(i, i + MAX_RELATIONSHIPS_PER_CALL);
+      const value = await this.#call("GET", `/friends/relationships?subs=${encodeURIComponent(chunk.join(","))}`);
+      Object.assign(found, field<Record<string, Relationship>>(value, "relationships"));
+    }
+    return found;
+  }
+
+  /** Where the person stands with `sub`. */
+  async relationship(sub: string): Promise<Relationship> {
+    return (await this.relationships([sub]))[sub] ?? "none";
   }
 
   /** Sends a request by exact username. Not found also covers blocks and privacy settings. */
