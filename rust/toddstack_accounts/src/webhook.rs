@@ -44,6 +44,15 @@ pub enum EventKind {
     /// `friendship.removed`: `sub` and `friend_sub` are no longer friends
     /// (unfriended or blocked). Sent once per side.
     FriendshipRemoved,
+    /// `friend_request.created`: `from_sub` asked `to_sub`. Sent once per
+    /// side. An accepted request sends only `friendship.created`.
+    FriendRequestCreated,
+    /// `friend_request.cancelled`: `from_sub` took back the request to
+    /// `to_sub`. Sent once per side.
+    FriendRequestCancelled,
+    /// `friend_request.declined`: `to_sub` turned down `from_sub`'s request.
+    /// Sent once per side.
+    FriendRequestDeclined,
     /// A type this version doesn't know.
     Other(String),
 }
@@ -61,6 +70,9 @@ impl EventKind {
             Self::GrantRevoked => "grant.revoked",
             Self::FriendshipCreated => "friendship.created",
             Self::FriendshipRemoved => "friendship.removed",
+            Self::FriendRequestCreated => "friend_request.created",
+            Self::FriendRequestCancelled => "friend_request.cancelled",
+            Self::FriendRequestDeclined => "friend_request.declined",
             Self::Other(kind) => kind,
         }
     }
@@ -77,6 +89,9 @@ impl From<String> for EventKind {
             "grant.revoked" => Self::GrantRevoked,
             "friendship.created" => Self::FriendshipCreated,
             "friendship.removed" => Self::FriendshipRemoved,
+            "friend_request.created" => Self::FriendRequestCreated,
+            "friend_request.cancelled" => Self::FriendRequestCancelled,
+            "friend_request.declined" => Self::FriendRequestDeclined,
             _ => Self::Other(kind),
         }
     }
@@ -109,7 +124,8 @@ pub struct Event {
     pub kind: EventKind,
     pub created_at: i64,
     /// Always has `sub`; `user.updated` adds the fields that changed, and the
-    /// friendship events add `friend_sub`.
+    /// friendship events add `friend_sub`, and the friend request events add
+    /// `from_sub` and `to_sub`.
     pub data: Value,
 }
 
@@ -125,6 +141,18 @@ impl Event {
     #[must_use]
     pub fn friend_sub(&self) -> Option<&str> {
         self.data.get("friend_sub").and_then(Value::as_str)
+    }
+
+    /// Who sent the request, for the `friend_request.*` events.
+    #[must_use]
+    pub fn from_sub(&self) -> Option<&str> {
+        self.data.get("from_sub").and_then(Value::as_str)
+    }
+
+    /// Who the request was sent to, for the `friend_request.*` events.
+    #[must_use]
+    pub fn to_sub(&self) -> Option<&str> {
+        self.data.get("to_sub").and_then(Value::as_str)
     }
 }
 
@@ -225,6 +253,28 @@ mod tests {
     }
 
     #[test]
+    fn friend_request_events_name_sender_and_receiver() {
+        for (wire, kind) in [
+            ("friend_request.created", EventKind::FriendRequestCreated),
+            (
+                "friend_request.cancelled",
+                EventKind::FriendRequestCancelled,
+            ),
+            ("friend_request.declined", EventKind::FriendRequestDeclined),
+        ] {
+            let body: String = format!(
+                r#"{{"id":"e4","type":"{wire}","created_at":1700000000,"data":{{"sub":"u2","from_sub":"u1","to_sub":"u2"}}}}"#
+            );
+            let event: Event = verified(&body);
+            assert_eq!(kind, event.kind);
+            assert_eq!(Some("u2"), event.sub());
+            assert_eq!(Some("u1"), event.from_sub());
+            assert_eq!(Some("u2"), event.to_sub());
+            assert_eq!(None, event.friend_sub());
+        }
+    }
+
+    #[test]
     fn every_known_type_round_trips_through_its_wire_name() {
         for kind in [
             EventKind::UserUpdated,
@@ -235,6 +285,9 @@ mod tests {
             EventKind::GrantRevoked,
             EventKind::FriendshipCreated,
             EventKind::FriendshipRemoved,
+            EventKind::FriendRequestCreated,
+            EventKind::FriendRequestCancelled,
+            EventKind::FriendRequestDeclined,
         ] {
             assert_eq!(kind, EventKind::from(kind.as_str().to_owned()));
             assert_ne!(EventKind::Other(kind.as_str().to_owned()), kind);

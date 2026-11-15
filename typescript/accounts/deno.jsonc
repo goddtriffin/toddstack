@@ -1,6 +1,6 @@
 {
   "name": "@todd/toddstack-accounts",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "exports": "./mod.ts",
   "publish": {
     "include": ["*.ts", "deno.jsonc", "LICENSE", "README.md"],

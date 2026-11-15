@@ -103,12 +103,16 @@ switch (event.type) {
     break;
   case "friendship.removed": /* drop friend-only state between them */
     break;
+  case "friend_request.created":
+  case "friend_request.cancelled":
+  case "friend_request.declined": /* event.data.from_sub asked event.data.to_sub, took it back, or was turned down */
+    break;
 }
 ```
 
 `event.type` is a `WebhookEventType` (the list is `WEBHOOK_EVENT_TYPES`) or a newer type, which still verifies;
-`isKnownWebhookEventType` tells them apart. Friendship events are sent once per side: each person gets one with
-themselves as `sub`, so handle only `sub`'s view.
+`isKnownWebhookEventType` tells them apart. Friendship and friend request events are sent once per side: each person
+gets one with themselves as `sub`, so handle only `sub`'s view. An accepted request sends only `friendship.created`.
 
 Your sessions are your own: accounts can't end them. On `user.signed_out`, `user.suspended` and `grant.revoked`, delete
 every session you hold for `event.data.sub`. Their refresh tokens are already revoked.
@@ -132,6 +136,25 @@ await friends.postEvent({
 
 Also `requests`, `requestByCode`, `accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `inbox(limit)`,
 `markRead`, `mutes`, `mute(kind)` (`ALL_KINDS` mutes everything), `unmute`.
+
+### Friend buttons
+
+`relationships` says where the person stands with each person you show, so a button can read the right thing:
+
+```ts
+const found = await friends.relationships([alexSub, samSub]); // any number; sent 100 per call
+const label = {
+  friends: "Friends",
+  request_sent: "Requested", // friends.cancel(sub) takes it back
+  request_received: "Accept", // friends.accept(sub)
+  blocked: "Unblock", // the person blocked them
+  none: "Add friend",
+}[await friends.relationship(alexSub)];
+```
+
+`none` also covers the person themselves, unknown or suspended accounts, people who don't use your app, and someone who
+blocked the person, so a block can't be probed. Keep buttons current with the `friend_request.*` and `friendship.*`
+webhooks.
 
 ## Tests
 

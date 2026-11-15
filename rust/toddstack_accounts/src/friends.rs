@@ -3,6 +3,8 @@
 //!
 //! Your app only ever sees friends who also use your app.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -35,6 +37,32 @@ pub enum Sent {
     Accepted,
     AlreadyFriends,
 }
+
+/// Where the person stands with someone: what a friend button should say.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Relationship {
+    /// "Friends".
+    Friends,
+    /// The person asked them: "Requested" (take it back with [`Friends::cancel`]).
+    RequestSent,
+    /// They asked the person: "Accept" ([`Friends::accept`]).
+    RequestReceived,
+    /// The person blocked them: "Unblock".
+    Blocked,
+    /// "Add friend". Also the answer for the person themselves, unknown or
+    /// suspended accounts, people who don't use your app, and someone who
+    /// blocked the person, so a block can't be probed.
+    None,
+    /// A state newer than this crate.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The service answers at most this many people per call;
+/// [`Friends::relationships`] splits longer lists.
+pub const MAX_RELATIONSHIPS_PER_CALL: usize = 100;
 
 /// An event for friends' inboxes ("Alex beat your high score").
 #[derive(Clone, Debug, Default, Serialize)]
@@ -161,6 +189,50 @@ impl<'a> Friends<'a> {
             self.call(reqwest::Method::GET, "/friends", None).await?,
             "friends",
         )
+    }
+
+    /// Where the person stands with each of `subs`, keyed by sub. Any number:
+    /// longer lists go out as several calls.
+    ///
+    /// # Errors
+    /// A malformed sub, or the request failed.
+    pub async fn relationships(&self, subs: &[&str]) -> Result<HashMap<String, Relationship>> {
+        let mut found: HashMap<String, Relationship> = HashMap::new();
+        for chunk in subs.chunks(MAX_RELATIONSHIPS_PER_CALL) {
+            let mut url: reqwest::Url =
+                reqwest::Url::parse(&format!("{}/friends/relationships", self.base)).map_err(
+                    |e| Error::Api {
+                        status: 0,
+                        message: e.to_string(),
+                    },
+                )?;
+            url.query_pairs_mut().append_pair("subs", &chunk.join(","));
+            let value: Value = call(
+                self.accounts,
+                self.token,
+                reqwest::Method::GET,
+                url.as_str(),
+                None,
+            )
+            .await?;
+            found.extend(field::<HashMap<String, Relationship>>(
+                value,
+                "relationships",
+            )?);
+        }
+        Ok(found)
+    }
+
+    /// Where the person stands with `sub`.
+    ///
+    /// # Errors
+    /// A malformed sub, or the request failed.
+    pub async fn relationship(&self, sub: &str) -> Result<Relationship> {
+        Ok(self
+            .relationships(&[sub])
+            .await?
+            .remove(sub)
+            .unwrap_or(Relationship::None))
     }
 
     /// # Errors
@@ -363,6 +435,27 @@ mod tests {
             json,
             json!({ "kind": "daily_completed", "title": "Alex finished the daily", "body": "" })
         );
+    }
+
+    #[test]
+    fn relationships_read_the_service_values_and_tolerate_new_ones() {
+        let expected: HashMap<String, Relationship> = HashMap::from([
+            (String::from("a"), Relationship::Friends),
+            (String::from("b"), Relationship::RequestSent),
+            (String::from("c"), Relationship::RequestReceived),
+            (String::from("d"), Relationship::Blocked),
+            (String::from("e"), Relationship::None),
+            (String::from("f"), Relationship::Unknown),
+        ]);
+        let actual: HashMap<String, Relationship> = field(
+            json!({ "relationships": {
+                "a": "friends", "b": "request_sent", "c": "request_received",
+                "d": "blocked", "e": "none", "f": "something_new",
+            }}),
+            "relationships",
+        )
+        .unwrap();
+        assert_eq!(expected, actual);
     }
 
     #[test]

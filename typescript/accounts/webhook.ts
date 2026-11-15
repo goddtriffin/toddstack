@@ -22,6 +22,9 @@ export const WEBHOOK_TOLERANCE_SECONDS = 300;
  * - `user.reactivated`.
  * - `friendship.created`, `friendship.removed`: `data.sub` and `data.friend_sub` became (or stopped being)
  *   friends. Sent once per side, so each person gets an event with themselves as `sub`.
+ * - `friend_request.created`, `friend_request.cancelled`, `friend_request.declined`: `data.from_sub` asked
+ *   `data.to_sub`, took the request back, or was turned down. Sent once per side. An accepted request sends
+ *   only `friendship.created`.
  */
 export const WEBHOOK_EVENT_TYPES = [
   "user.updated",
@@ -32,6 +35,9 @@ export const WEBHOOK_EVENT_TYPES = [
   "grant.revoked",
   "friendship.created",
   "friendship.removed",
+  "friend_request.created",
+  "friend_request.cancelled",
+  "friend_request.declined",
 ] as const;
 
 /** An event type this version knows (see `WEBHOOK_EVENT_TYPES`). */
@@ -53,9 +59,10 @@ export interface WebhookEvent {
   createdAt: number;
   /**
    * Always has `sub` (the person the event is about); `user.updated` adds the fields that changed, and the
-   * friendship events add `friend_sub` (the other person).
+   * friendship events add `friend_sub` (the other person), and the friend request events add `from_sub` (who
+   * asked) and `to_sub` (who was asked).
    */
-  data: { sub?: string; friend_sub?: string; [field: string]: unknown };
+  data: { sub?: string; friend_sub?: string; from_sub?: string; to_sub?: string; [field: string]: unknown };
 }
 
 function reject(why: string): AccountsError {

@@ -111,6 +111,21 @@ Deno.test("friendship events name both people", async () => {
   }
 });
 
+Deno.test("friend request events name the sender and the receiver", async () => {
+  for (const type of ["friend_request.created", "friend_request.cancelled", "friend_request.declined"]) {
+    const body =
+      `{"id":"e4","type":"${type}","created_at":1700000000,"data":{"sub":"u2","from_sub":"u1","to_sub":"u2"}}`;
+    const event = await verifyWebhook("secret", await sign("secret", 1_700_000_000, body), body, 1_700_000_000);
+    assertEquals(event, {
+      id: "e4",
+      type,
+      createdAt: 1_700_000_000,
+      data: { sub: "u2", from_sub: "u1", to_sub: "u2" },
+    });
+    assert(isKnownWebhookEventType(event.type));
+  }
+});
+
 Deno.test("every event type the service sends is known, and newer ones still verify", async () => {
   assertEquals([...WEBHOOK_EVENT_TYPES], [
     "user.updated",
@@ -121,6 +136,9 @@ Deno.test("every event type the service sends is known, and newer ones still ver
     "grant.revoked",
     "friendship.created",
     "friendship.removed",
+    "friend_request.created",
+    "friend_request.cancelled",
+    "friend_request.declined",
   ]);
   const body = '{"id":"e3","type":"something.new","created_at":1700000000,"data":{"sub":"u1"}}';
   const event = await verifyWebhook("secret", await sign("secret", 1_700_000_000, body), body, 1_700_000_000);
@@ -289,6 +307,32 @@ Deno.test("friends API calls the service and maps fields", async () => {
   );
   assertEquals(calls[1].split(" ").slice(0, 2).join(" "), "GET /api/v1/inbox?limit=20");
   assertEquals(calls[3].split(" ").slice(0, 2).join(" "), "PUT /api/v1/mutes/*");
+});
+
+Deno.test("relationships ask in chunks of 100 and answer for each person", async () => {
+  const asked: string[][] = [];
+  const accounts = new Accounts(config, {
+    keys: jwks,
+    fetch: (input, init) => {
+      const url = new URL(new Request(input, init).url);
+      assertEquals(url.pathname, "/api/v1/friends/relationships");
+      const subs = url.searchParams.get("subs")!.split(",");
+      asked.push(subs);
+      return Promise.resolve(
+        Response.json({
+          relationships: Object.fromEntries(subs.map((s) => [s, s === "u0" ? "friends" : "none"])),
+        }),
+      );
+    },
+  });
+  const friends = accounts.friends("tok");
+  const subs = Array.from({ length: 150 }, (_, i) => `u${i}`);
+  const found = await friends.relationships(subs);
+  assertEquals(asked.map((a) => a.length), [100, 50]);
+  assertEquals(Object.keys(found).length, 150);
+  assertEquals([found.u0, found.u149], ["friends", "none"]);
+  assertEquals(await friends.relationship("u0"), "friends");
+  assertEquals(await friends.relationships([]), {});
 });
 
 Deno.test("versions agree", async () => {
