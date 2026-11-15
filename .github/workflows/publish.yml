@@ -1,0 +1,66 @@
+# Publishes the libraries (crates.io, JSR, npm) when a version is bumped on main. No tokens: every registry trusts
+# this workflow file through OpenID Connect (trusted publishing), set up once per package. Free: public repo.
+name: publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/Cargo.toml"
+      - "rust/webserver_base/**"
+      - "rust/flyball/**"
+      - "rust/toddstack_accounts/**"
+      - "typescript/deno.jsonc"
+      - "typescript/webserver-base/**"
+      - "typescript/accounts/**"
+      - "scripts/publish.sh"
+      - ".github/workflows/publish.yml"
+  pull_request:
+    paths:
+      - "rust/Cargo.toml"
+      - "rust/webserver_base/**"
+      - "rust/flyball/**"
+      - "rust/toddstack_accounts/**"
+      - "typescript/deno.jsonc"
+      - "typescript/webserver-base/**"
+      - "typescript/accounts/**"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-${{ github.ref }}
+
+jobs:
+  # On a PR: a library whose files changed must have a new version, or merging would publish nothing.
+  version-bumped:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - run: scripts/publish.sh check
+
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # tags and releases
+      id-token: write # trusted publishing to crates.io, JSR and npm
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: denoland/setup-deno@v2.0.5
+        with:
+          deno-version: v2.9.8
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26.13.1
+          registry-url: https://registry.npmjs.org
+      - run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
+      - uses: rust-lang/crates-io-auth-action@v1.0.6
+        id: crates-io
+      - run: scripts/publish.sh
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
