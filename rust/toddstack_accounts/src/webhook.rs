@@ -19,17 +19,97 @@ pub const HEADER: &str = "X-Accounts-Signature";
 /// How old a signature may be.
 pub const TOLERANCE_SECONDS: i64 = 300;
 
+/// What happened. Matches the wire `type`; [`EventKind::as_str`] gives it
+/// back. Types this version doesn't know yet arrive as [`EventKind::Other`],
+/// so a newer accounts service never breaks verification.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash)]
+#[serde(from = "String")]
+#[non_exhaustive]
+pub enum EventKind {
+    /// `user.updated`: `data` adds the fields that changed.
+    UserUpdated,
+    /// `user.deleted`: delete or anonymize the person's rows.
+    UserDeleted,
+    /// `user.suspended`: end the person's sessions.
+    UserSuspended,
+    /// `user.reactivated`.
+    UserReactivated,
+    /// `user.signed_out`: signed out everywhere; end the person's sessions.
+    UserSignedOut,
+    /// `grant.revoked`: the person removed your app; end their sessions.
+    GrantRevoked,
+    /// `friendship.created`: `sub` and `friend_sub` became friends. Sent once
+    /// per side, so each person gets an event with themselves as `sub`.
+    FriendshipCreated,
+    /// `friendship.removed`: `sub` and `friend_sub` are no longer friends
+    /// (unfriended or blocked). Sent once per side.
+    FriendshipRemoved,
+    /// A type this version doesn't know.
+    Other(String),
+}
+
+impl EventKind {
+    /// The wire name, such as `user.deleted`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::UserUpdated => "user.updated",
+            Self::UserDeleted => "user.deleted",
+            Self::UserSuspended => "user.suspended",
+            Self::UserReactivated => "user.reactivated",
+            Self::UserSignedOut => "user.signed_out",
+            Self::GrantRevoked => "grant.revoked",
+            Self::FriendshipCreated => "friendship.created",
+            Self::FriendshipRemoved => "friendship.removed",
+            Self::Other(kind) => kind,
+        }
+    }
+}
+
+impl From<String> for EventKind {
+    fn from(kind: String) -> Self {
+        match kind.as_str() {
+            "user.updated" => Self::UserUpdated,
+            "user.deleted" => Self::UserDeleted,
+            "user.suspended" => Self::UserSuspended,
+            "user.reactivated" => Self::UserReactivated,
+            "user.signed_out" => Self::UserSignedOut,
+            "grant.revoked" => Self::GrantRevoked,
+            "friendship.created" => Self::FriendshipCreated,
+            "friendship.removed" => Self::FriendshipRemoved,
+            _ => Self::Other(kind),
+        }
+    }
+}
+
+impl std::fmt::Display for EventKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for EventKind {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for EventKind {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 /// A verified event.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Event {
     /// Unique per event; repeated on retries.
     pub id: String,
-    /// `user.updated`, `user.deleted`, `user.suspended`, `user.reactivated`,
-    /// `user.signed_out`, or `grant.revoked`.
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: EventKind,
     pub created_at: i64,
-    /// Always has `sub`; `user.updated` adds the fields that changed.
+    /// Always has `sub`; `user.updated` adds the fields that changed, and the
+    /// friendship events add `friend_sub`.
     pub data: Value,
 }
 
@@ -38,6 +118,13 @@ impl Event {
     #[must_use]
     pub fn sub(&self) -> Option<&str> {
         self.data.get("sub").and_then(Value::as_str)
+    }
+
+    /// The other person, for [`EventKind::FriendshipCreated`] and
+    /// [`EventKind::FriendshipRemoved`].
+    #[must_use]
+    pub fn friend_sub(&self) -> Option<&str> {
+        self.data.get("friend_sub").and_then(Value::as_str)
     }
 }
 
@@ -99,8 +186,68 @@ mod tests {
             1_700_000_010,
         )
         .unwrap();
-        assert_eq!(event.kind, "user.deleted");
-        assert_eq!(event.sub(), Some("u1"));
+        let expected: Event = Event {
+            id: String::from("e1"),
+            kind: EventKind::UserDeleted,
+            created_at: 1_700_000_000,
+            data: serde_json::json!({ "sub": "u1" }),
+        };
+        assert_eq!(expected, event);
+        assert_eq!(Some("u1"), event.sub());
+        assert_eq!(None, event.friend_sub());
+    }
+
+    fn verified(body: &str) -> Event {
+        verify(
+            b"secret",
+            &sign(b"secret", 1_700_000_000, body),
+            body.as_bytes(),
+            1_700_000_000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn friendship_events_name_both_people() {
+        for (wire, kind) in [
+            ("friendship.created", EventKind::FriendshipCreated),
+            ("friendship.removed", EventKind::FriendshipRemoved),
+        ] {
+            let body: String = format!(
+                r#"{{"id":"e2","type":"{wire}","created_at":1700000000,"data":{{"sub":"u1","friend_sub":"u2"}}}}"#
+            );
+            let event: Event = verified(&body);
+            assert_eq!(kind, event.kind);
+            assert_eq!(wire, event.kind.as_str());
+            assert_eq!(Some("u1"), event.sub());
+            assert_eq!(Some("u2"), event.friend_sub());
+        }
+    }
+
+    #[test]
+    fn every_known_type_round_trips_through_its_wire_name() {
+        for kind in [
+            EventKind::UserUpdated,
+            EventKind::UserDeleted,
+            EventKind::UserSuspended,
+            EventKind::UserReactivated,
+            EventKind::UserSignedOut,
+            EventKind::GrantRevoked,
+            EventKind::FriendshipCreated,
+            EventKind::FriendshipRemoved,
+        ] {
+            assert_eq!(kind, EventKind::from(kind.as_str().to_owned()));
+            assert_ne!(EventKind::Other(kind.as_str().to_owned()), kind);
+        }
+    }
+
+    #[test]
+    fn a_type_this_version_does_not_know_still_verifies() {
+        let event: Event = verified(
+            r#"{"id":"e3","type":"something.new","created_at":1700000000,"data":{"sub":"u1"}}"#,
+        );
+        assert_eq!(EventKind::Other(String::from("something.new")), event.kind);
+        assert_eq!("something.new", event.kind.as_str());
     }
 
     #[test]

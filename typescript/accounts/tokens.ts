@@ -4,6 +4,7 @@ import { fromBase64, fromUtf8, utf8 } from "./encoding.ts";
 import { AccountsError } from "./error.ts";
 import { Friends } from "./friends.ts";
 import { type JwkSet, Keys } from "./jwks.ts";
+import { endSessionUrl, type LogoutOptions, type SignOut } from "./logout.ts";
 import { type LoginOptions, parseCallback, type PendingLogin, type StartedLogin, startLogin } from "./login.ts";
 import { VERSION } from "./version.ts";
 
@@ -181,6 +182,25 @@ export class Accounts {
     if (!response.ok) {
       throw new AccountsError("api", `accounts API returned ${response.status}`, { status: response.status });
     }
+  }
+
+  /**
+   * Signs out in one call: revokes `refreshToken` (if you hold one) and builds the end-session URL. End your own
+   * session first; then redirect to `url` to also sign the person out of the accounts service (every project in that
+   * browser), or skip it to sign out of your app alone. A failed revoke doesn't stop sign-out: it comes back as
+   * `revokeError`.
+   */
+  async signOut(refreshToken: string | null, options: LogoutOptions = {}): Promise<SignOut> {
+    let revokeError: AccountsError | null = null;
+    if (refreshToken !== null) {
+      try {
+        await this.revoke(refreshToken);
+      } catch (error) {
+        if (!(error instanceof AccountsError)) throw error;
+        revokeError = error;
+      }
+    }
+    return { url: endSessionUrl(this.config, options), revokeError };
   }
 
   /** Verifies an ID token: signature, ES256, issuer, audience (your client id), expiry, and the nonce if given. */

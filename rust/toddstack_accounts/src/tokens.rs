@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::jwks::Keys;
 use crate::login::{PendingLogin, parse_callback};
+use crate::logout::{self, SignOut};
 use crate::{Error, ISSUER, Result};
 
 /// Your app's registration with the accounts service.
@@ -222,6 +223,27 @@ impl Accounts {
                 status: response.status().as_u16(),
                 message: response.text().await.unwrap_or_default(),
             })
+        }
+    }
+
+    /// Signs out in one call: revokes `refresh_token` (if you hold one) and
+    /// builds the end-session URL. End your own session first; then redirect
+    /// to [`SignOut::url`] to also sign the person out of the accounts service
+    /// (every project in that browser), or skip it to sign out of your app
+    /// alone. A failed revoke doesn't stop sign-out: it comes back in
+    /// [`SignOut::revoke_error`].
+    pub async fn sign_out(
+        &self,
+        refresh_token: Option<&str>,
+        options: &logout::Options<'_>,
+    ) -> SignOut {
+        let revoke_error: Option<Error> = match refresh_token {
+            Some(token) => self.revoke(token).await.err(),
+            None => None,
+        };
+        SignOut {
+            url: logout::end_session_url(&self.config, options),
+            revoke_error,
         }
     }
 

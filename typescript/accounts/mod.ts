@@ -39,6 +39,7 @@ export {
   type StartedLogin,
   startLogin,
 } from "./login.ts";
+export { endSessionUrl, type LogoutOptions, postLogoutTarget, type SignOut } from "./logout.ts";
 export { safeReturnTo } from "./return-to.ts";
 export {
   type AccessClaims,
@@ -53,4 +54,12 @@ export {
   type TokenSet,
 } from "./tokens.ts";
 export { VERSION } from "./version.ts";
-export { verifyWebhook, WEBHOOK_HEADER, WEBHOOK_TOLERANCE_SECONDS, type WebhookEvent } from "./webhook.ts";
+export {
+  isKnownWebhookEventType,
+  verifyWebhook,
+  WEBHOOK_EVENT_TYPES,
+  WEBHOOK_HEADER,
+  WEBHOOK_TOLERANCE_SECONDS,
+  type WebhookEvent,
+  type WebhookEventType,
+} from "./webhook.ts";

@@ -1,5 +1,7 @@
-// The accounts service's published signing keys, cached. An unknown `kid` triggers one refetch (keys rotate),
-// at most once a minute.
+// The accounts service's published signing keys, cached. Keys rotate on a schedule (a new key is published
+// before it signs), so an unknown `kid` triggers a refetch, at most once a minute whether or not it succeeds: a
+// burst of tokens with made-up `kid`s can't turn into a burst of fetches. Concurrent callers share one fetch and
+// its outcome.
 
 import { AccountsError } from "./error.ts";
 
@@ -18,31 +20,40 @@ export interface JwkSet {
 const REFRESH_EVERY_MS = 3600_000;
 const MIN_REFETCH_MS = 60_000;
 
+const unknown = () => new AccountsError("invalid_token", "token rejected: unknown signing key");
+
 /** A key cache: remote (fetched from the issuer) or pinned (tests, offline use; never refetched). */
 export class Keys {
   #url: string | null;
   #fetch: typeof fetch;
-  #cache: { at: number; set: JwkSet } | null;
+  #now: () => number;
+  #set: JwkSet | null;
+  #fetchedAt: number | null;
+  /** The last fetch made for an unknown `kid`, successful or not. */
+  #refetchedAt: number | null = null;
+  #inFlight: Promise<void> | null = null;
   #imported = new Map<string, Promise<CryptoKey>>();
 
-  private constructor(url: string | null, set: JwkSet | null, fetcher: typeof fetch) {
+  private constructor(url: string | null, set: JwkSet | null, fetcher: typeof fetch, now: () => number) {
     this.#url = url;
     this.#fetch = fetcher;
-    this.#cache = set ? { at: Date.now(), set } : null;
+    this.#now = now;
+    this.#set = set;
+    this.#fetchedAt = set ? now() : null;
   }
 
-  /** Keys fetched from `url`. */
-  static remote(url: string, fetcher: typeof fetch): Keys {
-    return new Keys(url, null, fetcher);
+  /** Keys fetched from `url`. `now` (milliseconds) is a parameter so tests can move the clock. */
+  static remote(url: string, fetcher: typeof fetch, now: () => number = Date.now): Keys {
+    return new Keys(url, null, fetcher, now);
   }
 
   /** Fixed keys, never fetched. */
   static pinned(set: JwkSet): Keys {
-    return new Keys(null, set, fetch);
+    return new Keys(null, set, fetch, Date.now);
   }
 
   #lookup(kid: string): Promise<CryptoKey> | null {
-    const jwk = this.#cache?.set.keys.find((k) => k.kid === kid && k.kty === "EC" && k.crv === "P-256");
+    const jwk = this.#set?.keys.find((k) => k.kid === kid && k.kty === "EC" && k.crv === "P-256");
     if (!jwk) return null;
     const id = JSON.stringify([jwk.kid, jwk.x, jwk.y]);
     let key = this.#imported.get(id);
@@ -54,30 +65,50 @@ export class Keys {
     return key;
   }
 
-  /** The key for `kid`, fetching the key set if it's missing or stale. */
+  #fresh(): boolean {
+    return this.#fetchedAt !== null && this.#now() - this.#fetchedAt <= REFRESH_EVERY_MS;
+  }
+
+  async #fetchSet(url: string): Promise<void> {
+    let response: Response;
+    try {
+      response = await this.#fetch(url, { signal: AbortSignal.timeout(10_000) });
+    } catch (cause) {
+      throw new AccountsError("http", `http: ${cause}`, { cause });
+    }
+    if (!response.ok) {
+      throw new AccountsError("http", `http: JWKS fetch returned ${response.status}`, { status: response.status });
+    }
+    const set = (await response.json()) as JwkSet;
+    this.#set = set;
+    this.#fetchedAt = this.#refetchedAt = this.#now();
+  }
+
+  /** The key for `kid`, fetching the key set if it's stale, or if `kid` is new to it (rate-limited). */
   async get(kid: string): Promise<CryptoKey> {
-    const age = this.#cache ? Date.now() - this.#cache.at : null;
-    const stale = age === null || age > REFRESH_EVERY_MS;
-    if (!stale || this.#url === null) {
+    if (this.#url === null) return await (this.#lookup(kid) ?? Promise.reject(unknown()));
+    if (this.#fresh()) {
       const key = this.#lookup(kid);
       if (key) return await key;
-      if (this.#url === null) throw new AccountsError("invalid_token", "token rejected: unknown signing key");
     }
-    // Unknown kid on a fresh cache: refetch, but not more than once a minute.
-    if (stale || (age !== null && age > MIN_REFETCH_MS)) {
-      let response: Response;
-      try {
-        response = await this.#fetch(this.#url!, { signal: AbortSignal.timeout(10_000) });
-      } catch (cause) {
-        throw new AccountsError("http", `http: ${cause}`, { cause });
+    if (this.#inFlight) {
+      // Share the fetch already running, and its outcome.
+      await this.#inFlight.catch(() => {});
+      if (!this.#fresh()) {
+        throw new AccountsError("invalid_token", "token rejected: the signing keys couldn't be fetched (try again)");
       }
-      if (!response.ok) {
-        throw new AccountsError("http", `http: JWKS fetch returned ${response.status}`, { status: response.status });
-      }
-      this.#cache = { at: Date.now(), set: (await response.json()) as JwkSet };
+      return await (this.#lookup(kid) ?? Promise.reject(unknown()));
     }
-    const key = this.#lookup(kid);
-    if (!key) throw new AccountsError("invalid_token", "token rejected: unknown signing key");
-    return await key;
+    if (this.#fresh()) {
+      if (this.#refetchedAt !== null && this.#now() - this.#refetchedAt <= MIN_REFETCH_MS) throw unknown();
+      this.#refetchedAt = this.#now();
+    }
+    this.#inFlight = this.#fetchSet(this.#url);
+    try {
+      await this.#inFlight;
+    } finally {
+      this.#inFlight = null;
+    }
+    return await (this.#lookup(kid) ?? Promise.reject(unknown()));
   }
 }

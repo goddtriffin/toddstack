@@ -13,16 +13,49 @@ export const WEBHOOK_HEADER = "X-Accounts-Signature";
 /** How old a signature may be, seconds. */
 export const WEBHOOK_TOLERANCE_SECONDS = 300;
 
+/**
+ * Every event type this version knows, as sent on the wire:
+ *
+ * - `user.updated`: `data` adds the fields that changed.
+ * - `user.deleted`: delete or anonymize the person's rows.
+ * - `user.suspended`, `user.signed_out`, `grant.revoked`: end the person's sessions.
+ * - `user.reactivated`.
+ * - `friendship.created`, `friendship.removed`: `data.sub` and `data.friend_sub` became (or stopped being)
+ *   friends. Sent once per side, so each person gets an event with themselves as `sub`.
+ */
+export const WEBHOOK_EVENT_TYPES = [
+  "user.updated",
+  "user.deleted",
+  "user.suspended",
+  "user.reactivated",
+  "user.signed_out",
+  "grant.revoked",
+  "friendship.created",
+  "friendship.removed",
+] as const;
+
+/** An event type this version knows (see `WEBHOOK_EVENT_TYPES`). */
+export type WebhookEventType = typeof WEBHOOK_EVENT_TYPES[number];
+
+/** Whether `type` is one this version knows. Newer types still verify; they just aren't in the union. */
+export function isKnownWebhookEventType(type: string): type is WebhookEventType {
+  return (WEBHOOK_EVENT_TYPES as readonly string[]).includes(type);
+}
+
 /** A verified event. */
 export interface WebhookEvent {
   /** Unique per event; repeated on retries. */
   id: string;
-  /** `user.updated`, `user.deleted`, `user.suspended`, `user.reactivated`, `user.signed_out`, or `grant.revoked`. */
-  type: string;
+  /** One of `WEBHOOK_EVENT_TYPES`, or a type newer than this version (still verified, still delivered). */
+  // The intersection keeps editor completion for the known types while accepting newer ones.
+  type: WebhookEventType | (string & Record<never, never>);
   /** Unix seconds. */
   createdAt: number;
-  /** Always has `sub` (the person the event is about); `user.updated` adds the fields that changed. */
-  data: { sub?: string; [field: string]: unknown };
+  /**
+   * Always has `sub` (the person the event is about); `user.updated` adds the fields that changed, and the
+   * friendship events add `friend_sub` (the other person).
+   */
+  data: { sub?: string; friend_sub?: string; [field: string]: unknown };
 }
 
 function reject(why: string): AccountsError {

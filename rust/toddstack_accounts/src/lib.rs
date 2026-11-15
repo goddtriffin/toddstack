@@ -9,6 +9,7 @@
 //!   access tokens against the published signing keys.
 //! - [`webhook`]: verifying the signed webhooks the accounts service sends.
 //! - [`friends`]: the friends, events and inbox API.
+//! - [`logout`]: signing out (revoke, then the end-session URL) in one call.
 //! - [`return_to`]: keeping post-sign-in redirects on your own site.
 //!
 //! It holds no secrets of its own and never logs tokens. Your app's client
@@ -38,6 +39,7 @@ mod error;
 pub mod friends;
 mod jwks;
 pub mod login;
+pub mod logout;
 pub mod return_to;
 mod tokens;
 pub mod webhook;
