@@ -480,3 +480,43 @@ Deno.test("concurrent lookups share one fetch, and its failure", async () => {
   assertEquals(results.map((r) => r.status), Array(8).fill("rejected"));
   assertEquals(down.state.hits, 1);
 });
+
+Deno.test("blocks and reports reach the service with the right credentials", async () => {
+  const calls: string[] = [];
+  const accounts = new Accounts(config, {
+    keys: jwks,
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      calls.push(`${req.method} ${new URL(req.url).pathname} ${req.headers.get("authorization")} ${await req.text()}`);
+      if (req.url.endsWith("/blocks")) {
+        return Response.json({
+          blocked: [{ sub: "u2", username: "rude_bob", name: null, picture: null, since: "s" }],
+          hidden: ["u2", "u3"],
+        });
+      }
+      return new Response(null, { status: 204 });
+    },
+  });
+  const friends = accounts.friends("tok");
+  assertEquals(await friends.blocks(), {
+    blocked: [{ sub: "u2", username: "rude_bob", name: null, picture: null, since: "s" }],
+    hidden: ["u2", "u3"],
+  });
+  await friends.report("u2", "name");
+  await friends.report("u2", "other", "spam");
+  await accounts.reportAsGuest({ sub: "u2", reason: "harassment", guestId: "g1", guestIp: "203.0.113.9" });
+  assertEquals(calls, [
+    "GET /api/v1/blocks Bearer tok ",
+    'POST /api/v1/reports Bearer tok {"sub":"u2","reason":"name"}',
+    'POST /api/v1/reports Bearer tok {"sub":"u2","reason":"other","note":"spam"}',
+    `POST /api/v1/reports Basic ${
+      btoa("boggledygook:s3cret")
+    } {"sub":"u2","reason":"harassment","guest_id":"g1","guest_ip":"203.0.113.9"}`,
+  ]);
+});
+
+Deno.test("a public client can't report for guests", async () => {
+  const accounts = new Accounts({ ...config, clientSecret: null }, { keys: jwks, fetch: () => Promise.reject() });
+  const e = await assertRejects(() => accounts.reportAsGuest({ sub: "u2", reason: "name" }), AccountsError);
+  assertEquals(e.kind, "config");
+});
