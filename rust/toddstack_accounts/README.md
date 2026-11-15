@@ -118,7 +118,7 @@ friends.post_event(&Event {
 The person can mute your app's events, one kind or all (`friends.mute("daily_completed")`,
 `friends.mute(ALL_KINDS)`, `unmute`, `mutes()`), here or in Account Center.
 
-A block overrides everything (no requests, no events either way). Events go to friends' inboxes (`inbox()`),
+A block overrides everything (no requests, invite links or events either way). Events go to friends' inboxes (`inbox()`),
 and will also go out as push notifications once the native apps exist.
 
 ## Friend buttons
@@ -141,6 +141,41 @@ let label = match friends.relationship(&alex_sub).await? {
 `None` also covers the person themselves, unknown or suspended accounts, people who don't use your app, and
 someone who blocked the person, so a block can't be probed. Keep buttons current with the `friend_request.*`
 and `friendship.*` webhooks.
+
+## Blocks
+
+A block is silent: nobody is told. Keep the two apart yourself in friends lists, "Playing now" and chat
+(not leaderboards) with `blocks()`:
+
+```rust
+let blocks = friends.blocks().await?;
+// blocks.blocked: people this person blocked, for an Unblock list.
+// blocks.hidden: everyone blocked either way; hide them, never say why.
+let visible: Vec<_> = playing_now.into_iter().filter(|p| !blocks.hidden.contains(&p.sub)).collect();
+```
+
+## Reports
+
+Report a username, picture or behaviour to Todd's review queue. A signed-in person reports with their own
+token (no particular scope); a guest has no token, so your server reports for them with your client secret:
+
+```rust
+use toddstack_accounts::report::{GuestReport, Reason};
+
+friends.report(&sub, Reason::Harassment, Some("kept insulting me in chat")).await?;
+
+accounts.report_as_guest(&GuestReport {
+    sub,
+    reason: Reason::Name,
+    note: None,
+    guest_id: Some(guest_id),   // your stable guest id: limits and dedupes per guest
+    guest_ip: Some(client_ip),  // the verified IP nginx passed on
+}).await?;
+```
+
+Only accounts can be reported (a guest's id is 404), not yourself (400). Notes are at most `MAX_NOTE_CHARS`
+(500). 10 reports per reporter per hour (429). Reporting the same person for the same reason again while
+it's open succeeds and changes nothing, so always show the same thanks.
 
 ## Not in this crate
 

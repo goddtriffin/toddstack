@@ -8,7 +8,8 @@
 //! - [`Accounts`]: token exchange, refresh, revocation, and checking ID and
 //!   access tokens against the published signing keys.
 //! - [`webhook`]: verifying the signed webhooks the accounts service sends.
-//! - [`friends`]: the friends, events and inbox API.
+//! - [`friends`]: the friends, blocks, events and inbox API.
+//! - [`report`]: reporting someone to Todd's review queue, for people and guests.
 //! - [`logout`]: signing out (revoke, then the end-session URL) in one call.
 //! - [`return_to`]: keeping post-sign-in redirects on your own site.
 //!
@@ -40,6 +41,7 @@ pub mod friends;
 mod jwks;
 pub mod login;
 pub mod logout;
+pub mod report;
 pub mod return_to;
 mod tokens;
 pub mod webhook;

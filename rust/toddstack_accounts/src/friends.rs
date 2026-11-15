@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::report::{self, Reason};
 use crate::tokens::Accounts;
 use crate::{Error, Result};
 
@@ -26,6 +27,18 @@ pub struct Person {
 pub struct Requests {
     pub incoming: Vec<Person>,
     pub outgoing: Vec<Person>,
+}
+
+/// The person's blocks, for keeping people apart in your app.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Blocks {
+    /// People this person blocked, newest first: for an Unblock list.
+    pub blocked: Vec<Person>,
+    /// Everyone blocked either way (sorted `sub`s). Hide these from the
+    /// person in friends lists, "Playing now" and chat, and them from the
+    /// person, but never show it as a block (blocks are silent) and don't
+    /// filter leaderboards.
+    pub hidden: Vec<String>,
 }
 
 /// What sending a request did.
@@ -348,6 +361,35 @@ impl<'a> Friends<'a> {
             .map(|_| ())
     }
 
+    /// Who the person blocked, and everyone to keep apart from them.
+    ///
+    /// # Errors
+    /// The request failed.
+    pub async fn blocks(&self) -> Result<Blocks> {
+        let value: Value = self.call(reqwest::Method::GET, "/blocks", None).await?;
+        serde_json::from_value(value).map_err(|e| Error::Api {
+            status: 200,
+            message: e.to_string(),
+        })
+    }
+
+    /// Reports `sub` to Todd's review queue, from this person, at your app.
+    /// Needs no particular scope. `note` is at most
+    /// [`report::MAX_NOTE_CHARS`] characters.
+    ///
+    /// # Errors
+    /// 400 reporting themselves or a bad note, 404 an unknown account or a
+    /// guest, 429 too many reports, or the request failed.
+    pub async fn report(&self, sub: &str, reason: Reason, note: Option<&str>) -> Result<()> {
+        self.call(
+            reqwest::Method::POST,
+            "/reports",
+            Some(report::body(sub, reason, note)),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Posts an event; returns how many friends' inboxes it reached.
     ///
     /// # Errors
@@ -454,6 +496,27 @@ mod tests {
             }}),
             "relationships",
         )
+        .unwrap();
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn blocks_read_both_lists() {
+        let expected: Blocks = Blocks {
+            blocked: vec![Person {
+                sub: String::from("u2"),
+                username: String::from("rude_bob"),
+                name: None,
+                picture: Some(String::from("https://assets.toddgriffin.me/a.jpg")),
+                since: String::from("2026-11-15T10:00:00Z"),
+            }],
+            hidden: vec![String::from("u2"), String::from("u3")],
+        };
+        let actual: Blocks = serde_json::from_value(json!({
+            "blocked": [{ "sub": "u2", "username": "rude_bob", "name": null,
+                "picture": "https://assets.toddgriffin.me/a.jpg", "since": "2026-11-15T10:00:00Z" }],
+            "hidden": ["u2", "u3"],
+        }))
         .unwrap();
         assert_eq!(expected, actual);
     }

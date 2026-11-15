@@ -6,6 +6,7 @@ import { Friends } from "./friends.ts";
 import { type JwkSet, Keys } from "./jwks.ts";
 import { endSessionUrl, type LogoutOptions, type SignOut } from "./logout.ts";
 import { type LoginOptions, parseCallback, type PendingLogin, type StartedLogin, startLogin } from "./login.ts";
+import { type GuestReport, reportBody } from "./report.ts";
 import { VERSION } from "./version.ts";
 
 /** The production issuer. */
@@ -230,10 +231,26 @@ export class Accounts {
     return new Friends(this, accessToken);
   }
 
+  /**
+   * Reports someone for a guest, authenticated with your client credentials (so the config needs its client
+   * secret). Fails with 400 for a bad reason or note, 404 for an unknown account or a guest, 429 for too many.
+   */
+  async reportAsGuest(report: GuestReport): Promise<void> {
+    if (this.config.clientSecret === null) {
+      throw new AccountsError("config", "reporting for a guest needs the client secret: set `clientSecret`");
+    }
+    const url = `${this.config.issuer.replace(/\/oidc$/, "")}/api/v1/reports`;
+    await this.#callWith(`Basic ${this.#basic(this.config.clientSecret)}`, "POST", url, reportBody(report));
+  }
+
   /** One authenticated JSON call; errors carry the API's message. Used by `Friends`. */
-  async call(token: string, method: string, url: string, body?: unknown): Promise<unknown> {
+  call(token: string, method: string, url: string, body?: unknown): Promise<unknown> {
+    return this.#callWith(`Bearer ${token}`, method, url, body);
+  }
+
+  async #callWith(authorization: string, method: string, url: string, body?: unknown): Promise<unknown> {
     const headers: Record<string, string> = {
-      authorization: `Bearer ${token}`,
+      authorization,
       "user-agent": `toddstack-accounts/${VERSION}`,
     };
     if (body !== undefined) headers["content-type"] = "application/json";
@@ -272,6 +289,12 @@ export class Accounts {
     }
   }
 
+  /** RFC 6749 2.3.1 client credentials: form-encode both parts before Basic. */
+  #basic(secret: string): string {
+    const enc = (s: string) => new URLSearchParams({ v: s }).toString().slice(2);
+    return btoa(`${enc(this.config.clientId)}:${enc(secret)}`);
+  }
+
   /** A form POST with client authentication (Basic for confidential clients, `client_id` for public ones). */
   #post(url: string, params: Record<string, string>): Promise<Response> {
     const form = new URLSearchParams(params);
@@ -280,9 +303,7 @@ export class Accounts {
       "user-agent": `toddstack-accounts/${VERSION}`,
     };
     if (this.config.clientSecret !== null) {
-      // RFC 6749 2.3.1: form-encode both parts before Basic.
-      const enc = (s: string) => new URLSearchParams({ v: s }).toString().slice(2);
-      headers.authorization = `Basic ${btoa(`${enc(this.config.clientId)}:${enc(this.config.clientSecret)}`)}`;
+      headers.authorization = `Basic ${this.#basic(this.config.clientSecret)}`;
     } else {
       form.append("client_id", this.config.clientId);
     }

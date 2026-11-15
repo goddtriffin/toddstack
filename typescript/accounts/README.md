@@ -156,6 +156,38 @@ const label = {
 blocked the person, so a block can't be probed. Keep buttons current with the `friend_request.*` and `friendship.*`
 webhooks.
 
+### Blocks
+
+A block is silent: nobody is told. Keep the two apart yourself in friends lists, "Playing now" and chat (not
+leaderboards) with `blocks()`:
+
+```ts
+const { blocked, hidden } = await friends.blocks();
+// blocked: people this person blocked, for an Unblock list.
+// hidden: everyone blocked either way; hide them, never say why.
+const visible = playingNow.filter((p) => !hidden.includes(p.sub));
+```
+
+### Reports
+
+Report a username, picture or behaviour to Todd's review queue. A signed-in person reports with their own token (no
+particular scope); a guest has no token, so your server reports for them with your client secret:
+
+```ts
+await friends.report(sub, "harassment", "kept insulting me in chat");
+
+await accounts.reportAsGuest({
+  sub,
+  reason: "name",
+  guestId, // your stable guest id: limits and dedupes per guest
+  guestIp, // the verified IP nginx passed on
+});
+```
+
+Only accounts can be reported (a guest's id is 404), not yourself (400). Notes are at most `MAX_NOTE_CHARS` (500). 10
+reports per reporter per hour (429). Reporting the same person for the same reason again while it's open succeeds and
+changes nothing, so always show the same thanks.
+
 ## Tests
 
 `new Accounts(config, { keys, fetch })` pins the signing keys and swaps `fetch`, so tests run with no network.

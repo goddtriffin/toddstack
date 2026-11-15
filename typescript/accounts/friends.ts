@@ -2,6 +2,7 @@
 // `friends:events` to post events). Your app only ever sees friends who also use your app.
 
 import { AccountsError } from "./error.ts";
+import { type Reason, reportBody } from "./report.ts";
 import type { Accounts } from "./tokens.ts";
 
 /** A friend, request or blocked person as your app sees them. */
@@ -24,6 +25,18 @@ export interface Requests {
   incoming: Person[];
   /** Requests the person sent. */
   outgoing: Person[];
+}
+
+/** The person's blocks, for keeping people apart in your app. */
+export interface Blocks {
+  /** People this person blocked, newest first: for an Unblock list. */
+  blocked: Person[];
+  /**
+   * Everyone blocked either way (sorted `sub`s). Hide these from the person in friends lists, "Playing now"
+   * and chat, and them from the person, but never show it as a block (blocks are silent) and don't filter
+   * leaderboards.
+   */
+  hidden: string[];
 }
 
 /** What sending a request did: `accepted` means they had already asked, so you're friends now. */
@@ -184,6 +197,20 @@ export class Friends {
   /** Undoes `block`. */
   async unblock(sub: string): Promise<void> {
     await this.#call("DELETE", `/blocks/${encodeURIComponent(sub)}`);
+  }
+
+  /** Who the person blocked, and everyone to keep apart from them. */
+  async blocks(): Promise<Blocks> {
+    const value = await this.#call("GET", "/blocks");
+    return { blocked: field(value, "blocked"), hidden: field(value, "hidden") };
+  }
+
+  /**
+   * Reports `sub` to Todd's review queue, from this person, at your app. Needs no particular scope. Fails with
+   * 400 for reporting themselves or a bad note, 404 for an unknown account or a guest, 429 for too many.
+   */
+  async report(sub: string, reason: Reason, note?: string): Promise<void> {
+    await this.#call("POST", "/reports", reportBody({ sub, reason, note }));
   }
 
   /** Posts an event; returns how many friends' inboxes it reached. Rate limit: 60 per person per hour per app. */

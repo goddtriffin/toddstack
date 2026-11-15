@@ -22,6 +22,7 @@
 export { AccountsError, type AccountsErrorKind } from "./error.ts";
 export {
   ALL_KINDS,
+  type Blocks,
   type FriendEvent,
   Friends,
   type InboxItem,
@@ -32,6 +33,7 @@ export {
   type Sent,
 } from "./friends.ts";
 export type { Jwk, JwkSet } from "./jwks.ts";
+export { type GuestReport, MAX_NOTE_CHARS, type Reason } from "./report.ts";
 export {
   type Callback,
   type LoginOptions,
