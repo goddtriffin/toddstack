@@ -181,9 +181,10 @@ Tags name their package (`webserver-base-vX.Y.Z`, `flyball-vX.Y.Z`, `toddstack-a
 the **Rust** version; `@todd/webserver-base` alone (TS) gets no tag. Tags up to `v0.3.0` predate the rename.
 Bare `X.Y.Z` tags are reserved: Swift Package Manager reads a repo's plain semver tags as its versions.
 
-If CI cannot publish (a registry is down, trusted publishing unset), run `scripts/publish.sh` locally: it
-does the same and skips what is already out. Locally npm and JSR ask for browser approval, so hand those
-to the user (`! scripts/publish.sh`).
+If a publish fails, fix the cause and re-run the workflow (`gh workflow run publish.yml`): it skips what is
+already out. crates.io **requires** trusted publishing for these crates (Todd's setting), so a crate can only
+be published by this workflow, never from a laptop token. npm and JSR can still be published locally in an
+emergency, with the user's browser approval (`! scripts/publish.sh`).
 
 ## 10. Release notes
 
