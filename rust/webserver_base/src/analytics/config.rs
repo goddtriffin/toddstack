@@ -66,10 +66,24 @@ impl AnalyticsConfig {
     ///
     /// [`EnvError`] if `WSB_ENVIRONMENT` is unset, blank or invalid.
     pub fn from_env() -> Result<Self, EnvError> {
-        let environment: Environment = Environment::from_env()?;
-        Ok(Self::resolve(
-            environment,
+        Self::from_values(
+            std::env::var("WSB_ENVIRONMENT").ok().as_deref(),
             env::optional(ENV_ANALYTICS_ID).as_deref(),
+        )
+    }
+
+    /// [`AnalyticsConfig::from_env`]'s logic over already-read values.
+    ///
+    /// # Errors
+    ///
+    /// [`EnvError`] if the environment is `None`, blank or invalid.
+    pub fn from_values(
+        environment: Option<&str>,
+        script_id: Option<&str>,
+    ) -> Result<Self, EnvError> {
+        Ok(Self::resolve(
+            Environment::from_value(environment)?,
+            script_id,
         ))
     }
 
@@ -101,15 +115,33 @@ impl AnalyticsConfig {
         self.script_id.is_some()
     }
 
+    /// The configured script id, or an empty string when analytics is
+    /// disabled.
+    #[deprecated(note = "returns an empty string when analytics is disabled; \
+                         use `script_id_if_enabled`")]
+    #[must_use]
+    pub fn script_id(&self) -> &str {
+        self.script_id.as_deref().unwrap_or_default()
+    }
+
     /// The configured script id, if enabled.
     #[must_use]
-    pub fn script_id(&self) -> Option<&str> {
+    pub fn script_id_if_enabled(&self) -> Option<&str> {
         self.script_id.as_deref()
+    }
+
+    /// The upstream script URL this proxy fetches, or an empty string when
+    /// analytics is disabled.
+    #[deprecated(note = "returns an empty string when analytics is disabled; \
+                         use `upstream_script_url_if_enabled`")]
+    #[must_use]
+    pub fn upstream_script_url(&self) -> String {
+        self.upstream_script_url_if_enabled().unwrap_or_default()
     }
 
     /// The upstream script URL this proxy fetches, if enabled.
     #[must_use]
-    pub fn upstream_script_url(&self) -> Option<String> {
+    pub fn upstream_script_url_if_enabled(&self) -> Option<String> {
         self.script_id
             .as_ref()
             .map(|id| format!("{PLAUSIBLE_HOST}/js/{id}.js"))
@@ -191,7 +223,7 @@ mod tests {
     fn local_mode_disables_analytics_even_with_an_id() {
         let config: AnalyticsConfig = AnalyticsConfig::resolve(Environment::Local, Some("pa-x"));
         assert!(!config.is_enabled());
-        assert_eq!(None, config.upstream_script_url());
+        assert_eq!(None, config.upstream_script_url_if_enabled());
 
         let config: AnalyticsConfig =
             AnalyticsConfig::new("pa-x").for_environment(Environment::Local);
@@ -207,11 +239,39 @@ mod tests {
     }
 
     #[test]
+    fn from_values_covers_local_production_and_an_unset_environment() {
+        let local = AnalyticsConfig::from_values(Some("local"), Some("pa-x")).expect("valid");
+        assert!(!local.is_enabled());
+
+        let prod = AnalyticsConfig::from_values(Some("production"), Some("pa-x")).expect("valid");
+        assert!(prod.is_enabled());
+
+        let no_id = AnalyticsConfig::from_values(Some("production"), None).expect("valid");
+        assert!(!no_id.is_enabled());
+
+        assert!(AnalyticsConfig::from_values(None, Some("pa-x")).is_err());
+        assert!(AnalyticsConfig::from_values(Some(""), Some("pa-x")).is_err());
+        assert!(AnalyticsConfig::from_values(Some("staging"), Some("pa-x")).is_err());
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn the_deprecated_accessors_keep_their_types_and_are_empty_when_disabled() {
+        let off: AnalyticsConfig = AnalyticsConfig::disabled();
+        assert_eq!("", off.script_id());
+        assert_eq!(String::new(), off.upstream_script_url());
+
+        let on: AnalyticsConfig = AnalyticsConfig::new("pa-x");
+        assert_eq!("pa-x", on.script_id());
+        assert_eq!("https://plausible.io/js/pa-x.js", on.upstream_script_url());
+    }
+
+    #[test]
     fn production_with_an_id_is_unchanged() {
         let config: AnalyticsConfig =
             AnalyticsConfig::resolve(Environment::Production, Some("pa-x"));
         assert!(config.is_enabled());
-        assert_eq!(Some("pa-x"), config.script_id());
+        assert_eq!(Some("pa-x"), config.script_id_if_enabled());
         assert_eq!(config, AnalyticsConfig::new("pa-x"));
         assert_eq!(
             config,
@@ -226,7 +286,7 @@ mod tests {
         let expected: Option<String> = Some(String::from(
             "https://plausible.io/js/pa-1qi0TQEvpewNxVHboeeOC.js",
         ));
-        let actual: Option<String> = config.upstream_script_url();
+        let actual: Option<String> = config.upstream_script_url_if_enabled();
         assert_eq!(expected, actual);
     }
 

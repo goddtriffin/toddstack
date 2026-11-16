@@ -184,7 +184,7 @@ where
         } else if environment.is_local() {
             tracing::info!("analytics disabled: WSB_ENVIRONMENT is local");
         } else {
-            tracing::info!("analytics disabled: WSB_ANALYTICS_ID is unset or empty");
+            tracing::warn!("analytics disabled in production: WSB_ANALYTICS_ID is unset or empty");
         }
 
         let paths: ProxyPaths = ProxyPaths::derive(params.base.project());
