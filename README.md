@@ -14,6 +14,7 @@ published on its own and documented in its own README.
 | `toddstack-accounts` | Rust | [crates.io](https://crates.io/crates/toddstack-accounts) | [`rust/toddstack_accounts/README.md`](rust/toddstack_accounts/README.md) |
 | `toddstack-accounts` | TypeScript | [JSR](https://jsr.io/@todd/toddstack-accounts) `@todd/toddstack-accounts`, [npm](https://www.npmjs.com/package/toddstack-accounts) `toddstack-accounts` | [`typescript/accounts/README.md`](typescript/accounts/README.md) |
 | `ToddstackAccounts` | Swift | SwiftPM, `https://github.com/goddtriffin/toddstack` (product `ToddstackAccounts`) | [`swift/accounts/README.md`](swift/accounts/README.md) |
+| `toddstack-accounts` | Kotlin (Android) | Maven Central `me.toddgriffin:toddstack-accounts` (not yet published; see its README) | [`kotlin/accounts/README.md`](kotlin/accounts/README.md) |
 | `template-web-server` | Rust | not published; Docker image for several sites | [`rust/template_web_server/`](rust/template_web_server/) |
 
 ## Layout
@@ -26,6 +27,8 @@ rust/              Cargo workspace: every Rust crate
   toddstack_accounts/    client for the shared accounts: sign-in, tokens, webhooks, friends
 swift/             Swift package (Package.swift at the repo root points here): native-app sign-in
   accounts/              ToddstackAccounts for iOS and macOS apps (client of the project server's /app contract)
+kotlin/            Gradle build: Android libraries
+  accounts/              toddstack-accounts for Android (Auth Tab sign-in through the project's server)
 typescript/        JSR packages (deno.jsonc is the package config)
   webserver-base/        the browser/build-side half of webserver-base
   accounts/              toddstack-accounts for TypeScript (own deno.jsonc + package.json: JSR and npm)
