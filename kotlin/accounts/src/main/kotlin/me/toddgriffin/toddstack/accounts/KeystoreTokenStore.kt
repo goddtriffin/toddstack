@@ -15,7 +15,9 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 
 /**
  * A [TokenStore] that keeps values in DataStore, each encrypted with an AES-GCM key held in the Android
@@ -29,9 +31,9 @@ public class KeystoreTokenStore(
     private val alias: String = "toddstack_accounts_$name"
     private val dataStore: DataStore<Preferences> = sharedStore(context.applicationContext, name)
 
-    override suspend fun get(key: String): String? {
-        val stored: String = dataStore.data.first()[stringPreferencesKey(key)] ?: return null
-        return try {
+    override suspend fun get(key: String): String? = withContext(Dispatchers.IO) {
+        val stored: String = dataStore.data.first()[stringPreferencesKey(key)] ?: return@withContext null
+        try {
             decrypt(stored)
         } catch (e: java.security.GeneralSecurityException) {
             throw AccountsException(AccountsException.Kind.Storage, "stored value cannot be decrypted", cause = e)
@@ -40,7 +42,7 @@ public class KeystoreTokenStore(
         }
     }
 
-    override suspend fun put(key: String, value: String) {
+    override suspend fun put(key: String, value: String): Unit = withContext(Dispatchers.IO) {
         val sealed: String = encrypt(value)
         dataStore.edit { it[stringPreferencesKey(key)] = sealed }
     }

@@ -50,6 +50,7 @@ dependencies {
     implementation(libs.serialization.json)
     implementation(libs.androidx.browser)
     implementation(libs.androidx.activity)
+    implementation(libs.androidx.lifecycle.runtime)
     implementation(libs.androidx.datastore.preferences)
 
     testImplementation(libs.junit)

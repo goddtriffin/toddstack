@@ -10,10 +10,12 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
 /** [AccountsApi] over `HttpURLConnection`: no networking library needed. */
-public class UrlConnectionAccountsApi(
-    private val config: AccountsConfig,
-    private val timeoutMillis: Int = 15_000,
+public class UrlConnectionAccountsApi internal constructor(
+    private val baseUrl: String,
+    private val timeoutMillis: Int,
 ) : AccountsApi {
+    /** Talks to [config]'s `serverUrl`. */
+    public constructor(config: AccountsConfig, timeoutMillis: Int = 15_000) : this(config.server, timeoutMillis)
 
     @Serializable
     private data class ExchangeBody(val code: String, val code_verifier: String)
@@ -38,12 +40,14 @@ public class UrlConnectionAccountsApi(
         serializer: kotlinx.serialization.KSerializer<T>,
     ): T = withContext(Dispatchers.IO) {
         val connection: HttpURLConnection = try {
-            URL(config.server + path).openConnection() as HttpURLConnection
-        } catch (e: IOException) {
+            URL(baseUrl + path).openConnection() as HttpURLConnection
+        } catch (e: Exception) {
             throw AccountsException(AccountsException.Kind.Http, "could not open $path", cause = e)
         }
         try {
             connection.requestMethod = "POST"
+            // A redirect would replay the Authorization header and body on another origin.
+            connection.instanceFollowRedirects = false
             connection.connectTimeout = timeoutMillis
             connection.readTimeout = timeoutMillis
             connection.setRequestProperty("Accept", "application/json")
@@ -61,10 +65,14 @@ public class UrlConnectionAccountsApi(
             } else {
                 throw refusal(status, text)
             }
-        } catch (e: IOException) {
-            throw AccountsException(AccountsException.Kind.Http, "request to $path failed: ${e.message}", cause = e)
+        } catch (e: AccountsException) {
+            throw e
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: SerializationException) {
             throw AccountsException(AccountsException.Kind.Http, "unreadable reply from $path", cause = e)
+        } catch (e: Exception) {
+            throw AccountsException(AccountsException.Kind.Http, "request to $path failed: ${e.message}", cause = e)
         } finally {
             connection.disconnect()
         }

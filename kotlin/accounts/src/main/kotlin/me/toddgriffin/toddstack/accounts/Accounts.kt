@@ -54,7 +54,7 @@ public class Accounts(
      * is not on your server (same scheme, host and port as `serverUrl`), so the token never goes elsewhere.
      */
     public fun cachedAuthorizationHeader(url: String): String? =
-        if (isServerUrl(url)) _session.value?.let { "Bearer ${it.token}" } else null
+        if (isServerUrl(url)) _session.value?.takeUnless { it.isExpired(clock()) }?.let { "Bearer ${it.token}" } else null
 
     /** Like [cachedAuthorizationHeader] but reads the stored session. */
     public suspend fun authorizationHeader(url: String): String? =
@@ -83,9 +83,10 @@ public class Accounts(
         val pending = Pending(verifier = Pkce.randomToken(), state = Pkce.randomToken())
         val mine = CompletableDeferred<Session>()
         mutex.withLock {
-            if (waiter != null) {
-                throw AccountsException(AccountsException.Kind.SignInInProgress, "a sign-in is already open")
-            }
+            // A new sign-in supersedes an open one (the person may have closed the browser tab without a callback).
+            waiter?.completeExceptionally(
+                AccountsException(AccountsException.Kind.Cancelled, "superseded by a newer sign-in"),
+            )
             storage { store.put(PENDING_KEY, Json.encodeToString(Pending.serializer(), pending)) }
             waiter = mine
         }
@@ -116,7 +117,11 @@ public class Accounts(
         val query: Map<String, String> = parseCallback(uri)
         val raw: String = storage { store.get(PENDING_KEY) }
             ?: throw AccountsException(AccountsException.Kind.UnexpectedCallback, "no sign-in in progress")
-        val pending: Pending = Json.decodeFromString(Pending.serializer(), raw)
+        val pending: Pending = try {
+            Json.decodeFromString(Pending.serializer(), raw)
+        } catch (e: kotlinx.serialization.SerializationException) {
+            throw AccountsException(AccountsException.Kind.Storage, "stored sign-in state is corrupt", cause = e)
+        }
         val state: String? = query["state"]
         if (state == null || !Pkce.constantTimeEquals(state, pending.state)) {
             throw AccountsException(AccountsException.Kind.StateMismatch, "callback state does not match")
@@ -129,7 +134,14 @@ public class Accounts(
             val code: String = query["code"]
                 ?: throw AccountsException(AccountsException.Kind.MissingCode, "callback had no code")
             // Only a guest token is sent: the server merges that guest into the player and revokes the token.
-            val bearer: String? = load()?.takeIf { it.player.guest }?.token
+            val bearer: String? = try {
+                load()?.takeIf { it.player.guest }?.token
+            } catch (_: AccountsException) {
+                // Unreadable session (e.g. restored from backup without its Keystore key): drop it so sign-in repairs it.
+                storage { store.remove(SESSION_KEY) }
+                _session.value = null
+                null
+            }
             val fresh: Session = api.exchangeSession(code, pending.verifier, bearer)
             save(fresh)
             waiter?.complete(fresh)
@@ -160,21 +172,22 @@ public class Accounts(
      * the token locally even when the network fails. Returns true when the end-session page was opened.
      */
     public suspend fun signOut(): Boolean {
-        val token: String? = try {
-            mutex.withLock { load()?.token }
-        } catch (_: AccountsException) {
-            null // unreadable storage: still delete it below
+        // Read and delete under one lock so a sign-in finishing in between is not wiped without being signed out.
+        val token: String? = mutex.withLock {
+            val read: String? = try {
+                load()?.token
+            } catch (_: AccountsException) {
+                null // unreadable storage: still deleted below
+            }
+            storage { store.remove(SESSION_KEY) }
+            _session.value = null
+            read
         }
         var endSession: String? = null
         try {
             if (token != null) endSession = api.signOut(token).endSessionUrl
         } catch (_: AccountsException) {
-            // The token is deleted below regardless: signing out must work offline.
-        } finally {
-            mutex.withLock {
-                storage { store.remove(SESSION_KEY) }
-                _session.value = null
-            }
+            // The token is already deleted: signing out must work offline.
         }
         val url: String = endSession ?: return false
         val browser: BrowserLauncher = launcher ?: return false
