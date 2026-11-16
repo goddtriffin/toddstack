@@ -115,10 +115,8 @@ impl AnalyticsConfig {
         self.script_id.is_some()
     }
 
-    /// The configured script id, or an empty string when analytics is
-    /// disabled.
-    #[deprecated(note = "returns an empty string when analytics is disabled; \
-                         use `script_id_if_enabled`")]
+    /// The configured script id, or `""` when analytics is disabled. Prefer
+    /// [`AnalyticsConfig::script_id_if_enabled`].
     #[must_use]
     pub fn script_id(&self) -> &str {
         self.script_id.as_deref().unwrap_or_default()
@@ -130,10 +128,8 @@ impl AnalyticsConfig {
         self.script_id.as_deref()
     }
 
-    /// The upstream script URL this proxy fetches, or an empty string when
-    /// analytics is disabled.
-    #[deprecated(note = "returns an empty string when analytics is disabled; \
-                         use `upstream_script_url_if_enabled`")]
+    /// The upstream script URL this proxy fetches, or `""` when analytics is
+    /// disabled. Prefer [`AnalyticsConfig::upstream_script_url_if_enabled`].
     #[must_use]
     pub fn upstream_script_url(&self) -> String {
         self.upstream_script_url_if_enabled().unwrap_or_default()
@@ -255,8 +251,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(deprecated)]
-    fn the_deprecated_accessors_keep_their_types_and_are_empty_when_disabled() {
+    fn the_plain_accessors_keep_their_types_and_are_empty_when_disabled() {
         let off: AnalyticsConfig = AnalyticsConfig::disabled();
         assert_eq!("", off.script_id());
         assert_eq!(String::new(), off.upstream_script_url());
