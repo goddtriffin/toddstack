@@ -218,7 +218,8 @@ await accounts.unregisterDevice("ios", tokenHex); // sign-out; fine if it was ne
 - One phone, one person: registering a token that belonged to another player moves it. At most 10 devices are kept per
   player. Both calls are idempotent, so a transient failure is retried.
 - `conflict` (409): the token is registered to another project. `not_found` (404): the player never signed in to your
-  project. A malformed token or app id (400) or an unregistered app id (403) is `api`.
+  project. A malformed token or app id (400) or an unregistered app id (403) is `api`; a `sub` that isn't a UUID is 422
+  (`unprocessable`).
 
 ### Friend buttons
 
@@ -295,3 +296,8 @@ answer was lost has already rotated the token, so a second try would sign the pe
 
 `deno.jsonc` (JSR) and `package.json` (npm) carry the same version as `version.ts`; a test checks. The npm package is
 the `tsc` build of the same sources (`tsconfig.npm.json`, output in `dist/`, not committed).
+
+## Breaking changes
+
+**0.5.0**: `AccountsErrorKind` gained `"conflict"`, so a 409 from a project call is `kind: "conflict"` (it was `"api"`
+with `status: 409`). A `switch` checked with `never` needs a case for it.

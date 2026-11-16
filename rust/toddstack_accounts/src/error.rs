@@ -1,5 +1,6 @@
 /// Everything that can go wrong talking to the accounts service.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The callback's `state` doesn't match the pending login (a forged or
     /// stale callback: start over).

@@ -5,9 +5,9 @@ plugins {
     signing
 }
 
-// Equals the repo's shared release tag (`0.4.1`): one bare tag serves SwiftPM and JitPack. Bump it with
+// Equals the repo's shared release tag (`0.5.0`): one bare tag serves SwiftPM and JitPack. Bump it with
 // `toddstackAccountsVersion` in swift/ when cutting a tag.
-version = "0.4.1"
+version = "0.5.0"
 
 // JitPack (env JITPACK=true) serves only groups under `com.github.<user>.<repo>`; Maven Central will use me.toddgriffin.
 val publishGroup: String =

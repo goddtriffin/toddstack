@@ -3,7 +3,7 @@
 Sign-in for native Android apps. The same features as the Rust and TypeScript `toddstack-accounts`, for an app
 that signs in **through its project's server and never directly against `accounts.toddgriffin.me`**.
 
-- Coordinates (JitPack, from the repo's bare release tag): `com.github.goddtriffin.toddstack:toddstack-accounts:0.4.1`.
+- Coordinates (JitPack, from the repo's bare release tag): `com.github.goddtriffin.toddstack:toddstack-accounts:0.5.0`.
   Maven Central (`me.toddgriffin:toddstack-accounts`) comes later; see below.
 - Android library, minSdk 26. Dependencies: coroutines, kotlinx.serialization, androidx.browser (Auth Tab),
   androidx.activity, DataStore. No networking library (it uses `HttpURLConnection`).
@@ -134,7 +134,7 @@ Add to the app's `res/xml/backup_rules.xml` (`android:fullBackupContent`) and `d
 
 Tokens live in DataStore, each value encrypted with an AES-GCM key in the Android Keystore
 (`KeystoreTokenStore`). `Session.toString()` never prints the token. In unit tests use `InMemoryTokenStore` and
-`MockAccountsApi` from the `testFixtures` (`testImplementation(testFixtures("com.github.goddtriffin.toddstack:toddstack-accounts:0.4.1"))`):
+`MockAccountsApi` from the `testFixtures` (`testImplementation(testFixtures("com.github.goddtriffin.toddstack:toddstack-accounts:0.5.0"))`):
 seed a response per exact arguments (`seedExchangeSession(code, verifier, bearer, Result.success(session))`),
 inspect `calls`, and end every test with `assertAllSeedsConsumed()`. An unseeded call throws.
 
@@ -148,19 +148,19 @@ pin the exact version (a release tag; never a branch or `-SNAPSHOT`):
 dependencyResolutionManagement { repositories { google(); mavenCentral(); maven("https://jitpack.io") } }
 
 // app/build.gradle.kts
-implementation("com.github.goddtriffin.toddstack:toddstack-accounts:0.4.1")
+implementation("com.github.goddtriffin.toddstack:toddstack-accounts:0.5.0")
 ```
 
 The group is `com.github.goddtriffin.toddstack` (JitPack's group for a module of a multi-module repo), the artifact is
 `toddstack-accounts`, and the version is the tag. Your app must use Kotlin 2.4 or later (the library's metadata is 2.4).
 The first request for a tag makes JitPack build it, which takes a few minutes; check
-`https://jitpack.io/com/github/goddtriffin/toddstack/toddstack-accounts/0.4.1/` or the build log at
+`https://jitpack.io/com/github/goddtriffin/toddstack/toddstack-accounts/0.5.0/` or the build log at
 <https://jitpack.io/#goddtriffin/toddstack>.
 
 ### Local build
 
 From a checkout of this repo, for work in progress: `cd kotlin && ./gradlew :accounts:publishToMavenLocal`, then in
-the app `repositories { mavenLocal() }` and `implementation("me.toddgriffin:toddstack-accounts:0.4.1")` (the local
+the app `repositories { mavenLocal() }` and `implementation("me.toddgriffin:toddstack-accounts:0.5.0")` (the local
 group is `me.toddgriffin`; only JitPack's build uses the `com.github...` group). Run it again after any change.
 
 ## Releasing
