@@ -17,3 +17,7 @@ cache-buster.json
 
 # npm build output of typescript/accounts (built by make test / the publish workflow)
 typescript/accounts/dist/
+
+# SwiftPM build output
+.build/
+.swiftpm/

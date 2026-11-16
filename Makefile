@@ -144,6 +144,10 @@ fix: ## fixes the codebase
 docs: ## generates local documentation
 	cd $(TS) && deno doc --html --name="webserver-base" ./webserver-base/
 
+.PHONY: swift_test
+swift_test: ## builds and tests the Swift accounts package (macOS; Xcode's toolchain provides swift-testing)
+	DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+
 .PHONY: publish_dry_run
 publish_dry_run: ## dry run of publishing libraries to crates.io and JSR
 	echo "\033[1;35m[Packaging Rust]\033[0m"
