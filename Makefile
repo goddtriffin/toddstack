@@ -26,6 +26,7 @@ help: # Prints out help
 # before anything is removed.
 RUST := rust
 TS := typescript
+KOTLIN := kotlin
 TWS := rust/template_web_server
 # The TypeScript package, seen from inside $(TWS).
 TS_FROM_TWS := ../../typescript
@@ -120,6 +121,9 @@ lint: ## lints the codebase
 
 	cd $(RUST) && cargo fmt
 
+	# Android lint (warnings are errors); needs the Android SDK (kotlin/local.properties or ANDROID_HOME)
+	cd $(KOTLIN) && ./gradlew --console=plain lint
+
 .PHONY: test
 test: assets ## runs tests; the template's tests serve the bin/ that assets builds
 	cd $(TS) && deno check webserver-base/
@@ -133,6 +137,8 @@ test: assets ## runs tests; the template's tests serve the bin/ that assets buil
 	cd $(RUST) && cargo fmt --check
 	cd $(RUST) && cargo check --all-features
 	cd $(RUST) && cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+	cd $(KOTLIN) && ./gradlew --console=plain test
 	cd $(RUST) && cargo test --all-features
 
 .PHONY: fix

@@ -103,11 +103,26 @@ Interceptor { chain ->
 ### Errors
 
 Everything throws `AccountsException`; switch on `kind`: `StateMismatch`, `Authorization` (see `error`),
-`MissingCode`, `InvalidGrant`, `Api`, `Http`, `Config`, `UnexpectedCallback`, `Cancelled`, `NotSignedIn`,
-`SignInInProgress` (a second `signIn` while one is open fails at once), `Storage` (the token store failed:
-this is never treated as signed out). A state mismatch leaves the real sign-in pending.
+`MissingCode`, `InvalidGrant`, `Api`, `Http`, `Config`, `UnexpectedCallback`, `Cancelled`, `Storage` (the token store
+failed: this is never treated as signed out). A state mismatch leaves the real sign-in pending.
+
+A new `signIn` supersedes an open one: the old call fails with `Cancelled`. With the Custom Tab fallback nothing
+tells the SDK the person closed the tab, so just let them tap sign-in again. (Closing an Auth Tab is reported, and
+cancels the sign-in.) The SDK does not cancel on activity resume, because the App Link callback and the resume race.
 
 ### Storage and testing
+
+The library manifest declares `INTERNET`. Exclude the token file from Auto Backup: a restored file without its
+Keystore key cannot be decrypted (the SDK then drops it and the next sign-in repairs it, but exclude it anyway).
+Add to the app's `res/xml/backup_rules.xml` (`android:fullBackupContent`) and `data_extraction_rules.xml`
+(inside `<cloud-backup>` and `<device-transfer>`):
+
+```xml
+<exclude domain="file" path="datastore/toddstack_accounts.preferences_pb" />
+```
+
+(`toddstack_accounts` is the default `KeystoreTokenStore` name.)
+
 
 Tokens live in DataStore, each value encrypted with an AES-GCM key in the Android Keystore
 (`KeystoreTokenStore`). `Session.toString()` never prints the token. In unit tests use `InMemoryTokenStore` and
@@ -145,4 +160,4 @@ credentials. Todd must:
 
 ## Develop
 
-`cd kotlin && ./gradlew build test` (lint runs in `build` and fails on warnings). JDK 17 or later.
+`make lint test` from the repo root also covers `kotlin/` (`./gradlew lint test`), or `cd kotlin && ./gradlew build test` (lint fails on warnings). JDK 17 or later; needs the Android SDK with platform 36.

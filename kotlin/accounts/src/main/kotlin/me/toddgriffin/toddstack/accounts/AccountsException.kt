@@ -35,14 +35,8 @@ public class AccountsException(
         /** A callback arrived with no sign-in in progress, or for a different URL. */
         UnexpectedCallback,
 
-        /** The person closed the browser before finishing. */
+        /** The person closed the browser before finishing, or a newer sign-in replaced this one. */
         Cancelled,
-
-        /** The call needs a signed-in or guest session and there is none. */
-        NotSignedIn,
-
-        /** Another sign-in is already open; finish or [Accounts.cancelSignIn] it first. */
-        SignInInProgress,
 
         /** The token store could not be read or written (corrupt value, lost key, disk). Not the same as signed out. */
         Storage,

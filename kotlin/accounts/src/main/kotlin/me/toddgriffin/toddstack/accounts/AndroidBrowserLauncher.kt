@@ -7,9 +7,7 @@ import android.content.Intent
 import androidx.browser.auth.AuthTabIntent
 import androidx.browser.customtabs.CustomTabsClient
 import androidx.browser.customtabs.CustomTabsIntent
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 
 /**
@@ -17,23 +15,26 @@ import kotlinx.coroutines.launch
  * through the result callback), and in a Custom Tab otherwise (the redirect arrives as an App Link, which your
  * callback Activity passes to [Accounts.handleCallback]).
  *
+ * With the Custom Tab fallback there is no signal when the person closes the tab, so a new [Accounts.signIn]
+ * supersedes an open one (the old call fails with `Cancelled`).
+ *
  * Create it in `onCreate`, before the Activity is started: it registers an activity result launcher.
  */
 public class AndroidBrowserLauncher(
     private val activity: ComponentActivity,
     private val accounts: Accounts,
 ) : BrowserLauncher {
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
     private val authTab: ActivityResultLauncher<Intent> =
         AuthTabIntent.registerActivityResultLauncher(activity) { result ->
-            scope.launch {
+            activity.lifecycleScope.launch {
                 val uri: Uri? = result.resultUri
                 if (result.resultCode == AuthTabIntent.RESULT_OK && uri != null) {
                     try {
                         accounts.handleCallback(uri.toString())
-                    } catch (_: AccountsException) {
-                        // signIn() already received the failure.
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // signIn() already received a failure that is an AccountsException; nothing else may crash the app.
                     }
                 } else {
                     accounts.cancelSignIn()

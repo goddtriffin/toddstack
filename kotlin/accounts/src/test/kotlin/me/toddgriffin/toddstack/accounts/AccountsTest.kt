@@ -313,15 +313,45 @@ class AccountsTest {
     }
 
     @Test
-    fun a_second_sign_in_while_one_is_open_fails_fast() = runTest {
+    fun a_new_sign_in_supersedes_an_abandoned_one_which_fails_with_cancelled() = runTest {
         val first = async(StandardTestDispatcher(testScheduler)) { runCatching { accounts.signIn() } }
         runCurrent()
-        val e = assertThrows(AccountsException::class.java) { kotlinx.coroutines.runBlocking { accounts.signIn() } }
-        assertEquals(AccountsException.Kind.SignInInProgress, e.kind)
-        assertEquals(1, launcher.signIns.size)
+        val second = async(StandardTestDispatcher(testScheduler)) { runCatching { accounts.signIn() } }
+        runCurrent()
+        assertEquals(2, launcher.signIns.size)
+        assertEquals(AccountsException.Kind.Cancelled, (first.await().exceptionOrNull() as AccountsException).kind)
         accounts.cancelSignIn()
-        val cancelled: AccountsException = first.await().exceptionOrNull() as AccountsException
-        assertEquals(AccountsException.Kind.Cancelled, cancelled.kind)
+        assertEquals(AccountsException.Kind.Cancelled, (second.await().exceptionOrNull() as AccountsException).kind)
+    }
+
+    @Test
+    fun a_corrupt_pending_sign_in_is_a_storage_error() = runTest {
+        store.put("pending", "{not json")
+        val e = assertThrows(AccountsException::class.java) {
+            kotlinx.coroutines.runBlocking { accounts.handleCallback("$callback?code=c&state=$state") }
+        }
+        assertEquals(AccountsException.Kind.Storage, e.kind)
+    }
+
+    @Test
+    fun an_unreadable_stored_session_is_dropped_so_sign_in_repairs_it() = runTest {
+        givenPending()
+        store.put("session", "{not json")
+        mock.seedExchangeSession("c", verifier, null, Result.success(signedIn))
+        assertEquals(signedIn, accounts.handleCallback("$callback?code=c&state=$state"))
+        assertEquals(signedIn, accounts.currentSession())
+        mock.assertAllSeedsConsumed()
+    }
+
+    @Test
+    fun a_cached_session_that_has_since_expired_gets_no_bearer() = runTest {
+        val clock = java.util.concurrent.atomic.AtomicReference(now)
+        val ticking = Accounts(config, mock, store) { clock.get() }
+        givenSession(signedIn.copy(expiresAt = "2026-11-16T00:01:00Z"))
+        ticking.currentSession()
+        assertEquals("Bearer signed-in-token", ticking.cachedAuthorizationHeader("https://www.boggledygook.com/x"))
+        clock.set(now.plusSeconds(120))
+        assertNull(ticking.cachedAuthorizationHeader("https://www.boggledygook.com/x"))
     }
 
     @Test
