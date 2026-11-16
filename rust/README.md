@@ -334,7 +334,15 @@ crawler signals as high in the document as they go. Then `robots` and
 block with an **absolute, content-hashed** `og:image` plus its real width, height
 and MIME type; four X/Twitter tags (the rest provably fall back to Open Graph);
 the icon set and manifest link; JSON-LD; the pre-paint theme script; auto-derived
-`preconnect` hints; then stylesheets. Scripts go at the end of `<body>`.
+`preconnect` hints; the Plausible and Sentry loaders; then stylesheets. Scripts go
+at the end of `<body>`.
+
+Nothing in `<head>` blocks parsing except the stylesheets and the tiny inline
+theme script, which must run before first paint. Both third-party loaders are
+`defer`: Sentry's `sentryOnLoad` hook is defined inline just before its loader,
+and deferred scripts run in document order, so Sentry is initialised before any of
+the page's module scripts run. The inline scripts sit above the stylesheets on
+purpose: an inline script after a stylesheet waits for that stylesheet to load.
 
 ### Template data
 
@@ -714,6 +722,20 @@ for Sentry: a server that interpreted a client error and re-raised it through it
 own SDK would file a browser problem as a server one, with the wrong stack. The
 tunnel's destination comes from the configured DSN, not the envelope, so it
 cannot be used as an open relay.
+
+**The two scripts are cached in memory** (`ScriptRelay`), so the vendor's CDN is
+never on a page's critical path. After the first fetch every request is answered
+from memory, with the vendor's `Content-Type`, `Cache-Control` and `ETag`
+(`If-None-Match` gets a `304`). A copy older than five minutes is refreshed in
+the background; a failed refresh keeps serving the last good copy, and only
+reaches Sentry if the copy is a day old. A cold cache fetches inline.
+
+**Script fetches are retried; events and envelopes are not.** A script fetch is a
+read, so a connect error, a timeout, a `429` or a `5xx` is retried: three
+attempts, two seconds each, full-jitter exponential backoff (200 ms doubling, at
+most 1 s), a `Retry-After` of up to 2 s honoured (a longer one is not waited
+for), and no retry started after 4 s. Events and envelopes are writes, sent once:
+a retried write that had in fact landed is a duplicate pageview or error.
 
 `X-Forwarded-For` carries the true client IP (resolved through the usual proxy
 headers); without it Plausible's bot filter rejects proxied events outright.

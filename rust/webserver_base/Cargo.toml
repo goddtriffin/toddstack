@@ -29,8 +29,9 @@ templates = ["dep:handlebars", "dep:chrono"]
 # First-party proxies for Plausible and the Sentry browser SDK, with
 # true-client-IP resolution. Both are byte relays: nothing is parsed or
 # re-reported, so a blocked third-party origin becomes a same-origin request
-# without changing what the upstream receives.
-analytics = ["dep:axum", "dep:reqwest"]
+# without changing what the upstream receives. `tokio` refreshes the cached
+# scripts in the background and paces retries.
+analytics = ["dep:axum", "dep:reqwest", "dep:tokio"]
 
 # sitemap.xml generation.
 sitemap = ["dep:sitemap-rs", "dep:chrono"]

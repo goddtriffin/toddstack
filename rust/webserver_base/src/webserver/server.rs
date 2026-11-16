@@ -964,7 +964,7 @@ fn proxy_routes<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    use crate::analytics::{AnalyticsConfig, relay_envelope, relay_event, relay_script};
+    use crate::analytics::{AnalyticsConfig, ScriptRelay, relay_envelope, relay_event};
     use axum::body::Bytes;
     use axum::extract::ConnectInfo;
     use axum::http::HeaderMap;
@@ -973,37 +973,29 @@ where
     let client: reqwest::Client = reqwest::Client::new();
     let paths: &crate::templates::FrontendRuntime = &frontend.runtime;
 
-    let analytics_script_upstream: String = frontend.analytics.upstream_script_url();
     let analytics_event_upstream: String = AnalyticsConfig::upstream_event_url();
-    let sentry_script_upstream: String = frontend.sentry_dsn.upstream_script_url();
     let sentry_envelope_upstream: String = frontend.sentry_dsn.upstream_envelope_url();
 
+    let script_route = |relay: ScriptRelay| {
+        get(move |headers: HeaderMap| {
+            let relay: ScriptRelay = relay.clone();
+            async move { relay.respond(&headers).await }
+        })
+    };
     let scripts: Router<WebServerState<S>> = Router::new()
         .route(
             &paths.analytics.script_path,
-            get({
-                let client: reqwest::Client = client.clone();
-                let upstream: std::sync::Arc<str> =
-                    std::sync::Arc::from(analytics_script_upstream.as_str());
-                move || {
-                    let client: reqwest::Client = client.clone();
-                    let upstream: std::sync::Arc<str> = std::sync::Arc::clone(&upstream);
-                    async move { relay_script(&client, &upstream).await }
-                }
-            }),
+            script_route(ScriptRelay::new(
+                client.clone(),
+                frontend.analytics.upstream_script_url(),
+            )),
         )
         .route(
             &paths.sentry_browser.script_path,
-            get({
-                let client: reqwest::Client = client.clone();
-                let upstream: std::sync::Arc<str> =
-                    std::sync::Arc::from(sentry_script_upstream.as_str());
-                move || {
-                    let client: reqwest::Client = client.clone();
-                    let upstream: std::sync::Arc<str> = std::sync::Arc::clone(&upstream);
-                    async move { relay_script(&client, &upstream).await }
-                }
-            }),
+            script_route(ScriptRelay::new(
+                client.clone(),
+                frontend.sentry_dsn.upstream_script_url(),
+            )),
         );
 
     // Nested under the API prefix, so the paths registered here are relative.
