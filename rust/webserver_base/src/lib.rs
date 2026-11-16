@@ -80,5 +80,5 @@ pub use metrics;
 pub use reqwest;
 #[cfg(feature = "observability")]
 pub use sentry;
-#[cfg(any(feature = "webserver", feature = "telegram"))]
+#[cfg(any(feature = "webserver", feature = "analytics", feature = "telegram"))]
 pub use tokio;

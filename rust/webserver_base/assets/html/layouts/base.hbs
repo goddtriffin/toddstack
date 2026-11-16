@@ -126,13 +126,16 @@
   {{#if sentry_browser}}
   {{! Browser error monitoring. `tunnel` routes envelopes back through this
       origin; the server relays them verbatim, so Sentry receives a genuine
-      browser event rather than a server-side re-report. }}
+      browser event rather than a server-side re-report. The loader is
+      `defer`red so it never blocks parsing or first paint: `sentryOnLoad` is
+      defined first, and deferred scripts run in document order, so Sentry is
+      initialised before any of the page's module scripts run. }}
   <script>
     window.sentryOnLoad = function () {
       Sentry.init({ environment: "{{sentry_browser.environment}}", tunnel: "{{sentry_browser.tunnel_path}}" });
     };
   </script>
-  <script src="{{sentry_browser.script_path}}" crossorigin="anonymous"></script>
+  <script defer src="{{sentry_browser.script_path}}" crossorigin="anonymous"></script>
   {{/if}}
 
   {{! Style Sheets }}

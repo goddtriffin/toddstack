@@ -8,12 +8,15 @@
 //! Nothing here interprets a payload — see [`proxy`] for why that matters.
 
 mod config;
+#[cfg(test)]
+mod fake_upstream;
 mod ip;
 mod proxy;
+mod retry;
 
 pub use config::{
     AnalyticsConfig, ENV_ANALYTICS_ID, ENV_SENTRY_BROWSER_DSN, PLAUSIBLE_HOST, SENTRY_CDN_HOST,
     SentryDsn, SentryDsnParseError,
 };
 pub use ip::{CLIENT_IP_HEADERS, resolve_true_client_ip_address};
-pub use proxy::{relay_envelope, relay_event, relay_script};
+pub use proxy::{ScriptRelay, relay_envelope, relay_event, relay_script};
