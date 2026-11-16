@@ -25,7 +25,7 @@ let state: String = base64URL(Data(repeating: 2, count: 32))
 func signInURL(prompt: Bool = false) -> URL {
     let challenge: String = pkceChallenge(verifier: verifier)
     let extra: String = prompt ? "&prompt=login" : ""
-    return URL(string: "https://www.boggledygook.com/app/sign-in?code_challenge=\(challenge)&state=\(state)\(extra)")!
+    return URL(string: "https://www.boggledygook.com/app/sign-in?code_challenge=\(challenge)&code_challenge_method=S256&state=\(state)\(extra)")!
 }
 
 func callbackURL(_ query: String) -> URL { URL(string: "https://www.boggledygook.com/app/callback?\(query)")! }
@@ -76,5 +76,31 @@ struct Harness {
     func verify() {
         transport.verifyExhausted()
         web.verifyExhausted()
+    }
+}
+
+/// A web authenticator that stays open until the test finishes it, to hold one sign-in in flight.
+actor BlockingWebAuthenticator: WebAuthenticator {
+    private var continuation: CheckedContinuation<URL, any Error>?
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var opened: Int = 0
+
+    func authenticate(url: URL, callbackURL: URL) async throws -> URL {
+        opened += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            for waiter in waiters { waiter.resume() }
+            waiters = []
+        }
+    }
+
+    func waitUntilOpen() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func finish(with error: any Error) {
+        continuation?.resume(throwing: error)
+        continuation = nil
     }
 }

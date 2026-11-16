@@ -16,6 +16,10 @@ public enum AccountsError: Error, Equatable, Sendable {
     case cancelled
     /// An authorized call was made with no session.
     case notSignedIn
+    /// `authorized(_:)` was given a request for a host other than the project server; the token is never sent there.
+    case foreignHost(String)
+    /// `signIn` was called while another sign-in is still open.
+    case signInInProgress
     /// The server refused a call; `status` and its error code, when it sent one.
     case api(status: Int, message: String?)
     /// The request itself failed (network, timeout).
@@ -36,6 +40,8 @@ extension AccountsError: LocalizedError {
         case .invalidGrant: "The sign-in code expired or was already used. Please try again."
         case .cancelled: "Sign-in was cancelled."
         case .notSignedIn: "You are not signed in."
+        case .foreignHost(let host): "Refusing to send the sign-in token to \(host)."
+        case .signInInProgress: "A sign-in is already in progress."
         case .api(let status, let message): "The server refused the request (\(status)\(message.map { ": \($0)" } ?? ""))."
         case .network(let message): "The network request failed: \(message)"
         case .invalidResponse(let message): "The server sent an unreadable response: \(message)"

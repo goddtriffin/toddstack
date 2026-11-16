@@ -6,18 +6,24 @@ import Security
 public struct KeychainSessionStore: SessionStore {
     private let service: String
     private let account: String
+    private let dataProtection: Bool
 
-    public init(service: String = "toddstack-accounts", account: String = "session") {
+    /// `useDataProtectionKeychain` is the macOS modern keychain, which honors the accessibility class and is the right
+    /// choice in a signed app. Only an unsigned test runner, which lacks the entitlement, should turn it off.
+    public init(service: String = "toddstack-accounts", account: String = "session", useDataProtectionKeychain: Bool = true) {
         self.service = service
         self.account = account
+        self.dataProtection = useDataProtectionKeychain
     }
 
     private var query: [String: Any] {
-        [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
+        if dataProtection { query[kSecUseDataProtectionKeychain as String] = true }
+        return query
     }
 
     public func load() throws -> Session? {
@@ -42,7 +48,11 @@ public struct KeychainSessionStore: SessionStore {
     public func save(_ session: Session) throws {
         let data: Data
         do { data = try JSONEncoder().encode(session) } catch { throw AccountsError.storage("encode failed") }
-        let update: [String: Any] = [kSecValueData as String: data]
+        // Re-assert the accessibility class so items saved by older builds are upgraded too.
+        let update: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
         var status: OSStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
         if status == errSecItemNotFound {
             var add: [String: Any] = query

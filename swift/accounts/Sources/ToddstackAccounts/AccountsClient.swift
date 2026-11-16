@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Why `signIn` shows the sign-in page.
 public enum SignInPrompt: Sendable, Equatable {
@@ -19,6 +20,7 @@ public final class AccountsClient: Sendable {
     private let store: any SessionStore
     private let random: @Sendable (Int) -> Data
     private let now: @Sendable () -> Date
+    private let signingIn = OSAllocatedUnfairLock(initialState: false)
 
     /// `store` defaults to the Keychain item for `config.clientId`. `random` and `now` exist so tests are deterministic.
     public init(
@@ -37,11 +39,13 @@ public final class AccountsClient: Sendable {
         self.now = now
     }
 
-    /// The stored session, or nil when signed out. An expired session is deleted and reads as signed out.
-    public var currentSession: Session? {
-        guard let session = try? store.load() else { return nil }
+    /// The stored session, or nil when signed out. An expired session is deleted and reads as signed out. Throws
+    /// `AccountsError.storage` when the Keychain cannot be read (for example while the device is locked): that is
+    /// not "signed out", so do not replace the account with a guest on it.
+    public func currentSession() throws -> Session? {
+        guard let session = try store.load() else { return nil }
         if let expiresAt = session.expiresAt, expiresAt <= now() {
-            try? store.delete()
+            try store.delete()
             return nil
         }
         return session
@@ -52,16 +56,26 @@ public final class AccountsClient: Sendable {
         config.accountURL(path)
     }
 
-    /// Opens the sign-in sheet and, on success, stores and returns the new session. A stored guest token is sent
-    /// with the exchange so the server can merge the guest into the player.
+    /// Opens the sign-in sheet and, on success, stores and returns the new session. A stored guest token (and only a
+    /// guest's) is sent with the exchange so the server can merge the guest into the player. Throws
+    /// `signInInProgress` when another sign-in is open.
     @discardableResult
     public func signIn(prompt: SignInPrompt = .none) async throws -> Session {
+        let started: Bool = signingIn.withLock { busy in
+            if busy { return false }
+            busy = true
+            return true
+        }
+        guard started else { throw AccountsError.signInInProgress }
+        defer { signingIn.withLock { $0 = false } }
+
         let pkce: PkcePair = PkcePair.generate(random: random)
         let state: String = base64URL(random(32))
 
         var components = URLComponents(url: endpoint("/app/sign-in"), resolvingAgainstBaseURL: false)!
         var items: [URLQueryItem] = [
             URLQueryItem(name: "code_challenge", value: pkce.challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
             URLQueryItem(name: "state", value: state),
         ]
         if prompt == .login { items.append(URLQueryItem(name: "prompt", value: "login")) }
@@ -81,9 +95,13 @@ public final class AccountsClient: Sendable {
         return try save(try Self.session(from: response))
     }
 
-    /// `request` with the bearer token added. Throws `notSignedIn` with no (or an expired) session.
+    /// `request` with the bearer token added. Throws `notSignedIn` with no (or an expired) session, and `foreignHost`
+    /// unless the request's scheme, host and port are the project server's: the token must never reach another host.
     public func authorized(_ request: URLRequest) throws -> URLRequest {
-        guard let session = currentSession else { throw AccountsError.notSignedIn }
+        guard let url = request.url, Self.sameOrigin(url, config.serverURL) else {
+            throw AccountsError.foreignHost(request.url?.host ?? "unknown host")
+        }
+        guard let session = try currentSession() else { throw AccountsError.notSignedIn }
         var signed: URLRequest = request
         signed.setValue("Bearer \(session.token)", forHTTPHeaderField: "Authorization")
         return signed
@@ -108,7 +126,7 @@ public final class AccountsClient: Sendable {
 
     private func exchange(code: String, verifier: String) async throws -> Session {
         var headers: [String: String] = jsonHeaders()
-        if let guest = try? store.load() { headers["Authorization"] = "Bearer \(guest.token)" }
+        if let stored = try store.load(), stored.player.guest { headers["Authorization"] = "Bearer \(stored.token)" }
         let body: Data = try Self.encode(["code": code, "code_verifier": verifier])
         let response: HTTPResponse = try await transport.send(
             HTTPRequest(url: endpoint("/api/v1/app/session"), method: "POST", headers: headers, body: body)
@@ -148,6 +166,15 @@ public final class AccountsClient: Sendable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return try encoder.encode(value)
+    }
+
+    static func sameOrigin(_ a: URL, _ b: URL) -> Bool {
+        func origin(_ url: URL) -> (String, String, Int)? {
+            guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else { return nil }
+            return (scheme, host, url.port ?? (scheme == "https" ? 443 : 80))
+        }
+        guard let x = origin(a), let y = origin(b) else { return false }
+        return x == y
     }
 
     /// The state is checked first, in constant time, so a forged callback learns nothing from the error it gets.

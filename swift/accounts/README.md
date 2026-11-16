@@ -37,14 +37,14 @@ those is a gap until a project needs it.
 
 Your project's server implements this; the SDK speaks only this.
 
-1. `GET {server}/app/sign-in?code_challenge=<base64url SHA-256>&state=<random>[&prompt=login]`: the server runs its
+1. `GET {server}/app/sign-in?code_challenge=<base64url SHA-256>&code_challenge_method=S256&state=<random>[&prompt=login]`: the server runs its
    accounts web flow, then redirects to the app's claimed https callback with `?code=<one-time>&state=<same>`, or
    `?error=<code>&state=<same>`.
 2. `POST {server}/api/v1/app/session` with JSON `{"code","code_verifier"}` answers `200 {"token","expires_at","player"}`
    (`expires_at` is RFC 3339 or `null`; `player` is `{"id","username","picture","guest"}`) or `400 {"error":"invalid_grant"}`.
-   If a token is stored (for example a guest token), the SDK sends it as `Authorization: Bearer <token>`: the server
-   merges that guest into the signed-in player and revokes the guest token, and the SDK replaces the stored token with
-   the new one.
+   If the stored session is a **guest** (`player.guest` true), the SDK sends its token as `Authorization: Bearer <token>`:
+   the server merges that guest into the signed-in player and revokes the guest token, and the SDK replaces the stored
+   token with the new one. A signed-in account's token is never sent here (switching accounts).
 3. Authenticated calls carry `Authorization: Bearer <token>`.
 4. `POST {server}/api/v1/app/sign-out` (bearer) answers `{"end_session_url": <https url or null>}`. The SDK deletes
    the token, then opens `end_session_url` in the web-auth session (global sign-out of the browser's accounts session).
@@ -63,8 +63,10 @@ let config = try AccountsConfig(
 )
 let accounts = AccountsClient(config: config)
 
-// Launch: reuse the stored session, else start as a guest (zero clicks to start).
-let session = try accounts.currentSession ?? await accounts.startGuest()
+// Launch: reuse the stored session, else start as a guest (zero clicks to start). A Keychain read error
+// throws instead of reading as "signed out", so it never replaces an account with a guest.
+let session: Session
+if let stored = try accounts.currentSession() { session = stored } else { session = try await accounts.startGuest() }
 
 // "Sign in": silent when the browser already has an accounts session. Merges the guest.
 do { try await accounts.signIn() } catch AccountsError.cancelled { /* person closed the sheet */ }
@@ -72,7 +74,7 @@ try await accounts.signIn(prompt: .login)   // force a fresh sign-in (switch acc
 
 // Calls to your server
 var request = URLRequest(url: URL(string: "https://www.boggledygook.com/api/v1/me")!)
-request = try accounts.authorized(request)  // adds Bearer; throws .notSignedIn
+request = try accounts.authorized(request)  // adds Bearer; throws .notSignedIn, or .foreignHost for any host but serverURL
 
 // Links to the accounts site carry ?client=<clientId>
 let manage: String = accounts.accountURL("/account")
@@ -88,11 +90,11 @@ try await accounts.signOut()   // deletes the token even if the network fails
 | `AccountsClient(config:transport:webAuthenticator:store:random:now:)` | everything below; defaults are `URLSession`, `ASWebAuthenticationSession`, Keychain |
 | `signIn(prompt:)` | `.none` (default) or `.login`; PKCE S256, constant-time `state` check, code exchange, stores the session |
 | `startGuest()` | guest session |
-| `currentSession` | stored session; an expired one is deleted and reads as nil |
-| `authorized(_:)` | `URLRequest` with the Bearer token |
+| `currentSession()` | stored session or nil; an expired one is deleted; a Keychain read error throws |
+| `authorized(_:)` | `URLRequest` with the Bearer token, only for the server's scheme, host and port |
 | `signOut()` | server sign-out, local delete, global sign-out sheet; throws only on a Keychain failure |
 | `accountURL(_:)` | accounts-site link tagged `?client=` (a query is kept, a fragment stays last) |
-| `AccountsError` | `config`, `stateMismatch`, `authorization(code:)`, `missingCode`, `invalidGrant`, `cancelled`, `notSignedIn`, `api(status:message:)`, `network`, `invalidResponse`, `storage` |
+| `AccountsError` | `config`, `stateMismatch`, `foreignHost`, `signInInProgress`, `authorization(code:)`, `missingCode`, `invalidGrant`, `cancelled`, `notSignedIn`, `api(status:message:)`, `network`, `invalidResponse`, `storage` |
 | `SessionStore` | `KeychainSessionStore` (production), `InMemorySessionStore` (tests) |
 | `AccountsTransport`, `WebAuthenticator` | the network and the browser sheet; swap them for mocks |
 
@@ -114,8 +116,8 @@ From the repo root: `make swift_test` (macOS; uses Xcode's toolchain for swift-t
 
 SwiftPM reads a repo's **plain semver tags** (`1.2.3` or `v1.2.3`) as the package's versions and ignores everything
 else. The other packages here use prefixed tags (`webserver-base-vX.Y.Z`, `toddstack-accounts-vX.Y.Z`), which SwiftPM
-ignores, so they do not collide. The old `v0.2.5` ... `v0.3.0` tags (from before the rename) do: SwiftPM reads them
-as versions 0.2.5 ... 0.3.0 of this package, and they have no `Package.swift`.
+ignores, so they do not collide. The old `v0.1.0` ... `v0.3.0` tags (from before the rename) do: SwiftPM reads them
+as versions 0.1.0 ... 0.3.0 of this package, and they have no `Package.swift`.
 
 Scheme: **Swift releases are the only bare `X.Y.Z` tags** (no `v`), and the first one is above 0.3.0, so it
 sorts after the old tags: tag **`0.4.0`** for the first release (set `toddstackAccountsVersion` to match). Later

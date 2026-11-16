@@ -18,7 +18,7 @@ public struct Player: Codable, Sendable, Equatable {
 }
 
 /// A bearer token and who it belongs to. Stored in the Keychain between launches.
-public struct Session: Codable, Sendable, Equatable {
+public struct Session: Codable, Sendable, Equatable, CustomStringConvertible, CustomDebugStringConvertible {
     /// Sent as `Authorization: Bearer <token>`.
     public let token: String
     /// When the token stops working; nil when it does not expire.
@@ -30,6 +30,10 @@ public struct Session: Codable, Sendable, Equatable {
         self.expiresAt = expiresAt
         self.player = player
     }
+
+    /// Redacts the token so logging a session never leaks it.
+    public var description: String { "Session(token: <redacted>, expiresAt: \(String(describing: expiresAt)), player: \(player))" }
+    public var debugDescription: String { description }
 
     private enum CodingKeys: String, CodingKey {
         case token, player

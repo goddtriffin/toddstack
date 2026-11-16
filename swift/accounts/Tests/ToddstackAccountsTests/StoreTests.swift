@@ -4,7 +4,7 @@ import ToddstackAccounts
 
 @Suite struct StoreTests {
     @Test func keychainStoreSavesLoadsReplacesAndDeletes() throws {
-        let store = KeychainSessionStore(service: "toddstack-accounts-tests-\(UUID().uuidString)", account: "session")
+        let store = KeychainSessionStore(service: "toddstack-accounts-tests-\(UUID().uuidString)", account: "session", useDataProtectionKeychain: false)
         defer { try? store.delete() }
         #expect(try store.load() == nil)
         let first = Session(token: "a", expiresAt: nil, player: player())
