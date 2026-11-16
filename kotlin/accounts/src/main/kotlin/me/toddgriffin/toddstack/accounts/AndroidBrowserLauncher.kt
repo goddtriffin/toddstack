@@ -46,8 +46,13 @@ public class AndroidBrowserLauncher(
         val callback: Uri = Uri.parse(accounts.config.callbackUrl)
         val host: String? = callback.host
         val path: String? = callback.path
-        if (host != null && path != null && authTabSupported()) {
+        if (!authTabSupported()) {
+            CustomTabsIntent.Builder().build().launchUrl(activity, Uri.parse(url))
+        } else if (callback.scheme.equals("https", ignoreCase = true) && host != null && path != null) {
             AuthTabIntent.Builder().build().launch(authTab, Uri.parse(url), host, path)
+        } else if (callback.scheme != null) {
+            // a reverse-DNS custom scheme (local debug builds)
+            AuthTabIntent.Builder().build().launch(authTab, Uri.parse(url), callback.scheme!!)
         } else {
             CustomTabsIntent.Builder().build().launchUrl(activity, Uri.parse(url))
         }

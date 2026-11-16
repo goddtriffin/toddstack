@@ -127,7 +127,8 @@ Local testing never touches production: every base URL is yours to set. `serverU
 `http` on loopback (`127.0.0.1`, `localhost`, `::1`) and nowhere else (`AccountsError.config`);
 `AccountsConfig.local(serverURL:callbackURL:clientId:)` also points `accountsBaseURL` at
 `AccountsConfig.localAccountsBaseURL` (`http://127.0.0.1:8790`). The sign-out URL your server returns follows the same
-rule. `callbackURL` stays an https Universal Link.
+rule. `callbackURL` is an https Universal Link, or (any mode, local debug builds) a reverse-DNS custom scheme such as
+`me.toddgriffin.boggledygook.debug:/app/callback` (RFC 8252; the sheet then uses `ASWebAuthenticationSession.Callback.customScheme`); plain http is rejected.
 
 ```swift
 let config = try AccountsConfig.local(

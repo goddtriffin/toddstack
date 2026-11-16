@@ -20,12 +20,17 @@ public struct ASWebAuthenticator: WebAuthenticator {
     }
 
     public func authenticate(url: URL, callbackURL: URL) async throws -> URL {
-        guard let host = callbackURL.host else {
-            throw AccountsError.config("callbackURL has no host")
-        }
-        let path: String = callbackURL.path
         let ephemeral: Bool = prefersEphemeralSession
-        return try await WebAuthRun().start(url: url, host: host, path: path, ephemeral: ephemeral)
+        let callback: ASWebAuthenticationSession.Callback
+        if callbackURL.scheme?.lowercased() == "https" {
+            guard let host = callbackURL.host else { throw AccountsError.config("callbackURL has no host") }
+            callback = .https(host: host, path: callbackURL.path)
+        } else {
+            // a reverse-DNS private-use scheme (RFC 8252), for local debug builds
+            guard let scheme = callbackURL.scheme else { throw AccountsError.config("callbackURL has no scheme") }
+            callback = .customScheme(scheme)
+        }
+        return try await WebAuthRun().start(url: url, callback: callback, ephemeral: ephemeral)
     }
 }
 
@@ -53,7 +58,7 @@ private final class WebAuthRun: NSObject, ASWebAuthenticationPresentationContext
     private var cancelled: Bool = false
 
     /// Cancelling the calling task closes the sheet; the completion handler then reports `cancelled`.
-    func start(url: URL, host: String, path: String, ephemeral: Bool) async throws -> URL {
+    func start(url: URL, callback: ASWebAuthenticationSession.Callback, ephemeral: Bool) async throws -> URL {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, any Error>) in
                 let once = OnceResumer(continuation)
@@ -61,7 +66,7 @@ private final class WebAuthRun: NSObject, ASWebAuthenticationPresentationContext
                     once.resume(with: .failure(AccountsError.cancelled))
                     return
                 }
-                let session = ASWebAuthenticationSession(url: url, callback: .https(host: host, path: path)) { callbackURL, error in
+                let session = ASWebAuthenticationSession(url: url, callback: callback) { callbackURL, error in
                     if let callbackURL {
                         once.resume(with: .success(callbackURL))
                     } else if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin {

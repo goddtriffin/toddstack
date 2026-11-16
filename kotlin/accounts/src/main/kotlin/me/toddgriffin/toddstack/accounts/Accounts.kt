@@ -255,7 +255,9 @@ public class Accounts(
         }
         val expected: String = config.callbackUrl.substringBefore('?').trimEnd('/')
         val actual: String = uri.substringBefore('?').substringBefore('#').trimEnd('/')
-        if (parsed.scheme != "https" || !actual.equals(expected, ignoreCase = true)) {
+        if (!parsed.scheme.equals(expected.substringBefore(':'), ignoreCase = true) ||
+            !actual.equals(expected, ignoreCase = true)
+        ) {
             throw AccountsException(AccountsException.Kind.UnexpectedCallback, "not the callback URL: $actual")
         }
         val query: String = parsed.rawQuery ?: return emptyMap()

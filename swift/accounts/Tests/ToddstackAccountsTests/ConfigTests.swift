@@ -23,7 +23,7 @@ import ToddstackAccounts
     }
 
     @Test func nonHttpsUrlsAreRejected() {
-        #expect(throws: AccountsError.config("callbackURL must be an https URL with a host")) {
+        #expect(throws: AccountsError.config("callbackURL must be an https URL with a host, or a reverse-DNS custom scheme URL")) {
             try AccountsConfig(serverURL: server, callbackURL: URL(string: "boggle://callback")!, clientId: "x")
         }
         #expect(throws: AccountsError.config("serverURL must be an https URL with a host (http only on loopback)")) {
@@ -49,12 +49,22 @@ import ToddstackAccounts
                 )
             }
         }
-        // the callback is an https App Link, never http
-        #expect(throws: AccountsError.self) {
-            try AccountsConfig(
-                serverURL: server, callbackURL: URL(string: "http://127.0.0.1:8992/app/callback")!, clientId: "x"
-            )
+    }
+
+    @Test func callbackAcceptsHttpsOrAReverseDnsCustomScheme() throws {
+        for ok in ["https://www.boggledygook.com/app/callback", "me.toddgriffin.boggledygook.debug:/app/callback"] {
+            _ = try AccountsConfig(serverURL: server, callbackURL: URL(string: ok)!, clientId: "x")
         }
+        for bad in ["http://127.0.0.1:8992/app/callback", "boggle://callback", "boggle:/app/callback", "https:///x"] {
+            #expect(throws: AccountsError.self) {
+                try AccountsConfig(serverURL: server, callbackURL: URL(string: bad)!, clientId: "x")
+            }
+        }
+        let local = try AccountsConfig.local(
+            serverURL: URL(string: "http://127.0.0.1:8992")!,
+            callbackURL: URL(string: "me.toddgriffin.boggledygook.debug:/app/callback")!, clientId: "x"
+        )
+        #expect(local.callbackURL.scheme == "me.toddgriffin.boggledygook.debug")
     }
 
     @Test func localPointsAtTheLocalAccountsSite() throws {
