@@ -183,6 +183,30 @@ let later = accounts.notification_status(&receipt.id).await?; // poll a fan-out'
 - The named `User` or `FriendsOf` player must have signed in to your project: otherwise `Error::NotFound` (404). A rate
   limit (6000 requests an hour, 10 fan-outs an hour) is `Error::RateLimited` (429).
 
+## Devices (push)
+
+Your server registers a player's phone for push, as your project (client credentials). Native apps never call the
+accounts service: the app sends its token to your server (Swift's `apnsTokenHex` makes the hex string; an Android FCM
+token is already text), and your server registers it for the signed-in player.
+
+```rust
+use toddstack_accounts::devices::{Device, Environment, Platform};
+
+accounts.register_device(&Device {
+    sub: sub.clone(),                                   // must have signed in to your project
+    platform: Platform::Ios,                            // or Platform::Android
+    token: token_hex,
+    app_id: String::from("me.toddgriffin.boggledygook"), // bundle / package id an admin registered for your project
+    environment: Environment::Production,               // or Sandbox (development builds)
+}).await?;
+accounts.unregister_device(Platform::Ios, &token_hex).await?; // sign-out; fine if it was never registered
+```
+
+- One phone, one person: registering a token that belonged to another player moves it. At most 10 devices are kept per
+  player. Both calls are idempotent, so a transient failure is retried.
+- `Error::Conflict` (409): the token is registered to another project. `Error::NotFound` (404): the player never
+  signed in to your project. A malformed token or app id (400) or an unregistered app id (403) is `Error::Api`.
+
 ## Friend buttons
 
 `relationships` says where the person stands with each person you show, so a button can read the right thing:

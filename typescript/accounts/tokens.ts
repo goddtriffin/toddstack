@@ -6,13 +6,15 @@ import { Friends } from "./friends.ts";
 import { type JwkSet, Keys } from "./jwks.ts";
 import { endSessionUrl, type LogoutOptions, type SignOut } from "./logout.ts";
 import { type LoginOptions, parseCallback, type PendingLogin, type StartedLogin, startLogin } from "./login.ts";
+import { type Device, deviceBody, type Platform } from "./devices.ts";
 import { type Notification, notificationBody, readReceipt, type Receipt } from "./notifications.ts";
 import { type GuestReport, reportBody } from "./report.ts";
 import { KEYED_SEND, NOTIFICATION_STATUS, READ, type RetryPolicy, send } from "./retry.ts";
 import { VERSION } from "./version.ts";
 
-const TYPED_STATUS: Record<number, "not_found" | "unprocessable" | "rate_limited"> = {
+const TYPED_STATUS: Record<number, "not_found" | "conflict" | "unprocessable" | "rate_limited"> = {
   404: "not_found",
+  409: "conflict",
   422: "unprocessable",
   429: "rate_limited",
 };
@@ -294,9 +296,27 @@ export class Accounts {
     return readReceipt(await this.#projectCall("GET", `/notifications/${encodeURIComponent(id)}`));
   }
 
+  /**
+   * Registers a device for a player, or moves it to them if it was another player's (one phone, one person). At most
+   * 10 devices are kept per player; registering more drops the least recently registered. Idempotent, so an
+   * intermittent failure is retried.
+   *
+   * Fails with `not_found` (404) when the player never signed in to your project, `conflict` (409) when the token is
+   * registered to another project, `api` for a malformed token or app id (400) or an app id not registered to your
+   * project (403), or `config` without a client secret.
+   */
+  async registerDevice(device: Device): Promise<void> {
+    await this.#projectCall("POST", "/devices", deviceBody(device), true);
+  }
+
+  /** Forgets a device token (on sign-out). Succeeds whether or not it was registered, and only touches your project's own devices. */
+  async unregisterDevice(platform: Platform, token: string): Promise<void> {
+    await this.#projectCall("DELETE", "/devices", { platform, token }, true);
+  }
+
   async #projectCall(method: string, path: string, body?: unknown, retryWrites = false): Promise<unknown> {
     if (this.config.clientSecret === null) {
-      throw new AccountsError("config", "notifications need the client secret: set `clientSecret`");
+      throw new AccountsError("config", "this call needs the client secret: set `clientSecret`");
     }
     const url = `${this.config.issuer.replace(/\/oidc$/, "")}/api/v1${path}`;
     return await this.#callWith(`Basic ${this.#basic(this.config.clientSecret)}`, method, url, body, {

@@ -1,7 +1,8 @@
-//! The notification API and the time zone hint against a fake accounts API.
+//! The notification API, the device API and the time zone hint against a fake accounts API.
 
 use std::sync::{Arc, Mutex};
 
+use toddstack_accounts::devices::{Device, Environment, Platform};
 use toddstack_accounts::friends::Friends;
 use toddstack_accounts::notifications::{
     Counts, Notification, Outcome, Receipt, Recipient, Status,
@@ -344,4 +345,112 @@ async fn the_inbox_and_event_answers_carry_the_new_fields() {
         .unwrap();
     assert_eq!((2, 1), (result.delivered, result.dropped));
     assert_eq!(1, result.counts.unwrap().dropped_runaway);
+}
+
+fn device() -> Device {
+    Device {
+        sub: String::from("u1"),
+        platform: Platform::Ios,
+        token: String::from("ab12cd34"),
+        app_id: String::from("me.toddgriffin.boggledygook"),
+        environment: Environment::Production,
+    }
+}
+
+#[tokio::test]
+async fn registering_a_device_posts_it_with_the_client_credentials() {
+    let (issuer, seen) = service(vec![(204, "")]).await;
+    accounts(&issuer, Some("s3cret"))
+        .register_device(&device())
+        .await
+        .unwrap();
+    let request: String = seen.lock().unwrap()[0].clone();
+    assert!(
+        request.starts_with("POST /api/v1/devices HTTP/1.1"),
+        "{request}"
+    );
+    assert!(
+        request.contains("authorization: Basic Ym9nZ2xlZHlnb29rOnMzY3JldA=="),
+        "{request}"
+    );
+    let expected: &str = r#"{"app_id":"me.toddgriffin.boggledygook","environment":"production","platform":"ios","sub":"u1","token":"ab12cd34"}"#;
+    assert!(request.ends_with(expected), "{request}");
+}
+
+#[tokio::test]
+async fn unregistering_a_device_deletes_by_platform_and_token() {
+    let (issuer, seen) = service(vec![(204, "")]).await;
+    accounts(&issuer, Some("s3cret"))
+        .unregister_device(Platform::Android, "fcm-token")
+        .await
+        .unwrap();
+    let request: String = seen.lock().unwrap()[0].clone();
+    assert!(
+        request.starts_with("DELETE /api/v1/devices HTTP/1.1"),
+        "{request}"
+    );
+    assert!(
+        request.ends_with(r#"{"platform":"android","token":"fcm-token"}"#),
+        "{request}"
+    );
+}
+
+#[tokio::test]
+async fn device_refusals_become_typed_errors() {
+    let (issuer, _seen) = service(vec![(
+        409,
+        r#"{"error":"That device token is registered to another project."}"#,
+    )])
+    .await;
+    let error: Error = accounts(&issuer, Some("s3cret"))
+        .register_device(&device())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Conflict(m) if m == "That device token is registered to another project."),
+        "{error:?}"
+    );
+
+    let (issuer, _seen) = service(vec![(404, r#"{"error":"Not found."}"#)]).await;
+    let error: Error = accounts(&issuer, Some("s3cret"))
+        .register_device(&device())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotFound(_)), "{error:?}");
+
+    let (issuer, _seen) = service(vec![(
+        403,
+        r#"{"error":"That app id isn't registered to this project."}"#,
+    )])
+    .await;
+    let error: Error = accounts(&issuer, Some("s3cret"))
+        .register_device(&device())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Api { status: 403, .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_device_call_is_retried_after_a_503_because_it_is_idempotent() {
+    let (issuer, seen) = service(vec![(503, "{}"), (204, "")]).await;
+    accounts(&issuer, Some("s3cret"))
+        .register_device(&device())
+        .await
+        .unwrap();
+    assert_eq!(2, seen.lock().unwrap().len());
+}
+
+#[tokio::test]
+async fn a_public_client_cannot_register_devices() {
+    let (issuer, seen) = service(vec![(204, "")]).await;
+    let accounts: Accounts = accounts(&issuer, None);
+    assert!(matches!(
+        accounts.register_device(&device()).await,
+        Err(Error::Config(_))
+    ));
+    assert!(matches!(
+        accounts.unregister_device(Platform::Ios, "ab12").await,
+        Err(Error::Config(_))
+    ));
+    assert_eq!(0, seen.lock().unwrap().len());
 }

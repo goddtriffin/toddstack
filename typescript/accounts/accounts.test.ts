@@ -792,6 +792,63 @@ Deno.test("a public client can't send notifications", async () => {
   for (const call of bad) assertEquals((await assertRejects(call, AccountsError)).kind, "config");
 });
 
+const DEVICE = {
+  sub: "u1",
+  platform: "ios",
+  token: "ab12cd34",
+  appId: "me.toddgriffin.boggledygook",
+  environment: "production",
+} as const;
+
+Deno.test("registering a device posts it with the client credentials, and unregistering deletes it", async () => {
+  const { fetcher, calls } = recording(new Response(null, { status: 204 }));
+  const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+  await accounts.registerDevice(DEVICE);
+  await accounts.unregisterDevice("android", "fcm-token");
+  assertEquals(
+    calls.map((c) => [c.method, c.path, c.authorization, JSON.parse(c.body)]),
+    [
+      ["POST", "/api/v1/devices", `Basic ${btoa("boggledygook:s3cret")}`, {
+        sub: "u1",
+        platform: "ios",
+        token: "ab12cd34",
+        app_id: "me.toddgriffin.boggledygook",
+        environment: "production",
+      }],
+      ["DELETE", "/api/v1/devices", `Basic ${btoa("boggledygook:s3cret")}`, {
+        platform: "android",
+        token: "fcm-token",
+      }],
+    ],
+  );
+});
+
+Deno.test("device refusals become typed errors", async () => {
+  const cases = [
+    [409, "conflict", "That device token is registered to another project."],
+    [404, "not_found", "Not found."],
+    [403, "api", "That app id isn't registered to this project."],
+  ] as const;
+  for (const [status, kind, message] of cases) {
+    const { fetcher } = recording(Response.json({ error: message }, { status }));
+    const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+    const e = await assertRejects(() => accounts.registerDevice(DEVICE), AccountsError);
+    assertEquals([e.kind, e.status, e.message], [kind, status, `accounts API returned ${status}: ${message}`]);
+  }
+});
+
+Deno.test("a device call is retried after a 503 because it is idempotent", async () => {
+  const { fetcher, calls } = recording(new Response("down", { status: 503 }), new Response(null, { status: 204 }));
+  await new Accounts(config, { keys: jwks, fetch: fetcher }).registerDevice(DEVICE);
+  assertEquals(calls.length, 2);
+});
+
+Deno.test("a public client can't register devices", async () => {
+  const accounts = new Accounts({ ...config, clientSecret: null }, { keys: jwks, fetch: () => Promise.reject() });
+  const bad = [() => accounts.registerDevice(DEVICE), () => accounts.unregisterDevice("ios", "ab12")];
+  for (const call of bad) assertEquals((await assertRejects(call, AccountsError)).kind, "config");
+});
+
 Deno.test("the time zone hint is a PUT with the person's token", async () => {
   const { fetcher, calls } = recording(new Response(null, { status: 204 }));
   const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });

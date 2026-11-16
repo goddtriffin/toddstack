@@ -11,6 +11,7 @@
 //! - [`friends`]: the friends, blocks, events and inbox API.
 //! - [`notifications`]: sending notifications to players from your server, and
 //!   the time zone hint behind `send_at_local`.
+//! - [`devices`]: registering a player's phone for push from your server.
 //! - [`report`]: reporting someone to Todd's review queue, for people and guests.
 //! - [`logout`]: signing out (revoke, then the end-session URL) in one call.
 //! - [`return_to`]: keeping post-sign-in redirects on your own site.
@@ -40,6 +41,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod devices;
 mod error;
 pub mod friends;
 mod jwks;

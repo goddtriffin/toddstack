@@ -64,7 +64,8 @@ rotation never rejects a valid token.
 
 Errors are `AccountsError` with a `kind`: `state_mismatch`, `authorization` (the person cancelled, or `login_required`
 after `prompt: "none"`), `missing_code`, `token_refused`, `invalid_token`, `invalid_webhook`, `api` (with `status`),
-`not_found`, `unprocessable` and `rate_limited` (the notification calls; with `status`), `http`, `config`.
+`not_found`, `conflict`, `unprocessable` and `rate_limited` (the notification and device calls; with `status`), `http`,
+`config`.
 
 ## Sign out (one route)
 
@@ -196,6 +197,28 @@ const later = await accounts.notificationStatus(receipt.id); // poll a fan-out's
   `not_delivered` folds together muted, left your project and suspended, so a send can't probe players.
 - The named `user` or `friendsOf` player must have signed in to your project: otherwise `not_found` (404). A rate limit
   (6000 requests an hour, 10 fan-outs an hour) is `rate_limited` (429).
+
+### Devices (push)
+
+Your server registers a player's phone for push, as your project (client credentials). Native apps never call the
+accounts service: the app sends its token to your server (Swift's `apnsTokenHex` makes the hex string; an Android FCM
+token is already text), and your server registers it for the signed-in player.
+
+```ts
+await accounts.registerDevice({
+  sub, // must have signed in to your project
+  platform: "ios", // or "android"
+  token: tokenHex,
+  appId: "me.toddgriffin.boggledygook", // bundle / package id an admin registered for your project
+  environment: "production", // or "sandbox" (development builds)
+});
+await accounts.unregisterDevice("ios", tokenHex); // sign-out; fine if it was never registered
+```
+
+- One phone, one person: registering a token that belonged to another player moves it. At most 10 devices are kept per
+  player. Both calls are idempotent, so a transient failure is retried.
+- `conflict` (409): the token is registered to another project. `not_found` (404): the player never signed in to your
+  project. A malformed token or app id (400) or an unregistered app id (403) is `api`.
 
 ### Friend buttons
 

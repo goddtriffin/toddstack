@@ -34,6 +34,9 @@ pub enum Error {
     /// who never signed in to your project, or an unknown send.
     #[error("not found: {0}")]
     NotFound(String),
+    /// A device registration named a token that belongs to another project (409).
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// A notification call was refused as unprocessable (422): the same
     /// idempotency key with a different request, or a field the service can't
     /// parse.

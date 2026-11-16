@@ -19,6 +19,7 @@
  * @module
  */
 
+export type { Device, Environment, Platform } from "./devices.ts";
 export { AccountsError, type AccountsErrorKind } from "./error.ts";
 export {
   ALL_KINDS,
