@@ -6,7 +6,9 @@
 // Everything else is sent exactly once, and must stay that way: the token exchange (an authorization code is
 // single-use), refresh (rotation: a retried refresh that had in fact landed presents a spent token and signs the
 // person out), revocation, and every POST, PUT and DELETE (a retried event or friend request that had landed the
-// first time is a duplicate). `send` enforces this itself, so a caller cannot opt a write in by mistake.
+// first time is a duplicate). `send` enforces this itself, so a caller cannot opt a write in by mistake. The one
+// exception is `retryWrites`, for a notification send that carries an idempotency key: the service replays the
+// recorded answer instead of sending twice, so retrying it cannot duplicate.
 
 /** How hard to try before giving up. */
 export interface RetryPolicy {
@@ -30,6 +32,16 @@ export const READ: RetryPolicy = {
   maxDelayMs: 1_000,
   maxRetryAfterMs: 2_000,
   budgetMs: 6_000,
+};
+
+/** A notification send that carries an idempotency key: its deadline is the same as an unkeyed write's. */
+export const KEYED_SEND: RetryPolicy = {
+  attempts: 3,
+  attemptTimeoutMs: 10_000,
+  baseDelayMs: 200,
+  maxDelayMs: 1_000,
+  maxRetryAfterMs: 2_000,
+  budgetMs: 15_000,
 };
 
 /** The deadline for a request that is sent once. */
@@ -61,7 +73,8 @@ function isIntermittent(error: unknown): boolean {
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
- * Sends a request: once for anything but a GET, and under `policy` for a GET. Resolves with the last response (a
+ * Sends a request: once for anything but a GET, and under `policy` for a GET (or for any method when
+ * `retryWrites` is set, which is only for a request the service deduplicates by key). Resolves with the last response (a
  * success, a final answer, or the last retryable one once attempts or the budget run out) and rejects with the last
  * error.
  */
@@ -70,8 +83,9 @@ export async function send(
   url: string,
   init: RequestInit = {},
   policy: RetryPolicy = READ,
+  retryWrites = false,
 ): Promise<Response> {
-  if ((init.method ?? "GET").toUpperCase() !== "GET") {
+  if (!retryWrites && (init.method ?? "GET").toUpperCase() !== "GET") {
     return await fetcher(url, { ...init, signal: AbortSignal.timeout(WRITE_TIMEOUT_MS) });
   }
   const started = Date.now();

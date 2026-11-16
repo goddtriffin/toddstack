@@ -114,6 +114,45 @@ Deno.test("tampering, wrong secret and age are refused", async () => {
   }
 });
 
+Deno.test("an empty secret is refused before any signature is checked", async () => {
+  const header = `t=1700000000,v1=${"00".repeat(32)}`;
+  for (const secret of ["", new Uint8Array()]) {
+    const e = await assertRejects(() => verifyWebhook(secret, header, BODY, 1_700_000_000), AccountsError);
+    assertEquals([e.kind, e.message], ["invalid_webhook", "webhook rejected: empty secret"]);
+  }
+});
+
+Deno.test("any one of several signatures may match during a secret rotation", async () => {
+  const oldV1 = (await sign("old-secret", 1_700_000_000, BODY)).split("v1=")[1];
+  const newV1 = (await sign("new-secret", 1_700_000_000, BODY)).split("v1=")[1];
+  // Either secret verifies, whichever position its signature is in.
+  for (const header of [`t=1700000000,v1=${oldV1},v1=${newV1}`, `t=1700000000,v1=${newV1},v1=${oldV1}`]) {
+    for (const secret of ["old-secret", "new-secret"]) {
+      assertEquals((await verifyWebhook(secret, header, BODY, 1_700_000_010)).id, "e1");
+    }
+  }
+  // A malformed signature beside the right one is skipped, not fatal.
+  assertEquals(
+    (await verifyWebhook("new-secret", `v1=zz,t=1700000000,v1=${newV1},v1=00`, BODY, 1_700_000_010)).id,
+    "e1",
+  );
+});
+
+Deno.test("several signatures that all mismatch, or all malformed, are refused", async () => {
+  const a = (await sign("a", 1_700_000_000, BODY)).split("v1=")[1];
+  const b = (await sign("b", 1_700_000_000, BODY)).split("v1=")[1];
+  const mismatch = await assertRejects(
+    () => verifyWebhook("c", `t=1700000000,v1=${a},v1=${b}`, BODY, 1_700_000_000),
+    AccountsError,
+  );
+  assertEquals(mismatch.message, "webhook rejected: signature mismatch");
+  const malformed = await assertRejects(
+    () => verifyWebhook("a", "t=1700000000,v1=zz,v1=abc", BODY, 1_700_000_000),
+    AccountsError,
+  );
+  assertEquals(malformed.message, "webhook rejected: malformed signature header");
+});
+
 Deno.test("friendship events name both people", async () => {
   for (const type of ["friendship.created", "friendship.removed"]) {
     const body = `{"id":"e2","type":"${type}","created_at":1700000000,"data":{"sub":"u1","friend_sub":"u2"}}`;
@@ -533,6 +572,236 @@ Deno.test("a public client can't report for guests", async () => {
   const accounts = new Accounts({ ...config, clientSecret: null }, { keys: jwks, fetch: () => Promise.reject() });
   const e = await assertRejects(() => accounts.reportAsGuest({ sub: "u2", reason: "name" }), AccountsError);
   assertEquals(e.kind, "config");
+});
+
+// A fake accounts API that answers request `n` with reply `n` (the last repeats) and records each call.
+function recording(...replies: Response[]) {
+  const calls: { method: string; path: string; authorization: string | null; body: string }[] = [];
+  const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const req = new Request(input, init);
+    calls.push({
+      method: req.method,
+      path: new URL(req.url).pathname,
+      authorization: req.headers.get("authorization"),
+      body: await req.text(),
+    });
+    return replies[Math.min(calls.length, replies.length) - 1].clone();
+  };
+  return { fetcher: fetcher as typeof fetch, calls };
+}
+
+const DONE = {
+  id: "b1",
+  status: "done",
+  recipients: 1,
+  result: "delivered",
+  counts: { delivered: 1, scheduled: 0, not_delivered: 0, dropped_runaway: 0 },
+};
+
+Deno.test("a send goes to the API with the client credentials and reads the receipt", async () => {
+  const { fetcher, calls } = recording(Response.json(DONE, { status: 202 }));
+  const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+  const receipt = await accounts.sendNotification({
+    recipient: { user: "u1" },
+    type: "streak_at_risk",
+    title: "Your streak ends tonight",
+    sendAtLocal: "20:00",
+    collapseKey: "streak",
+    idempotencyKey: "daily-2026-11-15",
+  });
+  assertEquals(receipt, {
+    id: "b1",
+    status: "done",
+    recipients: 1,
+    counts: { delivered: 1, scheduled: 0, notDelivered: 0, droppedRunaway: 0 },
+    result: "delivered",
+    replayed: false,
+  });
+  assertEquals(calls.length, 1);
+  assertEquals([calls[0].method, calls[0].path], ["POST", "/api/v1/notifications"]);
+  assertEquals(calls[0].authorization, `Basic ${btoa("boggledygook:s3cret")}`);
+  assertEquals(JSON.parse(calls[0].body), {
+    recipient: { user: "u1" },
+    type: "streak_at_risk",
+    title: "Your streak ends tonight",
+    body: "",
+    send_at_local: "20:00",
+    collapse_key: "streak",
+    idempotency_key: "daily-2026-11-15",
+  });
+});
+
+Deno.test("every recipient uses the service shape, and a fan-out replay is polled by id", async () => {
+  const queued = { id: "b2", status: "queued", recipients: 40, counts: {}, replayed: true };
+  const finished = {
+    id: "b2",
+    status: "done",
+    recipients: 40,
+    counts: { delivered: 37, scheduled: 0, not_delivered: 3, dropped_runaway: 0 },
+  };
+  const { fetcher, calls } = recording(
+    Response.json(queued, { status: 202 }),
+    Response.json(queued, { status: 202 }),
+    Response.json(finished),
+  );
+  const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+  const sent = await accounts.sendNotification({
+    recipient: { allPlayers: true },
+    type: "daily_ready",
+    title: "Today's daily is ready",
+    idempotencyKey: "daily-2026-11-15",
+  });
+  assertEquals([sent.status, sent.replayed, sent.result], ["queued", true, null]);
+  await accounts.sendNotification({ recipient: { friendsOf: "u1" }, type: "k", title: "t" });
+  assertEquals([JSON.parse(calls[0].body).recipient, JSON.parse(calls[1].body).recipient], [
+    { all_players: true },
+    { friends_of: "u1" },
+  ]);
+  const status = await accounts.notificationStatus("b2");
+  assertEquals([status.status, status.counts, status.replayed], [
+    "done",
+    { delivered: 37, scheduled: 0, notDelivered: 3, droppedRunaway: 0 },
+    false,
+  ]);
+  assertEquals([calls[2].method, calls[2].path], ["GET", "/api/v1/notifications/b2"]);
+});
+
+Deno.test("cancelling names the key and optionally the player", async () => {
+  const { fetcher, calls } = recording(Response.json({ cancelled: 2 }));
+  const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+  assertEquals(await accounts.cancelNotifications("streak", "u1"), 2);
+  assertEquals(await accounts.cancelNotifications("streak"), 2);
+  assertEquals(calls.map((c) => [c.method, c.path, JSON.parse(c.body)]), [
+    ["POST", "/api/v1/notifications/cancel", { collapse_key: "streak", user: "u1" }],
+    ["POST", "/api/v1/notifications/cancel", { collapse_key: "streak" }],
+  ]);
+});
+
+Deno.test("notification refusals become typed errors", async () => {
+  const cases = [
+    [404, "not_found", "Not found."],
+    [422, "unprocessable", "That idempotency key was used for a different request."],
+    [429, "rate_limited", "Too many notifications."],
+    [400, "api", "title must be 1-80 characters."],
+  ] as const;
+  for (const [status, kind, message] of cases) {
+    const { fetcher } = recording(Response.json({ error: message }, { status }));
+    const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+    const e = await assertRejects(
+      () => accounts.sendNotification({ recipient: { user: "u1" }, type: "k", title: "t" }),
+      AccountsError,
+    );
+    assertEquals([e.kind, e.status, e.message], [kind, status, `accounts API returned ${status}: ${message}`]);
+  }
+  const { fetcher } = recording(Response.json({ error: "Not found." }, { status: 404 }));
+  const e = await assertRejects(
+    () => new Accounts(config, { keys: jwks, fetch: fetcher }).notificationStatus("nope"),
+    AccountsError,
+  );
+  assertEquals(e.kind, "not_found");
+});
+
+Deno.test("a send without a key is sent once on a 503; with a key it is retried", async () => {
+  const unkeyed = recording(new Response("down", { status: 503 }), Response.json(DONE, { status: 202 }));
+  const e = await assertRejects(
+    () =>
+      new Accounts(config, { keys: jwks, fetch: unkeyed.fetcher }).sendNotification({
+        recipient: { user: "u1" },
+        type: "k",
+        title: "t",
+      }),
+    AccountsError,
+  );
+  assertEquals([e.kind, e.status, unkeyed.calls.length], ["api", 503, 1]);
+
+  const keyed = recording(new Response("down", { status: 503 }), Response.json(DONE, { status: 202 }));
+  const receipt = await new Accounts(config, { keys: jwks, fetch: keyed.fetcher }).sendNotification({
+    recipient: { user: "u1" },
+    type: "k",
+    title: "t",
+    idempotencyKey: "k1",
+  });
+  assertEquals([receipt.id, keyed.calls.length], ["b1", 2]);
+  assertEquals(keyed.calls[0].body, keyed.calls[1].body);
+});
+
+Deno.test("send retries a keyed write but a refused one is an answer", async () => {
+  const { fetcher, seen } = scripted(status(503), status(422), status(200));
+  const response = await send(fetcher, "https://accounts.example/x", { method: "POST", body: "{}" }, FAST, true);
+  assertEquals([response.status, seen], [422, ["POST", "POST"]]);
+});
+
+Deno.test("a public client can't send notifications", async () => {
+  const accounts = new Accounts({ ...config, clientSecret: null }, { keys: jwks, fetch: () => Promise.reject() });
+  const bad = [
+    () => accounts.sendNotification({ recipient: { user: "u1" }, type: "k", title: "t", idempotencyKey: "k1" }),
+    () => accounts.cancelNotifications("streak"),
+    () => accounts.notificationStatus("b1"),
+  ];
+  for (const call of bad) assertEquals((await assertRejects(call, AccountsError)).kind, "config");
+});
+
+Deno.test("the time zone hint is a PUT with the person's token", async () => {
+  const { fetcher, calls } = recording(new Response(null, { status: 204 }));
+  const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+  await accounts.friends("tok").setTimeZone("America/Chicago");
+  assertEquals(calls, [{
+    method: "PUT",
+    path: "/api/v1/me/time-zone",
+    authorization: "Bearer tok",
+    body: '{"time_zone":"America/Chicago"}',
+  }]);
+});
+
+Deno.test("the inbox and event answers carry the new fields, and an old service's still read", async () => {
+  const { fetcher } = recording(
+    Response.json({
+      items: [{
+        id: "i1",
+        client_id: null,
+        from: null,
+        from_username: null,
+        kind: "friend_accepted",
+        title: "t",
+        body: "",
+        url: null,
+        created_at: "c",
+        read_at: null,
+      }],
+      unread: { project: 0, account: 1, total: 1 },
+    }),
+    Response.json({
+      items: [{
+        id: "i2",
+        from: null,
+        from_username: null,
+        kind: "k",
+        title: "t",
+        body: "",
+        url: null,
+        created_at: "c",
+        read_at: null,
+      }],
+    }),
+    Response.json({
+      delivered: 2,
+      dropped: 1,
+      counts: { delivered: 2, scheduled: 0, not_delivered: 0, dropped_runaway: 1 },
+    }, { status: 202 }),
+    Response.json({ delivered: 2 }, { status: 202 }),
+  );
+  const friends = new Accounts(config, { keys: jwks, fetch: fetcher }).friends("tok");
+  const inbox = await friends.inboxWithUnread(20);
+  assertEquals([inbox.items[0].clientId, inbox.unread], [null, { project: 0, account: 1, total: 1 }]);
+  const old = await friends.inboxWithUnread(20);
+  assertEquals([old.items[0].clientId, old.unread], [null, null]);
+  const event = { kind: "k", title: "t" };
+  assertEquals(await friends.postEventResult(event), {
+    delivered: 2,
+    dropped: 1,
+    counts: { delivered: 2, scheduled: 0, notDelivered: 0, droppedRunaway: 1 },
+  });
+  assertEquals(await friends.postEventResult(event), { delivered: 2, dropped: 0, counts: null });
 });
 
 Deno.test("accountUrl tags links with the client", () => {

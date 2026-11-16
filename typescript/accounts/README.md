@@ -4,8 +4,8 @@
 [![npm](https://img.shields.io/npm/v/toddstack-accounts)](https://www.npmjs.com/package/toddstack-accounts)
 
 Client for Todd Griffin's Projects accounts (`accounts.toddgriffin.me`): what a project's backend needs to sign people
-in, check tokens, verify webhooks, and use friends. The TypeScript half of `toddstack-accounts`, with the same features
-as the [Rust crate](../../rust/toddstack_accounts/README.md). Part of
+in, check tokens, verify webhooks, use friends, and send notifications. The TypeScript half of `toddstack-accounts`,
+with the same features as the [Rust crate](../../rust/toddstack_accounts/README.md). Part of
 [toddstack](https://github.com/goddtriffin/toddstack).
 
 Web Platform APIs only (`fetch`, WebCrypto): Node 20+, Deno, Bun. No dependencies.
@@ -64,7 +64,7 @@ rotation never rejects a valid token.
 
 Errors are `AccountsError` with a `kind`: `state_mismatch`, `authorization` (the person cancelled, or `login_required`
 after `prompt: "none"`), `missing_code`, `token_refused`, `invalid_token`, `invalid_webhook`, `api` (with `status`),
-`http`, `config`.
+`not_found`, `unprocessable` and `rate_limited` (the notification calls; with `status`), `http`, `config`.
 
 ## Sign out (one route)
 
@@ -118,8 +118,9 @@ gets one with themselves as `sub`, so handle only `sub`'s view. An accepted requ
 Your sessions are your own: accounts can't end them. On `user.signed_out`, `user.suspended` and `grant.revoked`, delete
 every session you hold for `event.data.sub`. Their refresh tokens are already revoked.
 
-Verify the raw body before parsing. Signatures older than 5 minutes are refused. Deliveries retry, so ignore repeated
-`event.id`s.
+Verify the raw body before parsing. An empty secret is refused. While you rotate a webhook secret the service signs with
+both, so the header carries several `v1=` values and the event is accepted when any one matches the secret you hold.
+Signatures older than 5 minutes are refused. Deliveries retry, so ignore repeated `event.id`s.
 
 ## Friends and events
 
@@ -137,6 +138,47 @@ await friends.postEvent({
 
 Also `requests`, `requestByCode`, `accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `inbox(limit)`,
 `markRead`, `mutes`, `mute(kind)` (`ALL_KINDS` mutes everything), `unmute`.
+
+`inboxWithUnread(limit)` returns `{ items, unread: { project, account, total } }`: `total` is your badge. An item with
+`clientId: null` is an account-level item from the service itself ("alex accepted your friend request"): it shows in
+every project, is one item read everywhere at once, and is never muted or dropped. `postEventResult` returns
+`{ delivered, dropped, counts }` where `postEvent` returns only `delivered`.
+
+## Notifications
+
+Your server sends notifications as your project (client credentials, so the config needs its client secret):
+
+```ts
+await friends.setTimeZone("America/Chicago"); // the person's token; from their browser or device, for sendAtLocal
+
+const receipt = await accounts.sendNotification({
+  recipient: { user: sub }, // or { friendsOf: sub } or { allPlayers: true }
+  type: "streak_at_risk", // 1-40 of a-z 0-9 _, first use creates it; players can mute a type
+  title: "Your streak ends tonight",
+  body: "Play today's daily to keep it.",
+  url: "https://www.boggledygook.com/daily", // on a registered redirect or logout origin
+  sendAtLocal: "20:00", // on the player's own clock
+  collapseKey: "streak",
+  idempotencyKey: "streak-2026-11-15", // always pass one
+});
+// receipt: { id, status, recipients, counts, result, replayed }
+
+await accounts.cancelNotifications("streak", sub); // they played: drop the scheduled reminder (sub optional)
+const later = await accounts.notificationStatus(receipt.id); // poll a fan-out's counts
+```
+
+- **Always pass `idempotencyKey`** (a date or game id). A retry with the same key gets the recorded send back
+  (`replayed: true`) and sends nothing; the same key with a different request is `unprocessable` (422).
+- There are **no caps and no quiet hours**: every notification is delivered, one per friend who finishes a daily. The
+  phone's own Focus handles quiet time. Only a runaway guard (over 100 to one player in an hour) drops the rest, counted
+  as `droppedRunaway`.
+- `collapseKey` replaces that player's unread item with the same key from your project, and names a scheduled one so
+  `cancelNotifications` can remove it. Nothing collapses without a key.
+- A send to one `user` is delivered inline: `status: "done"` and `result` (`delivered`, `scheduled` or `not_delivered`).
+  A fan-out (`friendsOf`, `allPlayers`) answers `status: "queued"`; poll `notificationStatus` for its `counts`.
+  `not_delivered` folds together muted, left your project and suspended, so a send can't probe players.
+- The named `user` or `friendsOf` player must have signed in to your project: otherwise `not_found` (404). A rate limit
+  (6000 requests an hour, 10 fan-outs an hour) is `rate_limited` (429).
 
 ### Friend buttons
 
@@ -195,6 +237,10 @@ Reads from the accounts service (the signing keys, `userinfo`, and every friends
 failure: a connection error, a timeout, a 5xx or a 429. Three attempts at most, each with its own 3 s deadline, paced by
 exponential backoff with full jitter (200 ms, doubling, capped at 1 s). A `Retry-After` of up to 2 s is waited out; a
 longer one ends the retries. No retry starts after 6 s. A 4xx is an answer and is never retried.
+
+A notification send is retried too, but only when it carries an `idempotencyKey` (two more attempts, each with a 10 s
+deadline, no retry after 15 s): the service replays the recorded send, so a retry cannot notify twice. Without a key it
+is sent once.
 
 Everything else is sent exactly once: the code exchange (a code is single-use), refresh (a refresh that landed but whose
 answer was lost has already rotated the token, so a second try would sign the person out), revocation, and every write

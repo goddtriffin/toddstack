@@ -2,6 +2,7 @@
 // `friends:events` to post events). Your app only ever sees friends who also use your app.
 
 import { AccountsError } from "./error.ts";
+import { type Counts, readCounts } from "./notifications.ts";
 import { type Reason, reportBody } from "./report.ts";
 import type { Accounts } from "./tokens.ts";
 
@@ -74,6 +75,11 @@ export interface FriendEvent {
 export interface InboxItem {
   /** Item id (for `markRead`). */
   id: string;
+  /**
+   * The project the item belongs to; null for an account-level item from the service itself ("Alex accepted your
+   * friend request"): shown in every project, one item, read everywhere at once, never muted or dropped.
+   */
+  clientId: string | null;
   /** The friend it came from (`sub`), null for system items. */
   from: string | null;
   /** That friend's username. */
@@ -92,11 +98,40 @@ export interface InboxItem {
   readAt: string | null;
 }
 
+/** Unread inbox counts. */
+export interface Unread {
+  /** Unread items from your project. */
+  project: number;
+  /** Unread account-level items, shared by every project. */
+  account: number;
+  /** Both together: the badge number. */
+  total: number;
+}
+
+/** The person's inbox for your project (its items plus the account-level ones) and the unread counts. */
+export interface Inbox {
+  /** Newest first. */
+  items: InboxItem[];
+  /** Null from a service older than the counts. */
+  unread: Unread | null;
+}
+
+/** What posting an event did. */
+export interface EventResult {
+  /** How many friends' inboxes it reached. */
+  delivered: number;
+  /** Dropped by the runaway guard (over 100 to one player in an hour). */
+  dropped: number;
+  /** Every outcome, counted; null from a service older than the counts. */
+  counts: Counts | null;
+}
+
 /** Mutes every event kind from your app. */
 export const ALL_KINDS = "*";
 
 interface RawInboxItem {
   id: string;
+  client_id?: string | null;
   from: string | null;
   from_username: string | null;
   kind: string;
@@ -107,12 +142,35 @@ interface RawInboxItem {
   read_at: string | null;
 }
 
+function eventBody(event: FriendEvent): Record<string, unknown> {
+  const wire: Record<string, unknown> = { kind: event.kind, title: event.title, body: event.body ?? "" };
+  if (event.url !== undefined) wire.url = event.url;
+  if (event.collapseKey !== undefined) wire.collapse_key = event.collapseKey;
+  if (event.recipients !== undefined) wire.recipients = event.recipients;
+  return wire;
+}
+
 function field<T>(value: unknown, name: string): T {
   const out = (value as Record<string, unknown> | null)?.[name];
   if (out === undefined) {
     throw new AccountsError("api", `accounts API returned 200: missing field \`${name}\``, { status: 200 });
   }
   return out as T;
+}
+
+function readItem(i: RawInboxItem): InboxItem {
+  return {
+    id: i.id,
+    clientId: i.client_id ?? null,
+    from: i.from,
+    fromUsername: i.from_username,
+    kind: i.kind,
+    title: i.title,
+    body: i.body,
+    url: i.url,
+    createdAt: i.created_at,
+    readAt: i.read_at,
+  };
 }
 
 /** The API for one person (their access token). Get one from `accounts.friends(token)`. */
@@ -215,27 +273,41 @@ export class Friends {
 
   /** Posts an event; returns how many friends' inboxes it reached. Rate limit: 60 per person per hour per app. */
   async postEvent(event: FriendEvent): Promise<number> {
-    const wire: Record<string, unknown> = { kind: event.kind, title: event.title, body: event.body ?? "" };
-    if (event.url !== undefined) wire.url = event.url;
-    if (event.collapseKey !== undefined) wire.collapse_key = event.collapseKey;
-    if (event.recipients !== undefined) wire.recipients = event.recipients;
-    return field(await this.#call("POST", "/events", wire), "delivered");
+    return field(await this.#call("POST", "/events", eventBody(event)), "delivered");
   }
 
-  /** The person's inbox items from your app, newest first. */
+  /** Posts an event, like `postEvent`, and returns the whole answer: delivered and dropped, and the full counts. */
+  async postEventResult(event: FriendEvent): Promise<EventResult> {
+    const value = await this.#call("POST", "/events", eventBody(event)) as Record<string, unknown>;
+    return {
+      delivered: field(value, "delivered"),
+      dropped: typeof value.dropped === "number" ? value.dropped : 0,
+      counts: value.counts === undefined || value.counts === null ? null : readCounts(value.counts),
+    };
+  }
+
+  /** The person's inbox items from your app, newest first, plus the account-level ones (`clientId` is null). */
   async inbox(limit: number): Promise<InboxItem[]> {
-    const items = field<RawInboxItem[]>(await this.#call("GET", `/inbox?limit=${Math.floor(limit)}`), "items");
-    return items.map((i) => ({
-      id: i.id,
-      from: i.from,
-      fromUsername: i.from_username,
-      kind: i.kind,
-      title: i.title,
-      body: i.body,
-      url: i.url,
-      createdAt: i.created_at,
-      readAt: i.read_at,
-    }));
+    return (await this.inboxWithUnread(limit)).items;
+  }
+
+  /** The inbox with the unread counts for your badge. */
+  async inboxWithUnread(limit: number): Promise<Inbox> {
+    const value = await this.#call("GET", `/inbox?limit=${Math.floor(limit)}`);
+    const raw = (value as { unread?: Partial<Unread> | null }).unread;
+    return {
+      items: field<RawInboxItem[]>(value, "items").map(readItem),
+      unread: raw ? { project: raw.project ?? 0, account: raw.account ?? 0, total: raw.total ?? 0 } : null,
+    };
+  }
+
+  /**
+   * Tells the service the person's time zone (an IANA name such as `America/Chicago`, from their browser or
+   * device), so a notification's `sendAtLocal` lands on their clock. Needs no particular scope; the last write
+   * wins. Send it when they sign in and when it changes. Fails with 400 for a name the service doesn't know.
+   */
+  async setTimeZone(timeZone: string): Promise<void> {
+    await this.#call("PUT", "/me/time-zone", { time_zone: timeZone });
   }
 
   /** Marks an inbox item read. */

@@ -1,6 +1,6 @@
 /**
  * Client for Todd Griffin's Projects accounts (`accounts.toddgriffin.me`): what a project's backend needs to
- * sign people in, check tokens, verify webhooks, and use friends. The TypeScript half of `toddstack-accounts`
+ * sign people in, check tokens, verify webhooks, use friends, and send notifications. The TypeScript half of `toddstack-accounts`
  * (same features as the Rust crate). Web Platform APIs only: runs on Node 20+, Deno and Bun.
  *
  * ```ts
@@ -23,16 +23,20 @@ export { AccountsError, type AccountsErrorKind } from "./error.ts";
 export {
   ALL_KINDS,
   type Blocks,
+  type EventResult,
   type FriendEvent,
   Friends,
+  type Inbox,
   type InboxItem,
   MAX_RELATIONSHIPS_PER_CALL,
   type Person,
   type Relationship,
   type Requests,
   type Sent,
+  type Unread,
 } from "./friends.ts";
 export type { Jwk, JwkSet } from "./jwks.ts";
+export type { Counts, Notification, Outcome, Receipt, Recipient, SendStatus } from "./notifications.ts";
 export { type GuestReport, MAX_NOTE_CHARS, type Reason } from "./report.ts";
 export {
   type Callback,

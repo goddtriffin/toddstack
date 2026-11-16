@@ -9,6 +9,8 @@
 //!   access tokens against the published signing keys.
 //! - [`webhook`]: verifying the signed webhooks the accounts service sends.
 //! - [`friends`]: the friends, blocks, events and inbox API.
+//! - [`notifications`]: sending notifications to players from your server, and
+//!   the time zone hint behind `send_at_local`.
 //! - [`report`]: reporting someone to Todd's review queue, for people and guests.
 //! - [`logout`]: signing out (revoke, then the end-session URL) in one call.
 //! - [`return_to`]: keeping post-sign-in redirects on your own site.
@@ -44,6 +46,7 @@ mod jwks;
 mod links;
 pub mod login;
 pub mod logout;
+pub mod notifications;
 pub mod report;
 mod retry;
 pub mod return_to;
