@@ -305,6 +305,10 @@ your machine (`LOCAL_BASE_URL`, `http://127.0.0.1:8790`); `toddgriffinAt(baseUrl
 is accepted only for `127.0.0.1`, `localhost` and `::1`; any other `http` base or issuer throws `AccountsError` with
 `kind: "config"` (from `toddgriffinAt` and `new Accounts`).
 
+**Issuer match:** the issuer must exactly match the local server's `ACCOUNTS_BASE_URL`. If you run accounts on
+`http://localhost:8790` (needed for passkeys), use `toddgriffinAt("http://localhost:8790", ..)`, not the `127.0.0.1`
+default.
+
 ## Breaking changes
 
 **0.6.0**: `new Accounts(config)` now throws `kind: "config"` for an `http` issuer that is not loopback (it was

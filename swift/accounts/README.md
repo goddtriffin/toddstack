@@ -127,7 +127,7 @@ Local testing never touches production: every base URL is yours to set. `serverU
 `http` on loopback (`127.0.0.1`, `localhost`, `::1`) and nowhere else (`AccountsError.config`);
 `AccountsConfig.local(serverURL:callbackURL:clientId:)` also points `accountsBaseURL` at
 `AccountsConfig.localAccountsBaseURL` (`http://127.0.0.1:8790`). The sign-out URL your server returns follows the same
-rule. `callbackURL` is an https Universal Link, or (any mode, local debug builds) a reverse-DNS custom scheme such as
+rule. **Issuer match:** `accountsBaseURL` must exactly match the local server's `ACCOUNTS_BASE_URL`; if accounts runs on `http://localhost:8790` (needed for passkeys), pass that as `accountsBaseURL`, not the `127.0.0.1` default. `callbackURL` is an https Universal Link, or (any mode, local debug builds) a reverse-DNS custom scheme such as
 `me.toddgriffin.boggledygook.debug:/app/callback` (RFC 8252; the sheet then uses `ASWebAuthenticationSession.Callback.customScheme`); plain http is rejected.
 
 ```swift
@@ -147,6 +147,12 @@ builds):
 
 From the repo root: `make swift_test` (macOS; uses Xcode's toolchain for swift-testing) and
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -scheme ToddstackAccounts -destination 'generic/platform=iOS' build`.
+
+## Breaking changes
+
+**0.6.0**: `serverURL` and `accountsBaseURL` accept `http` on loopback, with a new config error message for other
+URLs. The sign-out URL your server returns may now be loopback `http` (it was https only). `callbackURL` also accepts
+a reverse-DNS custom scheme.
 
 ## Releases
 

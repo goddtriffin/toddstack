@@ -10,7 +10,8 @@ private val LOOPBACK_HOSTS: Set<String> = setOf("127.0.0.1", "localhost", "[::1]
 
 /**
  * Whether [url] is https with a host, or http on a loopback host: `127.0.0.1`, `localhost`, `::1`, or `10.0.2.2`
- * (the Android emulator's alias for the development machine). Nothing else may go over the wire unencrypted.
+ * (the Android emulator's alias for the development machine; on a physical device it is an ordinary LAN address, so
+ * use it only from the emulator). Nothing else may go over the wire unencrypted.
  */
 internal fun isAllowedBaseUrl(url: String): Boolean {
     val uri: java.net.URI = try { java.net.URI(url) } catch (_: java.net.URISyntaxException) { return false }

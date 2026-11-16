@@ -286,6 +286,25 @@ class AccountsTest {
     }
 
     @Test
+    fun loopback_bypasses_are_rejected_and_hosts_are_case_insensitive() {
+        for (bad in listOf("http://localhost@evil.com", "http://localhost.", "http://[::ffff:127.0.0.1]", "http://127.0.0.2")) {
+            assertEquals(bad, AccountsException.Kind.Config, assertThrows(AccountsException::class.java) { config.copy(serverUrl = bad) }.kind)
+            assertEquals(bad, AccountsException.Kind.Config, assertThrows(AccountsException::class.java) { config.copy(accountsBaseUrl = bad) }.kind)
+        }
+        config.copy(serverUrl = "http://LOCALHOST:8790")
+    }
+
+    @Test
+    fun a_custom_scheme_callback_signs_in() = runTest {
+        val custom = "me.toddgriffin.boggledygook.debug:/app/callback"
+        val local = Accounts(AccountsConfig.local("http://10.0.2.2:8992", custom, "boggledygook"), mock, store) { now }
+        givenPending()
+        mock.seedExchangeSession("one-time", verifier, null, Result.success(signedIn))
+        assertEquals(signedIn, local.handleCallback("$custom?code=one-time&state=$state"))
+        mock.assertAllSeedsConsumed()
+    }
+
+    @Test
     fun the_callback_is_https_or_a_reverse_dns_custom_scheme() = runTest {
         for (ok in listOf(config.callbackUrl, "me.toddgriffin.boggledygook.debug:/app/callback")) config.copy(callbackUrl = ok)
         for (bad in listOf("http://127.0.0.1:8992/app/callback", "boggle://callback", "boggle:/app/callback", "https:///x")) {
@@ -295,6 +314,7 @@ class AccountsTest {
         val local = AccountsConfig.local("http://10.0.2.2:8992", custom, "boggledygook")
         val a = Accounts(local, mock, store)
         a.launcher = RecordingLauncher()
+        // an https callback no longer matches a custom-scheme config
         val e = assertThrows(AccountsException::class.java) {
             kotlinx.coroutines.runBlocking { a.handleCallback("https://www.boggledygook.com/app/callback?code=c&state=s") }
         }

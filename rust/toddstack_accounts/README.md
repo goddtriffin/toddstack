@@ -291,6 +291,8 @@ base. The issuer is `<base>/oidc`, and the JWKS, authorize, token, end-session, 
 derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; any other `http` base or issuer is
 `Error::Config` (from `toddgriffin_at` and `Accounts::new`).
 
+**Issuer match:** the issuer must exactly match the local server's `ACCOUNTS_BASE_URL`. If you run accounts on `http://localhost:8790` (needed for passkeys), use `toddgriffin_at("http://localhost:8790", ..)`, not the `127.0.0.1` default.
+
 ## Breaking changes
 
 **0.6.0**: `Accounts::new` and `Accounts::with_keys` now return `Error::Config` for an `http` issuer that is not
