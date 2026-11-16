@@ -5,8 +5,14 @@ plugins {
     signing
 }
 
-group = "me.toddgriffin"
-version = "0.1.0"
+// Equals the repo's shared release tag (`0.4.1`): one bare tag serves SwiftPM and JitPack. Bump it with
+// `toddstackAccountsVersion` in swift/ when cutting a tag.
+version = "0.4.1"
+
+// JitPack (env JITPACK=true) serves only groups under `com.github.<user>.<repo>`; Maven Central will use me.toddgriffin.
+val publishGroup: String =
+    if (System.getenv("JITPACK") == "true") "com.github.goddtriffin.toddstack" else "me.toddgriffin"
+group = publishGroup
 
 android {
     namespace = "me.toddgriffin.toddstack.accounts"
@@ -61,7 +67,7 @@ dependencies {
 publishing {
     publications {
         register<MavenPublication>("release") {
-            groupId = "me.toddgriffin"
+            groupId = publishGroup
             artifactId = "toddstack-accounts"
             version = project.version.toString()
             afterEvaluate { from(components["release"]) }

@@ -27,6 +27,7 @@ Diff against `main` and classify:
 | `rust/webserver_base/**` (the Rust lib) | Cargo bump, tag, release, crates.io publish — **and** the image steps, because the binary embeds the library |
 | `typescript/webserver-base/**` (the TS lib) | `typescript/deno.jsonc` PATCH bump, JSR publish |
 | `typescript/accounts/**` (TS `toddstack-accounts`) | PATCH bump of `deno.jsonc`, `package.json` and `version.ts` together (a test checks they agree), CI then publishes to JSR and npm on merge. Check the Rust crate has the same features (parity, see `contribution-guide`) |
+| `kotlin/**`, `swift/**` (native SDKs) | no CI publish: set the same `X.Y.Z` in `kotlin/accounts/build.gradle.kts` and `Version.swift`, then Todd tags the merge commit with the bare `X.Y.Z` (SwiftPM and JitPack); see `AGENTS.md` "Releasing the native SDKs" |
 | `rust/template_web_server/**` (the crate, its `html/`, `static/`, `Dockerfile`), `rust/Cargo.lock`, `Makefile` | the image steps: build, smoke test, push |
 | any `README.md`, `AGENTS.md`, `CLAUDE.md`, `.claude/**`, other docs | nothing but the pull request |
 

@@ -14,7 +14,7 @@ published on its own and documented in its own README.
 | `toddstack-accounts` | Rust | [crates.io](https://crates.io/crates/toddstack-accounts) | [`rust/toddstack_accounts/README.md`](rust/toddstack_accounts/README.md) |
 | `toddstack-accounts` | TypeScript | [JSR](https://jsr.io/@todd/toddstack-accounts) `@todd/toddstack-accounts`, [npm](https://www.npmjs.com/package/toddstack-accounts) `toddstack-accounts` | [`typescript/accounts/README.md`](typescript/accounts/README.md) |
 | `ToddstackAccounts` | Swift | SwiftPM, `https://github.com/goddtriffin/toddstack` (product `ToddstackAccounts`) | [`swift/accounts/README.md`](swift/accounts/README.md) |
-| `toddstack-accounts` | Kotlin (Android) | Maven Central `me.toddgriffin:toddstack-accounts` (not yet published; see its README) | [`kotlin/accounts/README.md`](kotlin/accounts/README.md) |
+| `toddstack-accounts` | Kotlin (Android) | JitPack `com.github.goddtriffin.toddstack:toddstack-accounts` (from the bare tag; Maven Central later; see its README) | [`kotlin/accounts/README.md`](kotlin/accounts/README.md) |
 | `template-web-server` | Rust | not published; Docker image for several sites | [`rust/template_web_server/`](rust/template_web_server/) |
 
 ## Layout
@@ -27,7 +27,7 @@ rust/              Cargo workspace: every Rust crate
   toddstack_accounts/    client for the shared accounts: sign-in, tokens, webhooks, friends
 swift/             Swift package (Package.swift at the repo root points here): native-app sign-in
   accounts/              ToddstackAccounts for iOS and macOS apps (client of the project server's /app contract)
-kotlin/            Gradle build: Android libraries
+kotlin/            Gradle build: Android libraries (jitpack.yml at the repo root builds it from a tag)
   accounts/              toddstack-accounts for Android (Auth Tab sign-in through the project's server)
 typescript/        JSR packages (deno.jsonc is the package config)
   webserver-base/        the browser/build-side half of webserver-base
@@ -57,4 +57,16 @@ Rules live in the skills, not here. Invoke `contribution-guide` before any
 change to this repo.
 
 Releases are tagged per package: `webserver-base-vX.Y.Z`, `toddstack-accounts-vX.Y.Z` (tags up to `v0.3.0`
-predate the rename from `goddtriffin/webserver-base`).
+predate the rename from `goddtriffin/webserver-base`). The **bare `X.Y.Z` tag** (no prefix) is the native SDKs':
+SwiftPM reads it and JitPack builds the Kotlin SDK from it, so the Swift and Kotlin versions always equal the tag.
+
+### How to release Kotlin (and Swift)
+
+1. Set the same new `X.Y.Z` in `kotlin/accounts/build.gradle.kts` (`version`) and
+   `swift/accounts/Sources/ToddstackAccounts/Version.swift` (`toddstackAccountsVersion`); `make lint test`; merge.
+2. `git tag X.Y.Z && git push origin X.Y.Z` on the merge commit.
+3. Open <https://jitpack.io/#goddtriffin/toddstack>, pick the tag, press Get it, and wait for green.
+
+Consumers then use `com.github.goddtriffin.toddstack:toddstack-accounts:X.Y.Z` (JitPack repository
+`https://jitpack.io`). Maven Central (`me.toddgriffin:toddstack-accounts`) comes later, once Todd has the Sonatype
+namespace, DNS TXT record, GPG key and token; the build is already configured for it (see `kotlin/accounts/README.md`).

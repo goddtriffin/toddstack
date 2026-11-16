@@ -180,6 +180,7 @@ fn refused(status: u16, text: &str) -> Error {
         .unwrap_or_else(|| text.to_owned());
     match status {
         404 => Error::NotFound(message),
+        409 => Error::Conflict(message),
         422 => Error::Unprocessable(message),
         429 => Error::RateLimited(message),
         _ => Error::Api { status, message },
@@ -189,7 +190,7 @@ fn refused(status: u16, text: &str) -> Error {
 impl Accounts {
     /// One call as your project, with your client credentials. `keyed` lets a
     /// POST be retried (see [`retry::execute_keyed`]); a GET is always retried.
-    async fn project_call(
+    pub(crate) async fn project_call(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -198,7 +199,7 @@ impl Accounts {
     ) -> Result<Value> {
         let secret: &str = self.config().client_secret.as_deref().ok_or_else(|| {
             Error::Config(String::from(
-                "notifications need the client secret: set Config::client_secret",
+                "this call needs the client secret: set Config::client_secret",
             ))
         })?;
         // RFC 6749 2.3.1, as at the token endpoint: form-encode both parts.
@@ -221,6 +222,10 @@ impl Accounts {
         let text: String = response.text().await?;
         if !status.is_success() {
             return Err(refused(status.as_u16(), &text));
+        }
+        // 204 answers (devices) have no body.
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
         }
         serde_json::from_str(&text).map_err(|e| Error::Api {
             status: status.as_u16(),

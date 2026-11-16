@@ -3,7 +3,8 @@
 Sign-in for native Android apps. The same features as the Rust and TypeScript `toddstack-accounts`, for an app
 that signs in **through its project's server and never directly against `accounts.toddgriffin.me`**.
 
-- Coordinates: `me.toddgriffin:toddstack-accounts:0.1.0`
+- Coordinates (JitPack, from the repo's bare release tag): `com.github.goddtriffin.toddstack:toddstack-accounts:0.4.1`.
+  Maven Central (`me.toddgriffin:toddstack-accounts`) comes later; see below.
 - Android library, minSdk 26. Dependencies: coroutines, kotlinx.serialization, androidx.browser (Auth Tab),
   androidx.activity, DataStore. No networking library (it uses `HttpURLConnection`).
 - Your app must compile against SDK 36 or later (androidx.browser 1.10 requires it).
@@ -44,6 +45,13 @@ Serve `https://www.boggledygook.com/.well-known/assetlinks.json` with the app's 
 (`me.toddgriffin.boggledygook`) and the SHA-256 fingerprint of every signing certificate (debug, release, and
 the Play App Signing key). Without it the link opens the browser, not the app. Check it with
 `adb shell pm get-app-links me.toddgriffin.boggledygook`.
+
+## Push
+
+Your app never calls the accounts service. Get the FCM token (`FirebaseMessaging`) and send it to your own server
+with the player's bearer token; your server registers it with `registerDevice` (`platform: "android"`, your package
+id) in its `toddstack-accounts` (Rust or TypeScript) and calls `unregisterDevice` on sign-out. An FCM token is
+already text, so unlike iOS there is nothing to encode here.
 
 ## Use it
 
@@ -126,23 +134,49 @@ Add to the app's `res/xml/backup_rules.xml` (`android:fullBackupContent`) and `d
 
 Tokens live in DataStore, each value encrypted with an AES-GCM key in the Android Keystore
 (`KeystoreTokenStore`). `Session.toString()` never prints the token. In unit tests use `InMemoryTokenStore` and
-`MockAccountsApi` from the `testFixtures` (`testImplementation(testFixtures("me.toddgriffin:toddstack-accounts:0.1.0"))`):
+`MockAccountsApi` from the `testFixtures` (`testImplementation(testFixtures("com.github.goddtriffin.toddstack:toddstack-accounts:0.4.1"))`):
 seed a response per exact arguments (`seedExchangeSession(code, verifier, bearer, Result.success(session))`),
 inspect `calls`, and end every test with `assertAllSeedsConsumed()`. An unseeded call throws.
 
-## Consume it tonight (no Maven Central)
+## Install (JitPack)
 
-From a checkout of this repo:
+[JitPack](https://jitpack.io) builds public GitHub repos from tags, with no account or key. Add its repository and
+pin the exact version (a release tag; never a branch or `-SNAPSHOT`):
 
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement { repositories { google(); mavenCentral(); maven("https://jitpack.io") } }
+
+// app/build.gradle.kts
+implementation("com.github.goddtriffin.toddstack:toddstack-accounts:0.4.1")
 ```
-cd kotlin && ./gradlew :accounts:publishToMavenLocal
-```
 
-then in the app: `repositories { mavenLocal() }` and `implementation("me.toddgriffin:toddstack-accounts:0.1.0")`.
-(Run it again after any change.) JitPack is not used: it builds from the repo root, and this Gradle build lives in
-`kotlin/`.
+The group is `com.github.goddtriffin.toddstack` (JitPack's group for a module of a multi-module repo), the artifact is
+`toddstack-accounts`, and the version is the tag. Your app must use Kotlin 2.4 or later (the library's metadata is 2.4).
+The first request for a tag makes JitPack build it, which takes a few minutes; check
+`https://jitpack.io/com/github/goddtriffin/toddstack/toddstack-accounts/0.4.1/` or the build log at
+<https://jitpack.io/#goddtriffin/toddstack>.
 
-## Publishing to Maven Central (not done yet)
+### Local build
+
+From a checkout of this repo, for work in progress: `cd kotlin && ./gradlew :accounts:publishToMavenLocal`, then in
+the app `repositories { mavenLocal() }` and `implementation("me.toddgriffin:toddstack-accounts:0.4.1")` (the local
+group is `me.toddgriffin`; only JitPack's build uses the `com.github...` group). Run it again after any change.
+
+## Releasing
+
+The Kotlin version is the repo's **bare release tag**, shared with SwiftPM: one tag `X.Y.Z` serves both. To release:
+
+1. Pick the next version. Set `version` in `kotlin/accounts/build.gradle.kts` and `toddstackAccountsVersion` in
+   `swift/accounts/Sources/ToddstackAccounts/Version.swift` to it (and bump the Rust and TypeScript
+   `toddstack-accounts` too when they changed: they keep their own `toddstack-accounts-vX.Y.Z` tags).
+2. `make lint test`, merge to `main`.
+3. Tag the merge commit and push the tag: `git tag X.Y.Z && git push origin X.Y.Z`. SwiftPM sees it at once.
+4. Warm JitPack: open <https://jitpack.io/#goddtriffin/toddstack>, choose the tag, press Get it, and wait for a green
+   build (or `curl -s https://jitpack.io/com/github/goddtriffin/toddstack/toddstack-accounts/X.Y.Z/toddstack-accounts-X.Y.Z.pom`).
+   `jitpack.yml` at the repo root runs `publishToMavenLocal` in `kotlin/` on JDK 17.
+
+## Publishing to Maven Central (later, not done)
 
 `maven-publish` and `signing` are configured with sources and javadoc jars and full POM metadata, and no
 credentials. Todd must:

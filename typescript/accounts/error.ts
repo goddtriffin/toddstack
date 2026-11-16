@@ -19,6 +19,8 @@ export type AccountsErrorKind =
   | "api"
   /** A notification call named something that doesn't exist (404): a player who never signed in to your project, or an unknown send. `status` is set. */
   | "not_found"
+  /** A device registration named a token that belongs to another project (409). `status` is set. */
+  | "conflict"
   /** A notification call was refused as unprocessable (422): the same idempotency key with a different request, or a field the service can't parse. `status` is set. */
   | "unprocessable"
   /** A notification call hit a rate limit (429). Wait before sending again. `status` is set. */
@@ -36,7 +38,7 @@ export class AccountsError extends Error {
   readonly error?: string;
   /** The OAuth `error_description`, when the service sent one. */
   readonly description?: string;
-  /** The HTTP status, for `api`, `not_found`, `unprocessable` and `rate_limited`. */
+  /** The HTTP status, for `api`, `not_found`, `conflict`, `unprocessable` and `rate_limited`. */
   readonly status?: number;
 
   /** Builds an error; `details` carries the OAuth code, description, HTTP status or cause. */

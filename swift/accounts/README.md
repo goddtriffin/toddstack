@@ -12,7 +12,7 @@ accounts web flow for it. Swift 6, iOS 17.4+ / macOS 14.4+, no third-party depen
 Swift Package Manager, from the repository URL (the manifest is `Package.swift` at the repo root):
 
 ```swift
-.package(url: "https://github.com/goddtriffin/toddstack", from: "0.4.0")  // first Swift tag; see Releases
+.package(url: "https://github.com/goddtriffin/toddstack", from: "0.4.1")  // see Releases
 // target dependency:
 .product(name: "ToddstackAccounts", package: "toddstack")
 ```
@@ -94,12 +94,26 @@ try await accounts.signOut()   // deletes the token even if the network fails
 | `authorized(_:)` | `URLRequest` with the Bearer token, only for the server's scheme, host and port |
 | `signOut()` | server sign-out, local delete, global sign-out sheet; throws only on a Keychain failure |
 | `accountURL(_:)` | accounts-site link tagged `?client=` (a query is kept, a fragment stays last) |
+| `apnsTokenHex(_:)` | the lowercase hex of an APNs device token's `Data`, the form your server registers (see below) |
 | `AccountsError` | `config`, `stateMismatch`, `foreignHost`, `signInInProgress`, `authorization(code:)`, `missingCode`, `invalidGrant`, `cancelled`, `notSignedIn`, `api(status:message:)`, `network`, `invalidResponse`, `storage` |
 | `SessionStore` | `KeychainSessionStore` (production), `InMemorySessionStore` (tests) |
 | `AccountsTransport`, `WebAuthenticator` | the network and the browser sheet; swap them for mocks |
 
 The sign-in session is **not ephemeral**: the browser's accounts cookie is what makes sign-in silent. A guest cannot
 customize anything; gate locked options and offer `signIn()`.
+
+## Push
+
+Your app never calls the accounts service. Ask for notification permission, then send the token to your own server in
+`application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`, with the build's environment (`sandbox` for
+development builds, `production` for TestFlight and the App Store):
+
+```swift
+let token: String = apnsTokenHex(deviceToken)   // POST this to your server with accounts.authorized(_:)
+```
+
+Your server then calls `registerDevice` (and `unregisterDevice` on sign-out) in its own `toddstack-accounts`
+(Rust or TypeScript); registering the token for another player moves it.
 
 ## Testing your app
 
@@ -119,6 +133,7 @@ else. The other packages here use prefixed tags (`webserver-base-vX.Y.Z`, `todds
 ignores, so they do not collide. The old `v0.1.0` ... `v0.3.0` tags (from before the rename) do: SwiftPM reads them
 as versions 0.1.0 ... 0.3.0 of this package, and they have no `Package.swift`.
 
-Scheme: **Swift releases are the only bare `X.Y.Z` tags** (no `v`), and the first one is above 0.3.0, so it
-sorts after the old tags: tag **`0.4.0`** for the first release (set `toddstackAccountsVersion` to match). Later
-tags follow the Swift package's own semver. Tags are not created by this change.
+Scheme: **bare `X.Y.Z` tags** (no `v`) serve SwiftPM **and** JitPack (the Kotlin SDK, see
+[`kotlin/accounts/README.md`](../../kotlin/accounts/README.md)), so the Swift and Kotlin versions are always equal
+to the tag. The first was **`0.4.0`** (above the old tags, so it sorts after them). Set `toddstackAccountsVersion`
+to the tag you are about to cut; the Rust and TypeScript packages keep their own `toddstack-accounts-vX.Y.Z` tags.
