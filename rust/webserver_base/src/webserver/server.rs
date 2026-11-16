@@ -987,7 +987,7 @@ where
     // 404 and nothing ever reaches Plausible.
     if let (Some(analytics_paths), Some(upstream)) = (
         paths.analytics.as_ref(),
-        frontend.analytics.upstream_script_url(),
+        frontend.analytics.upstream_script_url_if_enabled(),
     ) {
         scripts = scripts.route(
             &analytics_paths.script_path,

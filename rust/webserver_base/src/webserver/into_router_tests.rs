@@ -645,6 +645,17 @@ async fn local_mode_renders_no_analytics_and_its_proxy_routes_404_even_with_an_i
 
 #[tokio::test]
 async fn an_unset_or_empty_id_renders_no_analytics_in_production() {
+    let production: Router = analytics_router(
+        "analytics-unset-ref",
+        Environment::Production,
+        AnalyticsConfig::new("pa-fixture"),
+    );
+    let path: String =
+        analytics_script_path(&text(get(&production, "/").await).await).expect("a script tag");
+    let event_path: String = path
+        .replace("/script/", "/api/v1/")
+        .trim_end_matches(".js")
+        .to_string();
     for (name, analytics) in [
         ("analytics-unset", AnalyticsConfig::disabled()),
         ("analytics-empty", AnalyticsConfig::new("")),
@@ -653,5 +664,11 @@ async fn an_unset_or_empty_id_renders_no_analytics_in_production() {
 
         let body: String = text(get(&router, "/").await).await;
         assert!(!body.contains("plausible"), "{name}: {body}");
+        assert!(!body.contains(&path), "{name}: {body}");
+        assert_eq!(StatusCode::NOT_FOUND, get(&router, &path).await.status());
+        assert_eq!(
+            StatusCode::NOT_FOUND,
+            request(&router, Method::POST, &event_path).await.status()
+        );
     }
 }

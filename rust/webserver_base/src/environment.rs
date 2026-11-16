@@ -55,7 +55,28 @@ impl Environment {
     /// [`EnvError::Missing`] if unset, [`EnvError::Empty`] if blank, or
     /// [`EnvError::Invalid`] if it is neither `local` nor `production`.
     pub fn from_env() -> Result<Self, EnvError> {
-        let value: String = env::required(ENV_ENVIRONMENT)?;
+        Self::parse_value(env::required(ENV_ENVIRONMENT)?)
+    }
+
+    /// [`Environment::from_env`]'s logic over an already-read value, so it can
+    /// be tested without mutating the process environment.
+    ///
+    /// # Errors
+    ///
+    /// As [`Environment::from_env`].
+    pub fn from_value(raw: Option<&str>) -> Result<Self, EnvError> {
+        match raw {
+            None => Err(EnvError::Missing {
+                key: ENV_ENVIRONMENT.to_string(),
+            }),
+            Some(value) if value.trim().is_empty() => Err(EnvError::Empty {
+                key: ENV_ENVIRONMENT.to_string(),
+            }),
+            Some(value) => Self::parse_value(value.trim().to_string()),
+        }
+    }
+
+    fn parse_value(value: String) -> Result<Self, EnvError> {
         value.parse::<Self>().map_err(|_| EnvError::Invalid {
             key: ENV_ENVIRONMENT.to_string(),
             expected: "environment (`local` or `production`)",

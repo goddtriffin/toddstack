@@ -763,7 +763,14 @@ one is set, so a laptop can never pour into production's numbers. Production wit
 an id behaves as before. Sentry is unaffected: it stays on in every environment.
 In code, `AnalyticsConfig::disabled()` and `AnalyticsConfig::is_enabled()` expose
 the same state, and `Frontend` applies the local rule whatever config it is given.
-`AnalyticsConfig::from_env()` now also reads `WSB_ENVIRONMENT`.
+
+**Upgrading to 0.3.4:** `AnalyticsConfig::from_env()` (and so
+`FrontendParams::from_env`) now also reads `WSB_ENVIRONMENT` and fails when it is
+unset, blank or invalid. An id is trimmed, and a blank one disables analytics.
+`AnalyticsConfig::script_id()` and `upstream_script_url()` are deprecated: they
+keep their types but return an empty string when analytics is disabled. Use
+`script_id_if_enabled()` and `upstream_script_url_if_enabled()`, which return
+`Option`. In production with no id, startup logs a `warn`.
 
 ⚠️ Plausible's script disables itself on `localhost`, so a local pageview will
 not register no matter what you configure. To exercise it end to end, add your
