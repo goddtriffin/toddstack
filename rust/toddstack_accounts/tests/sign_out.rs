@@ -77,7 +77,7 @@ async fn sign_out_revokes_the_refresh_token_and_returns_the_end_session_url() {
     let expected: String = format!(
         "{issuer}/session/end?client_id=boggledygook&post_logout_redirect_uri=https%3A%2F%2Fwww.boggledygook.com%2F"
     );
-    assert_eq!(expected, signed_out.url);
+    assert_eq!(Some(expected), signed_out.url);
     let requests: Vec<String> = seen.lock().unwrap().clone();
     assert_eq!(1, requests.len());
     assert!(requests[0].starts_with("POST /oidc/token/revocation "));
@@ -95,7 +95,7 @@ async fn a_failed_revoke_still_signs_out() {
         Some(Error::Api { status: 503, .. })
     ));
     assert_eq!(
-        format!("{issuer}/session/end?client_id=boggledygook"),
+        Some(format!("{issuer}/session/end?client_id=boggledygook")),
         signed_out.url
     );
 }
@@ -106,4 +106,34 @@ async fn without_a_refresh_token_nothing_is_revoked() {
     let signed_out: SignOut = accounts(&issuer).sign_out(None, &Options::default()).await;
     assert!(signed_out.revoke_error.is_none());
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_url_carries_the_id_token_hint_redirect_and_state() {
+    let (issuer, _) = service(200).await;
+    let options: Options<'_> = Options {
+        id_token_hint: Some("a.b.c"),
+        post_logout_redirect_uri: Some("/bye"),
+        state: Some("s1"),
+        local_only: false,
+    };
+    let signed_out: SignOut = accounts(&issuer).sign_out(Some("rt1"), &options).await;
+    let expected: String = format!(
+        "{issuer}/session/end?client_id=boggledygook&id_token_hint=a.b.c&post_logout_redirect_uri=https%3A%2F%2Fwww.boggledygook.com%2Fbye&state=s1"
+    );
+    assert_eq!(Some(expected), signed_out.url);
+}
+
+#[tokio::test]
+async fn local_only_revokes_the_token_but_returns_no_url() {
+    let (issuer, seen) = service(200).await;
+    let options: Options<'_> = Options {
+        id_token_hint: Some("a.b.c"),
+        local_only: true,
+        ..Options::default()
+    };
+    let signed_out: SignOut = accounts(&issuer).sign_out(Some("rt1"), &options).await;
+    assert!(signed_out.revoke_error.is_none());
+    assert_eq!(None, signed_out.url);
+    assert_eq!(1, seen.lock().unwrap().len());
 }

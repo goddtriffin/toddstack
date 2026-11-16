@@ -36,6 +36,10 @@ pub enum EventKind {
     UserReactivated,
     /// `user.signed_out`: signed out everywhere; end the person's sessions.
     UserSignedOut,
+    /// `session.signed_out`: the person signed out of one accounts browser
+    /// session; `sub` and [`Event::sid`] say which. Drop every local session
+    /// with that `sid`.
+    SessionSignedOut,
     /// `grant.revoked`: the person removed your app; end their sessions.
     GrantRevoked,
     /// `friendship.created`: `sub` and `friend_sub` became friends. Sent once
@@ -67,6 +71,7 @@ impl EventKind {
             Self::UserSuspended => "user.suspended",
             Self::UserReactivated => "user.reactivated",
             Self::UserSignedOut => "user.signed_out",
+            Self::SessionSignedOut => "session.signed_out",
             Self::GrantRevoked => "grant.revoked",
             Self::FriendshipCreated => "friendship.created",
             Self::FriendshipRemoved => "friendship.removed",
@@ -86,6 +91,7 @@ impl From<String> for EventKind {
             "user.suspended" => Self::UserSuspended,
             "user.reactivated" => Self::UserReactivated,
             "user.signed_out" => Self::UserSignedOut,
+            "session.signed_out" => Self::SessionSignedOut,
             "grant.revoked" => Self::GrantRevoked,
             "friendship.created" => Self::FriendshipCreated,
             "friendship.removed" => Self::FriendshipRemoved,
@@ -123,7 +129,7 @@ pub struct Event {
     #[serde(rename = "type")]
     pub kind: EventKind,
     pub created_at: i64,
-    /// Always has `sub`; `user.updated` adds the fields that changed, and the
+    /// Always has `sub`; `session.signed_out` adds `sid`; `user.updated` adds the fields that changed, and the
     /// friendship events add `friend_sub`, and the friend request events add
     /// `from_sub` and `to_sub`.
     pub data: Value,
@@ -134,6 +140,13 @@ impl Event {
     #[must_use]
     pub fn sub(&self) -> Option<&str> {
         self.data.get("sub").and_then(Value::as_str)
+    }
+
+    /// The accounts browser session that ended, for
+    /// [`EventKind::SessionSignedOut`]; matches [`crate::IdClaims::sid`].
+    #[must_use]
+    pub fn sid(&self) -> Option<&str> {
+        self.data.get("sid").and_then(Value::as_str)
     }
 
     /// The other person, for [`EventKind::FriendshipCreated`] and
@@ -267,6 +280,22 @@ mod tests {
     }
 
     #[test]
+    fn session_signed_out_carries_the_person_and_the_browser_session() {
+        let body: &str = r#"{"id":"e5","type":"session.signed_out","created_at":1700000000,"data":{"sub":"u1","sid":"s-1"}}"#;
+        let event: Event = verified(body);
+        assert_eq!(EventKind::SessionSignedOut, event.kind);
+        assert_eq!("session.signed_out", event.kind.as_str());
+        assert_eq!(Some("u1"), event.sub());
+        assert_eq!(Some("s-1"), event.sid());
+        assert_eq!(None, verified(BODY).sid());
+        let header: String = sign(b"other", 1_700_000_000, body);
+        assert_eq!(
+            "signature mismatch",
+            webhook_error(verify(b"secret", &header, body.as_bytes(), 1_700_000_000))
+        );
+    }
+
+    #[test]
     fn friend_request_events_name_sender_and_receiver() {
         for (wire, kind) in [
             ("friend_request.created", EventKind::FriendRequestCreated),
@@ -296,6 +325,7 @@ mod tests {
             EventKind::UserSuspended,
             EventKind::UserReactivated,
             EventKind::UserSignedOut,
+            EventKind::SessionSignedOut,
             EventKind::GrantRevoked,
             EventKind::FriendshipCreated,
             EventKind::FriendshipRemoved,

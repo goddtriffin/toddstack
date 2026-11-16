@@ -1,9 +1,10 @@
 // Signing out, as one call in your `/logout` route.
 //
 // Your session is your own: end it yourself. `Accounts.signOut` then revokes your refresh token and hands back the
-// accounts service's end-session URL (RP-initiated logout). Redirect there only if the person should leave *every*
-// project: the service asks "Sign out?" and, on yes, signs them out of all of Todd's projects in that browser. To
-// sign out of your app alone, revoke and skip the redirect.
+// accounts service's end-session URL (RP-initiated logout). Redirect the browser there: with a valid `id_token_hint`
+// the service ends the accounts browser session at once, which signs the person out of every project in that browser
+// (never other devices) and sends each of them a `session.signed_out` webhook. Without a hint it asks "Sign out?"
+// first. For a local-only sign-out, set `localOnly`: the token is revoked and there is no URL.
 
 import type { AccountsError } from "./error.ts";
 import { safeReturnTo } from "./return-to.ts";
@@ -11,7 +12,10 @@ import type { Config } from "./tokens.ts";
 
 /** What to put on the end-session URL. */
 export interface LogoutOptions {
-  /** The ID token from sign-in (expired is fine). Sent as `id_token_hint`. */
+  /**
+   * The raw ID token from sign-in (`TokenSet.idToken`, expired is fine), which you keep with your session. Sent as
+   * `id_token_hint`; with it the service signs the person out without a confirm page.
+   */
   idTokenHint?: string;
   /**
    * Where the person lands afterwards: a path on your site (`/`, checked like `safeReturnTo`) or an absolute URL on
@@ -21,12 +25,17 @@ export interface LogoutOptions {
   postLogoutRedirectUri?: string;
   /** Echoed back as `?state=` on that redirect. */
   state?: string;
+  /**
+   * Sign out of your app alone: revoke the refresh token and return no URL, so the accounts browser session (and the
+   * person's other projects) stays signed in and "Sign in" signs them straight back in.
+   */
+  localOnly?: boolean;
 }
 
 /** What `Accounts.signOut` did. */
 export interface SignOut {
-  /** The end-session URL (see `endSessionUrl`). */
-  url: string;
+  /** The end-session URL (see `endSessionUrl`): redirect the browser there. Null when `localOnly` was set. */
+  url: string | null;
   /** Why revoking the refresh token failed, if it did. Sign-out goes ahead regardless; log this. */
   revokeError: AccountsError | null;
 }
