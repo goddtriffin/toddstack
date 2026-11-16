@@ -11,7 +11,7 @@ export class FriendsClientError extends Error {
   /**
    * The server's error code: `account_required` (guest: offer sign-in), `session_expired`, `cross_site`,
    * `missing_scope`, `bad_request`, `refused` (not found, blocked, a privacy setting or a limit: `message` is
-   * meant for the person), `not_found`, `rate_limited`, `accounts_unavailable`, or `network`.
+   * meant for the person), `not_found`, `conflict`, `unprocessable`, `rate_limited`, `accounts_unavailable`, or `network`.
    */
   readonly code: string;
 
@@ -74,7 +74,12 @@ export class FriendsClient {
         body: body === undefined ? undefined : JSON.stringify(body),
       });
     } catch (cause) {
-      throw new FriendsClientError(0, "network", cause instanceof Error ? cause.message : String(cause));
+      // Only a failed request (fetch rejects with a TypeError, or an abort) is a network error; anything else,
+      // such as a mock's unseeded-call error, must fail loudly instead of looking like an outage.
+      if (cause instanceof TypeError || cause instanceof DOMException) {
+        throw new FriendsClientError(0, "network", cause.message);
+      }
+      throw cause;
     }
     const text: string = await response.text();
     let parsed: unknown = undefined;

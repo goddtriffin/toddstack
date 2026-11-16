@@ -3,8 +3,8 @@ import Foundation
 /// In-app friend requests: calls the friends routes your project's server mounts (the Rust crate's `friends_router`).
 /// The app never sees an accounts token; it authenticates to its own server with the session `AccountsClient` keeps.
 ///
-/// ; a guest session is refused by the server as
-/// `FriendsError` with code `account_required` (offer `signIn()`).
+/// With no session the client itself throws `FriendsError` with code `account_required` (offer `signIn()`); a guest
+/// session is sent, and the server answers the same code.
 public final class FriendsClient: Sendable {
     private let accounts: AccountsClient
     private let transport: any AccountsTransport

@@ -194,7 +194,6 @@ Writes authenticated by a cookie must be provably same-origin: `Sec-Fetch-Site: 
 an `Origin` equal to `public_origin`. `same-site`, `cross-site`, `none`, or neither header, is `cross_site` (403). The
 check follows the credential `access_token` reports, not the request's headers, so a `Bearer` header cannot excuse a
 cookie. `Credential::Bearer` (native apps) is exempt, as a forged cross-site request cannot carry it. The
-The
 routes sit beside, not on top of, a project's `/api/v1/app/*` sign-in routes. Your web UI uses the TypeScript
 `FriendsClient`; the Swift and Kotlin SDKs call the same routes (see their READMEs).
 
@@ -348,7 +347,7 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 
 ## Breaking changes
 
-**0.7.0**: no breaking changes. Added the `axum` feature and `friends_router`.
+**0.7.0**: the 0.6 `Friends` methods (`accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `relationships`, `mark_read`, `mute`, `unmute`) now reject an id outside `[A-Za-z0-9_-]{1,64}` with a bad-request error (`400`) before any request is sent, so a decoded `../`, `?` or `#` can't reach another accounts path. Real accounts-service subs always match, so callers passing real subs see no change. Added the `axum` feature and `friends_router`.
 
 **0.6.0**: `Accounts::new` and `Accounts::with_keys` now return `Error::Config` for an `http` issuer that is not
 loopback (it was accepted). Added `Config::local`, `Config::toddgriffin_at` and `LOCAL_BASE_URL`.
