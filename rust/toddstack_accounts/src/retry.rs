@@ -1,7 +1,8 @@
 //! Retries for reads from the accounts service.
 //!
 //! Only a `GET` is ever retried, and only on an intermittent failure: a
-//! connect error, a timeout, a 5xx or a 429. Anything else is an answer, and
+//! connect error, a timeout, a 5xx or a 429 (not for notification calls: their
+//! limits are hourly). Anything else is an answer, and
 //! asking again would get the same one.
 //!
 //! Everything else is sent exactly once, and must stay that way: the token
@@ -27,7 +28,7 @@ pub(crate) struct RetryPolicy {
     /// Attempts in all, the first included.
     pub(crate) attempts: u32,
     /// Each attempt's own deadline, so one hung connection cannot use up the
-    /// whole budget.
+    /// whole budget. Fixed per policy: 3 s for reads, 10 s for keyed sends.
     pub(crate) attempt_timeout: Duration,
     /// The backoff ceiling for the first retry; it doubles per retry.
     pub(crate) base_delay: Duration,
@@ -35,6 +36,9 @@ pub(crate) struct RetryPolicy {
     /// A `Retry-After` longer than this is obeyed by not retrying at all:
     /// waiting it out would stall the caller, and retrying sooner ignores it.
     pub(crate) max_retry_after: Duration,
+    /// Whether a 429 is retried. Off where the server's limits are hourly and
+    /// send no `Retry-After`: a retry within seconds cannot succeed.
+    pub(crate) retry_429: bool,
     /// No retry starts once this much time has passed, so the total is at
     /// most this plus one `attempt_timeout`.
     pub(crate) budget: Duration,
@@ -47,7 +51,14 @@ impl RetryPolicy {
         base_delay: Duration::from_millis(200),
         max_delay: Duration::from_secs(1),
         max_retry_after: Duration::from_secs(2),
+        retry_429: true,
         budget: Duration::from_secs(6),
+    };
+
+    /// A notification status read: like [`Self::READ`], but a 429 is final.
+    pub(crate) const NOTIFICATION_STATUS: Self = Self {
+        retry_429: false,
+        ..Self::READ
     };
 
     /// A notification send that carries an idempotency key. Its deadline is
@@ -58,6 +69,7 @@ impl RetryPolicy {
         base_delay: Duration::from_millis(200),
         max_delay: Duration::from_secs(1),
         max_retry_after: Duration::from_secs(2),
+        retry_429: false,
         budget: Duration::from_secs(15),
     };
 
@@ -80,7 +92,7 @@ impl RetryPolicy {
         }
         match outcome {
             Ok(response) => {
-                if !is_retryable_status(response.status().as_u16()) {
+                if !is_retryable_status(response.status().as_u16(), self.retry_429) {
                     return None;
                 }
                 match retry_after(response) {
@@ -95,8 +107,8 @@ impl RetryPolicy {
     }
 }
 
-const fn is_retryable_status(status: u16) -> bool {
-    status == 429 || (status >= 500 && status < 600)
+const fn is_retryable_status(status: u16, retry_429: bool) -> bool {
+    (status == 429 && retry_429) || (status >= 500 && status < 600)
 }
 
 /// `Retry-After` in delta-seconds. The HTTP-date form falls back to backoff:
@@ -187,6 +199,7 @@ pub(crate) mod tests {
         base_delay: Duration::from_millis(10),
         max_delay: Duration::from_millis(20),
         max_retry_after: Duration::from_secs(2),
+        retry_429: true,
         budget: Duration::from_secs(4),
     };
 
@@ -261,6 +274,29 @@ pub(crate) mod tests {
 
         assert_eq!(200, keyed_post_status(&server).await);
         assert_eq!(2, server.hits());
+    }
+
+    #[tokio::test]
+    async fn a_keyed_post_is_not_retried_on_a_429() {
+        let server: Scripted = Scripted::start(vec![(429, "", NOW), (200, "", NOW)]).await;
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client
+            .post(&server.url)
+            .json(&serde_json::json!({ "idempotency_key": "k1" }))
+            .build()
+            .unwrap();
+        let policy: RetryPolicy = RetryPolicy {
+            retry_429: false,
+            ..FAST
+        };
+        let status: u16 = super::execute_keyed(&client, request, &policy)
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+
+        assert_eq!(429, status);
+        assert_eq!(1, server.hits());
     }
 
     #[tokio::test]

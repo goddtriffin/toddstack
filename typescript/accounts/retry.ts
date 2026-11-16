@@ -1,6 +1,6 @@
 // Retries for reads from the accounts service.
 //
-// Only a GET is ever retried, and only on an intermittent failure: a network error, a timeout, a 5xx or a 429.
+// Only a GET is ever retried, and only on an intermittent failure: a network error, a timeout, a 5xx or a 429 (not for notification calls: their limits are hourly).
 // Anything else is an answer, and asking again would get the same one.
 //
 // Everything else is sent exactly once, and must stay that way: the token exchange (an authorization code is
@@ -21,6 +21,8 @@ export interface RetryPolicy {
   maxDelayMs: number;
   /** A `Retry-After` longer than this is obeyed by not retrying at all. */
   maxRetryAfterMs: number;
+  /** Whether a 429 is retried. Off where the server's limits are hourly and send no `Retry-After`. */
+  retry429: boolean;
   /** No retry starts once this much time has passed. */
   budgetMs: number;
 }
@@ -31,8 +33,12 @@ export const READ: RetryPolicy = {
   baseDelayMs: 200,
   maxDelayMs: 1_000,
   maxRetryAfterMs: 2_000,
+  retry429: true,
   budgetMs: 6_000,
 };
+
+/** A notification status read: like `READ`, but a 429 is final. */
+export const NOTIFICATION_STATUS: RetryPolicy = { ...READ, retry429: false };
 
 /** A notification send that carries an idempotency key: its deadline is the same as an unkeyed write's. */
 export const KEYED_SEND: RetryPolicy = {
@@ -41,6 +47,7 @@ export const KEYED_SEND: RetryPolicy = {
   baseDelayMs: 200,
   maxDelayMs: 1_000,
   maxRetryAfterMs: 2_000,
+  retry429: false,
   budgetMs: 15_000,
 };
 
@@ -53,8 +60,8 @@ export function backoff(policy: RetryPolicy, retry: number): number {
   return Math.floor(Math.random() * (ceiling + 1));
 }
 
-export function isRetryableStatus(status: number): boolean {
-  return status === 429 || (status >= 500 && status < 600);
+export function isRetryableStatus(status: number, retry429 = true): boolean {
+  return (status === 429 && retry429) || (status >= 500 && status < 600);
 }
 
 /** `Retry-After` in delta-seconds, as milliseconds. The HTTP-date form falls back to backoff. */
@@ -93,7 +100,7 @@ export async function send(
     let wait: number | null = null;
     try {
       const response = await fetcher(url, { ...init, signal: AbortSignal.timeout(policy.attemptTimeoutMs) });
-      if (retry >= policy.attempts || !isRetryableStatus(response.status)) return response;
+      if (retry >= policy.attempts || !isRetryableStatus(response.status, policy.retry429)) return response;
       const retryAfter = retryAfterMs(response);
       if (retryAfter !== null && retryAfter > policy.maxRetryAfterMs) return response;
       wait = retryAfter ?? backoff(policy, retry);

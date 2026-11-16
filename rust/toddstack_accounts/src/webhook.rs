@@ -183,7 +183,7 @@ pub fn verify(secret: &[u8], signature_header: &str, body: &[u8], now: i64) -> R
         (Some(t), false) => t,
         _ => return Err(Error::InvalidWebhook("malformed signature header")),
     };
-    if (now - t).abs() > TOLERANCE_SECONDS {
+    if now.abs_diff(t) > TOLERANCE_SECONDS.unsigned_abs() {
         return Err(Error::InvalidWebhook(
             "signature too old (or from the future)",
         ));
@@ -325,6 +325,14 @@ mod tests {
         assert!(verify(b"other", &header, BODY.as_bytes(), 1_700_000_000).is_err());
         assert!(verify(b"secret", &header, BODY.as_bytes(), 1_700_000_301).is_err());
         assert!(verify(b"secret", "nonsense", BODY.as_bytes(), 1_700_000_000).is_err());
+    }
+
+    #[test]
+    fn an_extreme_timestamp_is_refused_instead_of_overflowing() {
+        let header: String = sign(b"secret", i64::MIN, BODY);
+        let actual: &str =
+            webhook_error(verify(b"secret", &header, BODY.as_bytes(), 1_700_000_000));
+        assert_eq!("signature too old (or from the future)", actual);
     }
 
     fn webhook_error(result: Result<Event>) -> &'static str {

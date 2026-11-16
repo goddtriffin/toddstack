@@ -1,3 +1,5 @@
+import { AccountsError } from "./error.ts";
+
 // Notifications: what your server sends to players, and the wire shapes for them. `accounts.sendNotification`,
 // `accounts.cancelNotifications` and `accounts.notificationStatus` authenticate as your project (HTTP Basic, a
 // confidential client), with no person signed in. `friends.setTimeZone` uses a person's access token instead.
@@ -40,7 +42,7 @@ export interface Notification {
 }
 
 /** What happened to one player: `not_delivered` folds together muted, left your project and suspended, so a send can't probe players. */
-export type Outcome = "delivered" | "scheduled" | "not_delivered" | "dropped_runaway";
+export type Outcome = "delivered" | "scheduled" | "not_delivered" | "dropped_runaway" | "unknown";
 
 /** Outcomes, counted. */
 export interface Counts {
@@ -55,7 +57,7 @@ export interface Counts {
 }
 
 /** Where a send stands: `queued` is a fan-out still being delivered, `done` means every player was handled, `failed` is not retried. */
-export type SendStatus = "queued" | "done" | "failed";
+export type SendStatus = "queued" | "done" | "failed" | "unknown";
 
 /** The service's answer to a send (202), and to `accounts.notificationStatus`. */
 export interface Receipt {
@@ -100,15 +102,21 @@ export function readCounts(raw: unknown): Counts {
   };
 }
 
-/** Reads a send's answer (the wire JSON) as a `Receipt`. */
+const OUTCOMES: readonly string[] = ["delivered", "scheduled", "not_delivered", "dropped_runaway"];
+const STATUSES: readonly string[] = ["queued", "done", "failed"];
+
+/** Reads a send's answer (the wire JSON) as a `Receipt`; a status or result newer than this library is `"unknown"`. Throws an `api` error without an `id`. */
 export function readReceipt(raw: unknown): Receipt {
   const r = (raw ?? {}) as Record<string, unknown>;
+  if (typeof r.id !== "string") {
+    throw new AccountsError("api", "accounts API returned 200: missing field `id`", { status: 200 });
+  }
   return {
-    id: String(r.id),
-    status: r.status as SendStatus,
+    id: r.id,
+    status: typeof r.status === "string" && STATUSES.includes(r.status) ? r.status as SendStatus : "unknown",
     recipients: typeof r.recipients === "number" ? r.recipients : 0,
     counts: readCounts(r.counts),
-    result: typeof r.result === "string" ? r.result as Outcome : null,
+    result: typeof r.result === "string" ? OUTCOMES.includes(r.result) ? r.result as Outcome : "unknown" : null,
     replayed: r.replayed === true,
   };
 }

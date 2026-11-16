@@ -19,7 +19,7 @@ export type AccountsErrorKind =
   | "api"
   /** A notification call named something that doesn't exist (404): a player who never signed in to your project, or an unknown send. `status` is set. */
   | "not_found"
-  /** A notification call was refused as unprocessable (422): the same idempotency key was used for a different request. `status` is set. */
+  /** A notification call was refused as unprocessable (422): the same idempotency key with a different request, or a field the service can't parse. `status` is set. */
   | "unprocessable"
   /** A notification call hit a rate limit (429). Wait before sending again. `status` is set. */
   | "rate_limited"
