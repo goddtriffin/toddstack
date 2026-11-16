@@ -89,10 +89,27 @@ private func signedIn() throws -> (FriendsClient, MockAccountsTransport) {
         transport.verifyExhausted()
     }
 
-    @Test func withNoSessionNothingIsSentAndItThrowsNotSignedIn() async throws {
+    @Test func withNoSessionNothingIsSentAndItThrowsAccountRequired() async throws {
         let harness = try Harness()
         let friends = FriendsClient(accounts: harness.client, transport: harness.transport)
-        await #expect(throws: AccountsError.notSignedIn) { try await friends.list() }
+        await #expect(throws: FriendsError(status: 401, code: "account_required", message: "Sign in to use friends.")) {
+            try await friends.list()
+        }
         #expect(harness.transport.calls.isEmpty)
+    }
+
+    @Test func anIdThatCouldLeaveTheFriendsPathsIsRefusedBeforeAnyRequest() async throws {
+        let (friends, transport) = try signedIn()
+        let refused = FriendsError(status: 400, code: "bad_request", message: "That isn't a valid person id.")
+        for bad in ["../../oidc/x", "..", "a/b", "a?b=1", "a#b", "a%2Fb", ""] {
+            await #expect(throws: refused) { try await friends.accept(bad) }
+            await #expect(throws: refused) { try await friends.decline(bad) }
+            await #expect(throws: refused) { try await friends.cancel(bad) }
+            await #expect(throws: refused) { try await friends.remove(bad) }
+            await #expect(throws: refused) { try await friends.block(bad) }
+            await #expect(throws: refused) { try await friends.unblock(bad) }
+            await #expect(throws: refused) { try await friends.relationships(["u2", bad]) }
+        }
+        #expect(transport.calls.isEmpty)
     }
 }

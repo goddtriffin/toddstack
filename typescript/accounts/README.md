@@ -169,7 +169,7 @@ from your own UI. Same origin, with the session cookie by default; the accounts 
 ```ts
 import { FriendsClient, FriendsClientError } from "@todd/toddstack-accounts";
 
-const friends = new FriendsClient(); // { base?, fetch?, headers? }
+const friends = new FriendsClient(); // { base?, fetch?, headers?, signedIn? }
 const { incoming, outgoing } = await friends.requests();
 try {
   await friends.requestByUsername("alex"); // "requested" | "accepted" | "already_friends"
@@ -180,7 +180,10 @@ try {
 ```
 
 Also `list`, `requestByCode`, `accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `blocks`, and
-`relationships(subs)`. Use `Person`, `Requests`, `Blocks`, `Sent` and `Relationship` for the models. Unlike
+`relationships(subs)`. Use `Person`, `Requests`, `Blocks`, `Sent` and `Relationship` for the models.
+`signedIn: () => boolean` makes a signed-out call throw `account_required` without a request (the Swift and Kotlin
+clients do this by default). Tests pass `MockFriendsFetch.fetch` as `fetch`, seeding replies per exact call
+(`seed({ method, path, body }, { status, body })`) and ending with `assertAllSeedsConsumed()`. Unlike
 `accounts.friends(token)` (server to accounts), this never holds a token. Gap: the router itself is Rust-only; a
 TypeScript server mounts its own routes over `accounts.friends(token)`.
 

@@ -157,13 +157,14 @@ toddstack-accounts = { version = "0.7.0", features = ["axum"] }
 ```
 
 ```rust
-use toddstack_accounts::friends_router::{self, FriendsAuth};
+use toddstack_accounts::friends_router::{self, Credential, FriendsAuth};
 
 struct MyAuth { /* your sessions */ }
 impl FriendsAuth for MyAuth {
-    // The caller's accounts access token (refresh it if expired), from your session cookie or the native app's
+    // The caller's accounts access token (refresh it if expired) and the credential that proved it:
+    // Credential::Cookie(token) for your session cookie, Credential::Bearer(token) for the native app's
     // `Authorization: Bearer` app token. None for a guest or signed-out caller (they get 401).
-    async fn access_token(&self, headers: &axum::http::HeaderMap) -> Option<String> { /* ... */ }
+    async fn access_token(&self, headers: &axum::http::HeaderMap) -> Option<Credential> { /* ... */ }
     fn public_origin(&self) -> &str { "https://www.boggledygook.com" }
 }
 
@@ -186,11 +187,14 @@ let app = app.merge(friends_router::router(accounts.clone(), std::sync::Arc::new
 Errors are `{"error": <code>, "message": <text to show the person>}`: `account_required` (401, a guest or signed-out
 caller: offer sign-in), `session_expired` (401), `cross_site` (403), `missing_scope` (403), `bad_request` (400),
 `refused` (400: not found, blocked, the person's privacy setting, or a limit of 200 pending, 1000 friends; the message
-is deliberately vague so a block or setting can't be probed), `not_found` (404), `rate_limited` (429, 20 requests an
-hour), `accounts_unavailable` (502).
+is deliberately vague so a block or setting can't be probed), `not_found` (404), `conflict` (409), `unprocessable` (422), `rate_limited` (429, 20
+requests an hour), `accounts_unavailable` (502). A `sub` that isn't 1 to 64 of `A-Za-z0-9_-` is `bad_request`.
 
-Writes authenticated by a cookie must be same-origin (`Sec-Fetch-Site: same-origin`, else `Origin` equal to
-`public_origin`); a `Bearer` app token (native apps) is exempt, as it is not sent by a forged cross-site request. The
+Writes authenticated by a cookie must be provably same-origin: `Sec-Fetch-Site: same-origin`, or, without that header,
+an `Origin` equal to `public_origin`. `same-site`, `cross-site`, `none`, or neither header, is `cross_site` (403). The
+check follows the credential `access_token` reports, not the request's headers, so a `Bearer` header cannot excuse a
+cookie. `Credential::Bearer` (native apps) is exempt, as a forged cross-site request cannot carry it. The
+The
 routes sit beside, not on top of, a project's `/api/v1/app/*` sign-in routes. Your web UI uses the TypeScript
 `FriendsClient`; the Swift and Kotlin SDKs call the same routes (see their READMEs).
 

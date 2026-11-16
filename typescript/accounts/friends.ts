@@ -126,6 +126,19 @@ export interface EventResult {
   counts: Counts | null;
 }
 
+/**
+ * Whether `value` is safe to put in a URL path: 1 to 64 of `A-Za-z0-9_-`. A real `sub` is a UUID; anything else
+ * (`/`, `?`, `#`, `.`, `%`) could redirect the call to another accounts path carrying the person's token.
+ */
+export function isValidId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+function checked(value: string): string {
+  if (!isValidId(value)) throw new AccountsError("api", "not a valid id", { status: 400 });
+  return value;
+}
+
 /** Mutes every event kind from your app. */
 export const ALL_KINDS = "*";
 
@@ -203,6 +216,7 @@ export class Friends {
 
   /** Where the person stands with each of `subs`, keyed by sub. Any number: longer lists go out as several calls. */
   async relationships(subs: string[]): Promise<Record<string, Relationship>> {
+    subs.forEach(checked);
     const found: Record<string, Relationship> = {};
     for (let i = 0; i < subs.length; i += MAX_RELATIONSHIPS_PER_CALL) {
       const chunk = subs.slice(i, i + MAX_RELATIONSHIPS_PER_CALL);
@@ -229,32 +243,32 @@ export class Friends {
 
   /** Accepts `sub`'s request. */
   async accept(sub: string): Promise<void> {
-    await this.#call("POST", `/friends/requests/${encodeURIComponent(sub)}/accept`);
+    await this.#call("POST", `/friends/requests/${checked(sub)}/accept`);
   }
 
   /** Declines `sub`'s request. */
   async decline(sub: string): Promise<void> {
-    await this.#call("POST", `/friends/requests/${encodeURIComponent(sub)}/decline`);
+    await this.#call("POST", `/friends/requests/${checked(sub)}/decline`);
   }
 
   /** Cancels a request you sent. */
   async cancel(sub: string): Promise<void> {
-    await this.#call("DELETE", `/friends/requests/${encodeURIComponent(sub)}`);
+    await this.#call("DELETE", `/friends/requests/${checked(sub)}`);
   }
 
   /** Ends a friendship. */
   async remove(sub: string): Promise<void> {
-    await this.#call("DELETE", `/friends/${encodeURIComponent(sub)}`);
+    await this.#call("DELETE", `/friends/${checked(sub)}`);
   }
 
   /** Blocks: ends the friendship and requests, and stops events both ways. */
   async block(sub: string): Promise<void> {
-    await this.#call("POST", "/blocks", { sub });
+    await this.#call("POST", "/blocks", { sub: checked(sub) });
   }
 
   /** Undoes `block`. */
   async unblock(sub: string): Promise<void> {
-    await this.#call("DELETE", `/blocks/${encodeURIComponent(sub)}`);
+    await this.#call("DELETE", `/blocks/${checked(sub)}`);
   }
 
   /** Who the person blocked, and everyone to keep apart from them. */
@@ -312,7 +326,7 @@ export class Friends {
 
   /** Marks an inbox item read. */
   async markRead(id: string): Promise<void> {
-    await this.#call("POST", `/inbox/${encodeURIComponent(id)}/read`);
+    await this.#call("POST", `/inbox/${checked(id)}/read`);
   }
 
   /** The event kinds from your app the person has muted (`ALL_KINDS` means all of them). */
@@ -322,11 +336,11 @@ export class Friends {
 
   /** Stops friends' events of `kind` from your app reaching the person (`ALL_KINDS` for every kind). */
   async mute(kind: string): Promise<void> {
-    await this.#call("PUT", `/mutes/${encodeURIComponent(kind)}`);
+    await this.#call("PUT", `/mutes/${kind === ALL_KINDS ? kind : checked(kind)}`);
   }
 
   /** Undoes `mute`. */
   async unmute(kind: string): Promise<void> {
-    await this.#call("DELETE", `/mutes/${encodeURIComponent(kind)}`);
+    await this.#call("DELETE", `/mutes/${kind === ALL_KINDS ? kind : checked(kind)}`);
   }
 }

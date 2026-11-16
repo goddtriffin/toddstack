@@ -3,7 +3,7 @@ import Foundation
 /// In-app friend requests: calls the friends routes your project's server mounts (the Rust crate's `friends_router`).
 /// The app never sees an accounts token; it authenticates to its own server with the session `AccountsClient` keeps.
 ///
-/// A call with no session throws `AccountsError.notSignedIn`; a guest session is refused by the server as
+/// ; a guest session is refused by the server as
 /// `FriendsError` with code `account_required` (offer `signIn()`).
 public final class FriendsClient: Sendable {
     private let accounts: AccountsClient
@@ -57,7 +57,7 @@ public final class FriendsClient: Sendable {
 
     /// Blocks: ends the friendship and requests, both ways.
     public func block(_ sub: String) async throws {
-        _ = try await call("POST", "/friends/blocks", body: ["sub": sub])
+        _ = try await call("POST", "/friends/blocks", body: ["sub": try segment(sub)])
     }
 
     /// Undoes `block`.
@@ -75,7 +75,7 @@ public final class FriendsClient: Sendable {
         struct Body: Decodable { let relationships: [String: Relationship] }
         var allowed: CharacterSet = .urlQueryAllowed
         allowed.remove(charactersIn: ",&+=")
-        let query: String = subs.joined(separator: ",").addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+        let query: String = try subs.map(segment).joined(separator: ",").addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
         return try decode(Body.self, await call("GET", "/friends/relationships?subs=\(query)")).relationships
     }
 
@@ -86,13 +86,18 @@ public final class FriendsClient: Sendable {
         return try decode(Result.self, await call("POST", "/friends/requests", body: body)).result
     }
 
+    /// 1 to 64 of `A-Za-z0-9_-`: a real `sub` is a UUID, and anything else (`.`, `/`, `?`, `#`, `%`) could
+    /// redirect the call to another path on the server.
+    static func isValidID(_ value: String) -> Bool {
+        (1...64).contains(value.utf8.count)
+            && value.utf8.allSatisfy { ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) || $0 == 45 || $0 == 95 }
+    }
+
     private func segment(_ sub: String) throws -> String {
-        var allowed: CharacterSet = .urlPathAllowed
-        allowed.remove(charactersIn: "/")
-        guard let encoded = sub.addingPercentEncoding(withAllowedCharacters: allowed), !encoded.isEmpty else {
-            throw FriendsError(status: 400, code: "bad_request", message: "That person can't be found.")
+        guard Self.isValidID(sub) else {
+            throw FriendsError(status: 400, code: "bad_request", message: "That isn't a valid person id.")
         }
-        return encoded
+        return sub
     }
 
     private func call(_ method: String, _ path: String, body: [String: String]? = nil) async throws -> Data {
@@ -110,7 +115,10 @@ public final class FriendsClient: Sendable {
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
             payload = try encoder.encode(body)
         }
-        let signed: URLRequest = try accounts.authorized(request)
+        let signed: URLRequest
+        do { signed = try accounts.authorized(request) } catch AccountsError.notSignedIn {
+            throw FriendsError(status: 401, code: "account_required", message: "Sign in to use friends.")
+        }
         var headers: [String: String] = [:]
         for (name, value) in signed.allHTTPHeaderFields ?? [:] { headers[name] = value }
         let response: HTTPResponse = try await transport.send(

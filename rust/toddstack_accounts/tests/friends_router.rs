@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use toddstack_accounts::friends_router::{self, FriendsAuth};
+use toddstack_accounts::friends_router::{self, Credential, FriendsAuth};
 use toddstack_accounts::{Accounts, Config};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -21,14 +21,19 @@ const ORIGIN: &str = "https://www.example.com";
 struct Auth;
 
 impl FriendsAuth for Auth {
-    fn access_token(&self, headers: &HeaderMap) -> impl Future<Output = Option<String>> + Send {
+    fn access_token(&self, headers: &HeaderMap) -> impl Future<Output = Option<Credential>> + Send {
         let cookie: Option<&str> = headers.get("cookie").and_then(|v| v.to_str().ok());
         let bearer: Option<&str> = headers.get("authorization").and_then(|v| v.to_str().ok());
-        let token: Option<String> = cookie
+        // A cookie wins when both are present, and is reported as the credential used.
+        let credential: Option<Credential> = cookie
             .and_then(|c| c.strip_prefix("session="))
-            .or_else(|| bearer.and_then(|b| b.strip_prefix("Bearer ")))
-            .map(str::to_owned);
-        std::future::ready(token)
+            .map(|t| Credential::Cookie(t.to_owned()))
+            .or_else(|| {
+                bearer
+                    .and_then(|b| b.strip_prefix("Bearer "))
+                    .map(|t| Credential::Bearer(t.to_owned()))
+            });
+        std::future::ready(credential)
     }
 
     fn public_origin(&self) -> &str {
@@ -413,55 +418,135 @@ async fn accounts_errors_become_clear_json_errors() {
     }
 }
 
-#[tokio::test]
-async fn a_cross_site_cookie_write_is_refused_but_a_bearer_app_token_is_not() {
+const ACCEPT: &str = "/api/v1/friends/requests/u2/accept";
+
+async fn accept_with(headers: &[(&str, &str)]) -> (StatusCode, usize) {
     let (base, seen) = service(vec![(
         "POST /api/v1/friends/requests/u2/accept",
         204,
         Value::Null,
     )])
     .await;
+    let (status, _) = send(&app(&base), Method::POST, ACCEPT, headers, None).await;
+    let count: usize = seen.lock().unwrap().len();
+    (status, count)
+}
+
+#[tokio::test]
+async fn a_cookie_write_must_be_provably_same_origin() {
+    let cookie: (&str, &str) = ("cookie", "session=tok");
+    let refused: [Vec<(&str, &str)>; 5] = [
+        vec![cookie, ("sec-fetch-site", "cross-site")],
+        vec![cookie, ("sec-fetch-site", "same-site")],
+        vec![cookie, ("sec-fetch-site", "none")],
+        vec![cookie, ("origin", "https://evil.example")],
+        vec![cookie], // neither header: refused, never assumed same-origin
+    ];
+    for headers in refused {
+        assert_eq!(
+            (StatusCode::FORBIDDEN, 0),
+            accept_with(&headers).await,
+            "{headers:?}"
+        );
+    }
+    assert_eq!(
+        (StatusCode::NO_CONTENT, 1),
+        accept_with(&[cookie, ("sec-fetch-site", "same-origin")]).await
+    );
+    assert_eq!(
+        (StatusCode::NO_CONTENT, 1),
+        accept_with(&[cookie, ("origin", ORIGIN)]).await
+    );
+}
+
+#[tokio::test]
+async fn a_bearer_header_never_excuses_a_cookie_authenticated_write() {
+    let both: [(&str, &str); 3] = [
+        ("cookie", "session=tok"),
+        ("authorization", "Bearer apptok"),
+        ("sec-fetch-site", "cross-site"),
+    ];
+    assert_eq!((StatusCode::FORBIDDEN, 0), accept_with(&both).await);
+    assert_eq!(
+        (StatusCode::NO_CONTENT, 1),
+        accept_with(&[("authorization", "Bearer apptok")]).await
+    );
+}
+
+#[tokio::test]
+async fn an_id_that_could_leave_the_friends_paths_is_refused_before_any_call() {
+    let (base, seen) = service(vec![]).await;
     let a: Router = app(&base);
-    let path: &str = "/api/v1/friends/requests/u2/accept";
-    let (status, body) = send(
-        &a,
-        Method::POST,
-        path,
-        &[("cookie", "session=tok"), ("sec-fetch-site", "cross-site")],
-        None,
-    )
-    .await;
-    assert_eq!(StatusCode::FORBIDDEN, status);
-    assert_eq!("cross_site", body["error"]);
+    for path in [
+        "/api/v1/friends/requests/..%2F..%2Foidc%2Fx/accept",
+        "/api/v1/friends/requests/u2%2F..%2Fx/decline",
+        "/api/v1/friends/requests/u2%3Fx=1/accept",
+        "/api/v1/friends/requests/u2%23x/accept",
+    ] {
+        let method: Method = if path.ends_with('/') {
+            Method::DELETE
+        } else {
+            Method::POST
+        };
+        let (status, body) = send(&a, method, path, &COOKIE, None).await;
+        assert_eq!(StatusCode::BAD_REQUEST, status, "{path}");
+        assert_eq!("bad_request", body["error"], "{path}");
+    }
+    for (method, path) in [
+        (Method::DELETE, "/api/v1/friends/requests/a%2Fb"),
+        (Method::DELETE, "/api/v1/friends/a%3Fb"),
+        (Method::DELETE, "/api/v1/friends/blocks/%2E%2E%2Fx"),
+    ] {
+        let (status, _) = send(&a, method, path, &COOKIE, None).await;
+        assert_eq!(StatusCode::BAD_REQUEST, status, "{path}");
+    }
     let (status, _) = send(
         &a,
         Method::POST,
-        path,
-        &[
-            ("cookie", "session=tok"),
-            ("origin", "https://evil.example"),
-        ],
+        "/api/v1/friends/blocks",
+        &COOKIE,
+        Some(json!({ "sub": "../x" })),
+    )
+    .await;
+    assert_eq!(StatusCode::BAD_REQUEST, status);
+    let (status, _) = send(
+        &a,
+        Method::GET,
+        "/api/v1/friends/relationships?subs=u2,a%2Fb",
+        &COOKIE,
         None,
     )
     .await;
-    assert_eq!(StatusCode::FORBIDDEN, status);
+    assert_eq!(StatusCode::BAD_REQUEST, status);
     assert_eq!(0, seen.lock().unwrap().len());
-    let (status, _) = send(
-        &a,
-        Method::POST,
-        path,
-        &[("cookie", "session=tok"), ("origin", ORIGIN)],
-        None,
-    )
+}
+
+#[tokio::test]
+async fn conflicts_and_unprocessable_answers_keep_their_meaning() {
+    let (base, _) = service(vec![
+        (
+            "DELETE /api/v1/friends/u2",
+            409,
+            json!({ "error": "Already changed." }),
+        ),
+        (
+            "DELETE /api/v1/friends/u3",
+            422,
+            json!({ "error": "Can't do that." }),
+        ),
+    ])
     .await;
-    assert_eq!(StatusCode::NO_CONTENT, status);
-    let (status, _) = send(
-        &a,
-        Method::POST,
-        path,
-        &[("authorization", "Bearer apptok")],
-        None,
-    )
-    .await;
-    assert_eq!(StatusCode::NO_CONTENT, status);
+    let a: Router = app(&base);
+    let (status, body) = send(&a, Method::DELETE, "/api/v1/friends/u2", &COOKIE, None).await;
+    assert_eq!(StatusCode::CONFLICT, status);
+    assert_eq!(
+        json!({ "error": "conflict", "message": "Already changed." }),
+        body
+    );
+    let (status, body) = send(&a, Method::DELETE, "/api/v1/friends/u3", &COOKIE, None).await;
+    assert_eq!(StatusCode::UNPROCESSABLE_ENTITY, status);
+    assert_eq!(
+        json!({ "error": "unprocessable", "message": "Can't do that." }),
+        body
+    );
 }
