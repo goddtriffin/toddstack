@@ -101,6 +101,23 @@ Deno.test("valid webhooks verify", async () => {
   assertEquals([event.type, event.data.sub, event.createdAt], ["user.deleted", "u1", 1_700_000_000]);
 });
 
+Deno.test("session.signed_out verifies with sub and sid, and a bad signature is refused", async () => {
+  const body = '{"id":"e5","type":"session.signed_out","created_at":1700000000,"data":{"sub":"u1","sid":"s-1"}}';
+  const event = await verifyWebhook("secret", await sign("secret", 1_700_000_000, body), body, 1_700_000_000);
+  assertEquals(event, {
+    id: "e5",
+    type: "session.signed_out",
+    createdAt: 1_700_000_000,
+    data: { sub: "u1", sid: "s-1" },
+  });
+  assert(isKnownWebhookEventType(event.type));
+  const e = await assertRejects(
+    async () => verifyWebhook("secret", await sign("other", 1_700_000_000, body), body, 1_700_000_000),
+    AccountsError,
+  );
+  assertEquals(e.message, "webhook rejected: signature mismatch");
+});
+
 Deno.test("tampering, wrong secret and age are refused", async () => {
   const header = await sign("secret", 1_700_000_000, BODY);
   const bad = [
@@ -186,6 +203,7 @@ Deno.test("every event type the service sends is known, and newer ones still ver
     "user.suspended",
     "user.reactivated",
     "user.signed_out",
+    "session.signed_out",
     "grant.revoked",
     "friendship.created",
     "friendship.removed",
@@ -461,6 +479,28 @@ Deno.test("signOut revokes the refresh token and returns the end-session URL", a
   seen.length = 0;
   assertEquals((await accounts.signOut(null)).revokeError, null);
   assertEquals(seen, []);
+});
+
+Deno.test("signOut carries the hint, redirect and state, and localOnly gives no URL", async () => {
+  const accounts = new Accounts(config, { keys: jwks, fetch: () => Promise.resolve(new Response(null)) });
+  const { url } = await accounts.signOut("rt1", { idTokenHint: "a.b.c", postLogoutRedirectUri: "/bye", state: "s1" });
+  const params = Object.fromEntries(new URL(url!).searchParams);
+  assertEquals(params, {
+    client_id: config.clientId,
+    id_token_hint: "a.b.c",
+    post_logout_redirect_uri: "https://www.boggledygook.com/bye",
+    state: "s1",
+  });
+  assertEquals(new URL(url!).origin + new URL(url!).pathname, `${config.issuer}/session/end`);
+  const local = await accounts.signOut("rt1", { idTokenHint: "a.b.c", localOnly: true });
+  assertEquals(local, { url: null, revokeError: null });
+});
+
+Deno.test("the browser session id is exposed when the ID token carries one", async () => {
+  const accounts = new Accounts(config, { keys: jwks });
+  assertEquals((await accounts.verifyIdToken(await jwt(idClaims("n")), "n")).sid, undefined);
+  const claims = await accounts.verifyIdToken(await jwt({ ...idClaims("n"), sid: "sid-123" }), "n");
+  assertEquals(claims.sid, "sid-123");
 });
 
 // A JWKS endpoint whose keys and status the test controls, behind a clock the test moves.

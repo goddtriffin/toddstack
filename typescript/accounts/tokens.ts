@@ -41,7 +41,7 @@ export function toddgriffin(clientId: string, clientSecret: string | null, redir
 export interface TokenSet {
   /** For calls to the accounts API (10 minutes). */
   accessToken: string;
-  /** The signed ID token. */
+  /** The raw signed ID token. Keep it with your session: sign-out sends it as `idTokenHint`. */
   idToken: string;
   /**
    * Present when `offline_access` was granted. Rotates on every refresh: always store the new one, and never
@@ -74,6 +74,12 @@ export interface IdClaims {
   amr: string[];
   /** The nonce from the sign-in request. */
   nonce?: string;
+  /**
+   * The accounts browser session this sign-in belongs to, opaque and stable for that session. Store it with your
+   * session and drop every local session with the same `sid` on `session.signed_out`. Absent on tokens issued
+   * before the service added it.
+   */
+  sid?: string;
   /** Any other claim. */
   [claim: string]: unknown;
 }
@@ -195,8 +201,8 @@ export class Accounts {
 
   /**
    * Signs out in one call: revokes `refreshToken` (if you hold one) and builds the end-session URL. End your own
-   * session first; then redirect to `url` to also sign the person out of the accounts service (every project in that
-   * browser), or skip it to sign out of your app alone. A failed revoke doesn't stop sign-out: it comes back as
+   * session first, then redirect to `url`: that signs the person out of the accounts service and so of every project
+   * in that browser. Set `localOnly` to sign out of your app alone (`url` is null). A failed revoke doesn't stop sign-out: it comes back as
    * `revokeError`.
    */
   async signOut(refreshToken: string | null, options: LogoutOptions = {}): Promise<SignOut> {
@@ -209,7 +215,7 @@ export class Accounts {
         revokeError = error;
       }
     }
-    return { url: endSessionUrl(this.config, options), revokeError };
+    return { url: options.localOnly === true ? null : endSessionUrl(this.config, options), revokeError };
   }
 
   /** Verifies an ID token: signature, ES256, issuer, audience (your client id), expiry, and the nonce if given. */

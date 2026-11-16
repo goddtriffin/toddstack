@@ -55,19 +55,31 @@ use toddstack_accounts::logout;
 
 // GET /logout: end your own session first, then:
 let signed_out = accounts.sign_out(refresh_token.as_deref(), &logout::Options {
-    id_token_hint: Some(&id_token),               // optional, expired is fine
+    id_token_hint: Some(&id_token),               // the raw ID token you kept (tokens.id_token), expired is fine
     post_logout_redirect_uri: Some("/"),          // a path, or an absolute URL on your redirect URI's origin
     state: None,                                  // echoed back as ?state=
+    local_only: false,                            // true: sign out of your app alone, no URL
 }).await;
 if let Some(error) = signed_out.revoke_error { /* log it; sign-out still goes ahead */ }
-// Redirect to signed_out.url to also sign out of accounts.
+if let Some(url) = signed_out.url { /* redirect the browser to url */ }
 ```
 
-`sign_out` revokes the refresh token (pass `None` if you don't keep one) and builds the end-session URL
-(`logout::end_session_url`, with your `client_id`). Redirecting there signs the person out of **every** project in that
-browser, after the accounts service asks "Sign out?". To sign out of your app alone, use `accounts.revoke` and skip
-the redirect. The post-logout URL must be registered for your app exactly (ask Todd); an unregistered or off-site one
-is dropped and the person stays on the accounts "You're signed out" page.
+Sign-out is global by default. `sign_out` revokes the refresh token (pass `None` if you don't keep one) and builds the
+end-session URL (`logout::end_session_url`, with your `client_id`). **Redirect the browser to `signed_out.url`**: with
+a valid `id_token_hint` the accounts service ends the browser session at once (no confirm page), which signs the
+person out of every project in that browser (never their other devices) and sends each project a `session.signed_out`
+webhook. Skip the redirect and the accounts session survives, so "Sign in" silently signs them back in. Without a
+hint the service asks "Sign out?" first. Set `local_only: true` to sign out of your app alone: the token is revoked
+and `url` is `None`.
+
+What a project must do:
+
+- Keep `tokens.id_token` (the raw string) and `claims.sid` with your session, to pass as the hint and to match
+  `session.signed_out`. `sid` is `None` on tokens issued before the service added it.
+- Register a post-logout redirect URI for your client, exactly (Todd runs
+  `accounts-service admin client update ... --logout <URI>` or uses the admin UI). An unregistered or off-site one is
+  dropped and the person stays on the accounts "You're signed out" page.
+- Handle `session.signed_out` and `user.signed_out` (see Webhooks).
 
 ## Webhooks
 
@@ -79,6 +91,7 @@ match event.kind {
     EventKind::UserDeleted => { /* delete or anonymize event.sub()'s rows */ }
     EventKind::UserUpdated => { /* refresh cached username / picture */ }
     EventKind::UserSignedOut | EventKind::UserSuspended | EventKind::GrantRevoked => { /* end event.sub()'s sessions */ }
+    EventKind::SessionSignedOut => { /* drop every local session of event.sub() with sid == event.sid() */ }
     EventKind::FriendshipCreated => { /* event.sub() and event.friend_sub() are now friends */ }
     EventKind::FriendshipRemoved => { /* drop friend-only state between them */ }
     EventKind::FriendRequestCreated | EventKind::FriendRequestCancelled | EventKind::FriendRequestDeclined => {
@@ -95,6 +108,8 @@ only `friendship.created`.
 Your sessions are your own: accounts can't end them. On `user.signed_out` (the person signed out everywhere,
 changed or reset their password, or an admin signed them or everyone out), `user.suspended` and
 `grant.revoked`, delete every session you hold for `event.sub()`. Their refresh tokens are already revoked.
+On `session.signed_out` (the person signed out of one accounts browser session, from any project), delete only the
+sessions you hold for `event.sub()` whose stored `sid` equals `event.sid()`; their other devices stay signed in.
 
 Verify the raw body before parsing. An empty secret is refused. While you rotate a webhook secret the service signs
 with both, so the header carries several `v1=` values and the event is accepted when any one matches the secret you

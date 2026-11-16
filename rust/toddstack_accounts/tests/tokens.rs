@@ -80,6 +80,19 @@ async fn a_valid_id_token_verifies() {
         .unwrap();
     assert_eq!(claims.username.as_deref(), Some("player_one"));
     assert_eq!(claims.amr, vec![String::from("pwd")]);
+    assert_eq!(None, claims.sid);
+}
+
+#[tokio::test]
+async fn the_browser_session_id_is_exposed_when_the_token_carries_one() {
+    let s: Signer = signer();
+    let mut with_sid: Value = id_claims();
+    with_sid["sid"] = json!("sid-123");
+    let claims = accounts(&s)
+        .verify_id_token(&sign(&s, &with_sid, None), Some("n1"))
+        .await
+        .unwrap();
+    assert_eq!(Some(String::from("sid-123")), claims.sid);
 }
 
 #[tokio::test]

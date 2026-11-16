@@ -20,6 +20,8 @@ export const WEBHOOK_TOLERANCE_SECONDS = 300;
  * - `user.updated`: `data` adds the fields that changed.
  * - `user.deleted`: delete or anonymize the person's rows.
  * - `user.suspended`, `user.signed_out`, `grant.revoked`: end the person's sessions.
+ * - `session.signed_out`: one accounts browser session ended; `data.sub` and `data.sid` say whose and which. Drop
+ *   every local session with that `sid`.
  * - `user.reactivated`.
  * - `friendship.created`, `friendship.removed`: `data.sub` and `data.friend_sub` became (or stopped being)
  *   friends. Sent once per side, so each person gets an event with themselves as `sub`.
@@ -33,6 +35,7 @@ export const WEBHOOK_EVENT_TYPES = [
   "user.suspended",
   "user.reactivated",
   "user.signed_out",
+  "session.signed_out",
   "grant.revoked",
   "friendship.created",
   "friendship.removed",
@@ -59,11 +62,18 @@ export interface WebhookEvent {
   /** Unix seconds. */
   createdAt: number;
   /**
-   * Always has `sub` (the person the event is about); `user.updated` adds the fields that changed, and the
+   * Always has `sub` (the person the event is about); `session.signed_out` adds `sid`; `user.updated` adds the fields that changed, and the
    * friendship events add `friend_sub` (the other person), and the friend request events add `from_sub` (who
    * asked) and `to_sub` (who was asked).
    */
-  data: { sub?: string; friend_sub?: string; from_sub?: string; to_sub?: string; [field: string]: unknown };
+  data: {
+    sub?: string;
+    sid?: string;
+    friend_sub?: string;
+    from_sub?: string;
+    to_sub?: string;
+    [field: string]: unknown;
+  };
 }
 
 function reject(why: string): AccountsError {

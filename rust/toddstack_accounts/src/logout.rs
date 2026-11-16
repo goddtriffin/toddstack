@@ -2,10 +2,12 @@
 //!
 //! Your session is your own: end it yourself. [`crate::Accounts::sign_out`]
 //! then revokes your refresh token and hands back the accounts service's
-//! end-session URL (RP-initiated logout). Redirect there only if the person
-//! should leave *every* project: the service asks "Sign out?" and, on yes,
-//! signs them out of all of Todd's projects in that browser. To sign out of
-//! your app alone, revoke and skip the redirect.
+//! end-session URL (RP-initiated logout). Redirect the browser there: with a
+//! valid `id_token_hint` the service ends the accounts browser session at once,
+//! which signs the person out of every project in that browser (never other
+//! devices) and sends each of them a `session.signed_out` webhook. Without a
+//! hint it asks "Sign out?" first. For a local-only sign-out, set
+//! [`Options::local_only`]: the token is revoked and there is no URL.
 
 use crate::Error;
 use crate::tokens::Config;
@@ -13,7 +15,9 @@ use crate::tokens::Config;
 /// What to put on the end-session URL.
 #[derive(Clone, Debug, Default)]
 pub struct Options<'a> {
-    /// The ID token from sign-in (expired is fine). Sent as `id_token_hint`.
+    /// The raw ID token from sign-in ([`crate::TokenSet::id_token`], expired
+    /// is fine), which you keep with your session. Sent as `id_token_hint`;
+    /// with it the service signs the person out without a confirm page.
     pub id_token_hint: Option<&'a str>,
     /// Where the person lands afterwards: a path on your site (`/`, checked
     /// like [`crate::return_to::safe`]) or an absolute URL on your redirect
@@ -23,6 +27,10 @@ pub struct Options<'a> {
     pub post_logout_redirect_uri: Option<&'a str>,
     /// Echoed back as `?state=` on that redirect.
     pub state: Option<&'a str>,
+    /// Sign out of your app only: revoke the refresh token and return no URL,
+    /// so the accounts browser session (and the person's other projects)
+    /// stays signed in and "Sign in" signs them straight back in.
+    pub local_only: bool,
 }
 
 /// The absolute post-logout URL for `target`, if it stays on your site (the
@@ -74,8 +82,9 @@ pub fn end_session_url(config: &Config, options: &Options<'_>) -> String {
 #[derive(Debug)]
 #[must_use]
 pub struct SignOut {
-    /// The end-session URL (see [`end_session_url`]).
-    pub url: String,
+    /// The end-session URL (see [`end_session_url`]): redirect the browser
+    /// there. `None` when [`Options::local_only`] was set.
+    pub url: Option<String>,
     /// Why revoking the refresh token failed, if it did. Sign-out goes ahead
     /// regardless (drop the token from your store either way); log this.
     pub revoke_error: Option<Error>,
@@ -111,6 +120,7 @@ mod tests {
                 id_token_hint: Some("id.token.here"),
                 post_logout_redirect_uri: Some("/goodbye"),
                 state: Some("s1"),
+                local_only: false,
             },
         );
         assert_eq!(

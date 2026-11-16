@@ -71,19 +71,30 @@ after `prompt: "none"`), `missing_code`, `token_refused`, `invalid_token`, `inva
 ```ts
 // GET /logout: end your own session first, then:
 const { url, revokeError } = await accounts.signOut(refreshToken, {
-  idTokenHint: idToken, // optional, expired is fine
+  idTokenHint: idToken, // the raw ID token you kept (tokens.idToken), expired is fine
   postLogoutRedirectUri: "/", // a path, or an absolute URL on your redirect URI's origin
   state: undefined, // echoed back as ?state=
+  localOnly: false, // true: sign out of your app alone, no URL
 });
 if (revokeError) console.error(revokeError); // sign-out still goes ahead
-// Redirect to `url` to also sign out of accounts.
+if (url !== null) { /* redirect the browser to url */ }
 ```
 
-`signOut` revokes the refresh token (pass `null` if you don't keep one) and builds the end-session URL (`endSessionUrl`,
-with your `client_id`). Redirecting there signs the person out of **every** project in that browser, after the accounts
-service asks "Sign out?". To sign out of your app alone, use `accounts.revoke` and skip the redirect. The post-logout
-URL must be registered for your app exactly (ask Todd); an unregistered or off-site one is dropped (`postLogoutTarget`
-returns null) and the person stays on the accounts "You're signed out" page.
+Sign-out is global by default. `signOut` revokes the refresh token (pass `null` if you don't keep one) and builds the
+end-session URL (`endSessionUrl`, with your `client_id`). **Redirect the browser to `url`**: with a valid `idTokenHint`
+the accounts service ends the browser session at once (no confirm page), which signs the person out of every project in
+that browser (never their other devices) and sends each project a `session.signed_out` webhook. Skip the redirect and
+the accounts session survives, so "Sign in" silently signs them back in. Without a hint the service asks "Sign out?"
+first. Set `localOnly: true` to sign out of your app alone: the token is revoked and `url` is `null`.
+
+What a project must do:
+
+- Keep `tokens.idToken` (the raw string) and `claims.sid` with your session, to pass as the hint and to match
+  `session.signed_out`. `sid` is `undefined` on tokens issued before the service added it.
+- Register a post-logout redirect URI for your client, exactly (Todd runs
+  `accounts-service admin client update ... --logout <URI>` or uses the admin UI). An unregistered or off-site one is
+  dropped (`postLogoutTarget` returns null) and the person stays on the accounts "You're signed out" page.
+- Handle `session.signed_out` and `user.signed_out` (see Webhooks).
 
 ## Webhooks
 
@@ -99,6 +110,8 @@ switch (event.type) {
   case "user.signed_out":
   case "user.suspended":
   case "grant.revoked": /* end event.data.sub's sessions */
+    break;
+  case "session.signed_out": /* drop every local session of event.data.sub with sid === event.data.sid */
     break;
   case "friendship.created": /* event.data.sub and event.data.friend_sub are now friends */
     break;
@@ -116,7 +129,9 @@ switch (event.type) {
 gets one with themselves as `sub`, so handle only `sub`'s view. An accepted request sends only `friendship.created`.
 
 Your sessions are your own: accounts can't end them. On `user.signed_out`, `user.suspended` and `grant.revoked`, delete
-every session you hold for `event.data.sub`. Their refresh tokens are already revoked.
+every session you hold for `event.data.sub`. Their refresh tokens are already revoked. On `session.signed_out` (the
+person signed out of one accounts browser session, from any project), delete only the sessions you hold for
+`event.data.sub` whose stored `sid` equals `event.data.sid`; their other devices stay signed in.
 
 Verify the raw body before parsing. An empty secret is refused. While you rotate a webhook secret the service signs with
 both, so the header carries several `v1=` values and the event is accepted when any one matches the secret you hold.

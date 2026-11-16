@@ -40,6 +40,8 @@ impl Config {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TokenSet {
     pub access_token: String,
+    /// The raw signed ID token. Keep it with your session: sign-out sends it
+    /// as `id_token_hint` ([`crate::logout::Options::id_token_hint`]).
     pub id_token: String,
     /// Present when `offline_access` was granted. Rotates on every refresh:
     /// always store the new one, and never reuse an old one (that revokes the
@@ -65,6 +67,11 @@ pub struct IdClaims {
     #[serde(default)]
     pub amr: Vec<String>,
     pub nonce: Option<String>,
+    /// The accounts browser session this sign-in belongs to, opaque and
+    /// stable for that session. Store it with your session and drop every
+    /// local session with the same `sid` on `session.signed_out`. `None` for
+    /// tokens issued before the service added it.
+    pub sid: Option<String>,
 }
 
 /// Verified access token claims (RFC 9068).
@@ -228,10 +235,11 @@ impl Accounts {
     }
 
     /// Signs out in one call: revokes `refresh_token` (if you hold one) and
-    /// builds the end-session URL. End your own session first; then redirect
-    /// to [`SignOut::url`] to also sign the person out of the accounts service
-    /// (every project in that browser), or skip it to sign out of your app
-    /// alone. A failed revoke doesn't stop sign-out: it comes back in
+    /// builds the end-session URL. End your own session first, then redirect
+    /// to [`SignOut::url`]: that signs the person out of the accounts service
+    /// and so of every project in that browser. Set
+    /// [`logout::Options::local_only`] to sign out of your app alone (no URL).
+    /// A failed revoke doesn't stop sign-out: it comes back in
     /// [`SignOut::revoke_error`].
     pub async fn sign_out(
         &self,
@@ -243,7 +251,7 @@ impl Accounts {
             None => None,
         };
         SignOut {
-            url: logout::end_session_url(&self.config, options),
+            url: (!options.local_only).then(|| logout::end_session_url(&self.config, options)),
             revoke_error,
         }
     }
