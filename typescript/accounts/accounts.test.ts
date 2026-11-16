@@ -1079,6 +1079,10 @@ Deno.test("http off loopback is rejected", () => {
       "http://10.0.2.2:8790",
       "http://192.168.1.5:8790",
       "http://127.0.0.1.evil.example",
+      "http://localhost@evil.com",
+      "http://localhost.",
+      "http://[::ffff:127.0.0.1]",
+      "http://127.0.0.2",
       "ftp://127.0.0.1",
       "nonsense",
     ]
@@ -1088,4 +1092,8 @@ Deno.test("http off loopback is rejected", () => {
   }
   const hand = { issuer: "http://accounts.example.com/oidc", clientId: "app", clientSecret: null, redirectUri: "" };
   assertThrows(() => new Accounts(hand), AccountsError);
+});
+
+Deno.test("loopback hosts compare case-insensitively", () => {
+  assertEquals(toddgriffinAt("http://LOCALHOST:8790", "app", null, "x").issuer, "http://LOCALHOST:8790/oidc");
 });

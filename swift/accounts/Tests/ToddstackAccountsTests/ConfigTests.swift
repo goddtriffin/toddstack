@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import ToddstackAccounts
+import ToddstackAccountsTesting
 
 @Suite struct ConfigTests {
     @Test func accountURLTagsThePathWithTheClient() throws {
@@ -49,6 +50,52 @@ import ToddstackAccounts
                 )
             }
         }
+    }
+
+    @Test func loopbackBypassesAreRejectedAndHostsAreCaseInsensitive() throws {
+        for bad in ["http://localhost@evil.com", "http://localhost.", "http://[::ffff:127.0.0.1]", "http://127.0.0.2"] {
+            #expect(throws: AccountsError.self, "\(bad)") {
+                try AccountsConfig(serverURL: URL(string: bad)!, callbackURL: callback, clientId: "x")
+            }
+            #expect(throws: AccountsError.self, "\(bad)") {
+                try AccountsConfig(
+                    serverURL: server, callbackURL: callback, accountsBaseURL: URL(string: bad)!, clientId: "x"
+                )
+            }
+        }
+        // hosts compare case-insensitively
+        _ = try AccountsConfig(serverURL: URL(string: "http://LOCALHOST:8790")!, callbackURL: callback, clientId: "x")
+    }
+
+    @Test func aCustomSchemeCallbackSignsIn() async throws {
+        let custom = URL(string: "me.toddgriffin.boggledygook.debug:/app/callback")!
+        let config = try AccountsConfig.local(
+            serverURL: URL(string: "http://127.0.0.1:8992")!, callbackURL: custom, clientId: "boggledygook"
+        )
+        let transport = MockAccountsTransport()
+        let web = MockWebAuthenticator()
+        let client = AccountsClient(
+            config: config, transport: transport, webAuthenticator: web, store: InMemorySessionStore(nil),
+            random: countingRandom(), now: { Date() }
+        )
+        let challenge: String = pkceChallenge(verifier: verifier)
+        let open = URL(string: "http://127.0.0.1:8992/app/sign-in?code_challenge=\(challenge)&code_challenge_method=S256&state=\(state)")!
+        web.seedAuthenticate(
+            url: open, callbackURL: custom,
+            response: .success(URL(string: "me.toddgriffin.boggledygook.debug:/app/callback?code=c&state=\(state)")!)
+        )
+        let headers: [String: String] = ["Accept": "application/json", "Content-Type": "application/json"]
+        transport.seedSend(
+            HTTPRequest(
+                url: URL(string: "http://127.0.0.1:8992/api/v1/app/session")!, method: "POST", headers: headers,
+                body: Data(#"{"code":"c","code_verifier":"\#(verifier)"}"#.utf8)
+            ),
+            response: .success(HTTPResponse(status: 200, body: json(sessionBody(token: "tok"))))
+        )
+        let session: Session = try await client.signIn()
+        #expect(session.token == "tok")
+        transport.verifyExhausted()
+        web.verifyExhausted()
     }
 
     @Test func callbackAcceptsHttpsOrAReverseDnsCustomScheme() throws {

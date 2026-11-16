@@ -124,7 +124,7 @@ Local testing never touches production: every base URL is yours to set. `serverU
 `http` on loopback (`127.0.0.1`, `localhost`, `::1`) and on `10.0.2.2` (the emulator's alias for your machine), and
 nowhere else (`AccountsException` of kind `Config`). `AccountsConfig.local(serverUrl, callbackUrl, clientId)` also points
 `accountsBaseUrl` at `LOCAL_ACCOUNTS_BASE_URL` (`http://127.0.0.1:8790`). The bearer token follows the configured
-server's scheme and origin. `callbackUrl` is an https App Link, or (any mode, local debug builds) a reverse-DNS custom scheme such as
+server's scheme and origin. **Issuer match:** `accountsBaseUrl` must exactly match the local server's `ACCOUNTS_BASE_URL`; if accounts runs on `http://localhost:8790` (needed for passkeys), pass that as `accountsBaseUrl`, not the `127.0.0.1` default. `10.0.2.2` is the emulator's alias for your machine; on a physical device it is a real LAN address, so use it only from the emulator. `callbackUrl` is an https App Link, or (any mode, local debug builds) a reverse-DNS custom scheme such as
 `me.toddgriffin.boggledygook.debug:/app/callback` (RFC 8252; the Auth Tab is launched with that redirect scheme, and a Custom Tab fallback needs an intent filter for it in your debug manifest); plain http is rejected.
 
 ```kotlin
@@ -218,6 +218,12 @@ credentials. Todd must:
    staging flow): `./gradlew :accounts:publishToMavenLocal` produces the signed artifacts when
    `ORG_GRADLE_PROJECT_signingInMemoryKey` and `ORG_GRADLE_PROJECT_signingInMemoryKeyPassword` are set; upload the
    resulting bundle in the portal. Wiring a publishing plugin with the token is the remaining step.
+
+## Breaking changes
+
+**0.6.0**: `accountsBaseUrl` is now validated: it rejects `http` off loopback (it was unchecked). `serverUrl` now
+rejects an https URL with no host. Both accept `http` on loopback (`127.0.0.1`, `localhost`, `::1`, `10.0.2.2`).
+`callbackUrl` also accepts a reverse-DNS custom scheme.
 
 ## Develop
 

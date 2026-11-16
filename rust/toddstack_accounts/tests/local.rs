@@ -32,6 +32,10 @@ fn http_off_loopback_is_rejected() {
         "http://10.0.2.2:8790",
         "http://192.168.1.5:8790",
         "http://127.0.0.1.evil.example",
+        "http://localhost@evil.com",
+        "http://localhost.",
+        "http://[::ffff:127.0.0.1]",
+        "http://127.0.0.2",
         "ftp://127.0.0.1",
         "nonsense",
     ] {
@@ -54,4 +58,10 @@ fn a_hand_built_http_issuer_off_loopback_is_rejected() {
         redirect_uri: String::new(),
     };
     assert!(matches!(Accounts::new(c), Err(Error::Config(_))));
+}
+
+#[test]
+fn loopback_hosts_compare_case_insensitively() {
+    let c: Config = Config::toddgriffin_at("http://LOCALHOST:8790", "app", None, "x").unwrap();
+    assert!(c.issuer.ends_with(":8790/oidc"));
 }
