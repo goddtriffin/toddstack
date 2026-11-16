@@ -9,6 +9,7 @@
 //!   access tokens against the published signing keys.
 //! - [`webhook`]: verifying the signed webhooks the accounts service sends.
 //! - [`friends`]: the friends, blocks, events and inbox API.
+//! - `friends_router` (feature `axum`): in-app friend requests as one mountable axum router.
 //! - [`notifications`]: sending notifications to players from your server, and
 //!   the time zone hint behind `send_at_local`.
 //! - [`devices`]: registering a player's phone for push from your server.
@@ -44,6 +45,8 @@
 pub mod devices;
 mod error;
 pub mod friends;
+#[cfg(feature = "axum")]
+pub mod friends_router;
 mod jwks;
 mod links;
 pub mod login;

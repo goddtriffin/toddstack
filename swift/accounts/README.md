@@ -12,7 +12,7 @@ accounts web flow for it. Swift 6, iOS 17.4+ / macOS 14.4+, no third-party depen
 Swift Package Manager, from the repository URL (the manifest is `Package.swift` at the repo root):
 
 ```swift
-.package(url: "https://github.com/goddtriffin/toddstack", from: "0.6.0")  // see Releases
+.package(url: "https://github.com/goddtriffin/toddstack", from: "0.7.0")  // see Releases
 // target dependency:
 .product(name: "ToddstackAccounts", package: "toddstack")
 ```
@@ -21,7 +21,7 @@ Tests of your app can also depend on the product `ToddstackAccountsTesting` (moc
 into the shipping app target).
 
 **Parity:** this package is the app-side half. Backend features of the Rust and TypeScript packages (token verification,
-webhooks, friends, notifications, reports) are called through your project's server, not from the app; a Swift client for
+webhooks, notifications, reports) are called through your project's server, not from the app; a Swift client for
 those is a gap until a project needs it.
 
 ## What your app needs
@@ -102,6 +102,31 @@ try await accounts.signOut()   // deletes the token even if the network fails
 The sign-in session is **not ephemeral**: the browser's accounts cookie is what makes sign-in silent. A guest cannot
 customize anything; gate locked options and offer `signIn()`.
 
+## In-app friend requests
+
+`FriendsClient` calls the friends routes your server mounts (the Rust crate's `friends_router`; table in
+[its README](../../rust/toddstack_accounts/README.md)), authenticated with the session `AccountsClient` keeps. The app
+never sees an accounts token. A call with no session throws `AccountsError.notSignedIn`; a guest gets `FriendsError`
+with code `account_required` (offer `signIn()`).
+
+```swift
+let friends = FriendsClient(accounts: accounts)
+let requests: FriendRequests = try await friends.requests()   // .incoming, .outgoing: [Person]
+do {
+    let sent: Sent = try await friends.request(username: "alex") // .requested, .accepted, .alreadyFriends
+} catch let error as FriendsError {
+    show(error.message)   // already worded for the person; error.code is e.g. "rate_limited", "refused"
+}
+try await friends.accept(sub); try await friends.decline(sub); try await friends.cancel(sub)
+try await friends.remove(sub); try await friends.block(sub); try await friends.unblock(sub)
+let people: [Person] = try await friends.list()
+let blocks: Blocks = try await friends.blocks()
+let states: [String: Relationship] = try await friends.relationships(subs)
+```
+
+Also `request(friendCode:)`. Models: `Person` (`Identifiable`), `FriendRequests`, `Blocks`, `Sent`, `Relationship`
+(`.unknown` for a state newer than the SDK). Tests seed `MockAccountsTransport` with the request (see `FriendsTests`).
+
 ## Push
 
 Your app never calls the accounts service. Ask for notification permission, then send the token to your own server in
@@ -149,6 +174,8 @@ From the repo root: `make swift_test` (macOS; uses Xcode's toolchain for swift-t
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -scheme ToddstackAccounts -destination 'generic/platform=iOS' build`.
 
 ## Breaking changes
+
+**0.7.0**: no breaking changes. Added `FriendsClient` and the friends models.
 
 **0.6.0**: `serverURL` and `accountsBaseURL` accept `http` on loopback, with a new config error message for other
 URLs. The sign-out URL your server returns may now be loopback `http` (it was https only). `callbackURL` also accepts
