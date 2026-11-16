@@ -1,5 +1,6 @@
 import AuthenticationServices
 import Foundation
+import os
 
 #if canImport(UIKit)
 import UIKit
@@ -28,29 +29,62 @@ public struct ASWebAuthenticator: WebAuthenticator {
     }
 }
 
+/// Resumes a continuation at most once, whichever of the completion handler or a failed start gets there first.
+private final class OnceResumer: Sendable {
+    private let continuation: OSAllocatedUnfairLock<CheckedContinuation<URL, any Error>?>
+
+    init(_ continuation: CheckedContinuation<URL, any Error>) {
+        self.continuation = OSAllocatedUnfairLock(initialState: continuation)
+    }
+
+    func resume(with result: Result<URL, any Error>) {
+        let taken: CheckedContinuation<URL, any Error>? = continuation.withLock { value in
+            defer { value = nil }
+            return value
+        }
+        taken?.resume(with: result)
+    }
+}
+
 /// Holds the session and the presentation anchor for one run; main actor because the sheet is UI.
 @MainActor
 private final class WebAuthRun: NSObject, ASWebAuthenticationPresentationContextProviding {
     private var session: ASWebAuthenticationSession?
+    private var cancelled: Bool = false
 
+    /// Cancelling the calling task closes the sheet; the completion handler then reports `cancelled`.
     func start(url: URL, host: String, path: String, ephemeral: Bool) async throws -> URL {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, any Error>) in
-            let session = ASWebAuthenticationSession(url: url, callback: .https(host: host, path: path)) { callbackURL, error in
-                if let callbackURL {
-                    continuation.resume(returning: callbackURL)
-                } else if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin {
-                    continuation.resume(throwing: AccountsError.cancelled)
-                } else {
-                    continuation.resume(throwing: AccountsError.network(error?.localizedDescription ?? "sign-in failed"))
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, any Error>) in
+                let once = OnceResumer(continuation)
+                if cancelled {
+                    once.resume(with: .failure(AccountsError.cancelled))
+                    return
+                }
+                let session = ASWebAuthenticationSession(url: url, callback: .https(host: host, path: path)) { callbackURL, error in
+                    if let callbackURL {
+                        once.resume(with: .success(callbackURL))
+                    } else if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin {
+                        once.resume(with: .failure(AccountsError.cancelled))
+                    } else {
+                        once.resume(with: .failure(AccountsError.network(error?.localizedDescription ?? "sign-in failed")))
+                    }
+                }
+                session.presentationContextProvider = self
+                session.prefersEphemeralWebBrowserSession = ephemeral
+                self.session = session
+                if !session.start() {
+                    once.resume(with: .failure(AccountsError.network("the sign-in sheet could not start")))
                 }
             }
-            session.presentationContextProvider = self
-            session.prefersEphemeralWebBrowserSession = ephemeral
-            self.session = session
-            if !session.start() {
-                continuation.resume(throwing: AccountsError.network("the sign-in sheet could not start"))
-            }
+        } onCancel: {
+            Task { @MainActor in self.cancel() }
         }
+    }
+
+    private func cancel() {
+        cancelled = true
+        session?.cancel()
     }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {

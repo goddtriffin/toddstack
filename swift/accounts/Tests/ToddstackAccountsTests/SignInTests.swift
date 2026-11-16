@@ -11,7 +11,7 @@ import ToddstackAccountsTesting
         let session: Session = try await h.client.signIn()
         let expected = Session(token: "tok", expiresAt: Date(timeIntervalSince1970: 1_893_553_445), player: player())
         #expect(expected == session)
-        #expect(expected == h.client.currentSession)
+        #expect(expected == (try h.client.currentSession()))
         #expect(expected == (try h.store.load()))
         h.verify()
     }
@@ -29,7 +29,7 @@ import ToddstackAccountsTesting
         h.web.seedAuthenticate(url: signInURL(), callbackURL: callback, response: .success(callbackURL("code=c&state=forged")))
         await #expect(throws: AccountsError.stateMismatch) { try await h.client.signIn() }
         #expect(h.transport.calls.isEmpty)
-        #expect(h.client.currentSession == nil)
+        #expect(try h.client.currentSession() == nil)
         h.verify()
     }
 
@@ -66,7 +66,7 @@ import ToddstackAccountsTesting
         h.web.seedAuthenticate(url: signInURL(), callbackURL: callback, response: .success(callbackURL("code=used&state=\(state)")))
         h.transport.seedSend(sessionRequest(code: "used", bearer: nil), response: .success(HTTPResponse(status: 400, body: json(#"{"error":"invalid_grant"}"#))))
         await #expect(throws: AccountsError.invalidGrant) { try await h.client.signIn() }
-        #expect(h.client.currentSession == nil)
+        #expect(try h.client.currentSession() == nil)
         h.verify()
     }
 
@@ -85,7 +85,7 @@ import ToddstackAccountsTesting
         h.transport.seedSend(sessionRequest(code: "c", bearer: "guest-tok"), response: .success(HTTPResponse(status: 200, body: json(sessionBody(token: "new-tok")))))
         let session: Session = try await h.client.signIn()
         #expect("new-tok" == session.token)
-        #expect("new-tok" == h.client.currentSession?.token)
+        #expect("new-tok" == (try h.client.currentSession())?.token)
         #expect("Bearer guest-tok" == h.transport.calls.first?.request.headers["Authorization"])
         h.verify()
     }
@@ -97,5 +97,30 @@ import ToddstackAccountsTesting
         _ = try await h.client.signIn()
         #expect(h.transport.calls.first?.request.headers["Authorization"] == nil)
         h.verify()
+    }
+
+    @Test func aSignedInAccountsTokenIsNeverSentOnTheExchange() async throws {
+        let account = Session(token: "account-tok", expiresAt: nil, player: player(guest: false))
+        let h = try Harness(stored: account)
+        h.web.seedAuthenticate(url: signInURL(prompt: true), callbackURL: callback, response: .success(callbackURL("code=c&state=\(state)")))
+        h.transport.seedSend(sessionRequest(code: "c", bearer: nil), response: .success(HTTPResponse(status: 200, body: json(sessionBody(token: "other-tok")))))
+        _ = try await h.client.signIn(prompt: .login)
+        #expect(h.transport.calls.first?.request.headers["Authorization"] == nil)
+        h.verify()
+    }
+
+    @Test func aSecondSignInWhileOneIsOpenFailsFast() async throws {
+        let gate = BlockingWebAuthenticator()
+        let client = AccountsClient(config: try makeConfig(), transport: MockAccountsTransport(), webAuthenticator: gate, store: InMemorySessionStore(), random: countingRandom())
+        let first = Task { try await client.signIn() }
+        await gate.waitUntilOpen()
+        await #expect(throws: AccountsError.signInInProgress) { try await client.signIn() }
+        await gate.finish(with: AccountsError.cancelled)
+        await #expect(throws: AccountsError.cancelled) { try await first.value }
+        #expect(await gate.opened == 1)
+    }
+
+    @Test func theSignInURLAsksForS256() throws {
+        #expect(signInURL().absoluteString.contains("code_challenge_method=S256"))
     }
 }

@@ -14,7 +14,7 @@ import ToddstackAccountsTesting
         h.transport.seedSend(guestRequest, response: .success(HTTPResponse(status: 200, body: json(sessionBody(token: "g", guest: true)))))
         let session: Session = try await h.client.startGuest()
         #expect(Session(token: "g", expiresAt: nil, player: player(guest: true)) == session)
-        #expect(session == h.client.currentSession)
+        #expect(session == (try h.client.currentSession()))
         h.verify()
     }
 
@@ -34,7 +34,7 @@ import ToddstackAccountsTesting
     @Test func anExpiredSessionReadsAsSignedOutAndIsDeleted() async throws {
         let past = Session(token: "old", expiresAt: Date(timeIntervalSince1970: 100), player: player())
         let h = try Harness(stored: past, now: { Date(timeIntervalSince1970: 200) })
-        #expect(h.client.currentSession == nil)
+        #expect(try h.client.currentSession() == nil)
         #expect(try h.store.load() == nil)
     }
 
@@ -94,5 +94,30 @@ import ToddstackAccountsTesting
         let h = try Harness()
         try await h.client.signOut()
         #expect(h.transport.calls.isEmpty)
+    }
+
+    @Test func authorizedRefusesAnyHostButTheServer() throws {
+        let h = try Harness(stored: Session(token: "tok", expiresAt: nil, player: player()))
+        for text in ["https://evil.example/x", "http://www.boggledygook.com/x", "https://www.boggledygook.com:8443/x", "https://boggledygook.com/x"] {
+            #expect(throws: AccountsError.self) { try h.client.authorized(URLRequest(url: URL(string: text)!)) }
+        }
+        let ok: URLRequest = try h.client.authorized(URLRequest(url: URL(string: "https://WWW.boggledygook.com:443/api")!))
+        #expect("Bearer tok" == ok.value(forHTTPHeaderField: "Authorization"))
+    }
+
+    @Test func aSessionDescriptionRedactsTheToken() {
+        let session = Session(token: "super-secret", expiresAt: nil, player: player())
+        #expect(!"\(session)".contains("super-secret"))
+        #expect(!String(reflecting: session).contains("super-secret"))
+    }
+
+    @Test func aStoreReadErrorThrowsInsteadOfReadingAsSignedOut() throws {
+        struct FailingStore: SessionStore {
+            func load() throws -> Session? { throw AccountsError.storage("locked") }
+            func save(_ session: Session) throws {}
+            func delete() throws {}
+        }
+        let client = AccountsClient(config: try makeConfig(), transport: MockAccountsTransport(), webAuthenticator: MockWebAuthenticator(), store: FailingStore())
+        #expect(throws: AccountsError.storage("locked")) { try client.currentSession() }
     }
 }
