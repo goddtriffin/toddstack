@@ -29,19 +29,38 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::Error;
-use crate::friends::{Friends, MAX_RELATIONSHIPS_PER_CALL, Sent};
+use crate::friends::{Friends, MAX_RELATIONSHIPS_PER_CALL, Sent, is_valid_id};
 use crate::tokens::Accounts;
 
 /// Where [`router`] mounts every route. Chosen to sit beside, not on top of,
 /// a project's `/api/v1/app/*` sign-in routes and its own `/api/v1/profile/*`.
 pub const BASE: &str = "/api/v1/friends";
 
+/// The credential that proved who is calling. A cookie is sent by the browser on forged cross-site requests, a
+/// `Bearer` app token is not, so only cookie writes get the same-origin check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Credential {
+    /// Authenticated by a session cookie: its accounts access token.
+    Cookie(String),
+    /// Authenticated by an `Authorization: Bearer` app token (native apps): its accounts access token.
+    Bearer(String),
+}
+
+impl Credential {
+    fn token(&self) -> &str {
+        match self {
+            Self::Cookie(t) | Self::Bearer(t) => t,
+        }
+    }
+}
+
 /// Who is calling, for the router. Implement it over your sessions.
 pub trait FriendsAuth: Send + Sync + 'static {
-    /// The caller's accounts access token (scope `friends`), refreshed if it
-    /// expired; `None` for a guest or signed-out caller. Read your session
-    /// cookie or your `Authorization: Bearer` app token from `headers`.
-    fn access_token(&self, headers: &HeaderMap) -> impl Future<Output = Option<String>> + Send;
+    /// The caller's accounts access token (scope `friends`, refreshed if it
+    /// expired) and which credential proved it; `None` for a guest or
+    /// signed-out caller. Report [`Credential::Cookie`] whenever a cookie
+    /// authenticated the request, even if a `Bearer` header is also present.
+    fn access_token(&self, headers: &HeaderMap) -> impl Future<Output = Option<Credential>> + Send;
 
     /// Your site's origin (`https://www.example.com`), the only cross-origin
     /// answer a cookie-authenticated write accepts.
@@ -73,6 +92,10 @@ pub enum Failure {
     Refused,
     /// 404.
     NotFound,
+    /// 409: the accounts service reported a conflict.
+    Conflict,
+    /// 422: the accounts service couldn't process the request.
+    Unprocessable,
     /// 429: too many requests an hour. `message` says to wait.
     RateLimited,
     /// 502: the accounts service failed or is unreachable.
@@ -86,6 +109,8 @@ impl Failure {
             Self::AccountRequired | Self::SessionExpired => StatusCode::UNAUTHORIZED,
             Self::CrossSite | Self::MissingScope => StatusCode::FORBIDDEN,
             Self::BadRequest | Self::Refused => StatusCode::BAD_REQUEST,
+            Self::Conflict => StatusCode::CONFLICT,
+            Self::Unprocessable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::AccountsUnavailable => StatusCode::BAD_GATEWAY,
@@ -102,6 +127,8 @@ impl Failure {
             Self::BadRequest => "bad_request",
             Self::Refused => "refused",
             Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::Unprocessable => "unprocessable",
             Self::RateLimited => "rate_limited",
             Self::AccountsUnavailable => "accounts_unavailable",
         }
@@ -136,6 +163,16 @@ fn classify(error: &Error) -> (Failure, String) {
         }
         | Error::NotFound(message) => (Failure::NotFound, message.clone()),
         Error::Api {
+            status: 409,
+            message,
+        }
+        | Error::Conflict(message) => (Failure::Conflict, message.clone()),
+        Error::Api {
+            status: 422,
+            message,
+        }
+        | Error::Unprocessable(message) => (Failure::Unprocessable, message.clone()),
+        Error::Api {
             status: 429,
             message,
         }
@@ -152,16 +189,9 @@ fn fail(error: &Error) -> Response {
     failure.respond(&message)
 }
 
-/// Cookie-authenticated writes must be same-origin; a Bearer app token is not
-/// a cookie, so a forged cross-site request can't carry one.
+/// A cookie write must be provably same-origin: `Sec-Fetch-Site: same-origin`, or (without that header) an
+/// `Origin` equal to `public_origin`. `same-site`, `cross-site`, `none` and a request with neither header are refused.
 fn same_origin<A: FriendsAuth>(auth: &A, headers: &HeaderMap) -> bool {
-    if headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer "))
-    {
-        return true;
-    }
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return site == "same-origin";
     }
@@ -176,16 +206,31 @@ async fn token<A: FriendsAuth>(
     headers: &HeaderMap,
     write: bool,
 ) -> Result<String, Box<Response>> {
-    if write && !same_origin(shared.auth.as_ref(), headers) {
+    let credential: Credential = shared
+        .auth
+        .access_token(headers)
+        .await
+        .ok_or_else(|| Box::new(Failure::AccountRequired.respond("Sign in to use friends.")))?;
+    if write
+        && matches!(credential, Credential::Cookie(_))
+        && !same_origin(shared.auth.as_ref(), headers)
+    {
         return Err(Box::new(
             Failure::CrossSite.respond("That request came from another site."),
         ));
     }
-    shared
-        .auth
-        .access_token(headers)
-        .await
-        .ok_or_else(|| Box::new(Failure::AccountRequired.respond("Sign in to use friends.")))
+    Ok(credential.token().to_owned())
+}
+
+/// A `sub` from the URL is percent-decoded by axum: refuse anything that isn't a plain id before it reaches a path.
+fn id(value: &str) -> Result<(), Box<Response>> {
+    if is_valid_id(value) {
+        Ok(())
+    } else {
+        Err(Box::new(
+            Failure::BadRequest.respond("That isn't a valid person id."),
+        ))
+    }
 }
 
 fn done(result: Result<(), Error>) -> Response {
@@ -258,6 +303,9 @@ async fn accept<A: FriendsAuth>(
         Ok(t) => t,
         Err(r) => return *r,
     };
+    if let Err(r) = id(&sub) {
+        return *r;
+    }
     done(Friends::new(&s.accounts, &token).accept(&sub).await)
 }
 
@@ -270,6 +318,9 @@ async fn decline<A: FriendsAuth>(
         Ok(t) => t,
         Err(r) => return *r,
     };
+    if let Err(r) = id(&sub) {
+        return *r;
+    }
     done(Friends::new(&s.accounts, &token).decline(&sub).await)
 }
 
@@ -282,6 +333,9 @@ async fn cancel<A: FriendsAuth>(
         Ok(t) => t,
         Err(r) => return *r,
     };
+    if let Err(r) = id(&sub) {
+        return *r;
+    }
     done(Friends::new(&s.accounts, &token).cancel(&sub).await)
 }
 
@@ -294,6 +348,9 @@ async fn remove<A: FriendsAuth>(
         Ok(t) => t,
         Err(r) => return *r,
     };
+    if let Err(r) = id(&sub) {
+        return *r;
+    }
     done(Friends::new(&s.accounts, &token).remove(&sub).await)
 }
 
@@ -313,7 +370,10 @@ async fn relationships<A: FriendsAuth>(
     };
     let subs: String = query.subs.unwrap_or_default();
     let subs: Vec<&str> = subs.split(',').filter(|v| !v.is_empty()).collect();
-    if subs.is_empty() || subs.len() > MAX_RELATIONSHIPS_PER_CALL {
+    if subs.is_empty()
+        || subs.len() > MAX_RELATIONSHIPS_PER_CALL
+        || !subs.iter().all(|v| is_valid_id(v))
+    {
         return Failure::BadRequest.respond("Send 1 to 100 comma-separated subs.");
     }
     match Friends::new(&s.accounts, &token).relationships(&subs).await {
@@ -353,6 +413,9 @@ async fn block<A: FriendsAuth>(
     let Ok(Json(body)) = body else {
         return Failure::BadRequest.respond("Send the sub to block.");
     };
+    if let Err(r) = id(&body.sub) {
+        return *r;
+    }
     done(Friends::new(&s.accounts, &token).block(&body.sub).await)
 }
 
@@ -365,6 +428,9 @@ async fn unblock<A: FriendsAuth>(
         Ok(t) => t,
         Err(r) => return *r,
     };
+    if let Err(r) = id(&sub) {
+        return *r;
+    }
     done(Friends::new(&s.accounts, &token).unblock(&sub).await)
 }
 

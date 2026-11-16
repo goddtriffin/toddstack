@@ -1097,3 +1097,19 @@ Deno.test("http off loopback is rejected", () => {
 Deno.test("loopback hosts compare case-insensitively", () => {
   assertEquals(toddgriffinAt("http://LOCALHOST:8790", "app", null, "x").issuer, "http://LOCALHOST:8790/oidc");
 });
+
+Deno.test("the server-side Friends refuse ids that could leave their URL paths, without a request", async () => {
+  let requests = 0;
+  const accounts = new Accounts(config, { fetch: () => (requests++, Promise.resolve(new Response("{}"))) });
+  const friends = accounts.friends("tok");
+  for (const bad of ["../../oidc/x", "..", "a/b", "a?b=1", "a#b", "a%2Fb", ""]) {
+    for (
+      const call of [friends.accept, friends.decline, friends.cancel, friends.remove, friends.block, friends.unblock]
+    ) {
+      const error = await assertRejects(() => call.call(friends, bad), AccountsError);
+      assertEquals(["api", 400], [error.kind, error.status], bad);
+    }
+    await assertRejects(() => friends.relationships(["u2", bad]), AccountsError);
+  }
+  assertEquals(0, requests);
+});

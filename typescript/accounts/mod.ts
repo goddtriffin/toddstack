@@ -29,6 +29,7 @@ export {
   Friends,
   type Inbox,
   type InboxItem,
+  isValidId,
   MAX_RELATIONSHIPS_PER_CALL,
   type Person,
   type Relationship,
@@ -37,6 +38,7 @@ export {
   type Unread,
 } from "./friends.ts";
 export { FriendsClient, FriendsClientError, type FriendsClientOptions } from "./friends-client.ts";
+export { MockFriendsFetch, type MockReply, type SendArgs } from "./friends-client-mock.ts";
 export type { Jwk, JwkSet } from "./jwks.ts";
 export type { Counts, Notification, Outcome, Receipt, Recipient, SendStatus } from "./notifications.ts";
 export { type GuestReport, MAX_NOTE_CHARS, type Reason } from "./report.ts";

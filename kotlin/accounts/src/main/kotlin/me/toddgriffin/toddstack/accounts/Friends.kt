@@ -44,7 +44,7 @@ public enum class Sent {
 public enum class Relationship(internal val wire: String) {
     Friends("friends"),
 
-    /** "Requested": take it back with [com.github.goddtriffin.toddstack.accounts.Friends.cancel]. */
+    /** "Requested": take it back with [me.toddgriffin.toddstack.accounts.Friends.cancel]. */
     RequestSent("request_sent"),
 
     /** "Accept". */
@@ -112,7 +112,7 @@ public class Friends(private val accounts: Accounts, private val api: FriendsApi
     public suspend fun remove(sub: String) { call("DELETE", "/${segment(sub)}") }
 
     /** Blocks: ends the friendship and requests, both ways. */
-    public suspend fun block(sub: String) { call("POST", "/blocks", buildBody("sub", sub)) }
+    public suspend fun block(sub: String) { call("POST", "/blocks", buildBody("sub", segment(sub))) }
 
     /** Undoes [block]. */
     public suspend fun unblock(sub: String) { call("DELETE", "/blocks/${segment(sub)}") }
@@ -122,7 +122,7 @@ public class Friends(private val accounts: Accounts, private val api: FriendsApi
 
     /** Where the person stands with each of [subs] (1 to 100), keyed by sub: what a friend button should say. */
     public suspend fun relationships(subs: List<String>): Map<String, Relationship> =
-        read(RelationshipsBody.serializer(), call("GET", "/relationships?subs=${segment(subs.joinToString(","))}"))
+        read(RelationshipsBody.serializer(), call("GET", "/relationships?subs=${URLEncoder.encode(subs.joinToString(",") { segment(it) }, "UTF-8")}"))
             .relationships.mapValues { Relationship.fromWire(it.value) }
 
     @Serializable
@@ -171,10 +171,18 @@ public class Friends(private val accounts: Accounts, private val api: FriendsApi
     private fun buildBody(name: String, value: String): String =
         buildJsonObject { put(name, value) }.toString()
 
-    private fun segment(value: String): String = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+    /**
+     * 1 to 64 of `A-Za-z0-9_-`: a real `sub` is a UUID, and anything else (`.`, `/`, `?`, `#`, `%`) could redirect
+     * the call to another path on the server.
+     */
+    private fun segment(value: String): String {
+        if (!ID.matches(value)) throw FriendsException(400, "bad_request", "That isn't a valid person id.")
+        return value
+    }
 
     private companion object {
         const val BASE: String = "/api/v1/friends"
+        val ID: Regex = Regex("^[A-Za-z0-9_-]{1,64}$")
         val json: Json = Json { ignoreUnknownKeys = true }
     }
 }

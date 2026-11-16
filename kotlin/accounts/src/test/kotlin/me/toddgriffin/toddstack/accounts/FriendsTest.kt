@@ -100,4 +100,21 @@ class FriendsTest {
         assertEquals(Pair(401, "account_required"), Pair(error.status, error.code))
         assertEquals(emptyList<SendArgs>(), mock.calls)
     }
+
+    @Test
+    fun an_id_that_could_leave_the_friends_paths_is_refused_before_any_request() = runTest {
+        givenSignedIn()
+        for (bad in listOf("../../oidc/x", "..", "a/b", "a?b=1", "a#b", "a%2Fb", "")) {
+            val calls: List<suspend () -> Unit> = listOf(
+                { friends.accept(bad) }, { friends.decline(bad) }, { friends.cancel(bad) },
+                { friends.remove(bad) }, { friends.block(bad) }, { friends.unblock(bad) },
+                { friends.relationships(listOf("u2", bad)) },
+            )
+            for (call in calls) {
+                val error = assertThrows(FriendsException::class.java) { kotlinx.coroutines.runBlocking { call() } }
+                assertEquals(Pair(400, "bad_request"), Pair(error.status, error.code))
+            }
+        }
+        assertEquals(emptyList<SendArgs>(), mock.calls)
+    }
 }

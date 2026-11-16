@@ -152,6 +152,27 @@ pub struct EventResult {
     pub counts: Option<Counts>,
 }
 
+/// Whether `value` is safe to put in a URL path: 1 to 64 of `A-Za-z0-9_-`. A real `sub` is a UUID; anything
+/// else (`/`, `?`, `#`, `.`, `%`) could redirect the call to another accounts path with the person's token.
+#[must_use]
+pub fn is_valid_id(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn checked(value: &str) -> Result<&str> {
+    if is_valid_id(value) {
+        Ok(value)
+    } else {
+        Err(Error::Api {
+            status: 400,
+            message: String::from("not a valid id"),
+        })
+    }
+}
+
 /// One authenticated JSON call; errors carry the API's message. A `GET` is
 /// retried on an intermittent failure; anything else is sent once (see
 /// [`crate::retry`]).
@@ -186,6 +207,14 @@ pub(crate) async fn call(
         status: status.as_u16(),
         message: e.to_string(),
     })
+}
+
+fn checked_kind(kind: &str) -> Result<&str> {
+    if kind == ALL_KINDS {
+        Ok(kind)
+    } else {
+        checked(kind)
+    }
 }
 
 fn field<T: for<'de> Deserialize<'de>>(mut value: Value, name: &str) -> Result<T> {
@@ -254,6 +283,9 @@ impl<'a> Friends<'a> {
     /// # Errors
     /// A malformed sub, or the request failed.
     pub async fn relationships(&self, subs: &[&str]) -> Result<HashMap<String, Relationship>> {
+        for sub in subs {
+            checked(sub)?;
+        }
         let mut found: HashMap<String, Relationship> = HashMap::new();
         for chunk in subs.chunks(MAX_RELATIONSHIPS_PER_CALL) {
             let mut url: reqwest::Url =
@@ -342,7 +374,7 @@ impl<'a> Friends<'a> {
     pub async fn accept(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::POST,
-            &format!("/friends/requests/{sub}/accept"),
+            &format!("/friends/requests/{}/accept", checked(sub)?),
             None,
         )
         .await
@@ -354,7 +386,7 @@ impl<'a> Friends<'a> {
     pub async fn decline(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::POST,
-            &format!("/friends/requests/{sub}/decline"),
+            &format!("/friends/requests/{}/decline", checked(sub)?),
             None,
         )
         .await
@@ -368,7 +400,7 @@ impl<'a> Friends<'a> {
     pub async fn cancel(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::DELETE,
-            &format!("/friends/requests/{sub}"),
+            &format!("/friends/requests/{}", checked(sub)?),
             None,
         )
         .await
@@ -378,9 +410,13 @@ impl<'a> Friends<'a> {
     /// # Errors
     /// The request failed.
     pub async fn remove(&self, sub: &str) -> Result<()> {
-        self.call(reqwest::Method::DELETE, &format!("/friends/{sub}"), None)
-            .await
-            .map(|_| ())
+        self.call(
+            reqwest::Method::DELETE,
+            &format!("/friends/{}", checked(sub)?),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Blocks: ends the friendship and requests, and stops events both ways.
@@ -391,7 +427,7 @@ impl<'a> Friends<'a> {
         self.call(
             reqwest::Method::POST,
             "/blocks",
-            Some(json!({ "sub": sub })),
+            Some(json!({ "sub": checked(sub)? })),
         )
         .await
         .map(|_| ())
@@ -400,9 +436,13 @@ impl<'a> Friends<'a> {
     /// # Errors
     /// The request failed.
     pub async fn unblock(&self, sub: &str) -> Result<()> {
-        self.call(reqwest::Method::DELETE, &format!("/blocks/{sub}"), None)
-            .await
-            .map(|_| ())
+        self.call(
+            reqwest::Method::DELETE,
+            &format!("/blocks/{}", checked(sub)?),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Who the person blocked, and everyone to keep apart from them.
@@ -517,9 +557,13 @@ impl<'a> Friends<'a> {
     /// # Errors
     /// The request failed.
     pub async fn mark_read(&self, id: &str) -> Result<()> {
-        self.call(reqwest::Method::POST, &format!("/inbox/{id}/read"), None)
-            .await
-            .map(|_| ())
+        self.call(
+            reqwest::Method::POST,
+            &format!("/inbox/{}/read", checked(id)?),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// The event kinds from your app the person has muted ([`ALL_KINDS`] means
@@ -541,9 +585,13 @@ impl<'a> Friends<'a> {
     /// # Errors
     /// Malformed kind, or the request failed.
     pub async fn mute(&self, kind: &str) -> Result<()> {
-        self.call(reqwest::Method::PUT, &format!("/mutes/{kind}"), None)
-            .await
-            .map(|_| ())
+        self.call(
+            reqwest::Method::PUT,
+            &format!("/mutes/{}", checked_kind(kind)?),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Undoes [`Friends::mute`].
@@ -551,9 +599,13 @@ impl<'a> Friends<'a> {
     /// # Errors
     /// The request failed.
     pub async fn unmute(&self, kind: &str) -> Result<()> {
-        self.call(reqwest::Method::DELETE, &format!("/mutes/{kind}"), None)
-            .await
-            .map(|_| ())
+        self.call(
+            reqwest::Method::DELETE,
+            &format!("/mutes/{}", checked_kind(kind)?),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -703,6 +755,25 @@ mod tests {
             },
             old
         );
+    }
+
+    #[test]
+    fn only_plain_ids_are_allowed_into_a_url_path() {
+        assert!(is_valid_id("4b0b2c6e-0000-4000-8000-000000000001"));
+        assert!(is_valid_id("u_2"));
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "a/b",
+            "a?b",
+            "a#b",
+            "a%2Fb",
+            "a b",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_valid_id(bad), "{bad}");
+        }
     }
 
     #[test]

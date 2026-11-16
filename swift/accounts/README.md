@@ -106,8 +106,7 @@ customize anything; gate locked options and offer `signIn()`.
 
 `FriendsClient` calls the friends routes your server mounts (the Rust crate's `friends_router`; table in
 [its README](../../rust/toddstack_accounts/README.md)), authenticated with the session `AccountsClient` keeps. The app
-never sees an accounts token. A call with no session throws `AccountsError.notSignedIn`; a guest gets `FriendsError`
-with code `account_required` (offer `signIn()`).
+never sees an accounts token. With no session, or as a guest, a call throws `FriendsError` with code `account_required` (offer `signIn()`).
 
 ```swift
 let friends = FriendsClient(accounts: accounts)
