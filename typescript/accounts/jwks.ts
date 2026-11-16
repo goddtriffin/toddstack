@@ -4,6 +4,7 @@
 // its outcome.
 
 import { AccountsError } from "./error.ts";
+import { READ, type RetryPolicy, send } from "./retry.ts";
 
 /** One key from a JWKS document. */
 export interface Jwk extends JsonWebKey {
@@ -34,22 +35,34 @@ export class Keys {
   #inFlight: Promise<void> | null = null;
   #imported = new Map<string, Promise<CryptoKey>>();
 
-  private constructor(url: string | null, set: JwkSet | null, fetcher: typeof fetch, now: () => number) {
+  #policy: RetryPolicy;
+
+  private constructor(
+    url: string | null,
+    set: JwkSet | null,
+    fetcher: typeof fetch,
+    now: () => number,
+    policy: RetryPolicy,
+  ) {
     this.#url = url;
     this.#fetch = fetcher;
     this.#now = now;
     this.#set = set;
     this.#fetchedAt = set ? now() : null;
+    this.#policy = policy;
   }
 
-  /** Keys fetched from `url`. `now` (milliseconds) is a parameter so tests can move the clock. */
-  static remote(url: string, fetcher: typeof fetch, now: () => number = Date.now): Keys {
-    return new Keys(url, null, fetcher, now);
+  /**
+   * Keys fetched from `url`. `now` (milliseconds) and `policy` are parameters so tests can move the clock and keep
+   * retries fast.
+   */
+  static remote(url: string, fetcher: typeof fetch, now: () => number = Date.now, policy: RetryPolicy = READ): Keys {
+    return new Keys(url, null, fetcher, now, policy);
   }
 
   /** Fixed keys, never fetched. */
   static pinned(set: JwkSet): Keys {
-    return new Keys(null, set, fetch, Date.now);
+    return new Keys(null, set, fetch, Date.now, READ);
   }
 
   #lookup(kid: string): Promise<CryptoKey> | null {
@@ -72,7 +85,8 @@ export class Keys {
   async #fetchSet(url: string): Promise<void> {
     let response: Response;
     try {
-      response = await this.#fetch(url, { signal: AbortSignal.timeout(10_000) });
+      // One logical fetch, retried on an intermittent failure; the once-a-minute limit counts it once.
+      response = await send(this.#fetch, url, {}, this.#policy);
     } catch (cause) {
       throw new AccountsError("http", `http: ${cause}`, { cause });
     }

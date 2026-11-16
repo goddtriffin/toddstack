@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::report::{self, Reason};
+use crate::retry::{self, RetryPolicy};
 use crate::tokens::Accounts;
 use crate::{Error, Result};
 
@@ -110,7 +111,9 @@ pub struct InboxItem {
     pub read_at: Option<String>,
 }
 
-/// One authenticated JSON call; errors carry the API's message.
+/// One authenticated JSON call; errors carry the API's message. A `GET` is
+/// retried on an intermittent failure; anything else is sent once (see
+/// [`crate::retry`]).
 pub(crate) async fn call(
     accounts: &Accounts,
     token: &str,
@@ -122,7 +125,7 @@ pub(crate) async fn call(
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let response = request.send().await?;
+    let response = retry::execute(accounts.http(), request.build()?, &RetryPolicy::READ).await?;
     let status = response.status();
     let text: String = response.text().await?;
     if !status.is_success() {

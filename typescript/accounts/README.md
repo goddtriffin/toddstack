@@ -189,6 +189,17 @@ Only accounts can be reported (a guest's id is 404), not yourself (400). Notes a
 reports per reporter per hour (429). Reporting the same person for the same reason again while it's open succeeds and
 changes nothing, so always show the same thanks.
 
+## Retries
+
+Reads from the accounts service (the signing keys, `userinfo`, and every friends `GET`) are retried on an intermittent
+failure: a connection error, a timeout, a 5xx or a 429. Three attempts at most, each with its own 3 s deadline, paced by
+exponential backoff with full jitter (200 ms, doubling, capped at 1 s). A `Retry-After` of up to 2 s is waited out; a
+longer one ends the retries. No retry starts after 6 s. A 4xx is an answer and is never retried.
+
+Everything else is sent exactly once: the code exchange (a code is single-use), refresh (a refresh that landed but whose
+answer was lost has already rotated the token, so a second try would sign the person out), revocation, and every write
+(a repeated friend request, block, report or event would be a duplicate).
+
 ## Tests
 
 `new Accounts(config, { keys, fetch })` pins the signing keys and swaps `fetch`, so tests run with no network.

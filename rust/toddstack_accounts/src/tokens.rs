@@ -207,6 +207,7 @@ impl Accounts {
             ("token", refresh_token),
             ("token_type_hint", "refresh_token"),
         ];
+        // Sent once: a write, like every non-GET (see `crate::retry`).
         let response = self
             .authed(
                 self.http
@@ -264,6 +265,9 @@ impl Accounts {
         }
     }
 
+    /// Sent once, never retried: a code is single-use and a refresh rotates
+    /// the token, so a retry of a request that had in fact landed fails with
+    /// `invalid_grant` and signs the person out.
     async fn token_request(&self, params: &[(&str, &str)]) -> Result<TokenSet> {
         let mut form: Vec<(&str, &str)> = params.to_vec();
         let request = self.authed(

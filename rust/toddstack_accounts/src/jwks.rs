@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::jwk::JwkSet;
 
+use crate::retry::{self, RetryPolicy};
 use crate::{Error, Result};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(3600);
@@ -61,6 +62,7 @@ pub struct Keys {
     cache: RwLock<Cache>,
     /// Held while fetching.
     fetching: tokio::sync::Mutex<()>,
+    policy: RetryPolicy,
 }
 
 fn unknown() -> Error {
@@ -78,6 +80,7 @@ impl Keys {
             pinned: false,
             cache: RwLock::new(Cache::default()),
             fetching: tokio::sync::Mutex::new(()),
+            policy: RetryPolicy::READ,
         }
     }
 
@@ -91,6 +94,7 @@ impl Keys {
                 ..Cache::default()
             }),
             fetching: tokio::sync::Mutex::new(()),
+            policy: RetryPolicy::READ,
         }
     }
 
@@ -136,14 +140,16 @@ impl Keys {
         cache.lookup(kid).ok_or_else(unknown)
     }
 
+    /// One logical fetch, retried on an intermittent failure (see
+    /// [`crate::retry`]); the once-a-minute limit counts it once.
     async fn fetch(&self, http: &reqwest::Client) -> Result<JwkSet> {
-        Ok(http
-            .get(&self.url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        Ok(
+            retry::execute(http, http.get(&self.url).build()?, &self.policy)
+                .await?
+                .error_for_status()?
+                .json()
+                .await?,
+        )
     }
 }
 
@@ -223,6 +229,14 @@ mod tests {
         }
     }
 
+    /// Keys from `server`, retrying with millisecond backoff to keep tests fast.
+    fn fast(server: &Server) -> Keys {
+        Keys {
+            policy: crate::retry::tests::FAST,
+            ..Keys::remote(server.url.clone())
+        }
+    }
+
     fn backdate(keys: &Keys, by: Duration) {
         let mut cache = keys.cache.write().unwrap();
         let then: Instant = Instant::now().checked_sub(by).unwrap();
@@ -235,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn a_key_published_after_the_last_fetch_is_found_by_refetching() {
         let server: Server = Server::start(&[jwk(1, "old")]).await;
-        let keys: Keys = Keys::remote(server.url.clone());
+        let keys: Keys = fast(&server);
         let http: reqwest::Client = reqwest::Client::new();
         keys.get(&http, "old").await.unwrap();
         backdate(&keys, PAST_MIN_REFETCH);
@@ -248,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_kids_refetch_at_most_once_a_minute() {
         let server: Server = Server::start(&[jwk(1, "old")]).await;
-        let keys: Keys = Keys::remote(server.url.clone());
+        let keys: Keys = fast(&server);
         let http: reqwest::Client = reqwest::Client::new();
         keys.get(&http, "old").await.unwrap();
         backdate(&keys, PAST_MIN_REFETCH);
@@ -268,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_refetch_still_counts_against_the_minute() {
         let server: Server = Server::start(&[jwk(1, "old")]).await;
-        let keys: Keys = Keys::remote(server.url.clone());
+        let keys: Keys = fast(&server);
         let http: reqwest::Client = reqwest::Client::new();
         keys.get(&http, "old").await.unwrap();
         backdate(&keys, PAST_MIN_REFETCH);
@@ -276,14 +290,15 @@ mod tests {
 
         assert!(matches!(keys.get(&http, "new").await, Err(Error::Http(_))));
         assert!(keys.get(&http, "new").await.is_err());
-        assert_eq!(2, server.hits());
+        // One fetch of three attempts (a 503 is retried), and no second fetch.
+        assert_eq!(4, server.hits());
         keys.get(&http, "old").await.unwrap();
     }
 
     #[tokio::test]
     async fn a_new_key_within_a_minute_of_the_last_fetch_waits_for_the_next_window() {
         let server: Server = Server::start(&[jwk(1, "old")]).await;
-        let keys: Keys = Keys::remote(server.url.clone());
+        let keys: Keys = fast(&server);
         let http: reqwest::Client = reqwest::Client::new();
         keys.get(&http, "old").await.unwrap();
         server.publish(&[jwk(1, "old"), jwk(2, "new")]);
@@ -298,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_cache_is_refreshed_even_for_a_known_kid() {
         let server: Server = Server::start(&[jwk(1, "old")]).await;
-        let keys: Keys = Keys::remote(server.url.clone());
+        let keys: Keys = fast(&server);
         let http: reqwest::Client = reqwest::Client::new();
         keys.get(&http, "old").await.unwrap();
         backdate(&keys, REFRESH_EVERY + Duration::from_secs(1));
@@ -312,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_lookups_share_one_fetch() {
         let server: Server = Server::start(&[jwk(1, "old"), jwk(2, "new")]).await;
-        let keys: Arc<Keys> = Arc::new(Keys::remote(server.url.clone()));
+        let keys: Arc<Keys> = Arc::new(fast(&server));
         let http: reqwest::Client = reqwest::Client::new();
         let lookups: Vec<tokio::task::JoinHandle<bool>> = (0..8)
             .map(|_| {
@@ -330,7 +345,7 @@ mod tests {
     async fn concurrent_lookups_share_a_failed_fetch_instead_of_queueing_more() {
         let server: Server = Server::start(&[jwk(1, "old")]).await;
         server.status.store(503, Ordering::SeqCst);
-        let keys: Arc<Keys> = Arc::new(Keys::remote(server.url.clone()));
+        let keys: Arc<Keys> = Arc::new(fast(&server));
         let http: reqwest::Client = reqwest::Client::new();
         let lookups: Vec<tokio::task::JoinHandle<bool>> = (0..8)
             .map(|_| {
@@ -341,7 +356,8 @@ mod tests {
         for lookup in lookups {
             assert!(!lookup.await.unwrap());
         }
-        assert_eq!(1, server.hits());
+        // One fetch of three attempts (a 503 is retried), shared by all eight.
+        assert_eq!(3, server.hits());
     }
 
     #[tokio::test]
