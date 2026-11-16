@@ -45,6 +45,7 @@ mod links;
 pub mod login;
 pub mod logout;
 pub mod report;
+mod retry;
 pub mod return_to;
 mod tokens;
 pub mod webhook;

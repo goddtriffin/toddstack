@@ -7,6 +7,7 @@ import { type JwkSet, Keys } from "./jwks.ts";
 import { endSessionUrl, type LogoutOptions, type SignOut } from "./logout.ts";
 import { type LoginOptions, parseCallback, type PendingLogin, type StartedLogin, startLogin } from "./login.ts";
 import { type GuestReport, reportBody } from "./report.ts";
+import { send } from "./retry.ts";
 import { VERSION } from "./version.ts";
 
 /** The production issuer. */
@@ -281,9 +282,10 @@ export class Accounts {
     }
   }
 
+  /** A GET is retried on an intermittent failure; anything else (token, refresh, revocation, writes) is sent once. */
   async #send(url: string, init: RequestInit): Promise<Response> {
     try {
-      return await this.#fetch(url, { ...init, signal: AbortSignal.timeout(10_000) });
+      return await send(this.#fetch, url, init);
     } catch (cause) {
       throw new AccountsError("http", `http: ${cause}`, { cause });
     }

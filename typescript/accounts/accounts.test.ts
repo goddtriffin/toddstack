@@ -19,6 +19,17 @@ import {
 } from "./mod.ts";
 import { base64url, utf8 } from "./encoding.ts";
 import { Keys } from "./jwks.ts";
+import { type RetryPolicy, send } from "./retry.ts";
+
+// Retries as READ does them, with millisecond pauses so the tests stay fast.
+const FAST: RetryPolicy = {
+  attempts: 3,
+  attemptTimeoutMs: 500,
+  baseDelayMs: 10,
+  maxDelayMs: 20,
+  maxRetryAfterMs: 2_000,
+  budgetMs: 4_000,
+};
 
 const config = toddgriffin("boggledygook", "s3cret", "https://www.boggledygook.com/auth/callback");
 
@@ -421,7 +432,7 @@ async function rotatingKeys() {
     await new Promise((resolve) => setTimeout(resolve, 10)); // slow enough that concurrent lookups overlap
     return state.status === 200 ? Response.json(state.published) : new Response("down", { status: state.status });
   };
-  const keys = Keys.remote("https://accounts.example/oidc/jwks", fetcher, () => state.clock);
+  const keys = Keys.remote("https://accounts.example/oidc/jwks", fetcher, () => state.clock, FAST);
   return { keys, state, publishNew: () => state.published.keys.push(newKey) };
 }
 
@@ -457,7 +468,8 @@ Deno.test("a failed refetch still counts against the minute", async () => {
   state.status = 503;
   assertEquals((await assertRejects(() => keys.get("k2"), AccountsError)).kind, "http");
   assertEquals((await assertRejects(() => keys.get("k2"), AccountsError)).kind, "invalid_token");
-  assertEquals(state.hits, 2);
+  // The first fetch, then one refetch of three attempts (a 503 is retried); the second lookup fetches nothing.
+  assertEquals(state.hits, 4);
   await keys.get("k1");
 });
 
@@ -479,7 +491,8 @@ Deno.test("concurrent lookups share one fetch, and its failure", async () => {
   down.state.status = 503;
   const results = await Promise.allSettled(Array.from({ length: 8 }, () => down.keys.get("k1")));
   assertEquals(results.map((r) => r.status), Array(8).fill("rejected"));
-  assertEquals(down.state.hits, 1);
+  // One shared fetch: its three attempts, not three per caller.
+  assertEquals(down.state.hits, 3);
 });
 
 Deno.test("blocks and reports reach the service with the right credentials", async () => {
@@ -535,4 +548,90 @@ Deno.test("accountUrl tags links with the client", () => {
   );
   const local = { issuer: "http://localhost:8790/oidc/", clientId: "a b", clientSecret: null, redirectUri: "" };
   assertEquals(accountUrl(local, "/account"), "http://localhost:8790/account?client=a%20b");
+});
+
+// A server that answers each request with the next scripted response, and records the methods it saw.
+function scripted(...responses: (() => Response)[]) {
+  const seen: string[] = [];
+  const fetcher = (input: RequestInfo | URL, init?: RequestInit) => {
+    seen.push(new Request(input, init).method);
+    const next = responses[Math.min(seen.length, responses.length) - 1];
+    return Promise.resolve(next());
+  };
+  return { fetcher: fetcher as typeof fetch, seen };
+}
+const status = (code: number, headers: HeadersInit = {}) => () => new Response("x", { status: code, headers });
+
+Deno.test("a GET is retried after a 503 and returns the success", async () => {
+  const { fetcher, seen } = scripted(status(503), () => Response.json({ ok: true }));
+  const response = await send(fetcher, "https://accounts.example/x", {}, FAST);
+  assertEquals([response.status, seen.length], [200, 2]);
+});
+
+Deno.test("a GET gives up after the last attempt and returns its answer", async () => {
+  const { fetcher, seen } = scripted(status(502));
+  assertEquals((await send(fetcher, "https://accounts.example/x", {}, FAST)).status, 502);
+  assertEquals(seen.length, 3);
+});
+
+Deno.test("a 400 is an answer, not retried", async () => {
+  const { fetcher, seen } = scripted(status(400), status(200));
+  assertEquals((await send(fetcher, "https://accounts.example/x", {}, FAST)).status, 400);
+  assertEquals(seen.length, 1);
+});
+
+Deno.test("a POST is sent once, even on a 503", async () => {
+  const { fetcher, seen } = scripted(status(503), status(200));
+  const response = await send(fetcher, "https://accounts.example/x", { method: "POST", body: "a=1" }, FAST);
+  assertEquals([response.status, seen], [503, ["POST"]]);
+});
+
+Deno.test("a network error on a GET is retried", async () => {
+  let calls = 0;
+  const fetcher =
+    (() =>
+      ++calls === 1
+        ? Promise.reject(new TypeError("connection refused"))
+        : Promise.resolve(Response.json({}))) as typeof fetch;
+  assertEquals((await send(fetcher, "https://accounts.example/x", {}, FAST)).status, 200);
+  assertEquals(calls, 2);
+});
+
+Deno.test("Retry-After is honoured up to the cap, and a longer one stops retrying", async () => {
+  const short = scripted(status(429, { "retry-after": "1" }), status(200));
+  const started = Date.now();
+  assertEquals((await send(short.fetcher, "https://accounts.example/x", {}, FAST)).status, 200);
+  assert(Date.now() - started >= 950, "waited out the Retry-After");
+  assertEquals(short.seen.length, 2);
+
+  const long = scripted(status(503, { "retry-after": "30" }), status(200));
+  const quick = Date.now();
+  assertEquals((await send(long.fetcher, "https://accounts.example/x", {}, FAST)).status, 503);
+  assert(Date.now() - quick < 500, "did not wait 30 s");
+  assertEquals(long.seen.length, 1);
+});
+
+Deno.test("friends reads retry through Accounts; writes and refresh do not", async () => {
+  const seen: string[] = [];
+  let failNext = 0;
+  const accounts = new Accounts(config, {
+    keys: jwks,
+    fetch: (input, init) => {
+      const req = new Request(input, init);
+      seen.push(`${req.method} ${new URL(req.url).pathname}`);
+      if (failNext > 0) {
+        failNext--;
+        return Promise.resolve(new Response("down", { status: 503 }));
+      }
+      return Promise.resolve(Response.json({ friends: [] }));
+    },
+  });
+  failNext = 1;
+  await accounts.friends("at1").list();
+  assertEquals(seen, ["GET /api/v1/friends", "GET /api/v1/friends"]);
+
+  seen.length = 0;
+  failNext = 1;
+  await assertRejects(() => accounts.refresh("rt1"), AccountsError);
+  assertEquals(seen, ["POST /oidc/token"]);
 });
