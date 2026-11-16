@@ -3360,12 +3360,14 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "toddstack-accounts"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
+ "axum",
  "base64 0.23.1",
  "getrandom 0.4.3",
  "hex",
  "hmac",
+ "http-body-util",
  "jsonwebtoken",
  "p256",
  "reqwest",
@@ -3375,6 +3377,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "tower",
  "url",
 ]
 

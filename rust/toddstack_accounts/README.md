@@ -145,6 +145,55 @@ request"): it shows in every project, is one item read everywhere at once, and i
 A block overrides everything (no requests or events either way). Events go to friends' inboxes (`inbox()`),
 and will also go out as push notifications once the native apps exist.
 
+## In-app friend requests
+
+Every project can list, send, accept, decline, cancel, remove, block and unblock friends inside its own web and native
+apps, not only on accounts.toddgriffin.me. Enable the `axum` feature and mount one router; it forwards each call to
+`Friends` with the signed-in person's stored accounts token, so no browser or app ever sees that token. Your login
+needs the `friends` scope.
+
+```toml
+toddstack-accounts = { version = "0.7.0", features = ["axum"] }
+```
+
+```rust
+use toddstack_accounts::friends_router::{self, FriendsAuth};
+
+struct MyAuth { /* your sessions */ }
+impl FriendsAuth for MyAuth {
+    // The caller's accounts access token (refresh it if expired), from your session cookie or the native app's
+    // `Authorization: Bearer` app token. None for a guest or signed-out caller (they get 401).
+    async fn access_token(&self, headers: &axum::http::HeaderMap) -> Option<String> { /* ... */ }
+    fn public_origin(&self) -> &str { "https://www.boggledygook.com" }
+}
+
+let app = app.merge(friends_router::router(accounts.clone(), std::sync::Arc::new(MyAuth { /* .. */ })));
+```
+
+| route (all JSON) | does |
+|---|---|
+| `GET /api/v1/friends` | `{friends: [Person]}` |
+| `GET /api/v1/friends/requests` | `{incoming: [Person], outgoing: [Person]}` |
+| `POST /api/v1/friends/requests` `{username}` or `{friend_code}` | `{result: requested\|accepted\|already_friends}` |
+| `POST /api/v1/friends/requests/{sub}/accept` and `.../decline` | 204 |
+| `DELETE /api/v1/friends/requests/{sub}` | cancel a request you sent: 204 |
+| `DELETE /api/v1/friends/{sub}` | remove a friend: 204 |
+| `GET /api/v1/friends/relationships?subs=a,b` | `{relationships: {sub: friends\|request_sent\|request_received\|blocked\|none}}`, 1 to 100 subs |
+| `GET /api/v1/friends/blocks` | `{blocked: [Person], hidden: [sub]}` |
+| `POST /api/v1/friends/blocks` `{sub}` | 204 |
+| `DELETE /api/v1/friends/blocks/{sub}` | unblock: 204 |
+
+Errors are `{"error": <code>, "message": <text to show the person>}`: `account_required` (401, a guest or signed-out
+caller: offer sign-in), `session_expired` (401), `cross_site` (403), `missing_scope` (403), `bad_request` (400),
+`refused` (400: not found, blocked, the person's privacy setting, or a limit of 200 pending, 1000 friends; the message
+is deliberately vague so a block or setting can't be probed), `not_found` (404), `rate_limited` (429, 20 requests an
+hour), `accounts_unavailable` (502).
+
+Writes authenticated by a cookie must be same-origin (`Sec-Fetch-Site: same-origin`, else `Origin` equal to
+`public_origin`); a `Bearer` app token (native apps) is exempt, as it is not sent by a forged cross-site request. The
+routes sit beside, not on top of, a project's `/api/v1/app/*` sign-in routes. Your web UI uses the TypeScript
+`FriendsClient`; the Swift and Kotlin SDKs call the same routes (see their READMEs).
+
 ## Notifications
 
 Your server sends notifications as your project (client credentials, so `Config::client_secret` must be set):
@@ -281,7 +330,7 @@ answer was lost has already rotated the token, so a second try would sign the pe
 
 ## Not in this crate
 
-Secrets, session storage and HTTP routes stay in your app, so the crate works with any framework.
+Secrets and session storage stay in your app. HTTP routes do too, except the optional `friends_router` (feature `axum`), which asks your app who the caller is.
 
 ## Local mode
 
@@ -294,6 +343,8 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 **Issuer match:** the issuer must exactly match the local server's `ACCOUNTS_BASE_URL`. If you run accounts on `http://localhost:8790` (needed for passkeys), use `toddgriffin_at("http://localhost:8790", ..)`, not the `127.0.0.1` default.
 
 ## Breaking changes
+
+**0.7.0**: no breaking changes. Added the `axum` feature and `friends_router`.
 
 **0.6.0**: `Accounts::new` and `Accounts::with_keys` now return `Error::Config` for an `http` issuer that is not
 loopback (it was accepted). Added `Config::local`, `Config::toddgriffin_at` and `LOCAL_BASE_URL`.

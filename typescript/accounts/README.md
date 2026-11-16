@@ -161,6 +161,29 @@ Also `requests`, `requestByCode`, `accept`, `decline`, `cancel`, `remove`, `bloc
 every project, is one item read everywhere at once, and is never muted or dropped. `postEventResult` returns
 `{ delivered, dropped, counts }` where `postEvent` returns only `delivered`.
 
+## In-app friend requests (browser)
+
+`FriendsClient` calls the friends routes your Rust server mounts with `friends_router` (full table in the Rust README),
+from your own UI. Same origin, with the session cookie by default; the accounts token stays on your server.
+
+```ts
+import { FriendsClient, FriendsClientError } from "@todd/toddstack-accounts";
+
+const friends = new FriendsClient(); // { base?, fetch?, headers? }
+const { incoming, outgoing } = await friends.requests();
+try {
+  await friends.requestByUsername("alex"); // "requested" | "accepted" | "already_friends"
+} catch (e) {
+  if (e instanceof FriendsClientError && e.code === "account_required") showSignIn(); // a guest
+  else if (e instanceof FriendsClientError) showToast(e.message); // already worded for the person
+}
+```
+
+Also `list`, `requestByCode`, `accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `blocks`, and
+`relationships(subs)`. Use `Person`, `Requests`, `Blocks`, `Sent` and `Relationship` for the models. Unlike
+`accounts.friends(token)` (server to accounts), this never holds a token. Gap: the router itself is Rust-only; a
+TypeScript server mounts its own routes over `accounts.friends(token)`.
+
 ## Notifications
 
 Your server sends notifications as your project (client credentials, so the config needs its client secret):
@@ -310,6 +333,8 @@ is accepted only for `127.0.0.1`, `localhost` and `::1`; any other `http` base o
 default.
 
 ## Breaking changes
+
+**0.7.0**: no breaking changes. Added `FriendsClient` and `FriendsClientError`.
 
 **0.6.0**: `new Accounts(config)` now throws `kind: "config"` for an `http` issuer that is not loopback (it was
 accepted). Added `localConfig`, `toddgriffinAt` and `LOCAL_BASE_URL`.

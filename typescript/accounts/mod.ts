@@ -36,6 +36,7 @@ export {
   type Sent,
   type Unread,
 } from "./friends.ts";
+export { FriendsClient, FriendsClientError, type FriendsClientOptions } from "./friends-client.ts";
 export type { Jwk, JwkSet } from "./jwks.ts";
 export type { Counts, Notification, Outcome, Receipt, Recipient, SendStatus } from "./notifications.ts";
 export { type GuestReport, MAX_NOTE_CHARS, type Reason } from "./report.ts";

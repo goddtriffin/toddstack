@@ -44,6 +44,16 @@ one adds the feature to the others in the same change, or names the gap in both 
 New languages (Kotlin, ...) get their own top-level directory when the
 first project needs one.
 
+## How a project adds in-app friend requests
+
+1. **Server (Rust):** enable `toddstack-accounts`'s `axum` feature, implement `FriendsAuth` over your sessions (the
+   caller's accounts access token, or `None` for a guest), and `app.merge(friends_router::router(accounts, auth))`.
+   Request the `friends` scope at login. Routes: `/api/v1/friends/...` (table in the Rust README).
+2. **Web:** `new FriendsClient()` from `@todd/toddstack-accounts`, then build the lists and buttons in your own UI.
+3. **iOS / Android:** `FriendsClient(accounts:)` (Swift) or `Friends(accounts)` (Kotlin), which sign calls with the
+   session the app already holds. Guests get `account_required`: show the sign-in upsell.
+4. Show `message` from any error to the person as is; it is already worded for them.
+
 ## Working on this repo
 
 Everything runs from the repo root through the `Makefile` (`make help`).
