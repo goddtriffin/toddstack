@@ -18,7 +18,7 @@ for consumers of the published crate — so the cost of skipping it is not visib
 at the time you skip it.
 
 This repo is **toddstack**: shared code for all of Todd's projects, one
-top-level directory per language (`rust/`, `swift/`, `typescript/`). The root `README.md`
+top-level directory per language (`rust/`, `swift/`, `kotlin/`, `typescript/`). The root `README.md`
 maps the packages; each package's own README (`rust/README.md`,
 `typescript/README.md`) is its consumer-facing reference: keep it current as
 part of any feature change. Run everything from the repo root via the
