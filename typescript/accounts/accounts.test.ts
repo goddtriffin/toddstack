@@ -7,12 +7,15 @@ import {
   hasScope,
   isKnownWebhookEventType,
   type JwkSet,
+  LOCAL_BASE_URL,
+  localConfig,
   parseCallback,
   pkceChallenge,
   postLogoutTarget,
   safeReturnTo,
   startLogin,
   toddgriffin,
+  toddgriffinAt,
   verifyWebhook,
   VERSION,
   WEBHOOK_EVENT_TYPES,
@@ -1050,4 +1053,39 @@ Deno.test("notificationStatus percent-encodes the id", async () => {
   const { fetcher, calls } = recording(Response.json(DONE));
   await new Accounts(config, { keys: jwks, fetch: fetcher }).notificationStatus("a/b?c");
   assertEquals(calls[0].path.endsWith("/notifications/a%2Fb%3Fc"), true);
+});
+
+Deno.test("local mode derives everything from the local base", () => {
+  const c = localConfig("app", null, "http://127.0.0.1:8992/auth/callback");
+  assertEquals(LOCAL_BASE_URL, "http://127.0.0.1:8790");
+  assertEquals(c.issuer, "http://127.0.0.1:8790/oidc");
+  assertEquals(accountUrl(c, "/account"), "http://127.0.0.1:8790/account?client=app");
+  new Accounts(c);
+});
+
+Deno.test("a base URL overrides the issuer", () => {
+  assertEquals(toddgriffinAt("http://localhost:9000/", "app", null, "x").issuer, "http://localhost:9000/oidc");
+  assertEquals(toddgriffinAt("http://[::1]:9000", "app", null, "x").issuer, "http://[::1]:9000/oidc");
+  assertEquals(
+    toddgriffinAt("https://staging.example.com", "app", null, "x").issuer,
+    "https://staging.example.com/oidc",
+  );
+});
+
+Deno.test("http off loopback is rejected", () => {
+  for (
+    const base of [
+      "http://accounts.toddgriffin.me",
+      "http://10.0.2.2:8790",
+      "http://192.168.1.5:8790",
+      "http://127.0.0.1.evil.example",
+      "ftp://127.0.0.1",
+      "nonsense",
+    ]
+  ) {
+    const error = assertThrows(() => toddgriffinAt(base, "app", null, "x"), AccountsError, "", base);
+    assertEquals(error.kind, "config");
+  }
+  const hand = { issuer: "http://accounts.example.com/oidc", clientId: "app", clientSecret: null, redirectUri: "" };
+  assertThrows(() => new Accounts(hand), AccountsError);
 });

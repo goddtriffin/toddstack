@@ -1,8 +1,24 @@
 import Foundation
 
+/// Whether `url` has a host and is https, or http on a loopback host (`127.0.0.1`, `localhost`, `::1`): the only
+/// plain-http URLs the SDK accepts, so local testing never needs production and nothing else goes over the wire
+/// unencrypted.
+func isAllowedBaseURL(_ url: URL) -> Bool {
+    guard let host = url.host?.lowercased(), !host.isEmpty else { return false }
+    switch url.scheme?.lowercased() {
+    case "https": return true
+    case "http": return ["127.0.0.1", "localhost", "::1"].contains(host)
+    default: return false
+    }
+}
+
 /// Where a native app signs in. The app talks only to its project's server, never to the accounts service.
 public struct AccountsConfig: Sendable, Equatable {
-    /// The project server that implements the `/app/sign-in` contract, for example `https://www.boggledygook.com`.
+    /// The accounts site running locally. Local testing never touches production: see `local(...)`.
+    public static let localAccountsBaseURL: URL = URL(string: "http://127.0.0.1:8790")!
+
+    /// The project server that implements the `/app/sign-in` contract, for example `https://www.boggledygook.com`
+    /// (locally, `http://127.0.0.1:8992`).
     public let serverURL: URL
     /// The https URL the server redirects to after sign-in. Must be claimed by the app (Associated Domains).
     public let callbackURL: URL
@@ -11,23 +27,37 @@ public struct AccountsConfig: Sendable, Equatable {
     /// Your project's client id; tags every link to the accounts site.
     public let clientId: String
 
-    /// Throws `AccountsError.config` unless both `serverURL` and `callbackURL` are https URLs with a host.
+    /// Throws `AccountsError.config` unless `callbackURL` is an https URL with a host, and `serverURL` and
+    /// `accountsBaseURL` are https URLs with a host, or http on a loopback host (`127.0.0.1`, `localhost`, `::1`).
+    /// Local testing: pass a loopback `serverURL` (and `accountsBaseURL`), or use `local(...)`. The app itself must
+    /// allow cleartext to loopback: iOS needs `NSAllowsLocalNetworking` in its ATS settings (see the README).
     public init(
         serverURL: URL,
         callbackURL: URL,
         accountsBaseURL: URL = URL(string: "https://accounts.toddgriffin.me")!,
         clientId: String
     ) throws {
-        for (name, url) in [("serverURL", serverURL), ("callbackURL", callbackURL), ("accountsBaseURL", accountsBaseURL)] {
-            guard url.scheme?.lowercased() == "https", let host = url.host, !host.isEmpty else {
-                throw AccountsError.config("\(name) must be an https URL with a host")
+        for (name, url) in [("serverURL", serverURL), ("accountsBaseURL", accountsBaseURL)] {
+            guard isAllowedBaseURL(url) else {
+                throw AccountsError.config("\(name) must be an https URL with a host (http only on loopback)")
             }
+        }
+        guard callbackURL.scheme?.lowercased() == "https", let host = callbackURL.host, !host.isEmpty else {
+            throw AccountsError.config("callbackURL must be an https URL with a host")
         }
         guard !clientId.isEmpty else { throw AccountsError.config("clientId must not be empty") }
         self.serverURL = serverURL
         self.callbackURL = callbackURL
         self.accountsBaseURL = accountsBaseURL
         self.clientId = clientId
+    }
+
+    /// A config for local testing: your project's server on your machine (for example `http://127.0.0.1:8992`)
+    /// and the accounts site at `localAccountsBaseURL`.
+    public static func local(serverURL: URL, callbackURL: URL, clientId: String) throws -> AccountsConfig {
+        try AccountsConfig(
+            serverURL: serverURL, callbackURL: callbackURL, accountsBaseURL: localAccountsBaseURL, clientId: clientId
+        )
     }
 
     /// `path` on the accounts site tagged with your client:

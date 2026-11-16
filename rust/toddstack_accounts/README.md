@@ -283,7 +283,18 @@ answer was lost has already rotated the token, so a second try would sign the pe
 
 Secrets, session storage and HTTP routes stay in your app, so the crate works with any framework.
 
+## Local mode
+
+Local testing never touches production. `Config::local(client_id, secret, redirect_uri)` points at the accounts
+service on your machine (`LOCAL_BASE_URL`, `http://127.0.0.1:8790`); `Config::toddgriffin_at(base_url, ..)` takes any
+base. The issuer is `<base>/oidc`, and the JWKS, authorize, token, end-session, API (`/api/v1`) and account links all
+derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; any other `http` base or issuer is
+`Error::Config` (from `toddgriffin_at` and `Accounts::new`).
+
 ## Breaking changes
+
+**0.6.0**: `Accounts::new` and `Accounts::with_keys` now return `Error::Config` for an `http` issuer that is not
+loopback (it was accepted). Added `Config::local`, `Config::toddgriffin_at` and `LOCAL_BASE_URL`.
 
 **0.5.0**: `Error` is now `#[non_exhaustive]` and has a `Conflict` variant, so a 409 from a project call is
 `Error::Conflict` (it was `Error::Api { status: 409, .. }`). Add a wildcard arm to exhaustive matches.

@@ -12,7 +12,7 @@ accounts web flow for it. Swift 6, iOS 17.4+ / macOS 14.4+, no third-party depen
 Swift Package Manager, from the repository URL (the manifest is `Package.swift` at the repo root):
 
 ```swift
-.package(url: "https://github.com/goddtriffin/toddstack", from: "0.5.0")  // see Releases
+.package(url: "https://github.com/goddtriffin/toddstack", from: "0.6.0")  // see Releases
 // target dependency:
 .product(name: "ToddstackAccounts", package: "toddstack")
 ```
@@ -120,6 +120,27 @@ Your server then calls `registerDevice` (and `unregisterDevice` on sign-out) in 
 `ToddstackAccountsTesting` has `MockAccountsTransport` and `MockWebAuthenticator`. Seed responses by argument value
 (`seedSend(_:response:)`, `seedAuthenticate(url:callbackURL:response:)`); an unseeded call traps, and each test that seeds
 anything ends with `verifyExhausted()`. Inject `random:` to make `state` and the PKCE verifier deterministic.
+
+## Local mode
+
+Local testing never touches production: every base URL is yours to set. `serverURL` and `accountsBaseURL` accept
+`http` on loopback (`127.0.0.1`, `localhost`, `::1`) and nowhere else (`AccountsError.config`);
+`AccountsConfig.local(serverURL:callbackURL:clientId:)` also points `accountsBaseURL` at
+`AccountsConfig.localAccountsBaseURL` (`http://127.0.0.1:8790`). The sign-out URL your server returns follows the same
+rule. `callbackURL` stays an https Universal Link.
+
+```swift
+let config = try AccountsConfig.local(
+    serverURL: URL(string: "http://127.0.0.1:8992")!, callbackURL: callback, clientId: "boggledygook")
+```
+
+The library does not touch your app's settings. For cleartext to loopback, the app adds to its Info.plist (for debug
+builds):
+
+```xml
+<key>NSAppTransportSecurity</key>
+<dict><key>NSAllowsLocalNetworking</key><true/></dict>
+```
 
 ## Develop
 

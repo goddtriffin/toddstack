@@ -1,4 +1,4 @@
-# JitPack builds the Kotlin SDK from a bare repo tag (e.g. 0.5.0); the Gradle build lives in kotlin/.
+# JitPack builds the Kotlin SDK from a bare repo tag (e.g. 0.6.0); the Gradle build lives in kotlin/.
 # The Gradle wrapper pins Gradle; the SDK platform and build tools are installed here in case the image lacks them.
 jdk:
   - openjdk17

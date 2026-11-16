@@ -62,4 +62,8 @@ pub use tokens::{AccessClaims, Accounts, Config, IdClaims, SignedIn, TokenSet};
 /// The production issuer. Permanent: every app and passkey depends on it.
 pub const ISSUER: &str = "https://accounts.toddgriffin.me/oidc";
 
+/// The accounts service running locally. Local testing never touches production:
+/// use [`Config::local`] or [`Config::toddgriffin_at`].
+pub const LOCAL_BASE_URL: &str = "http://127.0.0.1:8790";
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
