@@ -130,8 +130,7 @@ pub struct Event {
     pub kind: EventKind,
     pub created_at: i64,
     /// Always has `sub`; `session.signed_out` adds `sid`; `user.updated` adds the fields that changed, and the
-    /// friendship events add `friend_sub`, and the friend request events add
-    /// `from_sub` and `to_sub`.
+    /// friendship events add `friend_sub`, and the friend request events add `from_sub` and `to_sub`.
     pub data: Value,
 }
 
