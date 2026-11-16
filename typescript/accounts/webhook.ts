@@ -62,8 +62,8 @@ export interface WebhookEvent {
   /** Unix seconds. */
   createdAt: number;
   /**
-   * Always has `sub` (the person the event is about); `session.signed_out` adds `sid`; `user.updated` adds the fields that changed, and the
-   * friendship events add `friend_sub` (the other person), and the friend request events add `from_sub` (who
+   * Always has `sub` (the person the event is about); `session.signed_out` adds `sid`; `user.updated` adds the fields that
+   * changed, and the friendship events add `friend_sub` (the other person), and the friend request events add `from_sub` (who
    * asked) and `to_sub` (who was asked).
    */
   data: {

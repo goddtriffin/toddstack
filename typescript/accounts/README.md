@@ -93,7 +93,8 @@ What a project must do:
   `session.signed_out`. `sid` is `undefined` on tokens issued before the service added it.
 - Register a post-logout redirect URI for your client, exactly (Todd runs
   `accounts-service admin client update ... --logout <URI>` or uses the admin UI). An unregistered or off-site one is
-  dropped (`postLogoutTarget` returns null) and the person stays on the accounts "You're signed out" page.
+  dropped (`postLogoutTarget` returns null). The service skips its "Sign out?" confirm page only when the ID token hint
+  is valid and the redirect URI is registered (or absent). Otherwise the person sees the confirm page.
 - Handle `session.signed_out` and `user.signed_out` (see Webhooks).
 
 ## Webhooks

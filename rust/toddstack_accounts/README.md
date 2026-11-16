@@ -77,8 +77,9 @@ What a project must do:
 - Keep `tokens.id_token` (the raw string) and `claims.sid` with your session, to pass as the hint and to match
   `session.signed_out`. `sid` is `None` on tokens issued before the service added it.
 - Register a post-logout redirect URI for your client, exactly (Todd runs
-  `accounts-service admin client update ... --logout <URI>` or uses the admin UI). An unregistered or off-site one is
-  dropped and the person stays on the accounts "You're signed out" page.
+  `accounts-service admin client update ... --logout <URI>` or uses the admin UI). The service skips its "Sign out?" confirm
+  page only when the ID token hint is valid and the redirect URI is registered (or absent). Otherwise the person sees
+  the confirm page.
 - Handle `session.signed_out` and `user.signed_out` (see Webhooks).
 
 ## Webhooks
@@ -141,7 +142,7 @@ badge. An item with `client_id: None` is an account-level item from the service 
 request"): it shows in every project, is one item read everywhere at once, and is never muted or dropped.
 `post_event_result` returns `EventResult { delivered, dropped, counts }` where `post_event` returns only `delivered`.
 
-A block overrides everything (no requests, invite links or events either way). Events go to friends' inboxes (`inbox()`),
+A block overrides everything (no requests or events either way). Events go to friends' inboxes (`inbox()`),
 and will also go out as push notifications once the native apps exist.
 
 ## Notifications

@@ -482,7 +482,14 @@ Deno.test("signOut revokes the refresh token and returns the end-session URL", a
 });
 
 Deno.test("signOut carries the hint, redirect and state, and localOnly gives no URL", async () => {
-  const accounts = new Accounts(config, { keys: jwks, fetch: () => Promise.resolve(new Response(null)) });
+  const seen: string[] = [];
+  const accounts = new Accounts(config, {
+    keys: jwks,
+    fetch: (input, init) => {
+      seen.push(new URL(new Request(input, init).url).pathname);
+      return Promise.resolve(new Response(null));
+    },
+  });
   const { url } = await accounts.signOut("rt1", { idTokenHint: "a.b.c", postLogoutRedirectUri: "/bye", state: "s1" });
   const params = Object.fromEntries(new URL(url!).searchParams);
   assertEquals(params, {
@@ -492,8 +499,10 @@ Deno.test("signOut carries the hint, redirect and state, and localOnly gives no 
     state: "s1",
   });
   assertEquals(new URL(url!).origin + new URL(url!).pathname, `${config.issuer}/session/end`);
+  seen.length = 0;
   const local = await accounts.signOut("rt1", { idTokenHint: "a.b.c", localOnly: true });
   assertEquals(local, { url: null, revokeError: null });
+  assertEquals(seen, ["/oidc/token/revocation"]);
 });
 
 Deno.test("the browser session id is exposed when the ID token carries one", async () => {

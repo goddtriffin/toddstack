@@ -202,8 +202,8 @@ export class Accounts {
   /**
    * Signs out in one call: revokes `refreshToken` (if you hold one) and builds the end-session URL. End your own
    * session first, then redirect to `url`: that signs the person out of the accounts service and so of every project
-   * in that browser. Set `localOnly` to sign out of your app alone (`url` is null). A failed revoke doesn't stop sign-out: it comes back as
-   * `revokeError`.
+   * in that browser. Set `localOnly` to sign out of your app alone (`url` is null). A failed revoke doesn't stop
+   * sign-out: it comes back as `revokeError`.
    */
   async signOut(refreshToken: string | null, options: LogoutOptions = {}): Promise<SignOut> {
     let revokeError: AccountsError | null = null;
