@@ -13,6 +13,7 @@ published on its own and documented in its own README.
 | `flyball` | Rust | [crates.io](https://crates.io/crates/flyball) | [`rust/flyball/README.md`](rust/flyball/README.md) |
 | `toddstack-accounts` | Rust | [crates.io](https://crates.io/crates/toddstack-accounts) | [`rust/toddstack_accounts/README.md`](rust/toddstack_accounts/README.md) |
 | `toddstack-accounts` | TypeScript | [JSR](https://jsr.io/@todd/toddstack-accounts) `@todd/toddstack-accounts`, [npm](https://www.npmjs.com/package/toddstack-accounts) `toddstack-accounts` | [`typescript/accounts/README.md`](typescript/accounts/README.md) |
+| `ToddstackAccounts` | Swift | SwiftPM, `https://github.com/goddtriffin/toddstack` (product `ToddstackAccounts`) | [`swift/accounts/README.md`](swift/accounts/README.md) |
 | `template-web-server` | Rust | not published; Docker image for several sites | [`rust/template_web_server/`](rust/template_web_server/) |
 
 ## Layout
@@ -23,6 +24,8 @@ rust/              Cargo workspace: every Rust crate
   template_web_server/   a complete site built on it (crate + html/ + static/ + Dockerfile)
   flyball/               keyed rate limiting: one trait, in-memory and mock implementations
   toddstack_accounts/    client for the shared accounts: sign-in, tokens, webhooks, friends
+swift/             Swift package (Package.swift at the repo root points here): native-app sign-in
+  accounts/              ToddstackAccounts for iOS and macOS apps (client of the project server's /app contract)
 typescript/        JSR packages (deno.jsonc is the package config)
   webserver-base/        the browser/build-side half of webserver-base
   accounts/              toddstack-accounts for TypeScript (own deno.jsonc + package.json: JSR and npm)
@@ -35,7 +38,7 @@ behaves the same whatever it is written in. Each one is written idiomatically fo
 async style and internals follow that language), but no language gets a feature the others lack. A change to
 one adds the feature to the others in the same change, or names the gap in both READMEs.
 
-New languages (Swift, Kotlin, ...) get their own top-level directory when the
+New languages (Kotlin, ...) get their own top-level directory when the
 first project needs one.
 
 ## Working on this repo
