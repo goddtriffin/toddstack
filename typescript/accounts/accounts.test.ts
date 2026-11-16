@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertNotEquals, assertRejects } from "@std/assert";
+import { assert, assertEquals, assertNotEquals, assertRejects, assertThrows } from "@std/assert";
 import {
   Accounts,
   AccountsError,
@@ -18,6 +18,7 @@ import {
   WEBHOOK_EVENT_TYPES,
 } from "./mod.ts";
 import { base64url, utf8 } from "./encoding.ts";
+import { readReceipt } from "./notifications.ts";
 import { Keys } from "./jwks.ts";
 import { type RetryPolicy, send } from "./retry.ts";
 
@@ -28,6 +29,7 @@ const FAST: RetryPolicy = {
   baseDelayMs: 10,
   maxDelayMs: 20,
   maxRetryAfterMs: 2_000,
+  retry429: true,
   budgetMs: 4_000,
 };
 
@@ -903,4 +905,43 @@ Deno.test("friends reads retry through Accounts; writes and refresh do not", asy
   failNext = 1;
   await assertRejects(() => accounts.refresh("rt1"), AccountsError);
   assertEquals(seen, ["POST /oidc/token"]);
+});
+
+Deno.test("a receipt with an unknown status or result reads as unknown, and one without an id is an api error", () => {
+  const receipt = readReceipt({ id: "b9", status: "paused", recipients: 1, counts: {}, result: "snoozed" });
+  assertEquals([receipt.status, receipt.result], ["unknown", "unknown"]);
+  const e = assertThrows(() => readReceipt({ status: "done" }), AccountsError);
+  assertEquals([e.kind, e.status], ["api", 200]);
+});
+
+Deno.test("a 429 is final for a keyed send and for notification status, and a 5xx is still retried", async () => {
+  const keyed = recording(new Response("slow", { status: 429 }), Response.json(DONE, { status: 202 }));
+  const e = await assertRejects(
+    () =>
+      new Accounts(config, { keys: jwks, fetch: keyed.fetcher }).sendNotification({
+        recipient: { user: "u1" },
+        type: "k",
+        title: "t",
+        idempotencyKey: "k1",
+      }),
+    AccountsError,
+  );
+  assertEquals([e.kind, keyed.calls.length], ["rate_limited", 1]);
+
+  const poll = recording(new Response("slow", { status: 429 }), Response.json(DONE));
+  const e2 = await assertRejects(
+    () => new Accounts(config, { keys: jwks, fetch: poll.fetcher }).notificationStatus("b1"),
+    AccountsError,
+  );
+  assertEquals([e2.kind, poll.calls.length], ["rate_limited", 1]);
+
+  const flaky = recording(new Response("down", { status: 503 }), Response.json(DONE));
+  const ok = await new Accounts(config, { keys: jwks, fetch: flaky.fetcher }).notificationStatus("b1");
+  assertEquals([ok.id, flaky.calls.length], ["b1", 2]);
+});
+
+Deno.test("notificationStatus percent-encodes the id", async () => {
+  const { fetcher, calls } = recording(Response.json(DONE));
+  await new Accounts(config, { keys: jwks, fetch: fetcher }).notificationStatus("a/b?c");
+  assertEquals(calls[0].path.endsWith("/notifications/a%2Fb%3Fc"), true);
 });

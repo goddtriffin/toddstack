@@ -155,7 +155,7 @@ let later = accounts.notification_status(&receipt.id).await?; // poll a fan-out'
 ```
 
 - **Always set `idempotency_key`** (a date or game id). A retry with the same key gets the recorded send back
-  (`replayed: true`) and sends nothing; the same key with a different request is `Error::Unprocessable` (422).
+  (`replayed: true`) and sends nothing; the same key with a different request, or a field the service can't parse, is `Error::Unprocessable` (422).
 - There are **no caps and no quiet hours**: every notification is delivered, one per friend who finishes a daily. The
   phone's own Focus handles quiet time. Only a runaway guard (over 100 to one player in an hour) drops the rest, counted
   as `dropped_runaway`.
@@ -232,7 +232,7 @@ longer one ends the retries. No retry starts after 6 s. A 4xx is an answer and i
 
 A notification send is retried too, but only when it carries an `idempotency_key` (two more attempts, each with a 10 s
 deadline, no retry after 15 s): the service replays the recorded send, so a retry cannot notify twice. Without a key it
-is sent once.
+is sent once. A 429 is never retried here (nor on `notification_status`): the service's limits are hourly and send no `Retry-After`, so another try would fail too. A malformed status id is a 400 (`Error::Api`).
 
 Everything else is sent exactly once: the code exchange (a code is single-use), refresh (a refresh that landed but whose
 answer was lost has already rotated the token, so a second try would sign the person out), revocation, and every write

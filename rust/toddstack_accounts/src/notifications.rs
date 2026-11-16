@@ -215,7 +215,7 @@ impl Accounts {
         let response: reqwest::Response = if keyed {
             retry::execute_keyed(self.http(), request, &RetryPolicy::KEYED_SEND).await?
         } else {
-            retry::execute(self.http(), request, &RetryPolicy::READ).await?
+            retry::execute(self.http(), request, &RetryPolicy::NOTIFICATION_STATUS).await?
         };
         let status: reqwest::StatusCode = response.status();
         let text: String = response.text().await?;
@@ -241,8 +241,8 @@ impl Accounts {
     /// # Errors
     /// [`Error::Config`] without a client secret; [`Error::NotFound`] when
     /// the named player never signed in to your project;
-    /// [`Error::Unprocessable`] when the same idempotency key was used for a
-    /// different request; [`Error::RateLimited`] (6000 requests an hour, 10
+    /// [`Error::Unprocessable`] for the same idempotency key with a different
+    /// request, or a field the service can't parse; [`Error::RateLimited`] (6000 requests an hour, 10
     /// fan-outs an hour); [`Error::Api`] for a bad request (400) or anything
     /// else; or the request failed.
     pub async fn send_notification(&self, notification: &Notification) -> Result<Receipt> {
@@ -295,9 +295,10 @@ impl Accounts {
     ///
     /// # Errors
     /// [`Error::Config`] without a client secret; [`Error::NotFound`] for an
-    /// unknown id or another project's; [`Error::RateLimited`]; or the request
-    /// failed.
+    /// unknown id or another project's; [`Error::Api`] (400) for a malformed
+    /// id; [`Error::RateLimited`]; or the request failed.
     pub async fn notification_status(&self, id: &str) -> Result<Receipt> {
+        let id: String = encode_path_segment(id);
         receipt(
             self.project_call(
                 reqwest::Method::GET,
@@ -310,6 +311,21 @@ impl Accounts {
     }
 }
 
+/// Percent-encodes everything but what `encodeURIComponent` leaves alone, so
+/// an id can never add path segments or a query.
+fn encode_path_segment(segment: &str) -> String {
+    let mut encoded: String = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push_str(&hex::encode_upper([byte]));
+        }
+    }
+    encoded
+}
+
 fn receipt(value: Value) -> Result<Receipt> {
     serde_json::from_value(value).map_err(|e| Error::Api {
         status: 200,
@@ -320,6 +336,13 @@ fn receipt(value: Value) -> Result<Receipt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_id_is_percent_encoded_so_it_cannot_change_the_path() {
+        let expected: &str = "a%2Fb%3Fc%20d%C3%A9-_.~";
+        let actual: String = encode_path_segment("a/b?c dé-_.~");
+        assert_eq!(expected, actual);
+    }
 
     #[test]
     fn a_notification_serializes_to_the_wire_shape_without_unset_fields() {

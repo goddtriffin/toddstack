@@ -35,7 +35,8 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
     /// A notification call was refused as unprocessable (422): the same
-    /// idempotency key was used for a different request.
+    /// idempotency key with a different request, or a field the service can't
+    /// parse.
     #[error("unprocessable: {0}")]
     Unprocessable(String),
     /// A notification call hit a rate limit (429). Wait before sending again.

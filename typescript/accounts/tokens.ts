@@ -8,7 +8,7 @@ import { endSessionUrl, type LogoutOptions, type SignOut } from "./logout.ts";
 import { type LoginOptions, parseCallback, type PendingLogin, type StartedLogin, startLogin } from "./login.ts";
 import { type Notification, notificationBody, readReceipt, type Receipt } from "./notifications.ts";
 import { type GuestReport, reportBody } from "./report.ts";
-import { KEYED_SEND, READ, type RetryPolicy, send } from "./retry.ts";
+import { KEYED_SEND, NOTIFICATION_STATUS, READ, type RetryPolicy, send } from "./retry.ts";
 import { VERSION } from "./version.ts";
 
 const TYPED_STATUS: Record<number, "not_found" | "unprocessable" | "rate_limited"> = {
@@ -261,7 +261,7 @@ export class Accounts {
    * no quiet hours; `collapseKey` replaces that player's unread item with the same key.
    *
    * Fails with `not_found` (404) when the named player never signed in to your project, `unprocessable` (422)
-   * when the same idempotency key was used for a different request, `rate_limited` (429: 6000 requests an hour,
+   * for the same idempotency key with a different request or a field the service can't parse, `rate_limited` (429: 6000 requests an hour,
    * 10 fan-outs an hour), `api` for a bad request (400), or `config` without a client secret.
    */
   async sendNotification(notification: Notification): Promise<Receipt> {
@@ -283,7 +283,7 @@ export class Accounts {
     return answer.cancelled;
   }
 
-  /** Your project's own send, by `Receipt.id`, with its counts so far. Finished sends are kept 7 days. Fails with `not_found` for an unknown id or another project's. */
+  /** Your project's own send, by `Receipt.id`, with its counts so far. Finished sends are kept 7 days. Fails with `not_found` for an unknown id or another project's, and `api` (400) for a malformed id. */
   async notificationStatus(id: string): Promise<Receipt> {
     return readReceipt(await this.#projectCall("GET", `/notifications/${encodeURIComponent(id)}`));
   }
@@ -319,7 +319,7 @@ export class Accounts {
     const response = await this.#send(
       url,
       { method, headers, body: body === undefined ? undefined : JSON.stringify(body) },
-      options.retryWrites ? KEYED_SEND : READ,
+      options.retryWrites ? KEYED_SEND : options.typedErrors ? NOTIFICATION_STATUS : READ,
       options.retryWrites,
     );
     const text = await response.text();
