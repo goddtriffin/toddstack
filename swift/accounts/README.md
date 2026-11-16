@@ -12,7 +12,7 @@ accounts web flow for it. Swift 6, iOS 17.4+ / macOS 14.4+, no third-party depen
 Swift Package Manager, from the repository URL (the manifest is `Package.swift` at the repo root):
 
 ```swift
-.package(url: "https://github.com/goddtriffin/toddstack", from: "0.4.1")  // see Releases
+.package(url: "https://github.com/goddtriffin/toddstack", from: "0.5.0")  // see Releases
 // target dependency:
 .product(name: "ToddstackAccounts", package: "toddstack")
 ```

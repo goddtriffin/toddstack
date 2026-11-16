@@ -205,7 +205,8 @@ accounts.unregister_device(Platform::Ios, &token_hex).await?; // sign-out; fine 
 - One phone, one person: registering a token that belonged to another player moves it. At most 10 devices are kept per
   player. Both calls are idempotent, so a transient failure is retried.
 - `Error::Conflict` (409): the token is registered to another project. `Error::NotFound` (404): the player never
-  signed in to your project. A malformed token or app id (400) or an unregistered app id (403) is `Error::Api`.
+  signed in to your project. A malformed token or app id (400) or an unregistered app id (403) is `Error::Api`; a `sub` that isn't a UUID or an unknown platform is
+  422 (`Error::Unprocessable`).
 
 ## Friend buttons
 
@@ -281,3 +282,8 @@ answer was lost has already rotated the token, so a second try would sign the pe
 ## Not in this crate
 
 Secrets, session storage and HTTP routes stay in your app, so the crate works with any framework.
+
+## Breaking changes
+
+**0.5.0**: `Error` is now `#[non_exhaustive]` and has a `Conflict` variant, so a 409 from a project call is
+`Error::Conflict` (it was `Error::Api { status: 409, .. }`). Add a wildcard arm to exhaustive matches.

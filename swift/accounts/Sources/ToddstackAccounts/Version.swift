@@ -1,2 +1,2 @@
 /// This library's version; the Swift twin of `VERSION` in the TypeScript package.
-public let toddstackAccountsVersion: String = "0.4.1"
+public let toddstackAccountsVersion: String = "0.5.0"
