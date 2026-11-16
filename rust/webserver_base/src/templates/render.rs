@@ -168,7 +168,7 @@ where
             theme_colors: base.theme_color().tags(),
 
             theme_script: frontend.map_or("", |f| f.theme_script.as_str()),
-            analytics: frontend.map(|f| &f.analytics),
+            analytics: frontend.and_then(|f| f.analytics.as_ref()),
             sentry_browser: frontend.map(|f| &f.sentry_browser),
             feed: frontend.and_then(|f| f.feed.as_ref()),
 
