@@ -30,6 +30,17 @@ pub enum Error {
     /// The API refused a call (status and its `error` message).
     #[error("accounts API returned {status}: {message}")]
     Api { status: u16, message: String },
+    /// A notification call named something that doesn't exist (404): a player
+    /// who never signed in to your project, or an unknown send.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// A notification call was refused as unprocessable (422): the same
+    /// idempotency key was used for a different request.
+    #[error("unprocessable: {0}")]
+    Unprocessable(String),
+    /// A notification call hit a rate limit (429). Wait before sending again.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
     #[error("configuration: {0}")]

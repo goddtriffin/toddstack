@@ -1,7 +1,8 @@
 // Verifying webhooks from the accounts service.
 //
 // Each delivery is a POST with JSON and `X-Accounts-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of
-// "<t>.<raw body>">` under your app's webhook secret. Verify against the raw body, before parsing. Deliveries
+// "<t>.<raw body>">` under your app's webhook secret. While a secret is being rotated the header carries several
+// `v1=` values, one per secret; the event is accepted when any one matches. Verify against the raw body, before parsing. Deliveries
 // can repeat (retries); use the event `id` to ignore duplicates.
 
 import { utf8 } from "./encoding.ts";
@@ -77,7 +78,8 @@ function fromHex(hex: string): Uint8Array<ArrayBuffer> | null {
 }
 
 /**
- * Checks the signature and age, then parses the event. `body` is the raw request body (text or bytes);
+ * Checks the signature and age, then parses the event. An empty secret is refused. The header may carry several
+ * `v1=` signatures (secret rotation): the event is accepted when any one matches `secret`. `body` is the raw request body (text or bytes);
  * `now` is the current Unix time in seconds (a parameter so tests can fix it).
  */
 export async function verifyWebhook(
@@ -86,23 +88,32 @@ export async function verifyWebhook(
   body: string | Uint8Array,
   now: number = Math.floor(Date.now() / 1000),
 ): Promise<WebhookEvent> {
+  if (secret.length === 0) throw reject("empty secret");
   let t: number | null = null;
-  let v1: Uint8Array<ArrayBuffer> | null = null;
+  const candidates: Uint8Array<ArrayBuffer>[] = [];
   for (const part of (signatureHeader ?? "").split(",")) {
     const eq = part.indexOf("=");
     if (eq < 0) continue;
     const [k, value] = [part.slice(0, eq).trim(), part.slice(eq + 1).trim()];
     if (k === "t") t = /^-?\d+$/.test(value) ? Number(value) : null;
-    if (k === "v1") v1 = fromHex(value);
+    if (k === "v1") {
+      const decoded = fromHex(value);
+      if (decoded !== null) candidates.push(decoded);
+    }
   }
-  if (t === null || v1 === null) throw reject("malformed signature header");
+  if (t === null || candidates.length === 0) throw reject("malformed signature header");
   if (Math.abs(now - t) > WEBHOOK_TOLERANCE_SECONDS) throw reject("signature too old (or from the future)");
   const bodyBytes = typeof body === "string" ? utf8(body) : body;
   const signed = new Uint8Array([...utf8(`${t}.`), ...bodyBytes]);
   const keyBytes = typeof secret === "string" ? utf8(secret) : new Uint8Array(secret);
   const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-  // WebCrypto's verify compares in constant time.
-  if (!(await crypto.subtle.verify("HMAC", key, v1, signed))) throw reject("signature mismatch");
+  // WebCrypto's verify compares in constant time. Every candidate is checked, none skipped on a match, so timing
+  // doesn't say which one matched.
+  let matched = false;
+  for (const candidate of candidates) {
+    if (await crypto.subtle.verify("HMAC", key, candidate, signed)) matched = true;
+  }
+  if (!matched) throw reject("signature mismatch");
   let raw: { id?: unknown; type?: unknown; created_at?: unknown; data?: unknown };
   try {
     raw = JSON.parse(new TextDecoder().decode(bodyBytes));

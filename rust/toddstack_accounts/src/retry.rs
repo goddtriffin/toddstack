@@ -9,7 +9,10 @@
 //! refresh that had in fact landed presents a spent token and signs the person
 //! out), revocation, and every `POST`, `PUT` and `DELETE` (a retried event or
 //! friend request that had landed the first time is a duplicate). [`execute`]
-//! enforces this itself, so a caller cannot opt a write in by mistake.
+//! enforces this itself, so a caller cannot opt a write in by mistake. The one
+//! exception is [`execute_keyed`], for a send that carries an idempotency key:
+//! the service replays the recorded answer instead of sending twice, so
+//! retrying it cannot duplicate.
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -45,6 +48,17 @@ impl RetryPolicy {
         max_delay: Duration::from_secs(1),
         max_retry_after: Duration::from_secs(2),
         budget: Duration::from_secs(6),
+    };
+
+    /// A notification send that carries an idempotency key. Its deadline is
+    /// the client's own, since a send to one player is delivered inline.
+    pub(crate) const KEYED_SEND: Self = Self {
+        attempts: 3,
+        attempt_timeout: Duration::from_secs(10),
+        base_delay: Duration::from_millis(200),
+        max_delay: Duration::from_secs(1),
+        max_retry_after: Duration::from_secs(2),
+        budget: Duration::from_secs(15),
     };
 
     /// Full jitter: uniformly random in `[0, min(max_delay, base_delay * 2^(retry - 1))]`,
@@ -114,13 +128,32 @@ pub(crate) async fn execute(
     request: Request,
     policy: &RetryPolicy,
 ) -> reqwest::Result<Response> {
-    if request.method() != Method::GET {
+    run(client, request, policy, false).await
+}
+
+/// Like [`execute`], but retries a write too. Only for a request the service
+/// deduplicates by an idempotency key.
+pub(crate) async fn execute_keyed(
+    client: &Client,
+    request: Request,
+    policy: &RetryPolicy,
+) -> reqwest::Result<Response> {
+    run(client, request, policy, true).await
+}
+
+async fn run(
+    client: &Client,
+    request: Request,
+    policy: &RetryPolicy,
+    retry_writes: bool,
+) -> reqwest::Result<Response> {
+    if request.method() != Method::GET && !retry_writes {
         return client.execute(request).await;
     }
     let started: Instant = Instant::now();
     let mut retry: u32 = 1;
     loop {
-        // A GET has no streaming body, so it always clones.
+        // Neither a GET nor a JSON body is a stream, so it always clones.
         let Some(mut attempt) = request.try_clone() else {
             return client.execute(request).await;
         };
@@ -207,6 +240,36 @@ pub(crate) mod tests {
     }
 
     const NOW: Duration = Duration::ZERO;
+
+    async fn keyed_post_status(server: &Scripted) -> u16 {
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client
+            .post(&server.url)
+            .json(&serde_json::json!({ "idempotency_key": "k1" }))
+            .build()
+            .unwrap();
+        super::execute_keyed(&client, request, &FAST)
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn a_keyed_post_is_retried_on_a_503() {
+        let server: Scripted = Scripted::start(vec![(503, "", NOW), (200, "", NOW)]).await;
+
+        assert_eq!(200, keyed_post_status(&server).await);
+        assert_eq!(2, server.hits());
+    }
+
+    #[tokio::test]
+    async fn a_keyed_post_that_is_refused_is_not_retried() {
+        let server: Scripted = Scripted::start(vec![(422, "", NOW), (200, "", NOW)]).await;
+
+        assert_eq!(422, keyed_post_status(&server).await);
+        assert_eq!(1, server.hits());
+    }
 
     #[tokio::test]
     async fn a_get_that_gets_a_503_is_retried_until_it_succeeds() {

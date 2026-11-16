@@ -6,9 +6,16 @@ import { Friends } from "./friends.ts";
 import { type JwkSet, Keys } from "./jwks.ts";
 import { endSessionUrl, type LogoutOptions, type SignOut } from "./logout.ts";
 import { type LoginOptions, parseCallback, type PendingLogin, type StartedLogin, startLogin } from "./login.ts";
+import { type Notification, notificationBody, readReceipt, type Receipt } from "./notifications.ts";
 import { type GuestReport, reportBody } from "./report.ts";
-import { send } from "./retry.ts";
+import { KEYED_SEND, READ, type RetryPolicy, send } from "./retry.ts";
 import { VERSION } from "./version.ts";
+
+const TYPED_STATUS: Record<number, "not_found" | "unprocessable" | "rate_limited"> = {
+  404: "not_found",
+  422: "unprocessable",
+  429: "rate_limited",
+};
 
 /** The production issuer. */
 export const ISSUER = "https://accounts.toddgriffin.me/oidc";
@@ -244,22 +251,77 @@ export class Accounts {
     await this.#callWith(`Basic ${this.#basic(this.config.clientSecret)}`, "POST", url, reportBody(report));
   }
 
+  /**
+   * Sends a notification as your project (your client credentials, so the config needs its client secret). The
+   * service records it and answers at once: a send to one player is delivered inline (`result`); a fan-out
+   * (`friendsOf`, `allPlayers`) is `queued`, so poll `notificationStatus` for its counts.
+   *
+   * Always set `idempotencyKey`: it is what makes a retry safe. With a key this call retries an intermittent
+   * failure itself; without one it sends exactly once, since a repeat could notify twice. There are no caps and
+   * no quiet hours; `collapseKey` replaces that player's unread item with the same key.
+   *
+   * Fails with `not_found` (404) when the named player never signed in to your project, `unprocessable` (422)
+   * when the same idempotency key was used for a different request, `rate_limited` (429: 6000 requests an hour,
+   * 10 fan-outs an hour), `api` for a bad request (400), or `config` without a client secret.
+   */
+  async sendNotification(notification: Notification): Promise<Receipt> {
+    const keyed = notification.idempotencyKey !== undefined;
+    return readReceipt(await this.#projectCall("POST", "/notifications", notificationBody(notification), keyed));
+  }
+
+  /**
+   * Removes scheduled notifications with `collapseKey` that haven't gone out ("they played, so no 8 PM reminder"):
+   * one player's (`user`, a `sub`), or all of your project's. Resolves with how many were removed.
+   */
+  async cancelNotifications(collapseKey: string, user?: string): Promise<number> {
+    const body: Record<string, string> = { collapse_key: collapseKey };
+    if (user !== undefined) body.user = user;
+    const answer = await this.#projectCall("POST", "/notifications/cancel", body, false) as { cancelled?: unknown };
+    if (typeof answer?.cancelled !== "number") {
+      throw new AccountsError("api", "accounts API returned 200: missing field `cancelled`", { status: 200 });
+    }
+    return answer.cancelled;
+  }
+
+  /** Your project's own send, by `Receipt.id`, with its counts so far. Finished sends are kept 7 days. Fails with `not_found` for an unknown id or another project's. */
+  async notificationStatus(id: string): Promise<Receipt> {
+    return readReceipt(await this.#projectCall("GET", `/notifications/${encodeURIComponent(id)}`));
+  }
+
+  async #projectCall(method: string, path: string, body?: unknown, retryWrites = false): Promise<unknown> {
+    if (this.config.clientSecret === null) {
+      throw new AccountsError("config", "notifications need the client secret: set `clientSecret`");
+    }
+    const url = `${this.config.issuer.replace(/\/oidc$/, "")}/api/v1${path}`;
+    return await this.#callWith(`Basic ${this.#basic(this.config.clientSecret)}`, method, url, body, {
+      typedErrors: true,
+      retryWrites,
+    });
+  }
+
   /** One authenticated JSON call; errors carry the API's message. Used by `Friends`. */
   call(token: string, method: string, url: string, body?: unknown): Promise<unknown> {
     return this.#callWith(`Bearer ${token}`, method, url, body);
   }
 
-  async #callWith(authorization: string, method: string, url: string, body?: unknown): Promise<unknown> {
+  async #callWith(
+    authorization: string,
+    method: string,
+    url: string,
+    body?: unknown,
+    options: { typedErrors?: boolean; retryWrites?: boolean } = {},
+  ): Promise<unknown> {
     const headers: Record<string, string> = {
       authorization,
       "user-agent": `toddstack-accounts/${VERSION}`,
     };
     if (body !== undefined) headers["content-type"] = "application/json";
-    const response = await this.#send(url, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    const response = await this.#send(
+      url,
+      { method, headers, body: body === undefined ? undefined : JSON.stringify(body) },
+      options.retryWrites ? KEYED_SEND : READ,
+      options.retryWrites,
+    );
     const text = await response.text();
     if (!response.ok) {
       let message = text;
@@ -267,7 +329,8 @@ export class Accounts {
         const parsed = JSON.parse(text);
         if (typeof parsed?.error === "string") message = parsed.error;
       } catch { /* not JSON: keep the text */ }
-      throw new AccountsError("api", `accounts API returned ${response.status}: ${message}`, {
+      const kind = options.typedErrors ? TYPED_STATUS[response.status] ?? "api" : "api";
+      throw new AccountsError(kind, `accounts API returned ${response.status}: ${message}`, {
         status: response.status,
       });
     }
@@ -282,10 +345,10 @@ export class Accounts {
     }
   }
 
-  /** A GET is retried on an intermittent failure; anything else (token, refresh, revocation, writes) is sent once. */
-  async #send(url: string, init: RequestInit): Promise<Response> {
+  /** A GET is retried on an intermittent failure; anything else (token, refresh, revocation, writes) is sent once, unless `retryWrites`. */
+  async #send(url: string, init: RequestInit, policy: RetryPolicy = READ, retryWrites = false): Promise<Response> {
     try {
-      return await send(this.#fetch, url, init);
+      return await send(this.#fetch, url, init, policy, retryWrites);
     } catch (cause) {
       throw new AccountsError("http", `http: ${cause}`, { cause });
     }

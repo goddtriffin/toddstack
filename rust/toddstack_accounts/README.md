@@ -96,7 +96,9 @@ Your sessions are your own: accounts can't end them. On `user.signed_out` (the p
 changed or reset their password, or an admin signed them or everyone out), `user.suspended` and
 `grant.revoked`, delete every session you hold for `event.sub()`. Their refresh tokens are already revoked.
 
-Verify the raw body before parsing. Signatures older than 5 minutes are refused. Deliveries retry, so ignore
+Verify the raw body before parsing. An empty secret is refused. While you rotate a webhook secret the service signs
+with both, so the header carries several `v1=` values and the event is accepted when any one matches the secret you
+hold. Signatures older than 5 minutes are refused. Deliveries retry, so ignore
 repeated `event.id`s.
 
 ## Friends and events
@@ -119,8 +121,51 @@ friends.post_event(&Event {
 The person can mute your app's events, one kind or all (`friends.mute("daily_completed")`,
 `friends.mute(ALL_KINDS)`, `unmute`, `mutes()`), here or in Account Center.
 
+`inbox_with_unread(limit)` returns `Inbox { items, unread: Some(Unread { project, account, total }) }`: `total` is your
+badge. An item with `client_id: None` is an account-level item from the service itself ("alex accepted your friend
+request"): it shows in every project, is one item read everywhere at once, and is never muted or dropped.
+`post_event_result` returns `EventResult { delivered, dropped, counts }` where `post_event` returns only `delivered`.
+
 A block overrides everything (no requests, invite links or events either way). Events go to friends' inboxes (`inbox()`),
 and will also go out as push notifications once the native apps exist.
+
+## Notifications
+
+Your server sends notifications as your project (client credentials, so `Config::client_secret` must be set):
+
+```rust
+use toddstack_accounts::notifications::{Notification, Recipient};
+
+friends.set_time_zone("America/Chicago").await?; // the person's token; from their browser or device, for send_at_local
+
+let mut streak = Notification::new(
+    Recipient::User(sub.clone()), // or Recipient::FriendsOf(sub) or Recipient::AllPlayers
+    "streak_at_risk",             // 1-40 of a-z 0-9 _, first use creates it; players can mute a type
+    "Your streak ends tonight",
+);
+streak.body = String::from("Play today's daily to keep it.");
+streak.url = Some(String::from("https://www.boggledygook.com/daily")); // on a registered redirect or logout origin
+streak.send_at_local = Some(String::from("20:00"));                      // on the player's own clock
+streak.collapse_key = Some(String::from("streak"));
+streak.idempotency_key = Some(String::from("streak-2026-11-15"));        // always set one
+let receipt = accounts.send_notification(&streak).await?; // Receipt { id, status, recipients, counts, result, replayed }
+
+accounts.cancel_notifications("streak", Some(&sub)).await?; // they played: drop the scheduled reminder (user optional)
+let later = accounts.notification_status(&receipt.id).await?; // poll a fan-out's counts
+```
+
+- **Always set `idempotency_key`** (a date or game id). A retry with the same key gets the recorded send back
+  (`replayed: true`) and sends nothing; the same key with a different request is `Error::Unprocessable` (422).
+- There are **no caps and no quiet hours**: every notification is delivered, one per friend who finishes a daily. The
+  phone's own Focus handles quiet time. Only a runaway guard (over 100 to one player in an hour) drops the rest, counted
+  as `dropped_runaway`.
+- `collapse_key` replaces that player's unread item with the same key from your project, and names a scheduled one so
+  `cancel_notifications` can remove it. Nothing collapses without a key.
+- A send to one `User` is delivered inline: `Status::Done` and `result` (`Delivered`, `Scheduled` or `NotDelivered`). A
+  fan-out (`FriendsOf`, `AllPlayers`) answers `Status::Queued`; poll `notification_status` for its `counts`.
+  `NotDelivered` folds together muted, left your project and suspended, so a send can't probe players.
+- The named `User` or `FriendsOf` player must have signed in to your project: otherwise `Error::NotFound` (404). A rate
+  limit (6000 requests an hour, 10 fan-outs an hour) is `Error::RateLimited` (429).
 
 ## Friend buttons
 
@@ -184,6 +229,10 @@ Reads from the accounts service (the signing keys, `userinfo`, and every friends
 failure: a connection error, a timeout, a 5xx or a 429. Three attempts at most, each with its own 3 s deadline, paced by
 exponential backoff with full jitter (200 ms, doubling, capped at 1 s). A `Retry-After` of up to 2 s is waited out; a
 longer one ends the retries. No retry starts after 6 s. A 4xx is an answer and is never retried.
+
+A notification send is retried too, but only when it carries an `idempotency_key` (two more attempts, each with a 10 s
+deadline, no retry after 15 s): the service replays the recorded send, so a retry cannot notify twice. Without a key it
+is sent once.
 
 Everything else is sent exactly once: the code exchange (a code is single-use), refresh (a refresh that landed but whose
 answer was lost has already rotated the token, so a second try would sign the person out), revocation, and every write

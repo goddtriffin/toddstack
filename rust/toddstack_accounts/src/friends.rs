@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::notifications::Counts;
 use crate::report::{self, Reason};
 use crate::retry::{self, RetryPolicy};
 use crate::tokens::Accounts;
@@ -101,6 +102,11 @@ pub struct Event {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub id: String,
+    /// The project the item belongs to; `None` for an account-level item from
+    /// the service itself ("Alex accepted your friend request"): shown in every
+    /// project, one item, read everywhere at once, never muted or dropped.
+    #[serde(default)]
+    pub client_id: Option<String>,
     pub from: Option<String>,
     pub from_username: Option<String>,
     pub kind: String,
@@ -109,6 +115,41 @@ pub struct InboxItem {
     pub url: Option<String>,
     pub created_at: String,
     pub read_at: Option<String>,
+}
+
+/// Unread inbox counts.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Unread {
+    /// Unread items from your project.
+    pub project: u64,
+    /// Unread account-level items, shared by every project.
+    pub account: u64,
+    /// Both together: the badge number.
+    pub total: u64,
+}
+
+/// The person's inbox for your project: its items plus the account-level
+/// ones, and the unread counts.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Inbox {
+    pub items: Vec<InboxItem>,
+    /// `None` from a service older than the counts.
+    #[serde(default)]
+    pub unread: Option<Unread>,
+}
+
+/// What posting an event did.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EventResult {
+    /// How many friends' inboxes it reached.
+    pub delivered: u64,
+    /// Dropped by the runaway guard (over 100 to one player in an hour).
+    #[serde(default)]
+    pub dropped: u64,
+    /// Every outcome, counted: delivered, scheduled, not delivered (muted,
+    /// left, suspended) and dropped.
+    #[serde(default)]
+    pub counts: Option<Counts>,
 }
 
 /// One authenticated JSON call; errors carry the API's message. A `GET` is
@@ -409,7 +450,28 @@ impl<'a> Friends<'a> {
         )
     }
 
-    /// The person's inbox items from your app, newest first.
+    /// Posts an event, like [`Friends::post_event`], and returns the whole
+    /// answer: how many were delivered and dropped, and the full counts.
+    ///
+    /// # Errors
+    /// As for [`Friends::post_event`].
+    pub async fn post_event_result(&self, event: &Event) -> Result<EventResult> {
+        let value: Value = serde_json::to_value(event).map_err(|e| Error::Api {
+            status: 0,
+            message: e.to_string(),
+        })?;
+        let answer: Value = self
+            .call(reqwest::Method::POST, "/events", Some(value))
+            .await?;
+        serde_json::from_value(answer).map_err(|e| Error::Api {
+            status: 200,
+            message: e.to_string(),
+        })
+    }
+
+    /// The person's inbox items from your app, newest first, plus the
+    /// account-level ones (`client_id` is `None`). See
+    /// [`Friends::inbox_with_unread`] for the unread counts.
     ///
     /// # Errors
     /// The request failed.
@@ -419,6 +481,37 @@ impl<'a> Friends<'a> {
                 .await?,
             "items",
         )
+    }
+
+    /// The inbox with the unread counts for your badge.
+    ///
+    /// # Errors
+    /// The request failed.
+    pub async fn inbox_with_unread(&self, limit: u32) -> Result<Inbox> {
+        let value: Value = self
+            .call(reqwest::Method::GET, &format!("/inbox?limit={limit}"), None)
+            .await?;
+        serde_json::from_value(value).map_err(|e| Error::Api {
+            status: 200,
+            message: e.to_string(),
+        })
+    }
+
+    /// Tells the service the person's time zone (an IANA name such as
+    /// `America/Chicago`, from their browser or device), so a notification's
+    /// `send_at_local` lands on their clock. Needs no particular scope; the
+    /// last write wins. Send it when they sign in and when it changes.
+    ///
+    /// # Errors
+    /// 400 for a name the service doesn't know, or the request failed.
+    pub async fn set_time_zone(&self, time_zone: &str) -> Result<()> {
+        self.call(
+            reqwest::Method::PUT,
+            "/me/time-zone",
+            Some(json!({ "time_zone": time_zone })),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// # Errors
@@ -522,6 +615,94 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn an_account_level_inbox_item_has_no_client_and_an_old_service_sends_none() {
+        let expected: Inbox = Inbox {
+            items: vec![
+                InboxItem {
+                    id: String::from("i1"),
+                    client_id: None,
+                    from: Some(String::from("u2")),
+                    from_username: Some(String::from("alex")),
+                    kind: String::from("friend_accepted"),
+                    title: String::from("alex accepted your friend request"),
+                    body: String::new(),
+                    url: None,
+                    created_at: String::from("2026-11-15T10:00:00Z"),
+                    read_at: None,
+                },
+                InboxItem {
+                    id: String::from("i2"),
+                    client_id: Some(String::from("boggledygook")),
+                    from: None,
+                    from_username: None,
+                    kind: String::from("daily_ready"),
+                    title: String::from("Today's daily is ready"),
+                    body: String::new(),
+                    url: None,
+                    created_at: String::from("2026-11-15T11:00:00Z"),
+                    read_at: None,
+                },
+            ],
+            unread: Some(Unread {
+                project: 1,
+                account: 1,
+                total: 2,
+            }),
+        };
+        let actual: Inbox = serde_json::from_value(json!({
+            "items": [
+                { "id": "i1", "client_id": null, "from": "u2", "from_username": "alex",
+                  "kind": "friend_accepted", "title": "alex accepted your friend request", "body": "",
+                  "url": null, "created_at": "2026-11-15T10:00:00Z", "read_at": null },
+                { "id": "i2", "client_id": "boggledygook", "from": null, "from_username": null,
+                  "kind": "daily_ready", "title": "Today's daily is ready", "body": "",
+                  "url": null, "created_at": "2026-11-15T11:00:00Z", "read_at": null },
+            ],
+            "unread": { "project": 1, "account": 1, "total": 2 },
+        }))
+        .unwrap();
+        assert_eq!(expected, actual);
+
+        let old: Inbox = serde_json::from_value(json!({ "items": [
+            { "id": "i3", "from": null, "from_username": null, "kind": "k", "title": "t",
+              "body": "", "url": null, "created_at": "c", "read_at": null },
+        ] }))
+        .unwrap();
+        assert_eq!(None, old.unread);
+        assert_eq!(None, old.items[0].client_id);
+    }
+
+    #[test]
+    fn an_event_answer_carries_dropped_and_counts_when_the_service_sends_them() {
+        let expected: EventResult = EventResult {
+            delivered: 3,
+            dropped: 1,
+            counts: Some(Counts {
+                delivered: 3,
+                scheduled: 0,
+                not_delivered: 2,
+                dropped_runaway: 1,
+            }),
+        };
+        let actual: EventResult = serde_json::from_value(json!({
+            "delivered": 3, "dropped": 1,
+            "counts": { "delivered": 3, "scheduled": 0, "not_delivered": 2, "dropped_runaway": 1 },
+        }))
+        .unwrap();
+        assert_eq!(expected, actual);
+
+        let old: EventResult = serde_json::from_value(json!({ "delivered": 2 })).unwrap();
+        assert_eq!(
+            EventResult {
+                delivered: 2,
+                dropped: 0,
+                counts: None
+            },
+            old
+        );
     }
 
     #[test]

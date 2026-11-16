@@ -156,24 +156,32 @@ impl Event {
     }
 }
 
-/// Checks the signature and age, then parses the event. `now` is the current
+/// Checks the signature and age, then parses the event. The header may carry
+/// several `v1=` signatures (the service does while a webhook secret is being
+/// rotated): the event is accepted when any one matches `secret`. `now` is the current
 /// Unix time (a parameter so tests can fix it).
 ///
 /// # Errors
-/// [`Error::InvalidWebhook`] for a missing or malformed header, a wrong
+/// [`Error::InvalidWebhook`] for an empty secret, a missing or malformed header, a wrong
 /// signature, an old or future timestamp, or a body that isn't an event.
 pub fn verify(secret: &[u8], signature_header: &str, body: &[u8], now: i64) -> Result<Event> {
+    if secret.is_empty() {
+        return Err(Error::InvalidWebhook("empty secret"));
+    }
     let mut t: Option<i64> = None;
-    let mut v1: Option<Vec<u8>> = None;
+    // More than one `v1` while a secret is being rotated: the service signs
+    // with both, and either may be the one you still hold.
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
     for part in signature_header.split(',') {
         match part.trim().split_once('=') {
             Some(("t", value)) => t = value.parse().ok(),
-            Some(("v1", value)) => v1 = hex::decode(value).ok(),
+            Some(("v1", value)) => candidates.extend(hex::decode(value).ok()),
             _ => {}
         }
     }
-    let (Some(t), Some(v1)) = (t, v1) else {
-        return Err(Error::InvalidWebhook("malformed signature header"));
+    let t: i64 = match (t, candidates.is_empty()) {
+        (Some(t), false) => t,
+        _ => return Err(Error::InvalidWebhook("malformed signature header")),
     };
     if (now - t).abs() > TOLERANCE_SECONDS {
         return Err(Error::InvalidWebhook(
@@ -186,7 +194,13 @@ pub fn verify(secret: &[u8], signature_header: &str, body: &[u8], now: i64) -> R
     mac.update(b".");
     mac.update(body);
     let expected = mac.finalize().into_bytes();
-    if !bool::from(expected.as_slice().ct_eq(&v1)) {
+    // Every candidate is compared, none skipped on a match, so timing doesn't
+    // say which one matched.
+    let mut matched: bool = false;
+    for candidate in &candidates {
+        matched |= bool::from(expected.as_slice().ct_eq(candidate));
+    }
+    if !matched {
         return Err(Error::InvalidWebhook("signature mismatch"));
     }
     serde_json::from_slice(body).map_err(|_| Error::InvalidWebhook("body is not an event"))
@@ -311,5 +325,64 @@ mod tests {
         assert!(verify(b"other", &header, BODY.as_bytes(), 1_700_000_000).is_err());
         assert!(verify(b"secret", &header, BODY.as_bytes(), 1_700_000_301).is_err());
         assert!(verify(b"secret", "nonsense", BODY.as_bytes(), 1_700_000_000).is_err());
+    }
+
+    fn webhook_error(result: Result<Event>) -> &'static str {
+        match result {
+            Err(Error::InvalidWebhook(why)) => why,
+            other => panic!("expected a rejected webhook, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_secret_is_refused_even_with_a_signature_made_under_it() {
+        let header: String = sign(b"", 1_700_000_000, BODY);
+        let actual: &str = webhook_error(verify(b"", &header, BODY.as_bytes(), 1_700_000_000));
+        assert_eq!("empty secret", actual);
+    }
+
+    #[test]
+    fn any_one_of_several_signatures_may_match_during_a_secret_rotation() {
+        let old: String = sign(b"old-secret", 1_700_000_000, BODY);
+        let new: String = sign(b"new-secret", 1_700_000_000, BODY);
+        let old_v1: &str = old.split_once("v1=").unwrap().1;
+        let new_v1: &str = new.split_once("v1=").unwrap().1;
+        // Either secret verifies, whichever position its signature is in.
+        for header in [
+            format!("t=1700000000,v1={old_v1},v1={new_v1}"),
+            format!("t=1700000000,v1={new_v1},v1={old_v1}"),
+        ] {
+            for secret in [&b"old-secret"[..], &b"new-secret"[..]] {
+                let event: Event = verify(secret, &header, BODY.as_bytes(), 1_700_000_010).unwrap();
+                assert_eq!("e1", event.id);
+            }
+        }
+        // A malformed signature beside the right one is skipped, not fatal.
+        let junk: String = format!("v1=zz,t=1700000000,v1={new_v1},v1=00");
+        assert!(verify(b"new-secret", &junk, BODY.as_bytes(), 1_700_000_010).is_ok());
+    }
+
+    #[test]
+    fn several_signatures_none_of_which_match_are_refused() {
+        let a: String = sign(b"a", 1_700_000_000, BODY);
+        let b: String = sign(b"b", 1_700_000_000, BODY);
+        let header: String = format!(
+            "t=1700000000,v1={},v1={}",
+            a.split_once("v1=").unwrap().1,
+            b.split_once("v1=").unwrap().1
+        );
+        let actual: &str = webhook_error(verify(b"c", &header, BODY.as_bytes(), 1_700_000_000));
+        assert_eq!("signature mismatch", actual);
+    }
+
+    #[test]
+    fn a_header_whose_signatures_are_all_malformed_hex_is_malformed() {
+        let actual: &str = webhook_error(verify(
+            b"secret",
+            "t=1700000000,v1=zz,v1=abc",
+            BODY.as_bytes(),
+            1_700_000_000,
+        ));
+        assert_eq!("malformed signature header", actual);
     }
 }
