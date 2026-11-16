@@ -337,7 +337,11 @@ default.
 
 ## Breaking changes
 
-**0.7.0**: no breaking changes. Added `FriendsClient` and `FriendsClientError`.
+**0.7.0**: the 0.6 `Friends` methods (`accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `relationships`,
+`markRead`, `mute`, `unmute`) now reject an id outside `[A-Za-z0-9_-]{1,64}` with a bad-request error (`kind: "api"`,
+`status: 400`) before any request is sent, so a decoded `../`, `?` or `#` can't reach another accounts path. Real
+accounts-service subs always match, so callers passing real subs see no change. Added `FriendsClient` and
+`FriendsClientError`.
 
 **0.6.0**: `new Accounts(config)` now throws `kind: "config"` for an `http` issuer that is not loopback (it was
 accepted). Added `localConfig`, `toddgriffinAt` and `LOCAL_BASE_URL`.

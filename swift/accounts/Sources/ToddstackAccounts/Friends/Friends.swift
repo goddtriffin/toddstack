@@ -99,8 +99,8 @@ public struct FriendsError: Error, Equatable, Sendable, LocalizedError {
     /// HTTP status.
     public let status: Int
     /// `account_required` (a guest: offer sign-in), `session_expired`, `cross_site`, `missing_scope`, `bad_request`,
-    /// `refused` (not found, blocked, a privacy setting or a limit), `not_found`, `rate_limited`,
-    /// `accounts_unavailable`.
+    /// `refused` (not found, blocked, a privacy setting or a limit), `not_found`, `conflict`, `unprocessable`,
+    /// `rate_limited`, `accounts_unavailable`.
     public let code: String
     public let message: String
 

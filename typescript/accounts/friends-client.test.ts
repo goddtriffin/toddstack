@@ -111,3 +111,10 @@ Deno.test("an unseeded call throws and a leftover seed fails the check", () => {
   mock.seed({ method: "GET", path: F }, { status: 200 });
   assertThrows(() => mock.assertAllSeedsConsumed(), Error, "mock_unconsumed_responses");
 });
+
+Deno.test("an unseeded call fails loudly and never becomes a FriendsClientError", async () => {
+  const [friends] = setup();
+  const error = await assertRejects(() => friends.list());
+  assertEquals(false, error instanceof FriendsClientError);
+  assertEquals(true, (error as Error).message.startsWith("mock_no_response_configured"));
+});

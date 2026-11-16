@@ -68,7 +68,7 @@ public enum class Relationship(internal val wire: String) {
 /**
  * A friends call your server refused. [code] is the server's error code: `account_required` (a guest: offer
  * sign-in), `session_expired`, `cross_site`, `missing_scope`, `bad_request`, `refused` (not found, blocked, a
- * privacy setting or a limit), `not_found`, `rate_limited`, `accounts_unavailable`. [message] is meant for the person.
+ * privacy setting or a limit), `not_found`, `conflict`, `unprocessable`, `rate_limited`, `accounts_unavailable`. [message] is meant for the person.
  */
 public class FriendsException(
     public val status: Int,
@@ -80,7 +80,7 @@ public class FriendsException(
  * In-app friend requests: calls the friends routes your project's server mounts (the Rust crate's `friends_router`),
  * authenticated with the session [accounts] keeps. The app never sees an accounts token.
  *
- * With no session a call throws [FriendsException] `account_required`, like a guest does.
+ * With no session the client itself throws [FriendsException] `account_required`; a guest is sent and the server answers the same code.
  */
 public class Friends(private val accounts: Accounts, private val api: FriendsApi) {
     /** Real network calls to [accounts]'s server. */
