@@ -67,10 +67,13 @@ where
     }
 
     /// Reads the analytics script id and browser DSN from the environment.
+    /// Analytics is off when `WSB_ENVIRONMENT` is `local` or the id is unset
+    /// or blank.
     ///
     /// # Errors
     ///
-    /// [`WebServerError::Env`] if either variable is unset or blank.
+    /// [`WebServerError::Env`] if `WSB_ENVIRONMENT` or the browser DSN is
+    /// unset, blank or invalid.
     pub fn from_env(base: BaseTemplateData, pages: Pages<S>) -> Result<Self, WebServerError> {
         Ok(Self::new(
             base,
@@ -174,6 +177,16 @@ where
 
         let icon_source: crate::assets::IconSource = crate::assets::validate_icons(cache_buster)?;
 
+        // Local runs never reach Plausible, whatever id was configured.
+        let analytics: AnalyticsConfig = params.analytics.clone().for_environment(environment);
+        if analytics.is_enabled() {
+            tracing::info!("analytics enabled");
+        } else if environment.is_local() {
+            tracing::info!("analytics disabled: WSB_ENVIRONMENT is local");
+        } else {
+            tracing::info!("analytics disabled: WSB_ANALYTICS_ID is unset or empty");
+        }
+
         let paths: ProxyPaths = ProxyPaths::derive(params.base.project());
         let social_image: SocialImageMetadata = probe_social_image(&params.base, cache_buster);
 
@@ -245,10 +258,10 @@ where
             theme_script: params.base.theme_script().source(),
             social_image,
             has_svg_icon: icon_source.is_vector(),
-            analytics: AnalyticsPaths {
+            analytics: analytics.is_enabled().then(|| AnalyticsPaths {
                 script_path: paths.analytics_script.clone(),
                 event_path: paths.analytics_event.clone(),
-            },
+            }),
             sentry_browser: SentryBrowser {
                 script_path: paths.sentry_script.clone(),
                 tunnel_path: paths.sentry_tunnel.clone(),
@@ -262,7 +275,7 @@ where
             base: params.base,
             runtime,
             well_known,
-            analytics: params.analytics,
+            analytics,
             sentry_dsn,
             not_found: params.not_found,
             has_svg_icon: icon_source.is_vector(),

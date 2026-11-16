@@ -84,6 +84,10 @@ fn frontend() -> FrontendParams {
 }
 
 fn frontend_with(pages: Pages) -> FrontendParams {
+    frontend_with_analytics(pages, AnalyticsConfig::new("fixture"))
+}
+
+fn frontend_with_analytics(pages: Pages, analytics: AnalyticsConfig) -> FrontendParams {
     FrontendParams::new(
         BaseTemplateData::new(BaseTemplateDataParams {
             project: String::from("Fixture"),
@@ -111,7 +115,7 @@ fn frontend_with(pages: Pages) -> FrontendParams {
             ],
         })),
         pages,
-        AnalyticsConfig::new("fixture"),
+        analytics,
         "https://abc123@o4504844394627072.ingest.sentry.io/4504862450515968",
     )
     .with_helper("shout", shout)
@@ -564,4 +568,90 @@ async fn a_route_that_sets_its_own_cache_policy_keeps_it() {
     assert_eq!(StatusCode::OK, response.status());
     assert_eq!("public, max-age=300", cache_control(&response));
     assert!(!response.headers().contains_key(header::PRAGMA));
+}
+
+fn analytics_home() -> Pages {
+    Pages::new().static_page(PageTemplateData::new("home", "Home", "/"), ())
+}
+
+fn analytics_router(name: &str, environment: Environment, analytics: AnalyticsConfig) -> Router {
+    let root: PathBuf = built_site(name);
+    WebServer::new("127.0.0.1", 0, environment)
+        .root_dir(&root)
+        .frontend(frontend_with_analytics(analytics_home(), analytics))
+        .into_router(Shutdown::manual())
+        .expect("the built site boots")
+}
+
+/// The proxied analytics script path in a rendered page, if it has one. The
+/// script tag is the only `defer` script a page without declared scripts has
+/// besides Sentry's, which is told apart by sitting before the `plausible`
+/// stub.
+fn analytics_script_path(body: &str) -> Option<String> {
+    let stub: usize = body.find("window.plausible")?;
+    let before: &str = &body[..stub];
+    let start: usize = before.rfind("<script defer src=\"")? + "<script defer src=\"".len();
+    let end: usize = start + before[start..].find('"')?;
+    Some(before[start..end].to_string())
+}
+
+#[tokio::test]
+async fn production_with_an_id_renders_the_analytics_script_tag() {
+    let router: Router = analytics_router(
+        "analytics-prod",
+        Environment::Production,
+        AnalyticsConfig::new("pa-fixture"),
+    );
+
+    let body: String = text(get(&router, "/").await).await;
+    let path: String = analytics_script_path(&body).expect("a script tag");
+    assert!(path.starts_with("/script/fixture-"), "{path}");
+    assert!(
+        body.contains("plausible.init({ endpoint: \"/api/v1/fixture-"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn local_mode_renders_no_analytics_and_its_proxy_routes_404_even_with_an_id() {
+    let production: Router = analytics_router(
+        "analytics-ref",
+        Environment::Production,
+        AnalyticsConfig::new("pa-fixture"),
+    );
+    let path: String =
+        analytics_script_path(&text(get(&production, "/").await).await).expect("a script tag");
+    let event_path: String = path
+        .replace("/script/", "/api/v1/")
+        .trim_end_matches(".js")
+        .to_string();
+
+    let router: Router = analytics_router(
+        "analytics-local",
+        Environment::Local,
+        AnalyticsConfig::new("pa-fixture"),
+    );
+
+    let body: String = text(get(&router, "/").await).await;
+    assert!(!body.contains("plausible"), "{body}");
+    assert!(!body.contains(&path), "{body}");
+
+    assert_eq!(StatusCode::NOT_FOUND, get(&router, &path).await.status());
+    assert_eq!(
+        StatusCode::NOT_FOUND,
+        request(&router, Method::POST, &event_path).await.status()
+    );
+}
+
+#[tokio::test]
+async fn an_unset_or_empty_id_renders_no_analytics_in_production() {
+    for (name, analytics) in [
+        ("analytics-unset", AnalyticsConfig::disabled()),
+        ("analytics-empty", AnalyticsConfig::new("")),
+    ] {
+        let router: Router = analytics_router(name, Environment::Production, analytics);
+
+        let body: String = text(get(&router, "/").await).await;
+        assert!(!body.contains("plausible"), "{name}: {body}");
+    }
 }

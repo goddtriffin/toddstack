@@ -3,7 +3,7 @@ members = ["webserver_base", "template_web_server", "flyball", "toddstack_accoun
 resolver = "3"
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.100"
 authors = ["Todd Everett Griffin <tgriffin115@gmail.com>"]

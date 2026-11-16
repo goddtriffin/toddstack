@@ -98,8 +98,9 @@ pub struct FrontendRuntime {
     /// authors a PNG instead, and the layout must not link a file that is not
     /// there.
     pub has_svg_icon: bool,
-    /// Analytics proxy paths.
-    pub analytics: AnalyticsPaths,
+    /// Analytics proxy paths; `None` when analytics is disabled, so the layout
+    /// renders no script tag.
+    pub analytics: Option<AnalyticsPaths>,
     /// Browser error monitoring.
     pub sentry_browser: SentryBrowser,
     /// Feed autodiscovery, when the site declared a feed.

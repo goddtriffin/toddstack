@@ -217,7 +217,7 @@ a share card.
 |---|---|
 | `base` | site identity: name, description, origin, social image, theme, copyright |
 | `pages` | the routes, which are also the sitemap |
-| `analytics` | the Plausible site — every frontend is measured |
+| `analytics` | the Plausible site; blank or `AnalyticsConfig::disabled()` turns it off, and it is always off locally |
 | `sentry_browser_dsn` | browser errors, separate from the server's DSN |
 
 Calling it gives you, with no further code: the embedded base layout, the
@@ -747,13 +747,23 @@ deployable, and it isolates rate limits.
 
 | variable | what it is |
 |---|---|
-| `WSB_ANALYTICS_ID` | the Plausible script id, e.g. `pa-1qi0TQ…` — Site Settings → Site Installation |
+| `WSB_ANALYTICS_ID` | the Plausible script id, e.g. `pa-1qi0TQ…` (Site Settings → Site Installation). Optional: unset or empty turns analytics off |
 | `WSB_SENTRY_SERVER_DSN` | the Rust server's DSN |
 | `WSB_SENTRY_BROWSER_DSN` | the browser's DSN — required for a frontend |
 
-All three are required in **every** environment, local included. A DSN exercised
-only in production is a DSN nobody has proved works; point local runs at
-development projects.
+The two DSNs are required in **every** environment, local included. A DSN
+exercised only in production is a DSN nobody has proved works; point local runs
+at development projects.
+
+**Analytics is off when `WSB_ENVIRONMENT=local`, or when `WSB_ANALYTICS_ID` is
+unset or empty.** Then no script tag is rendered, the script and event routes
+are not mounted (they 404), nothing is fetched from or forwarded to Plausible,
+and startup logs `analytics disabled` once. A local run ignores an id even if
+one is set, so a laptop can never pour into production's numbers. Production with
+an id behaves as before. Sentry is unaffected: it stays on in every environment.
+In code, `AnalyticsConfig::disabled()` and `AnalyticsConfig::is_enabled()` expose
+the same state, and `Frontend` applies the local rule whatever config it is given.
+`AnalyticsConfig::from_env()` now also reads `WSB_ENVIRONMENT`.
 
 ⚠️ Plausible's script disables itself on `localhost`, so a local pageview will
 not register no matter what you configure. To exercise it end to end, add your

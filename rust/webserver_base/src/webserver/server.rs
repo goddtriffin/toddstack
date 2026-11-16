@@ -982,28 +982,37 @@ where
             async move { relay.respond(&headers).await }
         })
     };
-    let scripts: Router<WebServerState<S>> = Router::new()
-        .route(
-            &paths.analytics.script_path,
-            script_route(ScriptRelay::new(
-                client.clone(),
-                frontend.analytics.upstream_script_url(),
-            )),
-        )
-        .route(
-            &paths.sentry_browser.script_path,
-            script_route(ScriptRelay::new(
-                client.clone(),
-                frontend.sentry_dsn.upstream_script_url(),
-            )),
+    let mut scripts: Router<WebServerState<S>> = Router::new();
+    // Analytics disabled (local, or no id): the routes are not mounted, so they
+    // 404 and nothing ever reaches Plausible.
+    if let (Some(analytics_paths), Some(upstream)) = (
+        paths.analytics.as_ref(),
+        frontend.analytics.upstream_script_url(),
+    ) {
+        scripts = scripts.route(
+            &analytics_paths.script_path,
+            script_route(ScriptRelay::new(client.clone(), upstream)),
         );
+    }
+    let scripts: Router<WebServerState<S>> = scripts.route(
+        &paths.sentry_browser.script_path,
+        script_route(ScriptRelay::new(
+            client.clone(),
+            frontend.sentry_dsn.upstream_script_url(),
+        )),
+    );
 
     // Nested under the API prefix, so the paths registered here are relative.
-    let event_path: String = strip_api_prefix(&paths.analytics.event_path);
     let tunnel_path: String = strip_api_prefix(&paths.sentry_browser.tunnel_path);
 
-    let endpoints: Router<WebServerState<S>> = Router::new()
-        .route(
+    let mut endpoints: Router<WebServerState<S>> = Router::new();
+    if let Some(analytics_paths) = paths
+        .analytics
+        .as_ref()
+        .filter(|_| frontend.analytics.is_enabled())
+    {
+        let event_path: String = strip_api_prefix(&analytics_paths.event_path);
+        endpoints = endpoints.route(
             &event_path,
             post({
                 let client: reqwest::Client = client.clone();
@@ -1017,19 +1026,20 @@ where
                     async move { relay_event(&client, &upstream, &headers, peer, body).await }
                 }
             }),
-        )
-        .route(
-            &tunnel_path,
-            post({
-                let upstream: std::sync::Arc<str> =
-                    std::sync::Arc::from(sentry_envelope_upstream.as_str());
-                move |body: Bytes| {
-                    let client: reqwest::Client = client.clone();
-                    let upstream: std::sync::Arc<str> = std::sync::Arc::clone(&upstream);
-                    async move { relay_envelope(&client, &upstream, body).await }
-                }
-            }),
         );
+    }
+    let endpoints: Router<WebServerState<S>> = endpoints.route(
+        &tunnel_path,
+        post({
+            let upstream: std::sync::Arc<str> =
+                std::sync::Arc::from(sentry_envelope_upstream.as_str());
+            move |body: Bytes| {
+                let client: reqwest::Client = client.clone();
+                let upstream: std::sync::Arc<str> = std::sync::Arc::clone(&upstream);
+                async move { relay_envelope(&client, &upstream, body).await }
+            }
+        }),
+    );
 
     (scripts, endpoints)
 }
