@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::jwks::Keys;
 use crate::login::{PendingLogin, parse_callback};
 use crate::logout::{self, SignOut};
-use crate::{Error, ISSUER, Result};
+use crate::{Error, ISSUER, LOCAL_BASE_URL, Result};
 
 /// Your app's registration with the accounts service.
 #[derive(Clone, Debug)]
@@ -33,6 +33,56 @@ impl Config {
             client_secret,
             redirect_uri: redirect_uri.to_owned(),
         }
+    }
+
+    /// A config for an accounts service at `base_url` (its origin, e.g.
+    /// `http://127.0.0.1:8790`): the issuer is `<base_url>/oidc`, and the
+    /// JWKS, authorize, token, end-session, API and account links all derive
+    /// from it. Local testing must never touch production: point at the
+    /// service you run on your machine.
+    ///
+    /// # Errors
+    /// [`Error::Config`] if `base_url` isn't an `https` URL, or an `http`
+    /// URL whose host is loopback (`127.0.0.1`, `localhost`, `::1`).
+    pub fn toddgriffin_at(
+        base_url: &str,
+        client_id: &str,
+        client_secret: Option<String>,
+        redirect_uri: &str,
+    ) -> Result<Self> {
+        let base: &str = base_url.trim_end_matches('/');
+        check_url(base)?;
+        Ok(Self {
+            issuer: format!("{base}/oidc"),
+            client_id: client_id.to_owned(),
+            client_secret,
+            redirect_uri: redirect_uri.to_owned(),
+        })
+    }
+
+    /// A config for the accounts service running locally
+    /// ([`LOCAL_BASE_URL`], `http://127.0.0.1:8790`).
+    #[must_use]
+    pub fn local(client_id: &str, client_secret: Option<String>, redirect_uri: &str) -> Self {
+        Self {
+            issuer: format!("{LOCAL_BASE_URL}/oidc"),
+            client_id: client_id.to_owned(),
+            client_secret,
+            redirect_uri: redirect_uri.to_owned(),
+        }
+    }
+}
+
+/// Accepts `https` URLs, and `http` only on loopback hosts.
+fn check_url(url: &str) -> Result<()> {
+    let parsed: url::Url =
+        url::Url::parse(url).map_err(|e| Error::Config(format!("`{url}` isn't a URL: {e}")))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")) => Ok(()),
+        _ => Err(Error::Config(format!(
+            "`{url}` must be https (http is allowed only on 127.0.0.1, localhost or ::1)"
+        ))),
     }
 }
 
@@ -114,8 +164,10 @@ struct OAuthError {
 
 impl Accounts {
     /// # Errors
-    /// The HTTP client can't be built.
+    /// The HTTP client can't be built, or the issuer is plain `http` off
+    /// loopback ([`Error::Config`]).
     pub fn new(config: Config) -> Result<Self> {
+        check_url(&config.issuer)?;
         let keys: Keys = Keys::remote(format!("{}/jwks", config.issuer));
         Ok(Self {
             config,
@@ -128,8 +180,9 @@ impl Accounts {
     /// them: for tests, or a service that pins keys.
     ///
     /// # Errors
-    /// The HTTP client can't be built.
+    /// The HTTP client can't be built, or the issuer is plain `http` off loopback.
     pub fn with_keys(config: Config, keys: JwkSet) -> Result<Self> {
+        check_url(&config.issuer)?;
         Ok(Self {
             config,
             http: http()?,

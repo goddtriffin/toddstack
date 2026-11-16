@@ -275,6 +275,34 @@ class AccountsTest {
     }
 
     @Test
+    fun http_is_allowed_only_on_loopback() {
+        for (host in listOf("127.0.0.1", "localhost", "[::1]", "10.0.2.2")) {
+            AccountsConfig("http://$host:8992", config.callbackUrl, "x", "http://$host:8790")
+        }
+        for (bad in listOf("http://192.168.1.5:8992", "http://127.0.0.1.evil.example", "http://example.com", "ftp://127.0.0.1")) {
+            assertEquals(bad, AccountsException.Kind.Config, assertThrows(AccountsException::class.java) { config.copy(serverUrl = bad) }.kind)
+            assertEquals(bad, AccountsException.Kind.Config, assertThrows(AccountsException::class.java) { config.copy(accountsBaseUrl = bad) }.kind)
+        }
+        // the callback is an https App Link, never http
+        assertEquals(
+            AccountsException.Kind.Config,
+            assertThrows(AccountsException::class.java) { config.copy(callbackUrl = "http://127.0.0.1:8992/app/callback") }.kind,
+        )
+    }
+
+    @Test
+    fun local_points_at_the_local_accounts_site_and_the_bearer_follows_the_local_server() = runTest {
+        val local = AccountsConfig.local("http://10.0.2.2:8992", config.callbackUrl, "boggledygook")
+        assertEquals("http://127.0.0.1:8790/account?client=boggledygook", Accounts(local, mock, store).accountUrl())
+        givenSession(signedIn)
+        val a = Accounts(local, mock, store)
+        a.currentSession()
+        assertEquals("Bearer signed-in-token", a.cachedAuthorizationHeader("http://10.0.2.2:8992/api/v1/x"))
+        assertNull(a.cachedAuthorizationHeader("https://10.0.2.2:8992/api/v1/x"))
+        assertNull(a.cachedAuthorizationHeader("http://10.0.2.2:9000/x"))
+    }
+
+    @Test
     fun the_bearer_is_added_only_for_https_requests_to_the_server_origin() = runTest {
         givenSession(signedIn)
         accounts.currentSession()

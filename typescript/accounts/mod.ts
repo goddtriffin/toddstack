@@ -59,8 +59,11 @@ export {
   hasScope,
   type IdClaims,
   ISSUER,
+  LOCAL_BASE_URL,
+  localConfig,
   type SignedIn,
   toddgriffin,
+  toddgriffinAt,
   type TokenSet,
 } from "./tokens.ts";
 export { VERSION } from "./version.ts";

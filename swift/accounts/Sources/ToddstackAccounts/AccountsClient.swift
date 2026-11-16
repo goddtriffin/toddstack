@@ -143,7 +143,7 @@ public final class AccountsClient: Sendable {
         guard (200..<300).contains(response.status) else { return nil }
         struct Body: Decodable { let end_session_url: String? }
         guard let text = try JSONDecoder().decode(Body.self, from: response.body).end_session_url,
-              let url = URL(string: text), url.scheme?.lowercased() == "https" else { return nil }
+              let url = URL(string: text), isAllowedBaseURL(url) else { return nil }
         return url
     }
 

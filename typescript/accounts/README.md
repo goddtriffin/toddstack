@@ -297,7 +297,18 @@ answer was lost has already rotated the token, so a second try would sign the pe
 `deno.jsonc` (JSR) and `package.json` (npm) carry the same version as `version.ts`; a test checks. The npm package is
 the `tsc` build of the same sources (`tsconfig.npm.json`, output in `dist/`, not committed).
 
+## Local mode
+
+Local testing never touches production. `localConfig(clientId, secret, redirectUri)` points at the accounts service on
+your machine (`LOCAL_BASE_URL`, `http://127.0.0.1:8790`); `toddgriffinAt(baseUrl, ...)` takes any base. The issuer is
+`<base>/oidc`, and the JWKS, authorize, token, end-session, API (`/api/v1`) and account links all derive from it. `http`
+is accepted only for `127.0.0.1`, `localhost` and `::1`; any other `http` base or issuer throws `AccountsError` with
+`kind: "config"` (from `toddgriffinAt` and `new Accounts`).
+
 ## Breaking changes
+
+**0.6.0**: `new Accounts(config)` now throws `kind: "config"` for an `http` issuer that is not loopback (it was
+accepted). Added `localConfig`, `toddgriffinAt` and `LOCAL_BASE_URL`.
 
 **0.5.0**: `AccountsErrorKind` gained `"conflict"`, so a 409 from a project call is `kind: "conflict"` (it was `"api"`
 with `status: 409`). A `switch` checked with `never` needs a case for it.

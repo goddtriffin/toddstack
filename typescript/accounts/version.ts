@@ -1,2 +1,2 @@
 /** This package's version; kept equal to `deno.jsonc` and `package.json` (a test checks). */
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";

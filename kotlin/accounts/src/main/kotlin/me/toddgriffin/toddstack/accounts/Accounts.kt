@@ -63,8 +63,9 @@ public class Accounts(
     private fun isServerUrl(url: String): Boolean {
         val target: URI = try { URI(url) } catch (_: URISyntaxException) { return false }
         val own: URI = URI(config.server)
-        fun port(u: URI): Int = if (u.port >= 0) u.port else 443
-        return target.scheme.equals("https", ignoreCase = true) &&
+        fun port(u: URI): Int = if (u.port >= 0) u.port else if (u.scheme.equals("http", ignoreCase = true)) 80 else 443
+        // the scheme must match the configured server's, and the config only allows https or loopback http
+        return target.scheme.equals(own.scheme, ignoreCase = true) &&
             target.host != null && target.host.equals(own.host, ignoreCase = true) &&
             port(target) == port(own)
     }

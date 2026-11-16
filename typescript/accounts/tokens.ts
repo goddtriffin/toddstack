@@ -39,6 +39,46 @@ export function toddgriffin(clientId: string, clientSecret: string | null, redir
   return { issuer: ISSUER, clientId, clientSecret, redirectUri };
 }
 
+/** The accounts service running locally. Local testing never touches production: use `localConfig` or `toddgriffinAt`. */
+export const LOCAL_BASE_URL = "http://127.0.0.1:8790";
+
+/**
+ * A config for an accounts service at `baseUrl` (its origin, e.g. `http://127.0.0.1:8790`): the issuer is
+ * `<baseUrl>/oidc`, and the JWKS, authorize, token, end-session, API and account links all derive from it.
+ * Throws `config` unless `baseUrl` is `https`, or `http` on a loopback host (`127.0.0.1`, `localhost`, `::1`).
+ */
+export function toddgriffinAt(
+  baseUrl: string,
+  clientId: string,
+  clientSecret: string | null,
+  redirectUri: string,
+): Config {
+  const base = baseUrl.replace(/\/+$/, "");
+  checkUrl(base);
+  return { issuer: `${base}/oidc`, clientId, clientSecret, redirectUri };
+}
+
+/** A config for the accounts service running locally (`LOCAL_BASE_URL`, `http://127.0.0.1:8790`). */
+export function localConfig(clientId: string, clientSecret: string | null, redirectUri: string): Config {
+  return toddgriffinAt(LOCAL_BASE_URL, clientId, clientSecret, redirectUri);
+}
+
+/** Accepts `https` URLs, and `http` only on loopback hosts; anything else throws `config`. */
+function checkUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new AccountsError("config", `configuration: \`${url}\` isn't a URL`);
+  }
+  const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname);
+  if (parsed.protocol === "https:" || (parsed.protocol === "http:" && loopback)) return;
+  throw new AccountsError(
+    "config",
+    `configuration: \`${url}\` must be https (http is allowed only on 127.0.0.1, localhost or ::1)`,
+  );
+}
+
 /** The token endpoint's answer. */
 export interface TokenSet {
   /** For calls to the accounts API (10 minutes). */
@@ -141,9 +181,10 @@ export class Accounts {
   #fetch: typeof fetch;
   #keys: Keys;
 
-  /** A client for `config`. Throws `config` if the client id is empty. */
+  /** A client for `config`. Throws `config` if the client id is empty, or the issuer is plain `http` off loopback. */
   constructor(config: Config, options: AccountsOptions = {}) {
     if (!config.clientId) throw new AccountsError("config", "configuration: clientId is required");
+    checkUrl(config.issuer);
     this.config = { ...config, issuer: config.issuer.replace(/\/+$/, "") };
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.#keys = options.keys ? Keys.pinned(options.keys) : Keys.remote(`${this.config.issuer}/jwks`, this.#fetch);
