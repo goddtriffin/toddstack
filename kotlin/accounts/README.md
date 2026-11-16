@@ -124,7 +124,8 @@ Local testing never touches production: every base URL is yours to set. `serverU
 `http` on loopback (`127.0.0.1`, `localhost`, `::1`) and on `10.0.2.2` (the emulator's alias for your machine), and
 nowhere else (`AccountsException` of kind `Config`). `AccountsConfig.local(serverUrl, callbackUrl, clientId)` also points
 `accountsBaseUrl` at `LOCAL_ACCOUNTS_BASE_URL` (`http://127.0.0.1:8790`). The bearer token follows the configured
-server's scheme and origin. `callbackUrl` stays an https App Link.
+server's scheme and origin. `callbackUrl` is an https App Link, or (any mode, local debug builds) a reverse-DNS custom scheme such as
+`me.toddgriffin.boggledygook.debug:/app/callback` (RFC 8252; the Auth Tab is launched with that redirect scheme, and a Custom Tab fallback needs an intent filter for it in your debug manifest); plain http is rejected.
 
 ```kotlin
 AccountsConfig.local("http://10.0.2.2:8992", "https://www.boggledygook.com/app/callback", "boggledygook")

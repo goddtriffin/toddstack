@@ -23,12 +23,23 @@ internal fun isAllowedBaseUrl(url: String): Boolean {
 }
 
 /**
+ * Whether [url] is an https URL with a host, or a reverse-DNS private-use scheme (RFC 8252: the scheme contains a dot,
+ * e.g. `me.toddgriffin.boggledygook.debug:/app/callback`). Plain http is never a callback.
+ */
+internal fun isAllowedCallbackUrl(url: String): Boolean {
+    val uri: java.net.URI = try { java.net.URI(url) } catch (_: java.net.URISyntaxException) { return false }
+    val scheme: String = uri.scheme?.lowercase() ?: return false
+    return if (scheme == "https") !uri.host.isNullOrEmpty() else scheme != "http" && '.' in scheme
+}
+
+/**
  * Settings for one app.
  *
  * @property serverUrl your project's server (`https://www.boggledygook.com`); the app only ever talks to it. For
  *   local testing, an http URL on loopback (`http://10.0.2.2:8992` from the emulator): see [local].
- * @property callbackUrl the https App Link the server redirects to after sign-in
- *   (`https://www.boggledygook.com/app/callback`).
+ * @property callbackUrl where the server redirects after sign-in: an https App Link
+ *   (`https://www.boggledygook.com/app/callback`), or a reverse-DNS custom scheme for local debug builds
+ *   (`me.toddgriffin.boggledygook.debug:/app/callback`).
  * @property accountsBaseUrl the accounts site, used only for links such as [Accounts.accountUrl]. https, or http on
  *   loopback (`127.0.0.1`, `localhost`, `::1`, `10.0.2.2`).
  * @property clientId your project's client id; tags every link to the accounts site.
@@ -52,10 +63,10 @@ public data class AccountsConfig(
                 "accountsBaseUrl must be https (http only on loopback), got $accountsBaseUrl",
             )
         }
-        if (!callbackUrl.startsWith("https://")) {
+        if (!isAllowedCallbackUrl(callbackUrl)) {
             throw AccountsException(
                 AccountsException.Kind.Config,
-                "callbackUrl must be an https App Link, got $callbackUrl",
+                "callbackUrl must be an https App Link or a reverse-DNS custom scheme, got $callbackUrl",
             )
         }
         if (clientId.isBlank()) {
@@ -66,7 +77,7 @@ public data class AccountsConfig(
     public companion object {
         /**
          * A config for local testing: your project's server on your machine (`http://10.0.2.2:8992` from the
-         * emulator) and the accounts site at [LOCAL_ACCOUNTS_BASE_URL].
+         * emulator) and the accounts site at [LOCAL_ACCOUNTS_BASE_URL]; [callbackUrl] is typically a debug custom scheme.
          */
         public fun local(serverUrl: String, callbackUrl: String, clientId: String): AccountsConfig =
             AccountsConfig(serverUrl, callbackUrl, clientId, LOCAL_ACCOUNTS_BASE_URL)

@@ -283,11 +283,22 @@ class AccountsTest {
             assertEquals(bad, AccountsException.Kind.Config, assertThrows(AccountsException::class.java) { config.copy(serverUrl = bad) }.kind)
             assertEquals(bad, AccountsException.Kind.Config, assertThrows(AccountsException::class.java) { config.copy(accountsBaseUrl = bad) }.kind)
         }
-        // the callback is an https App Link, never http
-        assertEquals(
-            AccountsException.Kind.Config,
-            assertThrows(AccountsException::class.java) { config.copy(callbackUrl = "http://127.0.0.1:8992/app/callback") }.kind,
-        )
+    }
+
+    @Test
+    fun the_callback_is_https_or_a_reverse_dns_custom_scheme() = runTest {
+        for (ok in listOf(config.callbackUrl, "me.toddgriffin.boggledygook.debug:/app/callback")) config.copy(callbackUrl = ok)
+        for (bad in listOf("http://127.0.0.1:8992/app/callback", "boggle://callback", "boggle:/app/callback", "https:///x")) {
+            assertEquals(bad, AccountsException.Kind.Config, assertThrows(AccountsException::class.java) { config.copy(callbackUrl = bad) }.kind)
+        }
+        val custom = "me.toddgriffin.boggledygook.debug:/app/callback"
+        val local = AccountsConfig.local("http://10.0.2.2:8992", custom, "boggledygook")
+        val a = Accounts(local, mock, store)
+        a.launcher = RecordingLauncher()
+        val e = assertThrows(AccountsException::class.java) {
+            kotlinx.coroutines.runBlocking { a.handleCallback("https://www.boggledygook.com/app/callback?code=c&state=s") }
+        }
+        assertEquals(AccountsException.Kind.UnexpectedCallback, e.kind)
     }
 
     @Test
