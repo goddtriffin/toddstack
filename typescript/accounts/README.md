@@ -92,6 +92,9 @@ What a project must do:
 
 - Keep `tokens.idToken` (the raw string) and `claims.sid` with your session, to pass as the hint and to match
   `session.signed_out`. `sid` is `undefined` on tokens issued before the service added it.
+- `claims.visibility` is `"review"` for a review account (the `toddgriffin_visibility` claim) and `"normal"` otherwise,
+  including when the claim is absent (type `Visibility`); `isReview(claims)` is the shortcut, and `visibilityOf(value)`
+  reads a raw claim from userinfo. A `user.updated` webhook carries `event.data.visibility` the same way.
 - Register a post-logout redirect URI for your client, exactly (Todd runs
   `accounts-service admin client update ... --logout <URI>` or uses the admin UI). An unregistered or off-site one is
   dropped (`postLogoutTarget` returns null). The service skips its "Sign out?" confirm page only when the ID token hint
@@ -203,8 +206,11 @@ const receipt = await accounts.sendNotification({
   sendAtLocal: "20:00", // on the player's own clock
   collapseKey: "streak",
   idempotencyKey: "streak-2026-11-15", // always pass one
+  senderSub: sub, // optional uuid: shows this person's name and avatar, to friends only
 });
 // receipt: { id, status, recipients, counts, result, replayed }
+// senderSub: accounts shows that person's name and avatar on the push only to their friends, and only when neither
+// side is a review account, is suspended, or has blocked the other; otherwise the push goes out plain.
 
 await accounts.cancelNotifications("streak", sub); // they played: drop the scheduled reminder (sub optional)
 const later = await accounts.notificationStatus(receipt.id); // poll a fan-out's counts
@@ -336,6 +342,10 @@ is accepted only for `127.0.0.1`, `localhost` and `::1`; any other `http` base o
 default.
 
 ## Breaking changes
+
+**0.8.0**: `IdClaims` has a new required `visibility` field, so code that builds an `IdClaims` by hand (a test double,
+say) must add it. Verified tokens always carry it. Added `Visibility`, `visibilityOf`, `isReview` and
+`Notification.senderSub`.
 
 **0.7.0**: the 0.6 `Friends` methods (`accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `relationships`,
 `markRead`, `mute`, `unmute`) now reject an id outside `[A-Za-z0-9_-]{1,64}` with a bad-request error (`kind: "api"`,

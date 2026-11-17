@@ -111,6 +111,22 @@ import ToddstackAccountsTesting
         #expect(!String(reflecting: session).contains("super-secret"))
     }
 
+    @Test func visibilityDefaultsToNormalAndReadsReview() throws {
+        let decoder = JSONDecoder()
+        let normal = try decoder.decode(Player.self, from: Data(#"{"id":"p1","username":"todd","picture":null,"guest":false}"#.utf8))
+        #expect(normal.visibility == .normal)
+        #expect(!normal.isReview)
+        let review = try decoder.decode(Player.self, from: Data(#"{"id":"p1","username":"todd","guest":false,"visibility":"review"}"#.utf8))
+        #expect(review.visibility == .review)
+        #expect(review.isReview)
+        let newer = try decoder.decode(Player.self, from: Data(#"{"id":"p1","username":"todd","guest":false,"visibility":"newer"}"#.utf8))
+        #expect(newer.visibility == .normal)
+        #expect(Visibility(wire: nil) == .normal)
+        // Round trip, as the Keychain store does.
+        let again = try decoder.decode(Player.self, from: try JSONEncoder().encode(review))
+        #expect(again == review)
+    }
+
     @Test func aStoreReadErrorThrowsInsteadOfReadingAsSignedOut() throws {
         struct FailingStore: SessionStore {
             func load() throws -> Session? { throw AccountsError.storage("locked") }

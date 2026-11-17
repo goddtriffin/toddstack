@@ -80,6 +80,12 @@ pub struct Notification {
     /// 1-100 characters, kept 7 days. Always set one (a date or a game id).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// The `sub` of the person the push is from (a uuid string). The service
+    /// shows that person's name and avatar on the push only to their friends,
+    /// and only when neither side is a review account, is suspended, or has
+    /// blocked the other. Otherwise the push goes out plain, with no sender.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_sub: Option<String>,
 }
 
 impl Notification {
@@ -95,6 +101,7 @@ impl Notification {
             send_at_local: None,
             collapse_key: None,
             idempotency_key: None,
+            sender_sub: None,
         }
     }
 }
@@ -366,6 +373,24 @@ mod tests {
         });
         let actual: Value = serde_json::to_value(&notification).unwrap();
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn sender_sub_serializes_only_when_set() {
+        let mut notification: Notification =
+            Notification::new(Recipient::User(String::from("u1")), "nudge", "Hi");
+        assert!(
+            serde_json::to_value(&notification)
+                .unwrap()
+                .get("sender_sub")
+                .is_none()
+        );
+        notification.sender_sub = Some(String::from("2f1c6a52-8f65-4c6b-9d8e-0a1b2c3d4e5f"));
+        let actual: Value = serde_json::to_value(&notification).unwrap();
+        assert_eq!(
+            json!("2f1c6a52-8f65-4c6b-9d8e-0a1b2c3d4e5f"),
+            actual["sender_sub"]
+        );
     }
 
     #[test]

@@ -76,6 +76,9 @@ What a project must do:
 
 - Keep `tokens.id_token` (the raw string) and `claims.sid` with your session, to pass as the hint and to match
   `session.signed_out`. `sid` is `None` on tokens issued before the service added it.
+- `claims.visibility` is `Visibility::Review` for a review account (the `toddgriffin_visibility: "review"` claim) and
+  `Visibility::Normal` otherwise, including when the claim is absent; `claims.is_review()` is the shortcut. A
+  `user.updated` webhook carries the same value: `event.visibility()` (`None` when the event has no such field).
 - Register a post-logout redirect URI for your client, exactly (Todd runs
   `accounts-service admin client update ... --logout <URI>` or uses the admin UI). The service skips its "Sign out?" confirm
   page only when the ID token hint is valid and the redirect URI is registered (or absent). Otherwise the person sees
@@ -153,7 +156,7 @@ apps, not only on accounts.toddgriffin.me. Enable the `axum` feature and mount o
 needs the `friends` scope.
 
 ```toml
-toddstack-accounts = { version = "0.7.0", features = ["axum"] }
+toddstack-accounts = { version = "0.8.0", features = ["axum"] }
 ```
 
 ```rust
@@ -216,6 +219,7 @@ streak.url = Some(String::from("https://www.boggledygook.com/daily")); // on a r
 streak.send_at_local = Some(String::from("20:00"));                      // on the player's own clock
 streak.collapse_key = Some(String::from("streak"));
 streak.idempotency_key = Some(String::from("streak-2026-11-15"));        // always set one
+streak.sender_sub = Some(sub.clone());                                   // show this person's name and avatar, to friends only
 let receipt = accounts.send_notification(&streak).await?; // Receipt { id, status, recipients, counts, result, replayed }
 
 accounts.cancel_notifications("streak", Some(&sub)).await?; // they played: drop the scheduled reminder (user optional)
@@ -229,6 +233,9 @@ let later = accounts.notification_status(&receipt.id).await?; // poll a fan-out'
   as `dropped_runaway`.
 - `collapse_key` replaces that player's unread item with the same key from your project, and names a scheduled one so
   `cancel_notifications` can remove it. Nothing collapses without a key.
+- `sender_sub` (a uuid string) names who the push is from. The service shows that person's name and avatar only to
+  their friends, and only when neither side is a review account, is suspended, or has blocked the other; otherwise the
+  push goes out plain.
 - A send to one `User` is delivered inline: `Status::Done` and `result` (`Delivered`, `Scheduled` or `NotDelivered`). A
   fan-out (`FriendsOf`, `AllPlayers`) answers `Status::Queued`; poll `notification_status` for its `counts`.
   `NotDelivered` folds together muted, left your project and suspended, so a send can't probe players.
@@ -346,6 +353,8 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 **Issuer match:** the issuer must exactly match the local server's `ACCOUNTS_BASE_URL`. If you run accounts on `http://localhost:8790` (needed for passkeys), use `toddgriffin_at("http://localhost:8790", ..)`, not the `127.0.0.1` default.
 
 ## Breaking changes
+
+**0.8.0**: `IdClaims` has a new `visibility` field and `Notification` a new `sender_sub` field, so code that builds either with a struct literal must add it (`Notification::new` and token verification are unchanged). Added `Visibility`, `IdClaims::is_review` and `Event::visibility`.
 
 **0.7.0**: the 0.6 `Friends` methods (`accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `relationships`, `mark_read`, `mute`, `unmute`) now reject an id outside `[A-Za-z0-9_-]{1,64}` with a bad-request error (`400`) before any request is sent, so a decoded `../`, `?` or `#` can't reach another accounts path. Real accounts-service subs always match, so callers passing real subs see no change. Added the `axum` feature and `friends_router`.
 

@@ -1,5 +1,6 @@
 // Tokens: exchanging codes, refreshing, revoking, and verifying ID and access tokens.
 
+import { type Visibility, visibilityOf } from "./visibility.ts";
 import { fromBase64, fromUtf8, utf8 } from "./encoding.ts";
 import { AccountsError } from "./error.ts";
 import { Friends } from "./friends.ts";
@@ -122,6 +123,11 @@ export interface IdClaims {
    * before the service added it.
    */
   sid?: string;
+  /**
+   * `"review"` for a review account (the `toddgriffin_visibility` claim), else `"normal"`, including when the claim
+   * is absent. See `isReview`.
+   */
+  visibility: Visibility;
   /** Any other claim. */
   [claim: string]: unknown;
 }
@@ -267,7 +273,11 @@ export class Accounts {
     if (nonce !== undefined && claims.nonce !== nonce) {
       throw new AccountsError("invalid_token", "token rejected: nonce mismatch");
     }
-    return { ...claims, amr: Array.isArray(claims.amr) ? claims.amr : [] } as IdClaims;
+    return {
+      ...claims,
+      amr: Array.isArray(claims.amr) ? claims.amr : [],
+      visibility: visibilityOf(claims.toddgriffin_visibility),
+    } as IdClaims;
   }
 
   /**

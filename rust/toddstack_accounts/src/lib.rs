@@ -60,7 +60,7 @@ pub mod webhook;
 
 pub use error::Error;
 pub use login::PendingLogin;
-pub use tokens::{AccessClaims, Accounts, Config, IdClaims, SignedIn, TokenSet};
+pub use tokens::{AccessClaims, Accounts, Config, IdClaims, SignedIn, TokenSet, Visibility};
 
 /// The production issuer. Permanent: every app and passkey depends on it.
 pub const ISSUER: &str = "https://accounts.toddgriffin.me/oidc";

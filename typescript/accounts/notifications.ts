@@ -39,6 +39,12 @@ export interface Notification {
   collapseKey?: string;
   /** 1-100 characters, kept 7 days. Always set one (a date or a game id). */
   idempotencyKey?: string;
+  /**
+   * The `sub` of the person the push is from (a uuid string). The service shows that person's name and avatar on the
+   * push only to their friends, and only when neither side is a review account, is suspended, or has blocked the
+   * other. Otherwise the push goes out plain, with no sender.
+   */
+  senderSub?: string;
 }
 
 /** What happened to one player: `not_delivered` folds together muted, left your project and suspended, so a send can't probe players. */
@@ -87,6 +93,7 @@ export function notificationBody(n: Notification): Record<string, unknown> {
   if (n.sendAtLocal !== undefined) wire.send_at_local = n.sendAtLocal;
   if (n.collapseKey !== undefined) wire.collapse_key = n.collapseKey;
   if (n.idempotencyKey !== undefined) wire.idempotency_key = n.idempotencyKey;
+  if (n.senderSub !== undefined) wire.sender_sub = n.senderSub;
   return wire;
 }
 

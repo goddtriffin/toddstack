@@ -12,7 +12,7 @@ accounts web flow for it. Swift 6, iOS 17.4+ / macOS 14.4+, no third-party depen
 Swift Package Manager, from the repository URL (the manifest is `Package.swift` at the repo root):
 
 ```swift
-.package(url: "https://github.com/goddtriffin/toddstack", from: "0.7.0")  // see Releases
+.package(url: "https://github.com/goddtriffin/toddstack", from: "0.8.0")  // see Releases
 // target dependency:
 .product(name: "ToddstackAccounts", package: "toddstack")
 ```
@@ -41,7 +41,7 @@ Your project's server implements this; the SDK speaks only this.
    accounts web flow, then redirects to the app's claimed https callback with `?code=<one-time>&state=<same>`, or
    `?error=<code>&state=<same>`.
 2. `POST {server}/api/v1/app/session` with JSON `{"code","code_verifier"}` answers `200 {"token","expires_at","player"}`
-   (`expires_at` is RFC 3339 or `null`; `player` is `{"id","username","picture","guest"}`) or `400 {"error":"invalid_grant"}`.
+   (`expires_at` is RFC 3339 or `null`; `player` is `{"id","username","picture","guest"}`, plus an optional `"visibility"`: `"review"` for a review account, which `Player.visibility` reads and `Player.isReview` tests; absent or anything else is `.normal`) or `400 {"error":"invalid_grant"}`.
    If the stored session is a **guest** (`player.guest` true), the SDK sends its token as `Authorization: Bearer <token>`:
    the server merges that guest into the signed-in player and revokes the guest token, and the SDK replaces the stored
    token with the new one. A signed-in account's token is never sent here (switching accounts).
@@ -173,6 +173,8 @@ From the repo root: `make swift_test` (macOS; uses Xcode's toolchain for swift-t
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -scheme ToddstackAccounts -destination 'generic/platform=iOS' build`.
 
 ## Breaking changes
+
+**0.8.0**: no breaking changes. Added `Visibility` (`.normal`, `.review`), `Player.visibility` (default `.normal`) and `Player.isReview`. Notifications and webhooks are server-side, so `sender_sub` and the `user.updated` visibility live in the Rust and TypeScript SDKs only.
 
 **0.7.0**: no breaking changes. Added `FriendsClient` and the friends models.
 

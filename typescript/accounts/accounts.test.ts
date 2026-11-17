@@ -6,6 +6,7 @@ import {
   endSessionUrl,
   hasScope,
   isKnownWebhookEventType,
+  isReview,
   type JwkSet,
   LOCAL_BASE_URL,
   localConfig,
@@ -18,6 +19,7 @@ import {
   toddgriffinAt,
   verifyWebhook,
   VERSION,
+  visibilityOf,
   WEBHOOK_EVENT_TYPES,
 } from "./mod.ts";
 import { base64url, utf8 } from "./encoding.ts";
@@ -513,6 +515,42 @@ Deno.test("the browser session id is exposed when the ID token carries one", asy
   assertEquals((await accounts.verifyIdToken(await jwt(idClaims("n")), "n")).sid, undefined);
   const claims = await accounts.verifyIdToken(await jwt({ ...idClaims("n"), sid: "sid-123" }), "n");
   assertEquals(claims.sid, "sid-123");
+});
+
+Deno.test("visibility is normal when the claim is absent and review for a review account", async () => {
+  const accounts = new Accounts(config, { keys: jwks });
+  const normal = await accounts.verifyIdToken(await jwt(idClaims("n")), "n");
+  assertEquals([normal.visibility, isReview(normal)], ["normal", false]);
+  const review = await accounts.verifyIdToken(
+    await jwt({ ...idClaims("n"), toddgriffin_visibility: "review" }),
+    "n",
+  );
+  assertEquals([review.visibility, isReview(review)], ["review", true]);
+  assertEquals([visibilityOf(undefined), visibilityOf("review"), visibilityOf("newer")], [
+    "normal",
+    "review",
+    "normal",
+  ]);
+});
+
+Deno.test("a user.updated webhook carries the visibility", async () => {
+  const body = '{"id":"e8","type":"user.updated","created_at":1700000000,"data":{"sub":"u1","visibility":"review"}}';
+  const event = await verifyWebhook("secret", await sign("secret", 1_700_000_000, body), body, 1_700_000_010);
+  assertEquals(event.data.visibility, "review");
+});
+
+Deno.test("senderSub is sent as sender_sub only when set", async () => {
+  const { fetcher, calls } = recording(Response.json(DONE, { status: 202 }), Response.json(DONE, { status: 202 }));
+  const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+  await accounts.sendNotification({ recipient: { user: "u1" }, type: "k", title: "t" });
+  await accounts.sendNotification({
+    recipient: { user: "u1" },
+    type: "k",
+    title: "t",
+    senderSub: "2f1c6a52-8f65-4c6b-9d8e-0a1b2c3d4e5f",
+  });
+  assertEquals("sender_sub" in JSON.parse(calls[0].body), false);
+  assertEquals(JSON.parse(calls[1].body).sender_sub, "2f1c6a52-8f65-4c6b-9d8e-0a1b2c3d4e5f");
 });
 
 // A JWKS endpoint whose keys and status the test controls, behind a clock the test moves.
