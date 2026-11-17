@@ -99,6 +99,23 @@ async fn the_review_visibility_claim_marks_a_review_account() {
 }
 
 #[tokio::test]
+async fn an_unknown_or_null_visibility_claim_reads_as_normal() {
+    let s: Signer = signer();
+    for value in [json!("newer"), json!(null), json!(7)] {
+        let mut claims: Value = id_claims();
+        claims["toddgriffin_visibility"] = value.clone();
+        let result = accounts(&s)
+            .verify_id_token(&sign(&s, &claims, None), Some("n1"))
+            .await;
+        if value.is_number() {
+            assert!(result.is_err(), "a non-string claim is malformed");
+        } else {
+            assert_eq!(Visibility::Normal, result.unwrap().visibility, "{value}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn the_browser_session_id_is_exposed_when_the_token_carries_one() {
     let s: Signer = signer();
     let mut with_sid: Value = id_claims();

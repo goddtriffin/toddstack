@@ -104,7 +104,7 @@ pub struct TokenSet {
 /// How the service treats an account. Review accounts (the App Store and Play
 /// reviewers' logins) are hidden from other people: they never appear to
 /// friends and get no friend-facing sender details on notifications.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
     /// An ordinary account. The default, and what an absent claim means.
@@ -130,6 +130,15 @@ impl Visibility {
         } else {
             Self::Normal
         }
+    }
+}
+
+/// Lenient: an unknown or `null` value reads as [`Visibility::Normal`], so a
+/// value the service adds later never breaks sign-in.
+impl<'de> Deserialize<'de> for Visibility {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Option::<String>::deserialize(deserializer)?;
+        Ok(Self::from_wire(value.as_deref()))
     }
 }
 
