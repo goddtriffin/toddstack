@@ -7,6 +7,7 @@
 
 import { utf8 } from "./encoding.ts";
 import { AccountsError } from "./error.ts";
+import type { Visibility } from "./visibility.ts";
 
 /** The header name. */
 export const WEBHOOK_HEADER = "X-Accounts-Signature";
@@ -63,7 +64,7 @@ export interface WebhookEvent {
   createdAt: number;
   /**
    * Always has `sub` (the person the event is about); `session.signed_out` adds `sid`; `user.updated` adds the fields that
-   * changed, and the friendship events add `friend_sub` (the other person), and the friend request events add `from_sub` (who
+   * changed (and `visibility`), and the friendship events add `friend_sub` (the other person), and the friend request events add `from_sub` (who
    * asked) and `to_sub` (who was asked).
    */
   data: {
@@ -72,6 +73,8 @@ export interface WebhookEvent {
     friend_sub?: string;
     from_sub?: string;
     to_sub?: string;
+    /** `user.updated`: whether the person is a review account (`"review"`) or not (`"normal"`). */
+    visibility?: Visibility;
     [field: string]: unknown;
   };
 }

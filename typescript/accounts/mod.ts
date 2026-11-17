@@ -70,6 +70,7 @@ export {
   type TokenSet,
 } from "./tokens.ts";
 export { VERSION } from "./version.ts";
+export { isReview, type Visibility, visibilityOf } from "./visibility.ts";
 export {
   isKnownWebhookEventType,
   verifyWebhook,

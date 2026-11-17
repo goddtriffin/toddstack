@@ -6,7 +6,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use p256::SecretKey;
 use p256::pkcs8::EncodePrivateKey;
 use serde_json::{Value, json};
-use toddstack_accounts::{Accounts, Config, Error, ISSUER};
+use toddstack_accounts::{Accounts, Config, Error, ISSUER, Visibility};
 
 const KID: &str = "test-key";
 
@@ -81,6 +81,21 @@ async fn a_valid_id_token_verifies() {
     assert_eq!(claims.username.as_deref(), Some("player_one"));
     assert_eq!(claims.amr, vec![String::from("pwd")]);
     assert_eq!(None, claims.sid);
+    assert_eq!(Visibility::Normal, claims.visibility);
+    assert!(!claims.is_review());
+}
+
+#[tokio::test]
+async fn the_review_visibility_claim_marks_a_review_account() {
+    let s: Signer = signer();
+    let mut review: Value = id_claims();
+    review["toddgriffin_visibility"] = json!("review");
+    let claims = accounts(&s)
+        .verify_id_token(&sign(&s, &review, None), Some("n1"))
+        .await
+        .unwrap();
+    assert_eq!(Visibility::Review, claims.visibility);
+    assert!(claims.is_review());
 }
 
 #[tokio::test]

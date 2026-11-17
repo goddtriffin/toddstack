@@ -1,5 +1,19 @@
 import Foundation
 
+/// How the service treats an account. Review accounts (the App Store and Play reviewers' logins) are hidden from other
+/// people: they never appear to friends and get no friend-facing sender details on notifications.
+public enum Visibility: String, Codable, Sendable, Equatable {
+    /// An ordinary account. The default, and what an absent value means.
+    case normal
+    /// A review account.
+    case review
+
+    /// Reads the wire value; anything but `"review"`, an absent value included, is `.normal`.
+    public init(wire: String?) {
+        self = wire == "review" ? .review : .normal
+    }
+}
+
 /// The signed-in person, as the project server reports them.
 public struct Player: Codable, Sendable, Equatable {
     public let id: String
@@ -8,12 +22,41 @@ public struct Player: Codable, Sendable, Equatable {
     public let picture: String?
     /// True for a guest session (no account; customize nothing).
     public let guest: Bool
+    /// `.review` for a review account (the accounts service's `toddgriffin_visibility: "review"` claim, passed on by
+    /// your project server as `visibility`); `.normal` otherwise, including when it is absent.
+    public let visibility: Visibility
 
-    public init(id: String, username: String, picture: String?, guest: Bool) {
+    /// Whether this is a review account.
+    public var isReview: Bool { visibility == .review }
+
+    public init(id: String, username: String, picture: String?, guest: Bool, visibility: Visibility = .normal) {
         self.id = id
         self.username = username
         self.picture = picture
         self.guest = guest
+        self.visibility = visibility
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, username, picture, guest, visibility
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        username = try container.decode(String.self, forKey: .username)
+        picture = try container.decodeIfPresent(String.self, forKey: .picture)
+        guest = try container.decode(Bool.self, forKey: .guest)
+        visibility = Visibility(wire: try container.decodeIfPresent(String.self, forKey: .visibility))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(username, forKey: .username)
+        try container.encodeIfPresent(picture, forKey: .picture)
+        try container.encode(guest, forKey: .guest)
+        try container.encode(visibility, forKey: .visibility)
     }
 }
 

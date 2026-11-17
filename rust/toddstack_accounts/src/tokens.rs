@@ -101,6 +101,38 @@ pub struct TokenSet {
     pub scope: String,
 }
 
+/// How the service treats an account. Review accounts (the App Store and Play
+/// reviewers' logins) are hidden from other people: they never appear to
+/// friends and get no friend-facing sender details on notifications.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    /// An ordinary account. The default, and what an absent claim means.
+    #[default]
+    Normal,
+    /// A review account.
+    Review,
+}
+
+impl Visibility {
+    /// Whether this is a review account.
+    #[must_use]
+    pub const fn is_review(self) -> bool {
+        matches!(self, Self::Review)
+    }
+
+    /// Reads the wire value (`"review"` or `"normal"`); anything else, a newer
+    /// value included, is [`Visibility::Normal`].
+    #[must_use]
+    pub fn from_wire(value: Option<&str>) -> Self {
+        if value == Some("review") {
+            Self::Review
+        } else {
+            Self::Normal
+        }
+    }
+}
+
 /// Verified ID token claims.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct IdClaims {
@@ -122,6 +154,19 @@ pub struct IdClaims {
     /// local session with the same `sid` on `session.signed_out`. `None` for
     /// tokens issued before the service added it.
     pub sid: Option<String>,
+    /// The `toddgriffin_visibility` claim: [`Visibility::Review`] for a review
+    /// account. The claim is absent for normal accounts, so this defaults to
+    /// [`Visibility::Normal`].
+    #[serde(default, rename = "toddgriffin_visibility")]
+    pub visibility: Visibility,
+}
+
+impl IdClaims {
+    /// Whether this is a review account (`visibility` is [`Visibility::Review`]).
+    #[must_use]
+    pub const fn is_review(&self) -> bool {
+        self.visibility.is_review()
+    }
 }
 
 /// Verified access token claims (RFC 9068).

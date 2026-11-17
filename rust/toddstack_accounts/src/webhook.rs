@@ -129,7 +129,7 @@ pub struct Event {
     #[serde(rename = "type")]
     pub kind: EventKind,
     pub created_at: i64,
-    /// Always has `sub`; `session.signed_out` adds `sid`; `user.updated` adds the fields that changed, and the
+    /// Always has `sub`; `session.signed_out` adds `sid`; `user.updated` adds the fields that changed (and `visibility`, `review` or `normal`), and the
     /// friendship events add `friend_sub`, and the friend request events add `from_sub` and `to_sub`.
     pub data: Value,
 }
@@ -159,6 +159,16 @@ impl Event {
     #[must_use]
     pub fn from_sub(&self) -> Option<&str> {
         self.data.get("from_sub").and_then(Value::as_str)
+    }
+
+    /// Whether the person is a review account, for [`EventKind::UserUpdated`]
+    /// (`data.visibility`). `None` when the event carries no such field.
+    #[must_use]
+    pub fn visibility(&self) -> Option<crate::Visibility> {
+        self.data
+            .get("visibility")
+            .and_then(Value::as_str)
+            .map(|v| crate::Visibility::from_wire(Some(v)))
     }
 
     /// Who the request was sent to, for the `friend_request.*` events.
@@ -276,6 +286,20 @@ mod tests {
             assert_eq!(Some("u1"), event.sub());
             assert_eq!(Some("u2"), event.friend_sub());
         }
+    }
+
+    #[test]
+    fn user_updated_carries_the_visibility() {
+        use crate::Visibility;
+        let review: Event = verified(
+            r#"{"id":"e6","type":"user.updated","created_at":1700000000,"data":{"sub":"u1","visibility":"review"}}"#,
+        );
+        assert_eq!(Some(Visibility::Review), review.visibility());
+        let normal: Event = verified(
+            r#"{"id":"e7","type":"user.updated","created_at":1700000000,"data":{"sub":"u1","visibility":"normal"}}"#,
+        );
+        assert_eq!(Some(Visibility::Normal), normal.visibility());
+        assert_eq!(None, verified(BODY).visibility());
     }
 
     #[test]

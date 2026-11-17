@@ -3,7 +3,7 @@
 Sign-in for native Android apps. The same features as the Rust and TypeScript `toddstack-accounts`, for an app
 that signs in **through its project's server and never directly against `accounts.toddgriffin.me`**.
 
-- Coordinates (JitPack, from the repo's bare release tag): `com.github.goddtriffin.toddstack:toddstack-accounts:0.7.0`.
+- Coordinates (JitPack, from the repo's bare release tag): `com.github.goddtriffin.toddstack:toddstack-accounts:0.8.0`.
   Maven Central (`me.toddgriffin:toddstack-accounts`) comes later; see below.
 - Android library, minSdk 26. Dependencies: coroutines, kotlinx.serialization, androidx.browser (Auth Tab),
   androidx.activity, DataStore. No networking library (it uses `HttpURLConnection`).
@@ -17,7 +17,7 @@ Your project's server implements these. The SDK only ever talks to `serverUrl`.
    runs the accounts web flow, then redirects to the app's claimed https callback:
    `https://www.boggledygook.com/app/callback?code=<one-time>&state=<same>`, or `?error=<code>&state=<same>`.
 2. `POST {server}/api/v1/app/session` with JSON `{"code","code_verifier"}` returns `200
-   {"token","expires_at": RFC 3339 or null,"player":{"id","username","picture","guest":bool}}`, or `400
+   {"token","expires_at": RFC 3339 or null,"player":{"id","username","picture","guest":bool,"visibility"?}}`, or `400
    {"error":"invalid_grant"}`. When the stored session is a **guest**, the SDK sends its token as
    `Authorization: Bearer <token>`; the server merges that guest into the signed-in player and revokes the
    guest token, and the SDK replaces the stored token with the new one. A signed-in token is never sent here.
@@ -186,7 +186,7 @@ Add to the app's `res/xml/backup_rules.xml` (`android:fullBackupContent`) and `d
 
 Tokens live in DataStore, each value encrypted with an AES-GCM key in the Android Keystore
 (`KeystoreTokenStore`). `Session.toString()` never prints the token. In unit tests use `InMemoryTokenStore` and
-`MockAccountsApi` from the `testFixtures` (`testImplementation(testFixtures("com.github.goddtriffin.toddstack:toddstack-accounts:0.7.0"))`):
+`MockAccountsApi` from the `testFixtures` (`testImplementation(testFixtures("com.github.goddtriffin.toddstack:toddstack-accounts:0.8.0"))`):
 seed a response per exact arguments (`seedExchangeSession(code, verifier, bearer, Result.success(session))`),
 inspect `calls`, and end every test with `assertAllSeedsConsumed()`. An unseeded call throws.
 
@@ -200,19 +200,19 @@ pin the exact version (a release tag; never a branch or `-SNAPSHOT`):
 dependencyResolutionManagement { repositories { google(); mavenCentral(); maven("https://jitpack.io") } }
 
 // app/build.gradle.kts
-implementation("com.github.goddtriffin.toddstack:toddstack-accounts:0.7.0")
+implementation("com.github.goddtriffin.toddstack:toddstack-accounts:0.8.0")
 ```
 
 The group is `com.github.goddtriffin.toddstack` (JitPack's group for a module of a multi-module repo), the artifact is
 `toddstack-accounts`, and the version is the tag. Your app must use Kotlin 2.4 or later (the library's metadata is 2.4).
 The first request for a tag makes JitPack build it, which takes a few minutes; check
-`https://jitpack.io/com/github/goddtriffin/toddstack/toddstack-accounts/0.7.0/` or the build log at
+`https://jitpack.io/com/github/goddtriffin/toddstack/toddstack-accounts/0.8.0/` or the build log at
 <https://jitpack.io/#goddtriffin/toddstack>.
 
 ### Local build
 
 From a checkout of this repo, for work in progress: `cd kotlin && ./gradlew :accounts:publishToMavenLocal`, then in
-the app `repositories { mavenLocal() }` and `implementation("me.toddgriffin:toddstack-accounts:0.7.0")` (the local
+the app `repositories { mavenLocal() }` and `implementation("me.toddgriffin:toddstack-accounts:0.8.0")` (the local
 group is `me.toddgriffin`; only JitPack's build uses the `com.github...` group). Run it again after any change.
 
 ## Releasing
@@ -245,6 +245,8 @@ credentials. Todd must:
    resulting bundle in the portal. Wiring a publishing plugin with the token is the remaining step.
 
 ## Breaking changes
+
+**0.8.0**: no breaking changes. Added `Visibility` (`NORMAL`, `REVIEW`), `Player.visibility` (default `NORMAL`, also for an absent or newer value) and `Player.isReview`. `visibility` is `"review"` for a review account (the accounts service's `toddgriffin_visibility` claim, passed on by your server). Notifications and webhooks are server-side, so `sender_sub` and the `user.updated` visibility live in the Rust and TypeScript SDKs only.
 
 **0.7.0**: no breaking changes. Added `Friends`, `FriendsApi` and the friends models.
 

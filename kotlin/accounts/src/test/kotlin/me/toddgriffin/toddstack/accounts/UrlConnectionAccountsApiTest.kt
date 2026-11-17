@@ -34,6 +34,27 @@ class UrlConnectionAccountsApiTest {
     private val sessionJson: String =
         """{"token":"t","expires_at":null,"player":{"id":"p","username":"u","picture":null,"guest":true},"extra":1}"""
 
+    private suspend fun playerWith(player: String): Player {
+        reply("/api/v1/app/session", 200, """{"token":"t","player":$player}""")
+        return api.exchangeSession("c", "v", null).player
+    }
+
+    @Test
+    fun a_review_player_reads_as_review() = runBlocking {
+        val player: Player = playerWith("""{"id":"p","username":"u","guest":false,"visibility":"review"}""")
+        assertEquals(Visibility.REVIEW, player.visibility)
+        assertEquals(true, player.isReview)
+    }
+
+    @Test
+    fun a_player_without_visibility_or_with_a_newer_value_is_normal() = runBlocking {
+        val absent: Player = playerWith("""{"id":"p","username":"u","guest":false}""")
+        assertEquals(Visibility.NORMAL, absent.visibility)
+        assertEquals(false, absent.isReview)
+        assertEquals(Visibility.NORMAL, Visibility.fromWire("newer"))
+        assertEquals(Visibility.NORMAL, Visibility.fromWire(null))
+    }
+
     @Test
     fun the_exchange_posts_the_code_and_verifier_with_the_bearer_and_reads_the_session() = runBlocking {
         reply("/api/v1/app/session", 200, sessionJson)
