@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use crate::traces::UpstreamFailure;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -13,6 +14,10 @@ use axum::{Router, serve};
 use tokio::net::TcpListener;
 use tower_http::CompressionLevel;
 use tower_http::LatencyUnit;
+use tower_http::classify::{
+    ClassifiedResponse, ClassifyResponse, MakeClassifier, NeverClassifyEos, ServerErrorsAsFailures,
+    ServerErrorsFailureClass,
+};
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -449,7 +454,7 @@ fn with_middleware(
     let router: Router = router
         .layer(axum::middleware::from_fn(telemetry::http_metrics))
         .layer(
-            TraceLayer::new_for_http()
+            TraceLayer::new(RelayAwareClassifier)
                 .make_span_with(move |request: &axum::http::Request<axum::body::Body>| {
                     trace_routes.span(request)
                 })
@@ -466,6 +471,44 @@ fn with_middleware(
         router
     };
     router.layer(DefaultBodyLimit::max(body_limit))
+}
+
+/// Tower-http's 5xx-is-failure rule, except a response marked
+/// [`UpstreamFailure`] (an analytics or Sentry proxy relaying its upstream's
+/// 5xx) is not a failure here: the relay already logged it at `warn`.
+#[derive(Clone, Copy)]
+struct RelayAwareClassifier;
+
+impl MakeClassifier for RelayAwareClassifier {
+    type Classifier = RelayAwareClassifier;
+    type FailureClass = ServerErrorsFailureClass;
+    type ClassifyEos = NeverClassifyEos<ServerErrorsFailureClass>;
+
+    fn make_classifier<B>(&self, _request: &axum::http::Request<B>) -> Self::Classifier {
+        *self
+    }
+}
+
+impl ClassifyResponse for RelayAwareClassifier {
+    type FailureClass = ServerErrorsFailureClass;
+    type ClassifyEos = NeverClassifyEos<ServerErrorsFailureClass>;
+
+    fn classify_response<B>(
+        self,
+        response: &axum::http::Response<B>,
+    ) -> ClassifiedResponse<Self::FailureClass, Self::ClassifyEos> {
+        if response.extensions().get::<UpstreamFailure>().is_some() {
+            return ClassifiedResponse::Ready(Ok(()));
+        }
+        ServerErrorsAsFailures::new().classify_response(response)
+    }
+
+    fn classify_error<E>(self, error: &E) -> Self::FailureClass
+    where
+        E: std::fmt::Display + 'static,
+    {
+        ServerErrorsAsFailures::new().classify_error(error)
+    }
 }
 
 /// Level 3 of every algorithm, chosen by measurement (see the README): about
@@ -1170,6 +1213,113 @@ mod tests {
         fn a_segment_past_the_file_name_limit_is_a_404() {
             let expected: bool = true;
             let actual: bool = has_overlong_segment(&format!("/js/{}", "a".repeat(256)));
+            assert_eq!(expected, actual);
+        }
+    }
+
+    #[cfg(all(feature = "analytics", feature = "observability"))]
+    mod upstream_failures {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use axum::Router;
+        use axum::body::Bytes;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+        use sentry::protocol::EnvelopeItem;
+        use sentry::test::TestTransport;
+        use sentry::{Client, ClientOptions, Hub, HubSwitchGuard};
+        use tower::ServiceExt;
+        use tracing_subscriber::Layer;
+
+        use crate::analytics::relay_event;
+        use crate::webserver::server::with_middleware;
+        use crate::webserver::telemetry::TraceRoutes;
+
+        /// How many Sentry events a POST to each of `paths` files, through the
+        /// real middleware, with a proxy that relays a 503 upstream and a
+        /// handler of the site's own that fails with a 500.
+        async fn events_filed(path: &str) -> (StatusCode, usize) {
+            let upstream: tokio::net::TcpListener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a free port");
+            let url: String = format!("http://{}/", upstream.local_addr().expect("an address"));
+            tokio::spawn(async move {
+                let app: Router =
+                    Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE });
+                axum::serve(upstream, app).await.expect("serves");
+            });
+            let client: reqwest::Client = reqwest::Client::new();
+            let router: Router = with_middleware(
+                Router::new()
+                    .route(
+                        "/proxy",
+                        post(move |headers: HeaderMap, body: Bytes| {
+                            let client: reqwest::Client = client.clone();
+                            let url: String = url.clone();
+                            async move {
+                                let peer: SocketAddr = "203.0.113.7:1".parse().expect("an address");
+                                relay_event(&client, &url, &headers, peer, body).await
+                            }
+                        }),
+                    )
+                    .route(
+                        "/boom",
+                        post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    ),
+                1024,
+                false,
+                TraceRoutes::new(Vec::new()),
+            );
+
+            let transport: Arc<TestTransport> = TestTransport::new();
+            let mut options: ClientOptions = ClientOptions::default();
+            options.dsn = Some("https://public@sentry.invalid/1".parse().expect("a DSN"));
+            options.transport = Some(Arc::new(transport.clone()));
+            let hub: Arc<Hub> = Arc::new(Hub::new(
+                Some(Arc::new(Client::from(options))),
+                Arc::new(sentry::Scope::default()),
+            ));
+            let _hub: HubSwitchGuard = HubSwitchGuard::new(hub);
+            let _subscriber: tracing::subscriber::DefaultGuard =
+                tracing::subscriber::set_default(tracing_subscriber::layer::SubscriberExt::with(
+                    tracing_subscriber::registry(),
+                    // The production layer that turns `error!` into an event.
+                    sentry::integrations::tracing::ErrorLayer::new()
+                        .with_filter(tracing_subscriber::filter::LevelFilter::ERROR),
+                ));
+
+            let response = router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .expect("a valid request"),
+                )
+                .await
+                .expect("a router never fails");
+            let status: StatusCode = response.status();
+            let events: usize = transport
+                .fetch_and_clear_envelopes()
+                .iter()
+                .flat_map(|envelope| envelope.items())
+                .filter(|item| matches!(item, EnvelopeItem::Event(_)))
+                .count();
+            (status, events)
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn an_upstream_503_through_a_proxy_reaches_the_visitor_but_files_no_sentry_event() {
+            let expected: (StatusCode, usize) = (StatusCode::SERVICE_UNAVAILABLE, 0);
+            let actual: (StatusCode, usize) = events_filed("/proxy").await;
+            assert_eq!(expected, actual);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_500_from_a_sites_own_handler_still_files_a_sentry_event() {
+            let expected: (StatusCode, usize) = (StatusCode::INTERNAL_SERVER_ERROR, 1);
+            let actual: (StatusCode, usize) = events_filed("/boom").await;
             assert_eq!(expected, actual);
         }
     }
