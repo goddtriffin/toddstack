@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn the_server_rate_defaults_to_the_named_constant_and_can_be_set() {
         let default: Observability = Observability::none(Environment::Local);
-        assert!(format!("{default:?}").contains("traces_sample_rate: TracesSampleRate(0.001)"));
+        assert!(format!("{default:?}").contains("traces_sample_rate: TracesSampleRate(0.01)"));
 
         let set: Observability =
             Observability::none(Environment::Local).with_traces_sample_rate(TracesSampleRate::OFF);

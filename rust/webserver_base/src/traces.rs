@@ -16,7 +16,7 @@ pub const DEFAULT_BROWSER_TRACES_SAMPLE_RATE: f32 = 0.2;
 ///
 /// Placeholder until real traffic numbers set it. Low because the server sees
 /// every request, including every browser-initiated one.
-pub const DEFAULT_SERVER_TRACES_SAMPLE_RATE: f32 = 0.001;
+pub const DEFAULT_SERVER_TRACES_SAMPLE_RATE: f32 = 0.01;
 
 /// The `op` of a request the server traces. Anything else is dropped by the
 /// sampler.
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn a_rate_prints_as_the_shortest_decimal_for_a_script_literal() {
         assert_eq!("0.2", TracesSampleRate::BROWSER_DEFAULT.to_string());
-        assert_eq!("0.001", TracesSampleRate::SERVER_DEFAULT.to_string());
+        assert_eq!("0.01", TracesSampleRate::SERVER_DEFAULT.to_string());
         assert_eq!("1", TracesSampleRate::ALL.to_string());
         assert_eq!("0", TracesSampleRate::OFF.to_string());
     }

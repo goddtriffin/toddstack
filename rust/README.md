@@ -851,13 +851,13 @@ FrontendParams::from_env(base, pages)?
     .with_browser_traces_sample_rate(TracesSampleRate::new(0.1).expect("0 to 1"))
 // server: a share of dynamic requests
 bootstrap!(
-    |observability| observability.with_traces_sample_rate(TracesSampleRate::new(0.001).expect("0 to 1")),
+    |observability| observability.with_traces_sample_rate(TracesSampleRate::new(0.05).expect("0 to 1")),
     |shutdown| async move { /* ... */ }
 )
 ```
 
 Without these a site gets `DEFAULT_BROWSER_TRACES_SAMPLE_RATE` (0.2) and
-`DEFAULT_SERVER_TRACES_SAMPLE_RATE` (0.001), placeholders until real traffic sets
+`DEFAULT_SERVER_TRACES_SAMPLE_RATE` (0.01), placeholders until real traffic sets
 them. Budget as traffic × rate × spans per sample: measured on the template
 site, a sampled page load is about 14 spans (a fixed ~9 plus one per resource it
 loads) and a sampled request 3 (the request, the cache middleware, the render).
