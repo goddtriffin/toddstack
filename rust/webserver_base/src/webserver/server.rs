@@ -672,9 +672,15 @@ where
         Router::new()
             .nest_service(
                 "/static",
+                // A `.br`, `.zst` or `.gz` sibling beside a file is served as-is to
+                // clients that accept it; no sibling falls back to the file,
+                // which the compression layer then handles.
                 tower_http::services::ServeDir::new(
                     cache_buster.root().join(crate::assets::STATIC_DIRECTORY),
-                ),
+                )
+                .precompressed_br()
+                .precompressed_zstd()
+                .precompressed_gzip(),
             )
             .layer(axum::middleware::from_fn(reject_unservable_static_path))
             .layer(axum::middleware::from_fn(

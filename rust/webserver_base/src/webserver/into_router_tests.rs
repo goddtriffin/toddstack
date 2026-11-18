@@ -200,6 +200,125 @@ async fn a_hashed_asset_is_served_from_the_root_and_cached_forever() {
     assert_eq!(expected, actual);
 }
 
+/// A site with `static/data/blob.txt` built and hashed, plus the hashed URL.
+/// The blob is over the compression threshold and repetitive, so the runtime
+/// layer would shrink it if it were let to.
+fn site_with_blob(name: &str) -> (PathBuf, String) {
+    let root: PathBuf = scratch_site(name);
+    fs::create_dir_all(root.join("static/data")).expect("data directory");
+    fs::write(root.join("static/data/blob.txt"), "abcdefgh".repeat(1024)).expect("the blob");
+    generate_static_assets_in(&root, Phase::NonScripts).expect("the fixture builds");
+    let hashed: String = CacheBuster::load_in(&root)
+        .expect("the manifest the build wrote")
+        .get_file("static/data/blob.txt");
+    (root, hashed)
+}
+
+const SIBLING_BODY: &[u8] = b"not really brotli, but distinguishable and long enough to be considered for compression: 0123456789012345678901234567890123456789";
+
+async fn get_encoded(router: &Router, method: Method, uri: &str, accept: &str) -> Response {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::ACCEPT_ENCODING, accept)
+                .body(Body::empty())
+                .expect("a valid request"),
+        )
+        .await
+        .expect("a router never fails")
+}
+
+fn header_of(response: &Response, name: header::HeaderName) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_precompressed_sibling_is_served_as_is_to_a_client_that_accepts_it() {
+    let (root, hashed): (PathBuf, String) = site_with_blob("precompressed");
+    fs::write(root.join(format!("{hashed}.br")), SIBLING_BODY).expect("the sibling");
+    let router: Router = site_router(&root).expect("the built site boots");
+
+    let response: Response =
+        get_encoded(&router, Method::GET, &format!("/{hashed}"), "br, gzip").await;
+    assert_eq!(StatusCode::OK, response.status());
+    assert_eq!("br", header_of(&response, header::CONTENT_ENCODING));
+    assert!(
+        header_of(&response, header::VARY)
+            .to_ascii_lowercase()
+            .contains("accept-encoding")
+    );
+    assert!(header_of(&response, header::CONTENT_TYPE).starts_with("text/plain"));
+    assert!(header_of(&response, header::CACHE_CONTROL).contains("immutable"));
+
+    // Byte-identical: the runtime layer did not compress it a second time.
+    let bytes: axum::body::Bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("a readable body");
+    assert_eq!(SIBLING_BODY, bytes.as_ref());
+}
+
+#[tokio::test]
+async fn a_head_request_for_a_precompressed_sibling_carries_its_headers_and_no_body() {
+    let (root, hashed): (PathBuf, String) = site_with_blob("precompressed-head");
+    fs::write(root.join(format!("{hashed}.br")), SIBLING_BODY).expect("the sibling");
+    let router: Router = site_router(&root).expect("the built site boots");
+
+    let response: Response = get_encoded(&router, Method::HEAD, &format!("/{hashed}"), "br").await;
+    assert_eq!(StatusCode::OK, response.status());
+    assert_eq!("br", header_of(&response, header::CONTENT_ENCODING));
+    assert_eq!(
+        SIBLING_BODY.len().to_string(),
+        header_of(&response, header::CONTENT_LENGTH)
+    );
+    let bytes: axum::body::Bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("a readable body");
+    assert!(bytes.is_empty());
+}
+
+#[tokio::test]
+async fn a_client_that_does_not_accept_brotli_gets_the_original_file() {
+    let (root, hashed): (PathBuf, String) = site_with_blob("precompressed-identity");
+    fs::write(root.join(format!("{hashed}.br")), SIBLING_BODY).expect("the sibling");
+    let router: Router = site_router(&root).expect("the built site boots");
+
+    for response in [
+        get(&router, &format!("/{hashed}")).await,
+        get_encoded(&router, Method::GET, &format!("/{hashed}"), "identity").await,
+    ] {
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!("", header_of(&response, header::CONTENT_ENCODING));
+        assert_eq!("abcdefgh".repeat(1024), text(response).await);
+    }
+}
+
+#[tokio::test]
+async fn a_file_with_no_sibling_is_compressed_at_runtime() {
+    let (root, hashed): (PathBuf, String) = site_with_blob("precompressed-absent");
+    let router: Router = site_router(&root).expect("the built site boots");
+
+    let response: Response = get_encoded(&router, Method::GET, &format!("/{hashed}"), "br").await;
+    assert_eq!(StatusCode::OK, response.status());
+    assert_eq!("br", header_of(&response, header::CONTENT_ENCODING));
+    assert!(
+        header_of(&response, header::VARY)
+            .to_ascii_lowercase()
+            .contains("accept-encoding")
+    );
+    let bytes: axum::body::Bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("a readable body");
+    assert!(bytes.len() < 1024, "{} bytes", bytes.len());
+}
+
 #[tokio::test]
 async fn a_static_miss_is_a_404_that_is_never_cached() {
     // A hashed URL can be asked for before its file is deployed; caching that
