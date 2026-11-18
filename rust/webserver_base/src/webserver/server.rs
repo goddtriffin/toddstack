@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tower_http::CompressionLevel;
 use tower_http::LatencyUnit;
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info, instrument, warn};
 
@@ -157,7 +158,9 @@ where
     /// Turns response compression off. On by default.
     ///
     /// Every response a client accepts compressed (zstd, brotli or gzip) is,
-    /// unless it is small, already compressed, an image or an event stream.
+    /// unless it is small, already compressed, an image, a range, or an event
+    /// or NDJSON stream. A route that streams any other type must set an exempt
+    /// `Content-Type` or the encoder buffers it; or use this to opt out.
     /// Turn it off when a proxy in front already compresses and the origin's
     /// CPU matters more than its bandwidth.
     #[must_use]
@@ -418,7 +421,8 @@ where
 /// matched route), tracing, the request id (outside tracing, so the span sees
 /// it), then the body cap (outermost, so tracing never sees a request it may
 /// never finish reading). Compression sits just inside the cap, outside
-/// tracing, so every response (404s and 304s included) gets `Vary`.
+/// tracing, so it sees every response (404s included). It adds `Vary` only to
+/// a response it considers for compression: not 304s, tiny bodies or streams.
 fn with_middleware(router: Router, body_limit: usize, compression: bool) -> Router {
     let router: Router = router
         .layer(axum::middleware::from_fn(telemetry::http_metrics))
@@ -463,11 +467,17 @@ fn with_middleware(router: Router, body_limit: usize, compression: bool) -> Rout
 /// milliseconds a response). `deflate` is off: no client that sends it lacks gzip.
 ///
 /// The default predicate skips bodies under 32 bytes, images (but not SVG),
-/// gRPC and `text/event-stream`, so streams keep flushing.
-fn compression_layer() -> CompressionLayer {
+/// gRPC and `text/event-stream`; newline-delimited JSON is added, so those
+/// streams keep flushing. Any other streamed body would sit in the encoder.
+fn compression_layer() -> CompressionLayer<impl Predicate> {
     CompressionLayer::new()
         .no_deflate()
         .quality(CompressionLevel::Precise(3))
+        .compress_when(
+            DefaultPredicate::new()
+                .and(NotForContentType::const_new("application/x-ndjson"))
+                .and(NotForContentType::const_new("application/jsonl")),
+        )
 }
 
 /// A server ready to bind: what [`WebServer::run`] serves and what it cleans

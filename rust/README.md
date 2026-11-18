@@ -171,14 +171,20 @@ neither. There is no `.assets()` call.
 ### Response compression
 
 On by default, for every route including the ones you merge in. The client's
-`Accept-Encoding` picks zstd, brotli or gzip; `Vary: Accept-Encoding` is set on
-every response, compressed or not; `Content-Length` is dropped from compressed
+`Accept-Encoding` picks zstd, brotli or gzip; `Vary: Accept-Encoding` is added to
+every body it considers for compression, whether or not this client accepted an
+encoding (not to 304s, tiny bodies, ranges, already-encoded or exempt streams); `Content-Length` and `Accept-Ranges` is dropped from compressed
 bodies; an `ETag` is left as the handler set it (the weak/strong pair is not
 worth breaking `If-None-Match` over).
 
 Not compressed: bodies under 32 bytes, images (SVG excepted), gRPC, anything
-already carrying `Content-Encoding`, and `text/event-stream`, so SSE keeps
-flushing each event. WebSocket upgrades pass through untouched.
+already carrying `Content-Encoding`, `206` range responses, `text/event-stream`
+and `application/x-ndjson` / `application/jsonl`, so those streams keep
+flushing each event or line. WebSocket upgrades pass through untouched.
+
+**A route that streams any other content type** (chunked text, say) would sit in
+the encoder until it fills: give it an exempt `Content-Type`, or turn compression
+off with `without_compression()`.
 
 Every algorithm runs at level 3. Measured on one core, per response:
 
@@ -795,6 +801,12 @@ one is set, so a laptop can never pour into production's numbers. Production wit
 an id behaves as before. Sentry is unaffected: it stays on in every environment.
 In code, `AnalyticsConfig::disabled()` and `AnalyticsConfig::is_enabled()` expose
 the same state, and `Frontend` applies the local rule whatever config it is given.
+
+**Upgrading to 0.3.5:** response compression is now on by default for every
+route, with no code change. Responses a client accepts compressed gain
+`Content-Encoding` and `Vary: Accept-Encoding` and lose `Content-Length`. Opt out
+with `WebServer::without_compression()` (see [Response compression](#response-compression)).
+A route streaming anything but SSE or NDJSON must set an exempt type or opt out.
 
 **Upgrading to 0.3.4:** `AnalyticsConfig::from_env()` (and so
 `FrontendParams::from_env`) now also reads `WSB_ENVIRONMENT` and fails when it is
