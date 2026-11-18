@@ -12,8 +12,17 @@ pub const ENV_SENTRY_BROWSER_DSN: &str = "WSB_SENTRY_BROWSER_DSN";
 /// Plausible's script host.
 pub const PLAUSIBLE_HOST: &str = "https://plausible.io";
 
-/// Sentry's loader-script CDN.
-pub const SENTRY_CDN_HOST: &str = "https://js.sentry-cdn.com";
+/// Sentry's browser-bundle CDN.
+pub const SENTRY_BROWSER_CDN_HOST: &str = "https://browser.sentry-cdn.com";
+
+/// The Sentry browser SDK version every site serves.
+///
+/// Pinned, so a Sentry release never changes what visitors run until this
+/// library is upgraded. The one place to bump it: check that both bundles
+/// exist at the new version, and that `window.Sentry` still carries
+/// `browserTracingIntegration`, `getActiveSpan`, `getRootSpan`,
+/// `spanToJSON` and `startInactiveSpan`, which the layout's span helper uses.
+pub const SENTRY_BROWSER_SDK_VERSION: &str = "10.78.0";
 
 /// Which Plausible site events belong to, or that none do.
 ///
@@ -158,7 +167,7 @@ impl AnalyticsConfig {
 /// byte relay and stops it being usable as an open relay to arbitrary projects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentryDsn {
-    public_key: String,
+    dsn: String,
     host: String,
     project_id: String,
 }
@@ -191,16 +200,31 @@ impl SentryDsn {
         }
 
         Ok(Self {
-            public_key: public_key.to_string(),
+            dsn: dsn.to_string(),
             host: host.to_string(),
             project_id: project_id.to_string(),
         })
     }
 
-    /// The upstream loader script for this DSN's public key.
+    /// The DSN as given. A browser DSN is public by design: it only lets a
+    /// client send events, and the browser needs it to build them.
     #[must_use]
-    pub fn upstream_script_url(&self) -> String {
-        format!("{SENTRY_CDN_HOST}/{}.min.js", self.public_key)
+    pub fn as_str(&self) -> &str {
+        &self.dsn
+    }
+
+    /// The pinned browser bundle, with tracing (page-load spans and web
+    /// vitals) or without. The tracing bundle is about 60% larger, so a site
+    /// that traces nothing is served the errors-only one.
+    ///
+    /// Not the per-project loader script: that one serves whichever bundle the
+    /// project's dashboard toggle names, so tracing would depend on a setting
+    /// outside the code, and it fetches the bundle from Sentry's origin, past
+    /// this site's proxy.
+    #[must_use]
+    pub fn upstream_bundle_url(tracing: bool) -> String {
+        let bundle: &str = if tracing { "bundle.tracing" } else { "bundle" };
+        format!("{SENTRY_BROWSER_CDN_HOST}/{SENTRY_BROWSER_SDK_VERSION}/{bundle}.min.js")
     }
 
     /// Where envelopes are relayed, verbatim.
@@ -212,7 +236,7 @@ impl SentryDsn {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalyticsConfig, SentryDsn};
+    use super::{AnalyticsConfig, SENTRY_BROWSER_SDK_VERSION, SentryDsn};
     use crate::environment::Environment;
 
     #[test]
@@ -286,20 +310,31 @@ mod tests {
     }
 
     #[test]
-    fn a_dsn_yields_its_loader_script_and_envelope_endpoint() {
+    fn a_dsn_yields_its_envelope_endpoint_and_is_kept_verbatim() {
         let dsn: SentryDsn =
             SentryDsn::parse("https://abc123@o4504844394627072.ingest.sentry.io/4504862450515968")
                 .expect("a well-formed DSN");
 
-        let expected: String = String::from("https://js.sentry-cdn.com/abc123.min.js");
-        let actual: String = dsn.upstream_script_url();
-        assert_eq!(expected, actual);
+        let expected: &str = "https://abc123@o4504844394627072.ingest.sentry.io/4504862450515968";
+        assert_eq!(expected, dsn.as_str());
 
         let expected: String = String::from(
             "https://o4504844394627072.ingest.sentry.io/api/4504862450515968/envelope/",
         );
         let actual: String = dsn.upstream_envelope_url();
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn the_bundle_is_pinned_and_the_tracing_one_is_only_named_when_asked_for() {
+        let expected: String =
+            format!("https://browser.sentry-cdn.com/{SENTRY_BROWSER_SDK_VERSION}/bundle.min.js");
+        assert_eq!(expected, SentryDsn::upstream_bundle_url(false));
+
+        let expected: String = format!(
+            "https://browser.sentry-cdn.com/{SENTRY_BROWSER_SDK_VERSION}/bundle.tracing.min.js"
+        );
+        assert_eq!(expected, SentryDsn::upstream_bundle_url(true));
     }
 
     #[test]

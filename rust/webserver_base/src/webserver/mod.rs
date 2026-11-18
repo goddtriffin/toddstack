@@ -23,7 +23,7 @@ mod shutdown;
 mod state;
 mod telemetry;
 
-pub use bootstrap::bootstrap_with_release;
+pub use bootstrap::{bootstrap_with_release, bootstrap_with_release_and};
 pub use error::WebServerError;
 #[cfg(feature = "pages")]
 pub use frontend::{Frontend, FrontendParams, WellKnown};

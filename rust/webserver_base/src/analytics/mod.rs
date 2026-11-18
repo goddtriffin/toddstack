@@ -15,8 +15,8 @@ mod proxy;
 mod retry;
 
 pub use config::{
-    AnalyticsConfig, ENV_ANALYTICS_ID, ENV_SENTRY_BROWSER_DSN, PLAUSIBLE_HOST, SENTRY_CDN_HOST,
-    SentryDsn, SentryDsnParseError,
+    AnalyticsConfig, ENV_ANALYTICS_ID, ENV_SENTRY_BROWSER_DSN, PLAUSIBLE_HOST,
+    SENTRY_BROWSER_CDN_HOST, SENTRY_BROWSER_SDK_VERSION, SentryDsn, SentryDsnParseError,
 };
 pub use ip::{CLIENT_IP_HEADERS, resolve_true_client_ip_address};
 pub use proxy::{ScriptRelay, relay_envelope, relay_event, relay_script};

@@ -153,6 +153,10 @@ axum = { workspace = true }
 # Streams the event-stream compression test feeds through the router.
 futures-util = "0.3"
 
+# `sentry::test`'s capturing transport, which the request-tracing tests read
+# transactions back from.
+sentry = { workspace = true, features = ["test"] }
+
 # Feed oracles. `roxmltree` proves well-formedness with a parser that is not the
 # one that wrote the document, because a generator checked by its own parser
 # waves through exactly the emit-and-accept bug the check exists for. `rss` and

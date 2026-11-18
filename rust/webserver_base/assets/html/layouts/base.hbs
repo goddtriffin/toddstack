@@ -124,18 +124,53 @@
   {{/if}}
 
   {{#if sentry_browser}}
-  {{! Browser error monitoring. `tunnel` routes envelopes back through this
-      origin; the server relays them verbatim, so Sentry receives a genuine
-      browser event rather than a server-side re-report. The loader is
-      `defer`red so it never blocks parsing or first paint: `sentryOnLoad` is
-      defined first, and deferred scripts run in document order, so Sentry is
-      initialised before any of the page's module scripts run. }}
-  <script>
-    window.sentryOnLoad = function () {
-      Sentry.init({ environment: "{{sentry_browser.environment}}", tunnel: "{{sentry_browser.tunnel_path}}" });
+  {{! Browser error monitoring, and page-load tracing when a rate is set. The
+      pinned bundle is proxied through this origin; `tunnel` routes envelopes
+      back through it too, and the server relays them verbatim, so Sentry
+      receives a genuine browser event rather than a server-side re-report.
+      The bundle is `defer`red so it never blocks parsing or first paint, and
+      the inline module that initialises it is deferred too: deferred scripts
+      and inline modules run in document order, so Sentry is initialised before
+      any of the page's own scripts run. Tracing is not left to the Sentry
+      project's dashboard: the bundle served, and `tracesSampleRate`, come from
+      this site's configuration alone.
+
+      `window.webserverBase.span` lets a page script add a child span to the
+      page load: `{ name, op, start, end, attributes }`, with `start` and `end`
+      in `performance.now()` milliseconds. It does nothing when tracing is off,
+      or once the page load's trace has ended. }}
+  <script defer src="{{sentry_browser.script_path}}" crossorigin="anonymous"></script>
+  <script type="module">
+    Sentry.init({
+      dsn: "{{sentry_browser.dsn}}",
+      environment: "{{sentry_browser.environment}}",
+      tunnel: "{{sentry_browser.tunnel_path}}",
+      {{#if sentry_browser.traces_sample_rate}}
+      tracesSampleRate: {{sentry_browser.traces_sample_rate}},
+      integrations: [Sentry.browserTracingIntegration()],
+      {{/if}}
+    });
+    window.webserverBase = {
+      span: function (options) {
+        {{#if sentry_browser.traces_sample_rate}}
+        try {
+          var active = Sentry.getActiveSpan();
+          var root = active && Sentry.getRootSpan(active);
+          var json = root && Sentry.spanToJSON(root);
+          if (!json || json.op !== "pageload" || json.timestamp) return;
+          var origin = performance.timeOrigin;
+          Sentry.startInactiveSpan({
+            name: options.name,
+            op: options.op || "app",
+            startTime: (origin + options.start) / 1000,
+            attributes: options.attributes,
+            parentSpan: root,
+          }).end((origin + options.end) / 1000);
+        } catch (error) {}
+        {{/if}}
+      },
     };
   </script>
-  <script defer src="{{sentry_browser.script_path}}" crossorigin="anonymous"></script>
   {{/if}}
 
   {{! Style Sheets }}

@@ -29,6 +29,9 @@ use crate::templates::{
 
 use crate::templates::TemplateError;
 
+#[cfg(feature = "observability")]
+mod trace_tests;
+
 use super::{FrontendParams, NotFound, Pages, Shutdown, WebServer, WebServerError, WebServerState};
 
 // A project's own helper, which the fixture's home page calls.
