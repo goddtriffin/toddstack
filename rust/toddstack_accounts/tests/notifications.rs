@@ -490,6 +490,19 @@ async fn friends_of_posts_the_distinct_subs_as_the_project_and_reads_the_map() {
 }
 
 #[tokio::test]
+async fn friends_of_lowercases_subs_before_deduping() {
+    let (issuer, seen) = service(vec![(200, FRIENDS)]).await;
+    accounts(&issuer, Some("s3cret"))
+        .friends_of(&["ABC-1", "abc-1", "Abc-1"])
+        .await
+        .unwrap();
+    let request: String = seen.lock().unwrap()[0].clone();
+    let actual_body: serde_json::Value =
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(serde_json::json!({ "subs": ["abc-1"] }), actual_body);
+}
+
+#[tokio::test]
 async fn friends_of_is_retried_after_a_503_and_maps_refusals_to_typed_errors() {
     let (issuer, seen) = service(vec![(503, "{}"), (200, FRIENDS)]).await;
     let friends = accounts(&issuer, Some("s3cret"))
