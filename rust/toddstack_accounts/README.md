@@ -156,7 +156,7 @@ apps, not only on accounts.toddgriffin.me. Enable the `axum` feature and mount o
 needs the `friends` scope.
 
 ```toml
-toddstack-accounts = { version = "0.8.0", features = ["axum"] }
+toddstack-accounts = { version = "0.8.1", features = ["axum"] }
 ```
 
 ```rust
@@ -224,6 +224,9 @@ let receipt = accounts.send_notification(&streak).await?; // Receipt { id, statu
 
 accounts.cancel_notifications("streak", Some(&sub)).await?; // they played: drop the scheduled reminder (user optional)
 let later = accounts.notification_status(&receipt.id).await?; // poll a fan-out's counts
+
+// Friends of a batch of your players (1 to 100 `sub`s), with no person's token: a BTreeMap of sub to sorted friend subs.
+let friends = accounts.friends_of(&[sub_a, sub_b]).await?;
 ```
 
 - **Always set `idempotency_key`** (a date or game id). A retry with the same key gets the recorded send back
@@ -241,6 +244,11 @@ let later = accounts.notification_status(&receipt.id).await?; // poll a fan-out'
   `NotDelivered` folds together muted, left your project and suspended, so a send can't probe players.
 - The named `User` or `FriendsOf` player must have signed in to your project: otherwise `Error::NotFound` (404). A rate
   limit (6000 requests an hour, 10 fan-outs an hour) is `Error::RateLimited` (429).
+
+`friends_of` returns the people a `FriendsOf` send would reach: accepted friends who have signed in to your project,
+not blocked either way, never review or suspended accounts. It is a read, so it is retried like `notification_status`;
+duplicate subs are sent once. Any sub that never signed in to your project fails the whole call with `Error::NotFound`;
+0 or over 100 distinct subs is a 400 (`Error::Api`). Don't log the subs.
 
 ## Devices (push)
 

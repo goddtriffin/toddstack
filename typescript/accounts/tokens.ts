@@ -348,6 +348,26 @@ export class Accounts {
   }
 
   /**
+   * Each given player's friends, as your project (no person's token): the same people a `{ friendsOf }` send
+   * reaches. Accepted friends who have signed in to your project, not blocked either way, never a review or
+   * suspended account. Resolves with a map of `sub` to its sorted friend `sub`s; a player with none maps to `[]`.
+   * Duplicate `subs` are sent once. A read, so an intermittent failure is retried. Don't log the subs.
+   *
+   * Fails with `not_found` (404) when any of `subs` never signed in to your project (the whole call fails), `api`
+   * (400) unless there are 1 to 100 distinct subs, `rate_limited` (429), or `config` without a client secret.
+   */
+  async friendsOf(subs: readonly string[]): Promise<Record<string, string[]>> {
+    const answer = await this.#projectCall("POST", "/friends-of", { subs: [...new Set(subs)] }, true) as
+      | { friends?: unknown }
+      | null;
+    const friends = answer?.friends;
+    if (typeof friends !== "object" || friends === null || Array.isArray(friends)) {
+      throw new AccountsError("api", "accounts API returned 200: missing field `friends`", { status: 200 });
+    }
+    return friends as Record<string, string[]>;
+  }
+
+  /**
    * Registers a device for a player, or moves it to them if it was another player's (one phone, one person). At most
    * 10 devices are kept per player; registering more drops the least recently registered. Idempotent, so an
    * intermittent failure is retried.

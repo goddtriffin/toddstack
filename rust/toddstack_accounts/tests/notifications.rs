@@ -454,3 +454,76 @@ async fn a_public_client_cannot_register_devices() {
     ));
     assert_eq!(0, seen.lock().unwrap().len());
 }
+
+const FRIENDS: &str = r#"{"friends":{"u1":["u2","u3"],"u2":["u1"],"u4":[]}}"#;
+
+#[tokio::test]
+async fn friends_of_posts_the_distinct_subs_as_the_project_and_reads_the_map() {
+    let (issuer, seen) = service(vec![(200, FRIENDS)]).await;
+    let actual: std::collections::BTreeMap<String, Vec<String>> = accounts(&issuer, Some("s3cret"))
+        .friends_of(&["u2", "u1", "u4", "u1"])
+        .await
+        .unwrap();
+    let expected: std::collections::BTreeMap<String, Vec<String>> = [
+        (
+            String::from("u1"),
+            vec![String::from("u2"), String::from("u3")],
+        ),
+        (String::from("u2"), vec![String::from("u1")]),
+        (String::from("u4"), vec![]),
+    ]
+    .into();
+    assert_eq!(expected, actual);
+    let request: String = seen.lock().unwrap()[0].clone();
+    assert!(
+        request.starts_with("POST /api/v1/friends-of HTTP/1.1"),
+        "{request}"
+    );
+    assert!(
+        request.contains("authorization: Basic Ym9nZ2xlZHlnb29rOnMzY3JldA=="),
+        "{request}"
+    );
+    let expected_body: serde_json::Value = serde_json::json!({ "subs": ["u1", "u2", "u4"] });
+    let actual_body: serde_json::Value =
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(expected_body, actual_body);
+}
+
+#[tokio::test]
+async fn friends_of_is_retried_after_a_503_and_maps_refusals_to_typed_errors() {
+    let (issuer, seen) = service(vec![(503, "{}"), (200, FRIENDS)]).await;
+    let friends = accounts(&issuer, Some("s3cret"))
+        .friends_of(&["u1"])
+        .await
+        .unwrap();
+    assert_eq!(3, friends.len());
+    assert_eq!(2, seen.lock().unwrap().len());
+
+    let (issuer, _) = service(vec![(404, r#"{"error":"Not found."}"#)]).await;
+    let error: Error = accounts(&issuer, Some("s3cret"))
+        .friends_of(&["nope"])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::NotFound(m) if m == "Not found."),
+        "{error:?}"
+    );
+
+    let (issuer, _) = service(vec![(400, r#"{"error":"Give 1 to 100 distinct subs."}"#)]).await;
+    let error: Error = accounts(&issuer, Some("s3cret"))
+        .friends_of(&[])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Api { status: 400, .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_public_client_cannot_ask_for_friends_of() {
+    let (issuer, seen) = service(vec![(200, FRIENDS)]).await;
+    let error: Error = accounts(&issuer, None)
+        .friends_of(&["u1"])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Config(_)), "{error:?}");
+    assert_eq!(0, seen.lock().unwrap().len());
+}

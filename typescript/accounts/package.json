@@ -1,6 +1,6 @@
 {
   "name": "toddstack-accounts",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Client for Todd Griffin's Projects accounts: OIDC sign-in, token checks, signed webhooks, friends, events, blocks, reports and notifications.",
   "license": "MIT",
   "author": "Todd Everett Griffin",

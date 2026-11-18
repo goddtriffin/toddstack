@@ -1,8 +1,8 @@
 //! Notifications: what your server sends to players, and the time zone hint
 //! that makes `send_at_local` land on their own clock.
 //!
-//! [`Accounts::send_notification`], [`Accounts::cancel_notifications`] and
-//! [`Accounts::notification_status`] authenticate as your project (HTTP Basic,
+//! [`Accounts::send_notification`], [`Accounts::cancel_notifications`],
+//! [`Accounts::notification_status`] and [`Accounts::friends_of`] authenticate as your project (HTTP Basic,
 //! a confidential client), with no person signed in. [`crate::friends::Friends::set_time_zone`]
 //! uses a person's access token instead.
 //!
@@ -20,6 +20,8 @@
 //!   the same key from your project, and names a scheduled notification so
 //!   [`Accounts::cancel_notifications`] can remove it. Nothing collapses
 //!   without a key.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -320,6 +322,39 @@ impl Accounts {
             )
             .await?,
         )
+    }
+}
+
+impl Accounts {
+    /// Each given player's friends, as your project (no person's token): the
+    /// same people a [`Recipient::FriendsOf`] send reaches. Accepted friends who
+    /// have signed in to your project, not blocked either way, never a review
+    /// or suspended account. Each list is sorted; a player with none maps to an
+    /// empty list. Duplicate `subs` are sent once.
+    ///
+    /// A read, so an intermittent failure is retried. Don't log the subs.
+    ///
+    /// # Errors
+    /// [`Error::Config`] without a client secret; [`Error::NotFound`] when any
+    /// of `subs` never signed in to your project (the whole call fails);
+    /// [`Error::Api`] (400) unless 1 to 100 distinct subs; [`Error::RateLimited`];
+    /// or the request failed.
+    pub async fn friends_of(&self, subs: &[&str]) -> Result<BTreeMap<String, Vec<String>>> {
+        let distinct: BTreeSet<&str> = subs.iter().copied().collect();
+        let answer: Value = self
+            .project_call(
+                reqwest::Method::POST,
+                "/friends-of",
+                Some(json!({ "subs": distinct })),
+                true,
+            )
+            .await?;
+        serde_json::from_value(answer.get("friends").cloned().unwrap_or(Value::Null)).map_err(|e| {
+            Error::Api {
+                status: 200,
+                message: format!("bad `friends`: {e}"),
+            }
+        })
     }
 }
 
