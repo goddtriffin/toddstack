@@ -357,7 +357,9 @@ export class Accounts {
    * (400) unless there are 1 to 100 distinct subs, `rate_limited` (429), or `config` without a client secret.
    */
   async friendsOf(subs: readonly string[]): Promise<Record<string, string[]>> {
-    const answer = await this.#projectCall("POST", "/friends-of", { subs: [...new Set(subs)] }, true) as
+    const answer = await this.#projectCall("POST", "/friends-of", {
+      subs: [...new Set(subs.map((s) => s.toLowerCase()))],
+    }, true) as
       | { friends?: unknown }
       | null;
     const friends = answer?.friends;

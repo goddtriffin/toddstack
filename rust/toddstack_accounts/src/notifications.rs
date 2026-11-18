@@ -330,7 +330,7 @@ impl Accounts {
     /// same people a [`Recipient::FriendsOf`] send reaches. Accepted friends who
     /// have signed in to your project, not blocked either way, never a review
     /// or suspended account. Each list is sorted; a player with none maps to an
-    /// empty list. Duplicate `subs` are sent once.
+    /// empty list. Duplicate `subs` (compared lowercased) are sent once.
     ///
     /// A read, so an intermittent failure is retried. Don't log the subs.
     ///
@@ -340,7 +340,7 @@ impl Accounts {
     /// [`Error::Api`] (400) unless 1 to 100 distinct subs; [`Error::RateLimited`];
     /// or the request failed.
     pub async fn friends_of(&self, subs: &[&str]) -> Result<BTreeMap<String, Vec<String>>> {
-        let distinct: BTreeSet<&str> = subs.iter().copied().collect();
+        let distinct: BTreeSet<String> = subs.iter().map(|s| s.to_lowercase()).collect();
         let answer: Value = self
             .project_call(
                 reqwest::Method::POST,

@@ -770,6 +770,12 @@ Deno.test("friendsOf posts the distinct subs as the project and returns the map"
   ]);
 });
 
+Deno.test("friendsOf lowercases subs before deduping", async () => {
+  const { fetcher, calls } = recording(Response.json({ friends: {} }));
+  await new Accounts(config, { keys: jwks, fetch: fetcher }).friendsOf(["ABC-1", "abc-1", "Abc-1"]);
+  assertEquals(JSON.parse(calls[0].body), { subs: ["abc-1"] });
+});
+
 Deno.test("friendsOf is retried after a 503 and refusals become typed errors", async () => {
   const flaky = recording(new Response("{}", { status: 503 }), Response.json({ friends: { u1: [] } }));
   assertEquals(await new Accounts(config, { keys: jwks, fetch: flaky.fetcher }).friendsOf(["u1"]), { u1: [] });
