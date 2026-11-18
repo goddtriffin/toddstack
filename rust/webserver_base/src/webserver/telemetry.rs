@@ -95,30 +95,48 @@ const UNTRACED_OP: &str = "http.server.untraced";
 ///
 /// A request is traced only if it matched a route of the site's own. Never
 /// traced: what no one reads a trace of and would drown the quota (static
-/// assets, icons, well-known documents, feeds, the health check, the analytics
-/// and Sentry proxies) and what matched nothing (a 404 is a scanner).
+/// assets and the project's own nested services, icons, well-known documents,
+/// feeds, trailing-slash redirects, the health check, the analytics and Sentry
+/// proxies) and what matched nothing (a 404 is a scanner).
 #[derive(Debug, Clone)]
 pub(crate) struct TraceRoutes {
     untraced: Vec<String>,
+    /// Patterns matched whole, never as a prefix (a trailing-slash redirect
+    /// `/docs` must not untrace the page `/docs/{slug}`).
+    untraced_exact: Vec<String>,
 }
 
 impl TraceRoutes {
     /// Everything except `untraced` (route patterns, or the prefix a service is
     /// nested under).
     pub(crate) const fn new(untraced: Vec<String>) -> Self {
-        Self { untraced }
+        Self {
+            untraced,
+            untraced_exact: Vec::new(),
+        }
+    }
+
+    /// Also never traces these route patterns, matched exactly.
+    #[must_use]
+    pub(crate) fn with_untraced_exact(mut self, untraced_exact: Vec<String>) -> Self {
+        self.untraced_exact = untraced_exact;
+        self
     }
 
     /// Whether a request that matched `route` (`None`: matched nothing) is
     /// traced.
     pub(crate) fn is_traced(&self, route: Option<&str>) -> bool {
         route.is_some_and(|route: &str| {
-            !self.untraced.iter().any(|untraced: &String| {
-                route == untraced
-                    || route
-                        .strip_prefix(untraced.as_str())
-                        .is_some_and(|rest: &str| rest.starts_with('/'))
-            })
+            !self
+                .untraced_exact
+                .iter()
+                .any(|exact: &String| route == exact)
+                && !self.untraced.iter().any(|untraced: &String| {
+                    route == untraced
+                        || route
+                            .strip_prefix(untraced.as_str())
+                            .is_some_and(|rest: &str| rest.starts_with('/'))
+                })
         })
     }
 

@@ -64,6 +64,8 @@ pub struct WebServer<S = ()> {
     compression: bool,
     root_dir: PathBuf,
     router: Router<WebServerState<S>>,
+    /// Prefixes of the project's own [`Self::nest_service`] services, never traced.
+    nested: Vec<String>,
 
     #[cfg(feature = "pages")]
     frontend: Option<super::frontend::FrontendParams<S>>,
@@ -117,6 +119,7 @@ where
             // Empty joins to the bare relative path: the working directory.
             root_dir: PathBuf::new(),
             router: Router::new(),
+            nested: Vec::new(),
             #[cfg(feature = "pages")]
             frontend: None,
             #[cfg(feature = "pages")]
@@ -209,6 +212,7 @@ where
         T::Future: Send + 'static,
     {
         self.router = self.router.nest_service(path, service);
+        self.nested.push(path.trim_end_matches('/').to_owned());
         self
     }
 
@@ -311,6 +315,7 @@ where
             compression,
             root_dir,
             router,
+            nested,
             #[cfg(feature = "pages")]
             frontend,
             #[cfg(feature = "pages")]
@@ -333,6 +338,12 @@ where
         let mut built_in: Router<WebServerState<S>> = Router::new().route("/health", get(health));
         let mut untraced: Vec<String> =
             vec![format!("{API_PREFIX}/health"), String::from("/static")];
+        untraced.extend(nested);
+        #[cfg_attr(
+            not(feature = "pages"),
+            expect(unused_mut, reason = "only a frontend adds redirects")
+        )]
+        let mut untraced_exact: Vec<String> = Vec::new();
 
         #[cfg(feature = "pages")]
         let mut frontend_runtime: Option<crate::templates::FrontendRuntime> = None;
@@ -355,6 +366,7 @@ where
                 assemble_frontend(params, feed, &cache_buster, environment)?;
 
             untraced.extend(assembled.untraced);
+            untraced_exact.extend(assembled.redirects);
             no_cache = no_cache.merge(assembled.routes);
             built_in = built_in.merge(assembled.api);
             proxy_scripts = Some(assembled.proxy_scripts);
@@ -408,7 +420,7 @@ where
             app_router.with_state(state.clone()),
             body_limit,
             compression,
-            telemetry::TraceRoutes::new(untraced),
+            telemetry::TraceRoutes::new(untraced).with_untraced_exact(untraced_exact),
         );
 
         Ok(Assembled {
@@ -940,6 +952,8 @@ struct AssembledFrontend<S> {
     not_found: super::not_found::NotFound<S>,
     /// Every route the library itself serves, which is never traced.
     untraced: Vec<String>,
+    /// The pages' trailing-slash redirect patterns, never traced.
+    redirects: Vec<String>,
 }
 
 /// Builds the frontend and sorts its routes by the cache policy each needs.
@@ -980,6 +994,7 @@ where
     let (proxy_scripts, api) = proxy_routes(&built);
     let untraced: Vec<String> = library_routes(&built);
 
+    let redirects: Vec<String> = built.pages.redirect_routes();
     routes = routes.merge(built.pages.into_router()?);
 
     Ok(AssembledFrontend {
@@ -992,6 +1007,7 @@ where
         templates,
         not_found: built.not_found,
         untraced,
+        redirects,
     })
 }
 
