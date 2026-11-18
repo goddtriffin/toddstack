@@ -200,10 +200,31 @@ of size for several times the CPU; the library default for brotli costs tens of
 milliseconds per response, which is why the level is pinned.
 
 Turn it off with `without_compression()` when a proxy in front already
-compresses and origin CPU matters more than origin bandwidth. Hashed `/static`
-files are compressed per request, not precompressed at build time: with a CDN
-in front they are fetched once per edge, so the saved CPU is not worth a build
-step.
+compresses and origin CPU matters more than origin bandwidth.
+
+#### Precompressed `/static` files
+
+For a few large, hot files, level 3 leaves bytes on the table that a build-time
+level 11 recovers (measured on a 334 KB wasm and a 1.15 MB word list: 67 KB and
+75 KB smaller than level 3, about 0.7 s off a throttled cold load; level 11 per
+request costs ~1.3 s a file, so it must happen at build time).
+
+`/static` serves a sibling beside the file when the client accepts its encoding:
+`<file>.br`, `<file>.zst` or `<file>.gz` next to `<file>` (preference br, zstd,
+gzip). It is sent as-is with the original's `Content-Type`, the matching
+`Content-Encoding` and `Vary: Accept-Encoding`, and the compression layer
+leaves it alone (it never re-encodes a response that has `Content-Encoding`).
+No sibling, or a client that does not accept it, falls back to the file plus
+runtime compression. `HEAD` works the same.
+
+Producing the siblings is **your build's job, and it must run after
+`gen-static-assets`**: siblings are named after the *hashed* file
+(`main.<hash>.wasm.br`) and are not in `cache-buster.json`. A `.br` made before
+hashing would itself be hashed and renamed, and no longer sit beside its file.
+The library does not generate them (that would pull a brotli encoder into every
+consumer); for example `brotli -f -q 11 static/data/words.<hash>.bdw`. Only
+precompress what is large and compressible: images and other already-compressed
+formats gain nothing.
 
 ### Testing with `into_router`
 
