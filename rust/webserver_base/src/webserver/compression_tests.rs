@@ -33,6 +33,44 @@ fn routes() -> Router<WebServerState> {
                     .into_response()
             }),
         )
+        .route(
+            "/precoded",
+            get(|| async { ([(header::CONTENT_ENCODING, "br")], big_body()).into_response() }),
+        )
+        .route(
+            "/ranged",
+            get(|| async {
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (header::CONTENT_RANGE, "bytes 0-399/1000"),
+                        (header::ACCEPT_RANGES, "bytes"),
+                    ],
+                    big_body(),
+                )
+                    .into_response()
+            }),
+        )
+        .route("/unchanged", get(|| async { StatusCode::NOT_MODIFIED }))
+        .route(
+            "/accepting",
+            get(|| async { ([(header::ACCEPT_RANGES, "bytes")], big_body()).into_response() }),
+        )
+        .route(
+            "/ndjson",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/x-ndjson")],
+                    Body::from_stream(
+                        stream::iter([Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                            big_body(),
+                        ))])
+                        .chain(stream::pending()),
+                    ),
+                )
+                    .into_response()
+            }),
+        )
         .route("/tiny", get(|| async { "ok" }))
         .route(
             "/events",
@@ -120,7 +158,7 @@ async fn a_client_that_accepts_nothing_gets_the_identity_body() {
 }
 
 #[tokio::test]
-async fn vary_names_accept_encoding_whether_or_not_the_body_was_compressed() {
+async fn vary_names_accept_encoding_on_every_body_it_considers_compressing() {
     let router: Router = router(server());
     for accept in [Some("gzip"), None] {
         let response: Response = fetch(&router, "/big", accept).await;
@@ -129,6 +167,15 @@ async fn vary_names_accept_encoding_whether_or_not_the_body_was_compressed() {
             header_text(&response, header::VARY).to_ascii_lowercase(),
             "{accept:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn vary_is_absent_when_the_body_is_never_considered() {
+    let router: Router = router(server());
+    for uri in ["/tiny", "/unchanged", "/ranged", "/precoded", "/events"] {
+        let response: Response = fetch(&router, uri, Some("gzip")).await;
+        assert!(response.headers().get(header::VARY).is_none(), "{uri}");
     }
 }
 
@@ -191,4 +238,67 @@ async fn a_websocket_upgrade_response_is_not_touched() {
     assert_eq!(StatusCode::SWITCHING_PROTOCOLS, response.status());
     assert_eq!("", header_text(&response, header::CONTENT_ENCODING));
     assert_eq!("websocket", header_text(&response, header::UPGRADE));
+}
+
+#[tokio::test]
+async fn a_304_has_no_body_and_no_content_encoding() {
+    let response: Response = fetch(&router(server()), "/unchanged", Some("gzip, br, zstd")).await;
+    assert_eq!(StatusCode::NOT_MODIFIED, response.status());
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    assert!(bytes(response).await.is_empty());
+}
+
+#[tokio::test]
+async fn head_gets_the_headers_and_no_body() {
+    let request = Request::builder()
+        .method(Method::HEAD)
+        .uri("/big")
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .body(Body::empty())
+        .expect("a valid request");
+    let response: Response = router(server())
+        .oneshot(request)
+        .await
+        .expect("a router never fails");
+    assert_eq!(StatusCode::OK, response.status());
+    assert!(bytes(response).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_range_response_is_not_compressed() {
+    let response: Response = fetch(&router(server()), "/ranged", Some("gzip, br, zstd")).await;
+    assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    assert_eq!("bytes", header_text(&response, header::ACCEPT_RANGES));
+    assert_eq!(big_body(), String::from_utf8_lossy(&bytes(response).await));
+}
+
+#[tokio::test]
+async fn a_compressed_response_drops_accept_ranges() {
+    let router: Router = router(server());
+    let compressed: Response = fetch(&router, "/accepting", Some("gzip")).await;
+    assert_eq!("gzip", header_text(&compressed, header::CONTENT_ENCODING));
+    assert!(compressed.headers().get(header::ACCEPT_RANGES).is_none());
+    let identity: Response = fetch(&router, "/accepting", None).await;
+    assert_eq!("bytes", header_text(&identity, header::ACCEPT_RANGES));
+}
+
+#[tokio::test]
+async fn a_response_already_encoded_is_not_encoded_again() {
+    let response: Response = fetch(&router(server()), "/precoded", Some("gzip")).await;
+    assert_eq!("br", header_text(&response, header::CONTENT_ENCODING));
+    assert_eq!(big_body(), String::from_utf8_lossy(&bytes(response).await));
+}
+
+#[tokio::test]
+async fn an_ndjson_stream_is_never_compressed_and_flushes_each_line() {
+    let response: Response = fetch(&router(server()), "/ndjson", Some("gzip, br, zstd")).await;
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    let mut lines = response.into_body().into_data_stream();
+    let first: Bytes = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next())
+        .await
+        .expect("the first chunk arrives before the stream ends")
+        .expect("the stream has a first chunk")
+        .expect("a readable chunk");
+    assert_eq!(big_body().as_bytes(), &first[..]);
 }
