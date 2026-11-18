@@ -214,6 +214,9 @@ const receipt = await accounts.sendNotification({
 
 await accounts.cancelNotifications("streak", sub); // they played: drop the scheduled reminder (sub optional)
 const later = await accounts.notificationStatus(receipt.id); // poll a fan-out's counts
+
+// Friends of a batch of your players (1 to 100 subs), with no person's token: { [sub]: sorted friend subs }.
+const friends = await accounts.friendsOf([subA, subB]);
 ```
 
 - **Always pass `idempotencyKey`** (a date or game id). A retry with the same key gets the recorded send back
@@ -229,6 +232,11 @@ const later = await accounts.notificationStatus(receipt.id); // poll a fan-out's
   `not_delivered` folds together muted, left your project and suspended, so a send can't probe players.
 - The named `user` or `friendsOf` player must have signed in to your project: otherwise `not_found` (404). A rate limit
   (6000 requests an hour, 10 fan-outs an hour) is `rate_limited` (429).
+
+`friendsOf` returns the people a `{ friendsOf }` send would reach: accepted friends who have signed in to your project,
+not blocked either way, never review or suspended accounts. It is a read, so it is retried like `notificationStatus`;
+duplicate subs are sent once. Any sub that never signed in to your project fails the whole call with `not_found`; 0 or
+over 100 distinct subs is `api` (400). Don't log the subs.
 
 ### Devices (push)
 

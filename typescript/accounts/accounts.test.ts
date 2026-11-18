@@ -758,6 +758,43 @@ Deno.test("every recipient uses the service shape, and a fan-out replay is polle
   assertEquals([calls[2].method, calls[2].path], ["GET", "/api/v1/notifications/b2"]);
 });
 
+Deno.test("friendsOf posts the distinct subs as the project and returns the map", async () => {
+  const friends = { u1: ["u2", "u3"], u2: ["u1"], u4: [] };
+  const { fetcher, calls } = recording(Response.json({ friends }));
+  const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
+  assertEquals(await accounts.friendsOf(["u2", "u1", "u4", "u1"]), friends);
+  assertEquals([calls[0].method, calls[0].path, JSON.parse(calls[0].body)], [
+    "POST",
+    "/api/v1/friends-of",
+    { subs: ["u2", "u1", "u4"] },
+  ]);
+});
+
+Deno.test("friendsOf is retried after a 503 and refusals become typed errors", async () => {
+  const flaky = recording(new Response("{}", { status: 503 }), Response.json({ friends: { u1: [] } }));
+  assertEquals(await new Accounts(config, { keys: jwks, fetch: flaky.fetcher }).friendsOf(["u1"]), { u1: [] });
+  assertEquals(flaky.calls.length, 2);
+  for (const [status, kind] of [[404, "not_found"], [400, "api"], [429, "rate_limited"]] as const) {
+    const { fetcher } = recording(Response.json({ error: "no" }, { status }));
+    const error = await assertRejects(
+      () => new Accounts(config, { keys: jwks, fetch: fetcher }).friendsOf(["u1"]),
+      AccountsError,
+    );
+    assertEquals(error.kind, kind);
+  }
+  const bad = recording(Response.json({}));
+  await assertRejects(() => new Accounts(config, { keys: jwks, fetch: bad.fetcher }).friendsOf(["u1"]), AccountsError);
+});
+
+Deno.test("friendsOf needs the client secret", async () => {
+  const { fetcher, calls } = recording(Response.json({ friends: {} }));
+  const error = await assertRejects(
+    () => new Accounts({ ...config, clientSecret: null }, { keys: jwks, fetch: fetcher }).friendsOf(["u1"]),
+    AccountsError,
+  );
+  assertEquals([error.kind, calls.length], ["config", 0]);
+});
+
 Deno.test("cancelling names the key and optionally the player", async () => {
   const { fetcher, calls } = recording(Response.json({ cancelled: 2 }));
   const accounts = new Accounts(config, { keys: jwks, fetch: fetcher });
