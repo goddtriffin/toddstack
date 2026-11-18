@@ -141,18 +141,21 @@
       or once the page load's trace has ended. }}
   <script defer src="{{sentry_browser.script_path}}" crossorigin="anonymous"></script>
   <script type="module">
-    Sentry.init({
-      dsn: "{{sentry_browser.dsn}}",
-      environment: "{{sentry_browser.environment}}",
-      tunnel: "{{sentry_browser.tunnel_path}}",
-      {{#if sentry_browser.traces_sample_rate}}
-      tracesSampleRate: {{sentry_browser.traces_sample_rate}},
-      integrations: [Sentry.browserTracingIntegration()],
-      {{/if}}
-    });
-    window.webserverBase = {
-      span: function (options) {
+    {{! A blocked or failed bundle leaves `Sentry` undefined: the helper must
+        still exist, so a page script can call it unconditionally. }}
+    window.webserverBase = { span: function () {} };
+    if (typeof Sentry !== "undefined") {
+      Sentry.init({
+        dsn: "{{sentry_browser.dsn}}",
+        environment: "{{sentry_browser.environment}}",
+        tunnel: "{{sentry_browser.tunnel_path}}",
         {{#if sentry_browser.traces_sample_rate}}
+        tracesSampleRate: {{sentry_browser.traces_sample_rate}},
+        integrations: [Sentry.browserTracingIntegration()],
+        {{/if}}
+      });
+      {{#if sentry_browser.traces_sample_rate}}
+      window.webserverBase.span = function (options) {
         try {
           var active = Sentry.getActiveSpan();
           var root = active && Sentry.getRootSpan(active);
@@ -167,9 +170,9 @@
             parentSpan: root,
           }).end((origin + options.end) / 1000);
         } catch (error) {}
-        {{/if}}
-      },
-    };
+      };
+      {{/if}}
+    }
   </script>
   {{/if}}
 

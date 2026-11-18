@@ -207,6 +207,17 @@ async fn a_browser_rate_of_zero_renders_errors_only_init_and_a_no_op_span_helper
 }
 
 #[tokio::test]
+async fn the_span_helper_exists_before_sentry_is_touched_so_a_blocked_bundle_cannot_break_page_scripts()
+ {
+    let body: String = page_at("trace-browser-blocked", None).await;
+
+    let helper: usize = body.find("window.webserverBase = ").expect("the helper");
+    let init: usize = body.find("Sentry.init({").expect("the init");
+    assert!(helper < init, "{body}");
+    assert!(body.contains("typeof Sentry !== \"undefined\""), "{body}");
+}
+
+#[tokio::test]
 async fn a_browser_rate_above_zero_renders_tracing_init_at_that_rate() {
     let body: String = page_at(
         "trace-browser-on",

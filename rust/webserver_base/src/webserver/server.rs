@@ -1006,14 +1006,10 @@ where
         String::from("/robots.txt"),
         String::from("/humans.txt"),
         String::from("/site.webmanifest"),
-        String::from(crate::sitemap::SITEMAP_INDEX_PATH),
         frontend.runtime.sentry_browser.script_path.clone(),
         frontend.runtime.sentry_browser.tunnel_path.clone(),
     ];
-    routes.extend(
-        (1..=frontend.well_known.sitemaps.chunks().len())
-            .map(|index: usize| format!("/sitemap-{index}.xml")),
-    );
+    routes.extend(frontend.well_known.sitemaps.paths());
     routes.extend(
         icon_sources(frontend.has_svg_icon)
             .into_iter()

@@ -233,8 +233,9 @@ impl Observability {
 
 /// `options`, sampling traces at `rate`.
 ///
-/// Left unset (not a zero rate) when off, so no transaction is ever started
-/// for a sampling decision to be made about.
+/// Left unset (not a zero rate) when off: an unset strategy ignores an incoming
+/// `sentry-trace` sampled flag, whereas a zero fixed rate would honour it and
+/// let the browser turn server tracing on.
 pub(crate) fn with_traces(
     options: sentry::ClientOptions,
     rate: TracesSampleRate,
