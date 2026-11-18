@@ -249,6 +249,19 @@ where
         Ok(urls)
     }
 
+    /// The patterns of the 308 redirects [`Self::into_router`] adds: each
+    /// page's opposite trailing-slash form. Matched exactly, never as a prefix.
+    pub(super) fn redirect_routes(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|entry| has_trailing_slash_alias(&entry.path))
+            .map(|entry| match entry.path.strip_suffix('/') {
+                Some(without) => without.to_owned(),
+                None => format!("{}/", entry.path),
+            })
+            .collect()
+    }
+
     /// Turns every declaration into routes.
     ///
     /// Each page also answers its opposite trailing-slash form with a 308 to

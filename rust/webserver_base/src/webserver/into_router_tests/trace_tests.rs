@@ -17,7 +17,7 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::{
     Environment, FrontendParams, Pages, Shutdown, WebServer, analytics_home, built_site,
-    frontend_with, frontend_with_analytics, get, request, text,
+    frontend_with, frontend_with_analytics, get, text,
 };
 use crate::TracesSampleRate;
 use crate::analytics::AnalyticsConfig;
@@ -27,8 +27,18 @@ use crate::templates::PageTemplateData;
 /// The transactions Sentry would receive for `requests`, in order, from a
 /// server whose router is `router`. Each request is a `(method, uri)`.
 async fn transactions(router: &Router, requests: &[(Method, &str)]) -> Vec<Transaction<'static>> {
+    transactions_at(router, TracesSampleRate::ALL, None, requests).await
+}
+
+/// Like [`transactions`], at `rate`, sending `sentry_trace` (if any) on each request.
+async fn transactions_at(
+    router: &Router,
+    rate: TracesSampleRate,
+    sentry_trace: Option<&str>,
+    requests: &[(Method, &str)],
+) -> Vec<Transaction<'static>> {
     let transport: Arc<TestTransport> = TestTransport::new();
-    let mut options: ClientOptions = with_traces(ClientOptions::default(), TracesSampleRate::ALL);
+    let mut options: ClientOptions = with_traces(ClientOptions::default(), rate);
     options.dsn = Some(
         "https://public@sentry.invalid/1"
             .parse()
@@ -46,12 +56,23 @@ async fn transactions(router: &Router, requests: &[(Method, &str)]) -> Vec<Trans
     );
 
     for (method, uri) in requests {
-        axum::body::to_bytes(
-            request(router, method.clone(), uri).await.into_body(),
-            usize::MAX,
+        let mut builder = axum::http::Request::builder()
+            .method(method.clone())
+            .uri(*uri);
+        if let Some(value) = sentry_trace {
+            builder = builder.header("sentry-trace", value);
+        }
+        let response = tower::ServiceExt::oneshot(
+            router.clone(),
+            builder
+                .body(axum::body::Body::empty())
+                .expect("a valid request"),
         )
         .await
-        .expect("a readable body");
+        .expect("a router never fails");
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a readable body");
     }
 
     transport
@@ -132,6 +153,89 @@ async fn a_dynamic_page_without_a_matching_resource_is_still_traced_and_a_scanne
     );
 
     assert_eq!(vec![String::from("GET /things/{slug}")], actual);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trailing_slash_redirects_are_never_traced_but_pages_under_their_prefix_are() {
+    let root: PathBuf = built_site("trace-redirects");
+    let pages: Pages = Pages::new()
+        .static_page(PageTemplateData::new("home", "Home", "/"), ())
+        .static_page(PageTemplateData::new("home", "About", "/about"), ())
+        .dynamic_page("/things/{slug}", axum::routing::get(super::thing))
+        .unlisted()
+        .dynamic_page("/docs/", axum::routing::get(|| async { "docs" }))
+        .dynamic_page("/docs/{slug}", axum::routing::get(super::thing))
+        .unlisted();
+    let router: Router = WebServer::new("127.0.0.1", 0, Environment::Local)
+        .root_dir(&root)
+        .frontend(frontend_with(pages))
+        .into_router(Shutdown::manual())
+        .expect("the built site boots");
+
+    let actual: Vec<String> = names(
+        &transactions(
+            &router,
+            &[
+                (Method::GET, "/about/"),
+                (Method::GET, "/things/a-slug/"),
+                (Method::GET, "/docs"),
+                (Method::GET, "/about"),
+                (Method::GET, "/docs/a-slug"),
+            ],
+        )
+        .await,
+    );
+
+    let expected: Vec<String> = vec![String::from("GET /about"), String::from("GET /docs/{slug}")];
+    assert_eq!(expected, actual);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_projects_own_nested_service_is_never_traced() {
+    let root: PathBuf = built_site("trace-nested");
+    std::fs::write(root.join("note.txt"), "hello").expect("a writable root");
+    let router: Router = WebServer::new("127.0.0.1", 0, Environment::Local)
+        .root_dir(&root)
+        .frontend(frontend_with(pages()))
+        .nest_service("/downloads/", tower_http::services::ServeDir::new(&root))
+        .into_router(Shutdown::manual())
+        .expect("the built site boots");
+
+    let actual: Vec<String> = names(
+        &transactions(
+            &router,
+            &[
+                (Method::GET, "/downloads/note.txt"),
+                (Method::GET, "/downloads/missing.txt"),
+                (Method::GET, "/"),
+            ],
+        )
+        .await,
+    );
+
+    assert_eq!(vec![String::from("GET /")], actual);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_incoming_sampled_flag_does_not_turn_tracing_on_when_the_server_rate_is_off() {
+    let root: PathBuf = built_site("trace-flag-off");
+    let router: Router = WebServer::new("127.0.0.1", 0, Environment::Local)
+        .root_dir(&root)
+        .frontend(frontend_with(pages()))
+        .into_router(Shutdown::manual())
+        .expect("the built site boots");
+
+    let actual: Vec<String> = names(
+        &transactions_at(
+            &router,
+            TracesSampleRate::OFF,
+            Some("771a43a4192642f0b136d5159a501700-1234567890abcdef-1"),
+            &[(Method::GET, "/")],
+        )
+        .await,
+    );
+
+    assert!(actual.is_empty(), "{actual:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]
