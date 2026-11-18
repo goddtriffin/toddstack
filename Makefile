@@ -171,9 +171,16 @@ publish_dry_run: ## dry run of publishing libraries to crates.io and JSR
 docker_build: ## builds the template web server's Docker image (build context: the repo root)
 	docker build \
 		--platform linux/amd64 \
+		--label repo=toddstack \
 		--tag goddtriffin/template-web-server:latest \
 		--file $(TWS)/Dockerfile \
 		.
+	docker image prune -f --filter label=repo=toddstack
+
+.PHONY: docker_clean
+docker_clean: ## removes this repo's containers, images and volumes (label repo=toddstack)
+	cd $(TWS) && docker compose down --volumes
+	docker image ls -q --filter label=repo=toddstack | sort -u | xargs -r docker image rm -f
 
 .PHONY: docker_run
 docker_run: ## runs Docker containers
