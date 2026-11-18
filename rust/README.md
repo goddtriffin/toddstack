@@ -846,10 +846,10 @@ separately. A rate runs from `0.0` (off: nothing loaded, started or sent) to
 ```rust
 // browser: a share of page loads
 FrontendParams::from_env(base, pages)?
-    .with_browser_traces_sample_rate(TracesSampleRate::new(0.1)?)
+    .with_browser_traces_sample_rate(TracesSampleRate::new(0.1).expect("0 to 1"))
 // server: a share of dynamic requests
 bootstrap!(
-    |observability| observability.with_traces_sample_rate(TracesSampleRate::new(0.001).unwrap()),
+    |observability| observability.with_traces_sample_rate(TracesSampleRate::new(0.001).expect("0 to 1")),
     |shutdown| async move { /* ... */ }
 )
 ```
@@ -867,7 +867,7 @@ also fetches that bundle from Sentry's origin, past your proxy. So the site
 proxies a **pinned bundle** (`SENTRY_BROWSER_SDK_VERSION`, bumped in one place)
 from its own origin: errors-only at rate 0 (about 32 KB over brotli), the tracing
 bundle above it (about 52 KB), served at a path that changes with the version and
-rate, so the year-long cache can never serve a stale one. Tracing adds
+whether tracing is on, so the year-long cache can never serve a stale one. Tracing adds
 page-load spans and web vitals.
 
 A page script adds a child span to its own page load:

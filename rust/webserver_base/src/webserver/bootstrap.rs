@@ -66,7 +66,7 @@ pub type Observability = ();
 ///
 /// # Errors
 ///
-/// Whatever `body` returns. `bootstrap_and` adds no failure of its own.
+/// Whatever `body` returns. `bootstrap_with_release_and` adds no failure of its own.
 ///
 /// # Panics
 ///
