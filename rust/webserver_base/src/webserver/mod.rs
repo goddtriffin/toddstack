@@ -7,6 +7,8 @@
 //! different ports and drain them together.
 
 mod bootstrap;
+#[cfg(test)]
+mod compression_tests;
 mod error;
 #[cfg(feature = "pages")]
 mod frontend;

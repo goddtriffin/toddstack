@@ -11,7 +11,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, serve};
 use tokio::net::TcpListener;
+use tower_http::CompressionLevel;
 use tower_http::LatencyUnit;
+use tower_http::compression::CompressionLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info, instrument, warn};
 
@@ -58,6 +60,7 @@ pub struct WebServer<S = ()> {
     app: S,
 
     body_limit: usize,
+    compression: bool,
     root_dir: PathBuf,
     router: Router<WebServerState<S>>,
 
@@ -109,6 +112,7 @@ where
             environment,
             app,
             body_limit: DEFAULT_BODY_LIMIT,
+            compression: true,
             // Empty joins to the bare relative path: the working directory.
             root_dir: PathBuf::new(),
             router: Router::new(),
@@ -147,6 +151,18 @@ where
     #[must_use]
     pub const fn body_limit(mut self, body_limit: usize) -> Self {
         self.body_limit = body_limit;
+        self
+    }
+
+    /// Turns response compression off. On by default.
+    ///
+    /// Every response a client accepts compressed (zstd, brotli or gzip) is,
+    /// unless it is small, already compressed, an image or an event stream.
+    /// Turn it off when a proxy in front already compresses and the origin's
+    /// CPU matters more than its bandwidth.
+    #[must_use]
+    pub const fn without_compression(mut self) -> Self {
+        self.compression = false;
         self
     }
 
@@ -289,6 +305,7 @@ where
             environment,
             app,
             body_limit,
+            compression,
             root_dir,
             router,
             #[cfg(feature = "pages")]
@@ -381,7 +398,11 @@ where
 
         // The router takes the state by value; `run`'s cleanup needs it after
         // serving ends, and `WebServerState` is an `Arc` so this is a refcount.
-        let app_router: Router = with_middleware(app_router.with_state(state.clone()), body_limit);
+        let app_router: Router = with_middleware(
+            app_router.with_state(state.clone()),
+            body_limit,
+            compression,
+        );
 
         Ok(Assembled {
             router: app_router,
@@ -396,9 +417,10 @@ where
 /// Every server's middleware, innermost first: route metrics (they need the
 /// matched route), tracing, the request id (outside tracing, so the span sees
 /// it), then the body cap (outermost, so tracing never sees a request it may
-/// never finish reading).
-fn with_middleware(router: Router, body_limit: usize) -> Router {
-    router
+/// never finish reading). Compression sits just inside the cap, outside
+/// tracing, so every response (404s and 304s included) gets `Vary`.
+fn with_middleware(router: Router, body_limit: usize, compression: bool) -> Router {
+    let router: Router = router
         .layer(axum::middleware::from_fn(telemetry::http_metrics))
         .layer(
             TraceLayer::new_for_http()
@@ -426,8 +448,26 @@ fn with_middleware(router: Router, body_limit: usize) -> Router {
                         .latency_unit(LatencyUnit::Millis),
                 ),
         )
-        .layer(axum::middleware::from_fn(telemetry::request_id))
-        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(axum::middleware::from_fn(telemetry::request_id));
+    let router: Router = if compression {
+        router.layer(compression_layer())
+    } else {
+        router
+    };
+    router.layer(DefaultBodyLimit::max(body_limit))
+}
+
+/// Level 3 of every algorithm, chosen by measurement (see the README): about
+/// 25% of the original on JSON at roughly 20-150 microseconds per 10-100 KB
+/// body. The library defaults are far costlier (brotli's is 11, tens of
+/// milliseconds a response). `deflate` is off: no client that sends it lacks gzip.
+///
+/// The default predicate skips bodies under 32 bytes, images (but not SVG),
+/// gRPC and `text/event-stream`, so streams keep flushing.
+fn compression_layer() -> CompressionLayer {
+    CompressionLayer::new()
+        .no_deflate()
+        .quality(CompressionLevel::Precise(3))
 }
 
 /// A server ready to bind: what [`WebServer::run`] serves and what it cleans

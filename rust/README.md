@@ -109,13 +109,14 @@ opt-in, so a sidecar serving one health check is a valid server.
 | `new` / `with_state` | explicit host, port and environment; `with_state` carries app state reachable as `state.app()` |
 | `from_env` / `from_env_with_state` | reads `WSB_ENVIRONMENT` (required), `WSB_HOST` (defaults `127.0.0.1` locally, `0.0.0.0` in production) and `WSB_PORT` (defaults `8080`) |
 | `body_limit` | request body cap, default 256 KiB — raise it for uploads |
+| `without_compression` | turns response compression off; see [Response compression](#response-compression) |
 | `root_dir` | where `html/`, `static/` and `cache-buster.json` are read from, default the working directory — see [Testing](#testing-with-into_router) |
 | `nest` / `merge` / `nest_service` | your own routes |
 | `frontend` | declares this server a website; see below |
 | `run` | binds, serves, drains, and runs the state's `AppShutdown` cleanup |
 | `into_router` | everything `run` does before binding: the finished `Router`, for `oneshot` tests or embedding |
 
-Always on, no method to enable them: `GET /api/v1/health`, the `/api/v1` prefix
+Always on, no method to enable them: response compression (opt out with `without_compression`), `GET /api/v1/health`, the `/api/v1` prefix
 itself, and the graceful-drain window.
 
 On the shutdown signal the server stops accepting connections and returns as
@@ -166,6 +167,37 @@ anything that would misbehave twice behind a `OnceCell` of your own.
 Static assets are **presence-detected**: if a `static/` directory exists under
 `root_dir` the server serves `/static` and loads the manifest; if not, it does
 neither. There is no `.assets()` call.
+
+### Response compression
+
+On by default, for every route including the ones you merge in. The client's
+`Accept-Encoding` picks zstd, brotli or gzip; `Vary: Accept-Encoding` is set on
+every response, compressed or not; `Content-Length` is dropped from compressed
+bodies; an `ETag` is left as the handler set it (the weak/strong pair is not
+worth breaking `If-None-Match` over).
+
+Not compressed: bodies under 32 bytes, images (SVG excepted), gRPC, anything
+already carrying `Content-Encoding`, and `text/event-stream`, so SSE keeps
+flushing each event. WebSocket upgrades pass through untouched.
+
+Every algorithm runs at level 3. Measured on one core, per response:
+
+| payload | gzip 3 | brotli 3 | zstd 3 | brotli 11 (library default) |
+|---|---|---|---|---|
+| 10 KB JSON | 28% / 42 us | 25% / 51 us | 25% / 23 us | 22% / 8 ms |
+| 100 KB JSON | 25% / 0.48 ms | 23% / 0.52 ms | 23% / 0.15 ms | 19% / 84 ms |
+| 24 KB HTML | 6.7% / 42 us | 4.3% / 0.11 ms | 5.0% / 21 us | 3.7% / 23 ms |
+| 73 KB minified JS | 37% / 0.52 ms | 37% / 0.57 ms | 37% / 0.15 ms | 31% / 51 ms |
+
+(size as a share of the original / CPU time.) Higher levels buy a few points
+of size for several times the CPU; the library default for brotli costs tens of
+milliseconds per response, which is why the level is pinned.
+
+Turn it off with `without_compression()` when a proxy in front already
+compresses and origin CPU matters more than origin bandwidth. Hashed `/static`
+files are compressed per request, not precompressed at build time: with a CDN
+in front they are fetched once per edge, so the saved CPU is not worth a build
+step.
 
 ### Testing with `into_router`
 
