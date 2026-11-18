@@ -816,7 +816,9 @@ pinned bundle from your own origin, and `SentryDsn::upstream_script_url` and
 `SENTRY_CDN_HOST` are gone (`SentryDsn::upstream_bundle_url` and
 `SENTRY_BROWSER_CDN_HOST` replace them). Errors thrown before the bundle runs
 (before first paint) are no longer buffered. If you wrote your own
-`sentryOnLoad` or init, remove it: the layout initialises Sentry.
+`sentryOnLoad` or init, remove it: the layout initialises Sentry. An upstream 5xx
+on the analytics or Sentry proxy is relayed to the browser unchanged but now logs
+at `warn`, not `error`, so it no longer files a Sentry event.
 
 **Upgrading to 0.3.5:** response compression is now on by default for every
 route, with no code change. Responses a client accepts compressed gain

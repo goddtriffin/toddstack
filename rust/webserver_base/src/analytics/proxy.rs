@@ -26,6 +26,18 @@ use tracing::{error, instrument, warn};
 
 use super::ip::resolve_true_client_ip_address;
 use super::retry::{self, RetryPolicy};
+use crate::traces::UpstreamFailure;
+
+/// `status` as a response, marked [`UpstreamFailure`] when it is a 5xx, with a
+/// `warn` naming the `what` that failed.
+fn relayed(status: StatusCode, what: &str) -> Response {
+    let mut response: Response = status.into_response();
+    if status.is_server_error() {
+        warn!("upstream answered {status} to {what}");
+        response.extensions_mut().insert(UpstreamFailure);
+    }
+    response
+}
 
 /// Fetches an upstream script and returns it with the upstream's own headers.
 ///
@@ -264,9 +276,10 @@ pub async fn relay_event(
     }
 
     match request.send().await {
-        Ok(response) => StatusCode::from_u16(response.status().as_u16())
-            .unwrap_or(StatusCode::ACCEPTED)
-            .into_response(),
+        Ok(response) => relayed(
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::ACCEPTED),
+            "an analytics event",
+        ),
         Err(error) => {
             error!("failed to forward an analytics event: {error}");
             // A dropped pageview must never surface to the visitor.
@@ -293,9 +306,10 @@ pub async fn relay_envelope(client: &reqwest::Client, upstream: &str, body: Byte
         .send()
         .await
     {
-        Ok(response) => StatusCode::from_u16(response.status().as_u16())
-            .unwrap_or(StatusCode::OK)
-            .into_response(),
+        Ok(response) => relayed(
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::OK),
+            "a Sentry envelope",
+        ),
         Err(error) => {
             error!("failed to relay a Sentry envelope: {error}");
             StatusCode::OK.into_response()

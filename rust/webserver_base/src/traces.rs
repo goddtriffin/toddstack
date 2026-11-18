@@ -23,6 +23,14 @@ pub const DEFAULT_SERVER_TRACES_SAMPLE_RATE: f32 = 0.001;
 #[cfg(any(feature = "webserver", feature = "observability"))]
 pub(crate) const HTTP_SERVER_OP: &str = "http.server";
 
+/// Response extension: this 5xx is an upstream's, relayed as-is, not a fault of
+/// this server. The server's trace layer treats the response as a success, so
+/// `tower_http` logs no `response failed` error and Sentry files no event for
+/// it. The relay logs a `warn` itself.
+#[cfg(any(feature = "webserver", feature = "analytics"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UpstreamFailure;
+
 /// A share of traces to send, from `0.0` (off) to `1.0` (all).
 ///
 /// `0.0` means tracing is off: nothing is loaded, started or sent for it.
