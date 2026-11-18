@@ -5,7 +5,7 @@
 //! rather than a page that quietly ships without a share card. A server that
 //! never calls it — a sidecar, a JSON API — needs none of it and boots clean.
 
-use crate::analytics::{AnalyticsConfig, SentryDsn};
+use crate::analytics::{AnalyticsConfig, SENTRY_BROWSER_SDK_VERSION, SentryDsn};
 use crate::assets::CacheBuster;
 use crate::feed::{ATOM_PATH, Feed, FeedSet, FeedSite, JSON_PATH, RSS_PATH, build_feeds};
 use crate::sitemap::{SitemapSet, SitemapUrl, build_sitemaps};
@@ -15,7 +15,7 @@ use crate::templates::{
     AnalyticsPaths, BaseTemplateData, FeedLinks, FrontendRuntime, SentryBrowser,
     SocialImageMetadata,
 };
-use crate::{Environment, env};
+use crate::{Environment, TracesSampleRate, env};
 use chrono::Datelike as _;
 
 use super::error::WebServerError;
@@ -38,6 +38,8 @@ pub struct FrontendParams<S = ()> {
     /// recommends a project per language and per deployable, and mixing Rust
     /// panics with JavaScript exceptions in one stream helps nobody.
     pub(super) sentry_browser_dsn: String,
+    /// The share of page loads that send a trace.
+    pub(super) browser_traces_sample_rate: TracesSampleRate,
     /// The router-fallback 404's `{{app}}`.
     pub(super) not_found: NotFound<S>,
     /// The project's own Handlebars helpers.
@@ -61,6 +63,7 @@ where
             pages,
             analytics,
             sentry_browser_dsn: sentry_browser_dsn.into(),
+            browser_traces_sample_rate: TracesSampleRate::BROWSER_DEFAULT,
             not_found: NotFound::none(),
             helpers: Vec::new(),
         }
@@ -81,6 +84,18 @@ where
             AnalyticsConfig::from_env().map_err(WebServerError::Env)?,
             env::required(crate::analytics::ENV_SENTRY_BROWSER_DSN).map_err(WebServerError::Env)?,
         ))
+    }
+
+    /// The share of page loads that send a trace (the page load's own spans
+    /// and web vitals). Defaults to [`TracesSampleRate::BROWSER_DEFAULT`];
+    /// [`TracesSampleRate::OFF`] serves the smaller errors-only bundle.
+    #[must_use]
+    pub const fn with_browser_traces_sample_rate(
+        mut self,
+        browser_traces_sample_rate: TracesSampleRate,
+    ) -> Self {
+        self.browser_traces_sample_rate = browser_traces_sample_rate;
+        self
     }
 
     /// What the router-fallback 404 shows as `{{app}}`. Defaults to
@@ -128,6 +143,8 @@ pub struct WellKnown {
 
 /// A frontend, assembled.
 pub struct Frontend<S> {
+    /// The browser bundle's tracing setting, which picks the bundle served.
+    pub browser_traces_sample_rate: TracesSampleRate,
     pub pages: Pages<S>,
     pub base: BaseTemplateData,
     pub runtime: FrontendRuntime,
@@ -179,15 +196,12 @@ where
 
         // Local runs never reach Plausible, whatever id was configured.
         let analytics: AnalyticsConfig = params.analytics.clone().for_environment(environment);
-        if analytics.is_enabled() {
-            tracing::info!("analytics enabled");
-        } else if environment.is_local() {
-            tracing::info!("analytics disabled: WSB_ENVIRONMENT is local");
-        } else {
-            tracing::warn!("analytics disabled in production: WSB_ANALYTICS_ID is unset or empty");
-        }
+        log_analytics(&analytics, environment);
 
-        let paths: ProxyPaths = ProxyPaths::derive(params.base.project());
+        let paths: ProxyPaths = ProxyPaths::derive(
+            params.base.project(),
+            &sentry_bundle_key(params.browser_traces_sample_rate),
+        );
         let social_image: SocialImageMetadata = probe_social_image(&params.base, cache_buster);
 
         if !social_image.is_large_enough() {
@@ -262,11 +276,12 @@ where
                 script_path: paths.analytics_script.clone(),
                 event_path: paths.analytics_event.clone(),
             }),
-            sentry_browser: SentryBrowser {
-                script_path: paths.sentry_script.clone(),
-                tunnel_path: paths.sentry_tunnel.clone(),
-                environment: environment.to_string(),
-            },
+            sentry_browser: sentry_browser(
+                &paths,
+                &sentry_dsn,
+                params.browser_traces_sample_rate,
+                environment,
+            ),
             feed: feed_links,
         };
 
@@ -277,9 +292,42 @@ where
             well_known,
             analytics,
             sentry_dsn,
+            browser_traces_sample_rate: params.browser_traces_sample_rate,
             not_found: params.not_found,
             has_svg_icon: icon_source.is_vector(),
         })
+    }
+}
+
+fn log_analytics(analytics: &AnalyticsConfig, environment: Environment) {
+    if analytics.is_enabled() {
+        tracing::info!("analytics enabled");
+    } else if environment.is_local() {
+        tracing::info!("analytics disabled: WSB_ENVIRONMENT is local");
+    } else {
+        tracing::warn!("analytics disabled in production: WSB_ANALYTICS_ID is unset or empty");
+    }
+}
+
+/// Which browser bundle a Sentry script path serves, for [`ProxyPaths`].
+fn sentry_bundle_key(rate: TracesSampleRate) -> String {
+    let kind: &str = if rate.is_on() { "tracing" } else { "errors" };
+    format!("{SENTRY_BROWSER_SDK_VERSION}:{kind}")
+}
+
+/// What the layout needs to initialise browser Sentry.
+fn sentry_browser(
+    paths: &ProxyPaths,
+    dsn: &SentryDsn,
+    rate: TracesSampleRate,
+    environment: Environment,
+) -> SentryBrowser {
+    SentryBrowser {
+        script_path: paths.sentry_script.clone(),
+        dsn: dsn.as_str().to_string(),
+        traces_sample_rate: rate.is_on().then(|| rate.to_string()),
+        tunnel_path: paths.sentry_tunnel.clone(),
+        environment: environment.to_string(),
     }
 }
 
@@ -300,17 +348,22 @@ struct ProxyPaths {
 }
 
 impl ProxyPaths {
-    fn derive(project: &str) -> Self {
+    /// `sentry_bundle` names which browser bundle the script path serves
+    /// (version and kind). It is hashed into that path: the bundle is cached
+    /// for a year, so a path that outlived a version bump or a tracing change
+    /// would keep serving visitors the old one.
+    fn derive(project: &str, sentry_bundle: &str) -> Self {
         let slug: String = slugify(project);
         let analytics: String = short_hash(project);
         // A second, unrelated hash, so the two scripts do not visibly belong to
         // one another.
         let sentry: String = short_hash(&format!("{project}:sentry"));
+        let sentry_script: String = short_hash(&format!("{project}:sentry:{sentry_bundle}"));
 
         Self {
             analytics_script: format!("/script/{slug}-{analytics}.js"),
             analytics_event: format!("{}/{slug}-{analytics}", super::server::API_PREFIX),
-            sentry_script: format!("/script/{slug}-{sentry}.js"),
+            sentry_script: format!("/script/{slug}-{sentry_script}.js"),
             sentry_tunnel: format!("{}/{slug}-{sentry}", super::server::API_PREFIX),
         }
     }
@@ -480,7 +533,7 @@ mod tests {
 
     #[test]
     fn the_proxy_paths_look_like_ordinary_bundler_output() {
-        let paths: ProxyPaths = ProxyPaths::derive("Boggledygook");
+        let paths: ProxyPaths = ProxyPaths::derive("Boggledygook", "1:errors");
 
         assert!(paths.analytics_script.starts_with("/script/boggledygook-"));
         assert!(
@@ -500,16 +553,28 @@ mod tests {
 
     #[test]
     fn the_two_proxies_do_not_share_a_hash() {
-        let paths: ProxyPaths = ProxyPaths::derive("Boggledygook");
+        let paths: ProxyPaths = ProxyPaths::derive("Boggledygook", "1:errors");
 
         assert_ne!(paths.analytics_script, paths.sentry_script);
         assert_ne!(paths.analytics_event, paths.sentry_tunnel);
     }
 
     #[test]
+    fn a_new_bundle_version_or_kind_changes_the_script_path_and_not_the_tunnel() {
+        let old: ProxyPaths = ProxyPaths::derive("Boggledygook", "1:errors");
+
+        for changed in ["2:errors", "1:tracing"] {
+            let new: ProxyPaths = ProxyPaths::derive("Boggledygook", changed);
+            assert_ne!(old.sentry_script, new.sentry_script, "{changed}");
+            assert_eq!(old.sentry_tunnel, new.sentry_tunnel, "{changed}");
+            assert_eq!(old.analytics_script, new.analytics_script, "{changed}");
+        }
+    }
+
+    #[test]
     fn two_projects_never_share_a_path_so_one_filter_rule_cannot_block_both() {
-        let first: ProxyPaths = ProxyPaths::derive("Boggledygook");
-        let second: ProxyPaths = ProxyPaths::derive("Eat Out");
+        let first: ProxyPaths = ProxyPaths::derive("Boggledygook", "1:errors");
+        let second: ProxyPaths = ProxyPaths::derive("Eat Out", "1:errors");
 
         assert_ne!(first.analytics_script, second.analytics_script);
     }

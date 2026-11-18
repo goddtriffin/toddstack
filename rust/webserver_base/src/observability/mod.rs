@@ -19,6 +19,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::env::{self, EnvError};
 use crate::environment::Environment;
+use crate::traces::{HTTP_SERVER_OP, TracesSampleRate};
 
 /// The environment variable holding the Sentry DSN.
 pub const ENV_SENTRY_DSN: &str = "WSB_SENTRY_SERVER_DSN";
@@ -49,6 +50,7 @@ pub struct Observability {
     environment: Environment,
     log_filter: Option<String>,
     release: String,
+    traces_sample_rate: TracesSampleRate,
 }
 
 /// The release string used when the application does not name itself.
@@ -68,6 +70,7 @@ impl Observability {
             environment,
             log_filter: None,
             release: String::from(UNKNOWN_RELEASE),
+            traces_sample_rate: TracesSampleRate::SERVER_DEFAULT,
         }
     }
 
@@ -79,6 +82,7 @@ impl Observability {
             environment,
             log_filter: None,
             release: String::from(UNKNOWN_RELEASE),
+            traces_sample_rate: TracesSampleRate::SERVER_DEFAULT,
         }
     }
 
@@ -101,6 +105,7 @@ impl Observability {
             environment,
             log_filter: None,
             release: String::from(UNKNOWN_RELEASE),
+            traces_sample_rate: TracesSampleRate::SERVER_DEFAULT,
         })
     }
 
@@ -120,6 +125,19 @@ impl Observability {
     #[must_use]
     pub fn with_log_filter(mut self, log_filter: impl Into<String>) -> Self {
         self.log_filter = Some(log_filter.into());
+        self
+    }
+
+    /// The share of dynamic requests that send a trace. Defaults to
+    /// [`TracesSampleRate::SERVER_DEFAULT`]; [`TracesSampleRate::OFF`] sends
+    /// none.
+    ///
+    /// Static assets, health checks, the analytics and Sentry proxies and 404s
+    /// are never traced, whatever the rate (see
+    /// [`webserver`](crate::webserver)).
+    #[must_use]
+    pub const fn with_traces_sample_rate(mut self, traces_sample_rate: TracesSampleRate) -> Self {
+        self.traces_sample_rate = traces_sample_rate;
         self
     }
 
@@ -152,6 +170,7 @@ impl Observability {
             options.release = Some(self.release.clone().into());
             options.environment = Some(self.environment.as_str().into());
             options.attach_stacktrace = true;
+            let options: sentry::ClientOptions = with_traces(options, self.traces_sample_rate);
 
             sentry::init((dsn.clone(), options))
         });
@@ -212,6 +231,43 @@ impl Observability {
     }
 }
 
+/// `options`, sampling traces at `rate`.
+///
+/// Left unset (not a zero rate) when off, so no transaction is ever started
+/// for a sampling decision to be made about.
+pub(crate) fn with_traces(
+    options: sentry::ClientOptions,
+    rate: TracesSampleRate,
+) -> sentry::ClientOptions {
+    if rate.is_on() {
+        let rate: f32 = rate.get();
+        options
+            .traces_sampler(move |context: &sentry::TransactionContext| sample_rate(context, rate))
+    } else {
+        options
+    }
+}
+
+/// The rate for one new transaction.
+///
+/// Only a request the server chose to trace (op [`HTTP_SERVER_OP`]) gets the
+/// configured rate; every other root span is dropped, because the tracing
+/// layer turns *any* root `info` span into a transaction (a background task, a
+/// proxy handler) and each would spend span quota nobody budgeted.
+///
+/// A sampled parent (`sentry-trace` from the browser) is deliberately not
+/// honoured: the browser's rate is ten to a hundred times the server's, so
+/// honouring it would send every request of every sampled page load and
+/// defeat the server rate. The trace id is still continued, so a sampled
+/// server transaction joins the browser's trace when the browser sampled too.
+fn sample_rate(context: &sentry::TransactionContext, rate: f32) -> f32 {
+    if context.operation() == HTTP_SERVER_OP {
+        rate
+    } else {
+        0.0
+    }
+}
+
 impl Debug for Observability {
     /// Never prints the DSN — it is a credential, and this type reaches logs.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -222,6 +278,7 @@ impl Debug for Observability {
             // this type reaches logs.
             .field("error_monitoring", &self.dsn.is_some())
             .field("log_filter", &self.log_filter)
+            .field("traces_sample_rate", &self.traces_sample_rate)
             .finish()
     }
 }
@@ -242,8 +299,11 @@ impl Debug for ObservabilityGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::Observability;
+    use sentry::TransactionContext;
+
+    use super::{Observability, sample_rate};
     use crate::environment::Environment;
+    use crate::traces::{HTTP_SERVER_OP, TracesSampleRate};
 
     #[test]
     fn debug_output_never_contains_the_dsn() {
@@ -262,5 +322,50 @@ mod tests {
 
         let actual: String = format!("{observability:?}");
         assert!(actual.contains("debug"));
+    }
+
+    #[test]
+    fn a_traced_request_gets_the_configured_rate() {
+        let context: TransactionContext = TransactionContext::new("GET /{slug}", HTTP_SERVER_OP);
+
+        assert_eq!(0.25, sample_rate(&context, 0.25));
+    }
+
+    #[test]
+    fn any_other_root_span_is_never_sampled() {
+        for op in [
+            "http.server.untraced",
+            "tower_http::trace::make_span",
+            "task",
+        ] {
+            let context: TransactionContext = TransactionContext::new("anything", op);
+
+            assert_eq!(0.0, sample_rate(&context, 1.0), "{op}");
+        }
+    }
+
+    #[test]
+    fn a_sampled_browser_parent_does_not_raise_the_server_rate() {
+        let mut context: TransactionContext = TransactionContext::continue_from_headers(
+            "GET /",
+            HTTP_SERVER_OP,
+            [(
+                "sentry-trace",
+                "771a43a4192642f0b136d5159a501700-1234567890abcdef-1",
+            )],
+        );
+        context.set_sampled(true);
+
+        assert_eq!(0.001, sample_rate(&context, 0.001));
+    }
+
+    #[test]
+    fn the_server_rate_defaults_to_the_named_constant_and_can_be_set() {
+        let default: Observability = Observability::none(Environment::Local);
+        assert!(format!("{default:?}").contains("traces_sample_rate: TracesSampleRate(0.001)"));
+
+        let set: Observability =
+            Observability::none(Environment::Local).with_traces_sample_rate(TracesSampleRate::OFF);
+        assert!(format!("{set:?}").contains("traces_sample_rate: TracesSampleRate(0.0)"));
     }
 }

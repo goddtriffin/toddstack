@@ -18,6 +18,7 @@ use tower_http::request_id::{MakeRequestId, MakeRequestUuid, RequestId};
 use tracing::{error, info};
 
 use super::shutdown::Shutdown;
+use crate::traces::HTTP_SERVER_OP;
 
 /// The port `/metrics` is served on, inside the container, in production only.
 ///
@@ -84,6 +85,81 @@ fn is_valid_request_id(value: &HeaderValue) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_')
+}
+
+/// The `op` of a request that is not traced. The sampler gives every `op` but
+/// [`HTTP_SERVER_OP`] a rate of zero.
+const UNTRACED_OP: &str = "http.server.untraced";
+
+/// Which routes become Sentry transactions.
+///
+/// A request is traced only if it matched a route of the site's own. Never
+/// traced: what no one reads a trace of and would drown the quota (static
+/// assets, icons, well-known documents, feeds, the health check, the analytics
+/// and Sentry proxies) and what matched nothing (a 404 is a scanner).
+#[derive(Debug, Clone)]
+pub(crate) struct TraceRoutes {
+    untraced: Vec<String>,
+}
+
+impl TraceRoutes {
+    /// Everything except `untraced` (route patterns, or the prefix a service is
+    /// nested under).
+    pub(crate) const fn new(untraced: Vec<String>) -> Self {
+        Self { untraced }
+    }
+
+    /// Whether a request that matched `route` (`None`: matched nothing) is
+    /// traced.
+    pub(crate) fn is_traced(&self, route: Option<&str>) -> bool {
+        route.is_some_and(|route: &str| {
+            !self.untraced.iter().any(|untraced: &String| {
+                route == untraced
+                    || route
+                        .strip_prefix(untraced.as_str())
+                        .is_some_and(|rest: &str| rest.starts_with('/'))
+            })
+        })
+    }
+
+    /// The request's `tracing` span, which `sentry-tracing` turns into the
+    /// transaction. `sentry.*` fields are its convention for the transaction's
+    /// name, `op` and incoming `sentry-trace`.
+    ///
+    /// Named by route pattern (`GET /blog/{slug}`), never the raw path, so
+    /// transactions group. `sentry-trace` is passed on only to continue the
+    /// browser's trace id; the sampler ignores its sampled flag.
+    pub(crate) fn span(&self, request: &Request) -> tracing::Span {
+        let request_id: &str = request
+            .headers()
+            .get(&REQUEST_ID_HEADER)
+            .and_then(|value: &HeaderValue| value.to_str().ok())
+            .unwrap_or_default();
+        let route: Option<&str> = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str);
+        let traced: bool = self.is_traced(route);
+        let name: String = format!("{} {}", request.method(), route.unwrap_or("unmatched"));
+        let incoming: Option<&str> = traced
+            .then(|| request.headers().get("sentry-trace"))
+            .flatten()
+            .and_then(|value: &HeaderValue| value.to_str().ok());
+        // `path`, not the URI: query strings can carry one-time codes and
+        // tokens. `request_id` joins these lines to nginx's access log. At
+        // INFO: under an INFO filter a DEBUG span is never created, and every
+        // request would log a status with no route.
+        tracing::info_span!(
+            "request",
+            "sentry.name" = name.as_str(),
+            "sentry.op" = if traced { HTTP_SERVER_OP } else { UNTRACED_OP },
+            "sentry.trace" = incoming,
+            method = %request.method(),
+            path = %request.uri().path(),
+            version = ?request.version(),
+            request_id,
+        )
+    }
 }
 
 /// Puts a request id on every request and response.
@@ -193,7 +269,7 @@ mod tests {
     use axum::response::Response;
     use tower::ServiceExt;
 
-    use super::{REQUEST_ID_HEADER, handle, is_valid_request_id};
+    use super::{REQUEST_ID_HEADER, TraceRoutes, handle, is_valid_request_id};
     use crate::environment::Environment;
     use crate::webserver::{Shutdown, WebServer};
 
@@ -283,5 +359,40 @@ mod tests {
             "a histogram, not a summary"
         );
         assert!(rendered.contains("build_info{"), "{rendered}");
+    }
+
+    fn routes() -> TraceRoutes {
+        TraceRoutes::new(vec![
+            String::from("/static"),
+            String::from("/api/v1/health"),
+            String::from("/robots.txt"),
+        ])
+    }
+
+    #[test]
+    fn a_route_the_site_owns_is_traced() {
+        assert!(routes().is_traced(Some("/")));
+        assert!(routes().is_traced(Some("/blog/{slug}")));
+        assert!(routes().is_traced(Some("/api/v1/things")));
+    }
+
+    #[test]
+    fn a_route_nothing_matched_is_never_traced() {
+        assert!(!routes().is_traced(None));
+    }
+
+    #[test]
+    fn an_untraced_route_is_excluded_exactly_and_under_a_nested_prefix() {
+        assert!(!routes().is_traced(Some("/api/v1/health")));
+        assert!(!routes().is_traced(Some("/robots.txt")));
+        assert!(!routes().is_traced(Some("/static")));
+        assert!(!routes().is_traced(Some("/static/{*__private__axum_nest_tail_param}")));
+    }
+
+    #[test]
+    fn a_site_route_that_merely_starts_like_an_untraced_one_is_still_traced() {
+        assert!(routes().is_traced(Some("/statically")));
+        assert!(routes().is_traced(Some("/robots.txt.html")));
+        assert!(routes().is_traced(Some("/api/v1/health-report")));
     }
 }

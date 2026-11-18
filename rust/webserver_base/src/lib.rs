@@ -29,6 +29,13 @@ mod environment;
 
 pub use environment::{ENV_ENVIRONMENT, Environment, EnvironmentParseError};
 
+mod traces;
+
+pub use traces::{
+    DEFAULT_BROWSER_TRACES_SAMPLE_RATE, DEFAULT_SERVER_TRACES_SAMPLE_RATE, TracesSampleRate,
+    TracesSampleRateError,
+};
+
 #[cfg(feature = "analytics")]
 pub mod analytics;
 #[cfg(feature = "webserver")]
@@ -49,6 +56,7 @@ pub mod webserver;
 #[cfg(feature = "webserver")]
 pub use webserver::{
     AppShutdown, Shutdown, WebServer, WebServerError, WebServerState, bootstrap_with_release,
+    bootstrap_with_release_and,
 };
 
 // Every crate whose types appear in this library's API, re-exported so a

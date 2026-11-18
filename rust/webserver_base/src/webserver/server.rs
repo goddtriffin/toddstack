@@ -331,6 +331,8 @@ where
 
         let mut no_cache: Router<WebServerState<S>> = router;
         let mut built_in: Router<WebServerState<S>> = Router::new().route("/health", get(health));
+        let mut untraced: Vec<String> =
+            vec![format!("{API_PREFIX}/health"), String::from("/static")];
 
         #[cfg(feature = "pages")]
         let mut frontend_runtime: Option<crate::templates::FrontendRuntime> = None;
@@ -352,6 +354,7 @@ where
             let assembled: AssembledFrontend<S> =
                 assemble_frontend(params, feed, &cache_buster, environment)?;
 
+            untraced.extend(assembled.untraced);
             no_cache = no_cache.merge(assembled.routes);
             built_in = built_in.merge(assembled.api);
             proxy_scripts = Some(assembled.proxy_scripts);
@@ -405,6 +408,7 @@ where
             app_router.with_state(state.clone()),
             body_limit,
             compression,
+            telemetry::TraceRoutes::new(untraced),
         );
 
         Ok(Assembled {
@@ -418,33 +422,24 @@ where
 }
 
 /// Every server's middleware, innermost first: route metrics (they need the
-/// matched route), tracing, the request id (outside tracing, so the span sees
+/// matched route), tracing (which also names and samples the Sentry
+/// transaction, so it needs it too), the request id (outside tracing, so the span sees
 /// it), then the body cap (outermost, so tracing never sees a request it may
 /// never finish reading). Compression sits just inside the cap, outside
 /// tracing, so it sees every response (404s included). It adds `Vary` only to
 /// a response it considers for compression: not 304s, tiny bodies or streams.
-fn with_middleware(router: Router, body_limit: usize, compression: bool) -> Router {
+fn with_middleware(
+    router: Router,
+    body_limit: usize,
+    compression: bool,
+    trace_routes: telemetry::TraceRoutes,
+) -> Router {
     let router: Router = router
         .layer(axum::middleware::from_fn(telemetry::http_metrics))
         .layer(
             TraceLayer::new_for_http()
-                // At INFO: under an INFO filter a DEBUG span is never created,
-                // and every request would log a status with no route. `path`,
-                // not the URI: query strings can carry one-time codes and
-                // tokens. `request_id` joins these lines to nginx's access log.
-                .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
-                    let request_id: &str = request
-                        .headers()
-                        .get(&telemetry::REQUEST_ID_HEADER)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default();
-                    tracing::info_span!(
-                        "request",
-                        method = %request.method(),
-                        path = %request.uri().path(),
-                        version = ?request.version(),
-                        request_id,
-                    )
+                .make_span_with(move |request: &axum::http::Request<axum::body::Body>| {
+                    trace_routes.span(request)
                 })
                 .on_response(
                     DefaultOnResponse::new()
@@ -742,6 +737,26 @@ where
     router
 }
 
+/// Each icon's root route and the file it resolves to.
+///
+/// Only a project whose art is vector has an SVG one to serve.
+#[cfg(feature = "pages")]
+fn icon_sources(has_svg_icon: bool) -> Vec<(&'static str, &'static str)> {
+    let mut icons: Vec<(&str, &str)> = vec![
+        ("/favicon.ico", "static/image/favicon/favicon.ico"),
+        (
+            "/apple-touch-icon.png",
+            "static/image/favicon/apple-touch-icon.png",
+        ),
+        ("/icon-192.png", "static/image/favicon/icon-192.png"),
+        ("/icon-512.png", "static/image/favicon/icon-512.png"),
+    ];
+    if has_svg_icon {
+        icons.push(("/favicon.svg", "static/image/favicon/favicon.svg"));
+    }
+    icons
+}
+
 /// Serves the icon set at the well-known root paths browsers actually request.
 ///
 /// Each one resolves through the manifest to its hashed file under `/static`,
@@ -757,36 +772,10 @@ where
 {
     use tower_http::services::ServeFile;
 
-    let mut icons: Vec<(&str, String)> = vec![
-        (
-            "/favicon.ico",
-            String::from("static/image/favicon/favicon.ico"),
-        ),
-        (
-            "/apple-touch-icon.png",
-            String::from("static/image/favicon/apple-touch-icon.png"),
-        ),
-        (
-            "/icon-192.png",
-            String::from("static/image/favicon/icon-192.png"),
-        ),
-        (
-            "/icon-512.png",
-            String::from("static/image/favicon/icon-512.png"),
-        ),
-    ];
-    // Only a project whose art is vector has one to serve.
-    if has_svg_icon {
-        icons.push((
-            "/favicon.svg",
-            String::from("static/image/favicon/favicon.svg"),
-        ));
-    }
-
     let mut router: Router<WebServerState<S>> = Router::new();
-    for (route, original) in icons {
+    for (route, original) in icon_sources(has_svg_icon) {
         // Existence was proved at boot, so this is a resolution, not a check.
-        router = router.nest_service(route, ServeFile::new(cache_buster.file(&original)));
+        router = router.nest_service(route, ServeFile::new(cache_buster.file(original)));
     }
     router
 }
@@ -949,6 +938,8 @@ struct AssembledFrontend<S> {
     base: crate::templates::BaseTemplateData,
     templates: crate::templates::TemplateRegistry<'static>,
     not_found: super::not_found::NotFound<S>,
+    /// Every route the library itself serves, which is never traced.
+    untraced: Vec<String>,
 }
 
 /// Builds the frontend and sorts its routes by the cache policy each needs.
@@ -987,6 +978,7 @@ where
     // cache policy, and stamping `no-store` over it would re-download the
     // analytics script on every page view.
     let (proxy_scripts, api) = proxy_routes(&built);
+    let untraced: Vec<String> = library_routes(&built);
 
     routes = routes.merge(built.pages.into_router()?);
 
@@ -999,7 +991,47 @@ where
         base: built.base,
         templates,
         not_found: built.not_found,
+        untraced,
     })
+}
+
+/// The route patterns the library serves itself: the documents, icons, feeds
+/// and proxies of [`assemble_frontend`]. None is traced.
+#[cfg(feature = "pages")]
+pub(super) fn library_routes<S>(frontend: &super::frontend::Frontend<S>) -> Vec<String>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let mut routes: Vec<String> = vec![
+        String::from("/robots.txt"),
+        String::from("/humans.txt"),
+        String::from("/site.webmanifest"),
+        String::from(crate::sitemap::SITEMAP_INDEX_PATH),
+        frontend.runtime.sentry_browser.script_path.clone(),
+        frontend.runtime.sentry_browser.tunnel_path.clone(),
+    ];
+    routes.extend(
+        (1..=frontend.well_known.sitemaps.chunks().len())
+            .map(|index: usize| format!("/sitemap-{index}.xml")),
+    );
+    routes.extend(
+        icon_sources(frontend.has_svg_icon)
+            .into_iter()
+            .map(|(route, _original)| String::from(route)),
+    );
+    if let Some(feeds) = &frontend.well_known.feeds {
+        routes.extend(
+            feeds
+                .documents()
+                .iter()
+                .map(|document| String::from(document.path())),
+        );
+    }
+    if let Some(analytics) = frontend.runtime.analytics.as_ref() {
+        routes.push(analytics.script_path.clone());
+        routes.push(analytics.event_path.clone());
+    }
+    routes
 }
 
 /// The first-party proxy routes.
@@ -1014,7 +1046,7 @@ fn proxy_routes<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    use crate::analytics::{AnalyticsConfig, ScriptRelay, relay_envelope, relay_event};
+    use crate::analytics::{AnalyticsConfig, ScriptRelay, SentryDsn, relay_envelope, relay_event};
     use axum::body::Bytes;
     use axum::extract::ConnectInfo;
     use axum::http::HeaderMap;
@@ -1048,7 +1080,7 @@ where
         &paths.sentry_browser.script_path,
         script_route(ScriptRelay::new(
             client.clone(),
-            frontend.sentry_dsn.upstream_script_url(),
+            SentryDsn::upstream_bundle_url(frontend.browser_traces_sample_rate.is_on()),
         )),
     );
 

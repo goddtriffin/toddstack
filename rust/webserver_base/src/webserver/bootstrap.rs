@@ -49,6 +49,39 @@ where
     Fut: Future<Output = Result<T, E>>,
     E: From<super::error::WebServerError>,
 {
+    bootstrap_with_release_and(release, |observability: Observability| observability, body)
+}
+
+/// What `configure` is given: the observability [`bootstrap`](crate::bootstrap)
+/// is about to start. Nothing when the `observability` feature is off.
+#[cfg(feature = "observability")]
+pub type Observability = crate::observability::Observability;
+/// What `configure` is given: the observability [`bootstrap`](crate::bootstrap)
+/// is about to start. Nothing when the `observability` feature is off.
+#[cfg(not(feature = "observability"))]
+pub type Observability = ();
+
+/// [`bootstrap_with_release`], with `configure` adjusting the observability
+/// before it starts, e.g. `|o| o.with_traces_sample_rate(rate)`.
+///
+/// # Errors
+///
+/// Whatever `body` returns. `bootstrap_and` adds no failure of its own.
+///
+/// # Panics
+///
+/// If the Tokio runtime cannot be built.
+pub fn bootstrap_with_release_and<F, Fut, T, E, C>(
+    release: &str,
+    configure: C,
+    body: F,
+) -> Result<T, E>
+where
+    F: FnOnce(Shutdown) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: From<super::error::WebServerError>,
+    C: FnOnce(Observability) -> Observability,
+{
     // Build-tool modes run and exit before the runtime, before error
     // monitoring, and before anything binds a port. Handling them here is what
     // lets every project reach the static-asset pipeline through its own server
@@ -75,11 +108,15 @@ where
     let _guard: crate::observability::ObservabilityGuard = {
         let environment: crate::Environment = crate::Environment::from_env()
             .map_err(|error| E::from(super::error::WebServerError::from(error)))?;
-        crate::observability::Observability::from_env(environment)
-            .map_err(|error| E::from(super::error::WebServerError::from(error)))?
-            .with_release(release)
-            .init()
+        configure(
+            crate::observability::Observability::from_env(environment)
+                .map_err(|error| E::from(super::error::WebServerError::from(error)))?
+                .with_release(release),
+        )
+        .init()
     };
+    #[cfg(not(feature = "observability"))]
+    drop(configure);
 
     let runtime: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -108,8 +145,26 @@ where
 ///     bootstrap!(|shutdown| async move { WebServer::from_env()?.run(shutdown).await })
 /// }
 /// ```
+///
+/// To set the server's trace sampling rate (or anything else on
+/// [`Observability`](crate::observability::Observability)), pass a closure
+/// first:
+///
+/// ```ignore
+/// bootstrap!(
+///     |observability| observability.with_traces_sample_rate(TracesSampleRate::ALL),
+///     |shutdown| async move { WebServer::from_env()?.run(shutdown).await }
+/// )
+/// ```
 #[macro_export]
 macro_rules! bootstrap {
+    ($configure:expr, $body:expr) => {
+        $crate::webserver::bootstrap_with_release_and(
+            concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),
+            $configure,
+            $body,
+        )
+    };
     ($body:expr) => {
         $crate::webserver::bootstrap_with_release(
             concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")),

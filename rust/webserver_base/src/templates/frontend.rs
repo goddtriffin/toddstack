@@ -24,8 +24,14 @@ pub struct AnalyticsPaths {
 /// Browser-side error monitoring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SentryBrowser {
-    /// The proxied Sentry loader script.
+    /// The proxied Sentry browser bundle.
     pub script_path: String,
+    /// The browser DSN, public by design.
+    pub dsn: String,
+    /// The share of page loads that send a trace, as a script literal
+    /// (`0.2`); `None` when tracing is off, so the layout loads and starts
+    /// nothing for it.
+    pub traces_sample_rate: Option<String>,
     /// Where the browser SDK posts envelopes, relayed verbatim to Sentry.
     pub tunnel_path: String,
     /// The Sentry `environment` tag.

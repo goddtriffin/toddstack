@@ -258,6 +258,9 @@ a share card.
 | `analytics` | the Plausible site; blank or `AnalyticsConfig::disabled()` turns it off, and it is always off locally |
 | `sentry_browser_dsn` | browser errors, separate from the server's DSN |
 
+Optional: `.with_browser_traces_sample_rate(rate)` (see
+[Tracing](#tracing)), `.with_not_found(..)`, `.with_helper(..)`.
+
 Calling it gives you, with no further code: the embedded base layout, the
 generated icon set, `site.webmanifest`, `robots.txt`, the sitemap index and its
 url sets, first-party analytics, the Sentry browser tunnel, and the pre-paint
@@ -372,14 +375,14 @@ crawler signals as high in the document as they go. Then `robots` and
 block with an **absolute, content-hashed** `og:image` plus its real width, height
 and MIME type; four X/Twitter tags (the rest provably fall back to Open Graph);
 the icon set and manifest link; JSON-LD; the pre-paint theme script; auto-derived
-`preconnect` hints; the Plausible and Sentry loaders; then stylesheets. Scripts go
+`preconnect` hints; the Plausible and Sentry scripts; then stylesheets. Scripts go
 at the end of `<body>`.
 
 Nothing in `<head>` blocks parsing except the stylesheets and the tiny inline
-theme script, which must run before first paint. Both third-party loaders are
-`defer`: Sentry's `sentryOnLoad` hook is defined inline just before its loader,
-and deferred scripts run in document order, so Sentry is initialised before any of
-the page's module scripts run. The inline scripts sit above the stylesheets on
+theme script, which must run before first paint. Both third-party scripts are
+`defer`: Sentry's `init` sits in an inline `<script type="module">` right after
+its bundle, and deferred scripts and inline modules run in document order, so
+Sentry is initialised before any of the page's own scripts run. The inline scripts sit above the stylesheets on
 purpose: an inline script after a stylesheet waits for that stylesheet to load.
 
 ### Template data
@@ -751,7 +754,7 @@ is what every bundler already emits.
 ```
 GET  /script/{project}-{hash}.js   →  the Plausible script
 POST /api/v1/{project}-{hash}      →  events, with the real visitor IP forwarded
-GET  /script/{project}-{hash2}.js  →  the Sentry browser loader
+GET  /script/{project}-{hash2}.js  →  the Sentry browser bundle (pinned)
 POST /api/v1/{project}-{hash2}     →  Sentry envelopes
 ```
 
@@ -802,6 +805,19 @@ an id behaves as before. Sentry is unaffected: it stays on in every environment.
 In code, `AnalyticsConfig::disabled()` and `AnalyticsConfig::is_enabled()` expose
 the same state, and `Frontend` applies the local rule whatever config it is given.
 
+**Upgrading to 0.3.6:** Sentry tracing is now configured by this library, not by
+each Sentry project's dashboard toggle, and it is **on by default**: the browser
+traces 20% of page loads and the server 0.1% of dynamic requests (both
+placeholders; see [Tracing](#tracing)). Nothing has to change to compile, but
+spans now count against your Sentry quota. To keep tracing off for a site, pass
+`TracesSampleRate::OFF` for each side. The browser no longer uses Sentry's
+per-project Loader Script (whose bundle the dashboard picked); it serves a
+pinned bundle from your own origin, and `SentryDsn::upstream_script_url` and
+`SENTRY_CDN_HOST` are gone (`SentryDsn::upstream_bundle_url` and
+`SENTRY_BROWSER_CDN_HOST` replace them). Errors thrown before the bundle runs
+(before first paint) are no longer buffered. If you wrote your own
+`sentryOnLoad` or init, remove it: the layout initialises Sentry.
+
 **Upgrading to 0.3.5:** response compression is now on by default for every
 route, with no code change. Responses a client accepts compressed gain
 `Content-Encoding` and `Vary: Accept-Encoding` and lose `Content-Length`. Opt out
@@ -820,6 +836,63 @@ return an empty string when analytics is disabled; prefer
 not register no matter what you configure. To exercise it end to end, add your
 development domain as its own Plausible site and map it to `127.0.0.1` in
 `/etc/hosts`.
+
+## Tracing
+
+Sentry tracing is set per project, in code, for the browser and the server
+separately. A rate runs from `0.0` (off: nothing loaded, started or sent) to
+`1.0`, and is a `TracesSampleRate`, which refuses anything else.
+
+```rust
+// browser: a share of page loads
+FrontendParams::from_env(base, pages)?
+    .with_browser_traces_sample_rate(TracesSampleRate::new(0.1)?)
+// server: a share of dynamic requests
+bootstrap!(
+    |observability| observability.with_traces_sample_rate(TracesSampleRate::new(0.001).unwrap()),
+    |shutdown| async move { /* ... */ }
+)
+```
+
+Without these a site gets `DEFAULT_BROWSER_TRACES_SAMPLE_RATE` (0.2) and
+`DEFAULT_SERVER_TRACES_SAMPLE_RATE` (0.001), placeholders until real traffic sets
+them. Budget as traffic × rate × spans per sample: measured on the template
+site, a sampled page load is about 14 spans (a fixed ~9 plus one per resource it
+loads) and a sampled request 3 (the request, the cache middleware, the render).
+
+**Browser.** The Sentry project's dashboard toggle no longer matters. Its Loader
+Script serves whichever bundle the toggle names, and with tracing off that is an
+errors-only bundle where `browserTracingIntegration()` does nothing but warn; it
+also fetches that bundle from Sentry's origin, past your proxy. So the site
+proxies a **pinned bundle** (`SENTRY_BROWSER_SDK_VERSION`, bumped in one place)
+from its own origin: errors-only at rate 0 (about 32 KB over brotli), the tracing
+bundle above it (about 52 KB), served at a path that changes with the version and
+rate, so the year-long cache can never serve a stale one. Tracing adds
+page-load spans and web vitals.
+
+A page script adds a child span to its own page load:
+
+```js
+window.webserverBase.span({
+  name: "bdg.core.ready", op: "bdg",
+  start: t0, end: performance.now(), // performance.now() milliseconds
+  attributes: { wasm: true },
+});
+```
+
+It does nothing when tracing is off, or once the page load's trace has ended
+(about a second after the last resource), and never starts a transaction of its
+own. Call it from a script that runs during load.
+
+**Server.** Each request to a route the site owns is one transaction, named by
+route pattern (`GET /blog/{slug}`). Never traced, at any rate: static assets,
+icons, `robots.txt`, the manifest, sitemaps, feeds, the health check, the
+analytics and Sentry proxies, and anything that matched no route (a 404 is a
+scanner). Any other root span (a background task) is dropped too, so the quota
+holds only what was budgeted. The rate is the server's own: a request carrying
+the browser's `sentry-trace` continues that trace's id but its sampled flag is
+ignored. Honouring it would send every request of every sampled page load, at the
+browser's rate instead of the server's.
 
 ## Observability
 
