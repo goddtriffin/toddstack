@@ -71,6 +71,16 @@ pub struct Profile {
     pub suspended: bool,
 }
 
+/// What [`Accounts::profile_by_sub`] and [`Accounts::profile_by_username`]
+/// answer: the public profile of any account holder, and nothing more.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PublicProfile {
+    pub sub: String,
+    pub username: String,
+    /// The stable public avatar URL.
+    pub picture: String,
+}
+
 /// An event with the idempotency key the Server API requires, as sent.
 #[derive(Serialize)]
 struct KeyedEvent<'a> {
@@ -180,6 +190,45 @@ impl Accounts {
             status: status.as_u16(),
             message: e.to_string(),
         })
+    }
+
+    /// The public profile (`sub`, `username`, `picture`) of any account
+    /// holder by `sub`, including people who never used your project, so you
+    /// can show, block and report them. Pass the `viewer` (the player asking)
+    /// to get `not_found` when either has blocked the other.
+    ///
+    /// # Errors
+    /// [`Error::Config`] without a client secret, [`Error::Server`]
+    /// (`bad_request` for a malformed sub or viewer; `not_found`, the same for
+    /// an unknown, suspended, review or deleted account and for a block), or
+    /// the request failed.
+    pub async fn profile_by_sub(&self, sub: &str, viewer: Option<&str>) -> Result<PublicProfile> {
+        self.lookup(&format!("/profiles/{}", checked(sub)?), viewer)
+            .await
+    }
+
+    /// As [`Accounts::profile_by_sub`], by exact username (case-insensitive).
+    ///
+    /// # Errors
+    /// As for [`Accounts::profile_by_sub`].
+    pub async fn profile_by_username(
+        &self,
+        username: &str,
+        viewer: Option<&str>,
+    ) -> Result<PublicProfile> {
+        let name: String = url::form_urlencoded::byte_serialize(username.trim().as_bytes())
+            .collect::<String>()
+            .replace('+', "%20");
+        self.lookup(&format!("/profiles/by-username/{name}"), viewer)
+            .await
+    }
+
+    async fn lookup(&self, path: &str, viewer: Option<&str>) -> Result<PublicProfile> {
+        let path: String = match viewer {
+            Some(viewer) => format!("{path}?viewer={}", checked(viewer)?),
+            None => path.to_owned(),
+        };
+        read(self.server_call(reqwest::Method::GET, &path, None).await?)
     }
 
     /// Reports `sub` to Todd's review queue on behalf of the signed-in player

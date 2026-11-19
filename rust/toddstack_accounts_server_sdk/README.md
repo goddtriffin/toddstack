@@ -149,6 +149,11 @@ Also `relationships(&[..])`, `relationship(sub)`, `requests()`, `accept`, `decli
 and `set_time_zone(tz)`. `accounts.report_as_player(&PlayerReport { reporter_sub, .. })` is the report with its
 `reporter_sub`.
 
+Any account holder's public profile, for showing, blocking and reporting people who never used your project:
+`accounts.profile_by_sub(sub, viewer)` and `accounts.profile_by_username(name, viewer)` return `PublicProfile { sub,
+username, picture }` (nothing else). Pass the `viewer` (the player asking) so a block either way is the same
+`not_found` as an unknown, suspended, review or deleted account.
+
 - **Errors carry the code.** A refusal is `Error::Server { status, code, message }`; `error.code()` is `not_found`,
   `suspended`, `scope`, `rate_limited`, `bad_request`, `unprocessable`, ... Match on it. Everything but a 429 and a 5xx is
   final. A player who never signed in to your project, a deleted one and one who removed your app are all `not_found`;
@@ -228,7 +233,7 @@ is stored (the config needs its client secret, and the player's `friends` scope 
 (`FriendsAuth::access_token`, forwarded with `Friends`) still works but is deprecated.
 
 ```toml
-toddstack-accounts-server-sdk = { version = "0.9.1", features = ["axum"] }
+toddstack-accounts-server-sdk = { version = "0.9.2", features = ["axum"] }
 ```
 
 ```rust
@@ -441,6 +446,8 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 **Issuer match:** the issuer must exactly match the local server's `ACCOUNTS_BASE_URL`. If you run accounts on `http://localhost:8790` (needed for passkeys), use `toddgriffin_at("http://localhost:8790", ..)`, not the `127.0.0.1` default.
 
 ## Breaking changes
+
+**0.9.2**: additive: `Accounts::profile_by_sub`, `Accounts::profile_by_username` and `player::PublicProfile`.
 
 **0.9.0**: added `Accounts::player` (the Server API), `report_as_player`, `revocation` (`Revocations`, the poller,
 `Accounts::handle_webhook`) and `EventKind::TokensRevoked`. `verify_access_token` now also refuses a token whose

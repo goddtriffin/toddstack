@@ -386,3 +386,69 @@ async fn a_client_without_a_secret_or_a_path_unsafe_id_is_refused_before_any_req
     ));
     assert!(fake.requests().is_empty());
 }
+
+#[tokio::test]
+async fn a_public_profile_is_looked_up_by_sub_or_username_with_an_optional_viewer() {
+    let fake: Fake = Fake::start(|_, _| {
+        ok(&json!({ "sub": OTHER, "username": "sam smith", "picture": "https://accounts.toddgriffin.me/avatars/x" }))
+    })
+    .await;
+    let accounts = accounts(&fake.issuer, Some("s3cret"));
+    let expected = toddstack_accounts_server_sdk::player::PublicProfile {
+        sub: String::from(OTHER),
+        username: String::from("sam smith"),
+        picture: String::from("https://accounts.toddgriffin.me/avatars/x"),
+    };
+    assert_eq!(
+        expected,
+        accounts.profile_by_sub(OTHER, None).await.unwrap()
+    );
+    assert_eq!(
+        expected,
+        accounts.profile_by_sub(OTHER, Some(SUB)).await.unwrap()
+    );
+    assert_eq!(
+        expected,
+        accounts
+            .profile_by_username("Sam Smith", Some(SUB))
+            .await
+            .unwrap()
+    );
+    let targets: Vec<String> = fake.requests().iter().map(|r| r.target.clone()).collect();
+    assert_eq!(
+        vec![
+            format!("/api/v1/profiles/{OTHER}"),
+            format!("/api/v1/profiles/{OTHER}?viewer={SUB}"),
+            format!("/api/v1/profiles/by-username/Sam%20Smith?viewer={SUB}"),
+        ],
+        targets
+    );
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|r| r.method == "GET" && r.authorization == Some(basic()))
+    );
+}
+
+#[tokio::test]
+async fn a_profile_lookup_that_is_not_found_is_final_and_bad_ids_never_go_out() {
+    let fake: Fake = Fake::start(|_, _| {
+        (
+            404,
+            json!({ "error": "not_found", "message": "Not found." }).to_string(),
+        )
+    })
+    .await;
+    let accounts = accounts(&fake.issuer, Some("s3cret"));
+    let error = accounts.profile_by_sub(OTHER, Some(SUB)).await.unwrap_err();
+    assert_eq!(Some("not_found"), error.code());
+    assert_eq!(1, fake.requests().len());
+    assert!(accounts.profile_by_sub("../x", None).await.is_err());
+    assert!(accounts.profile_by_sub(OTHER, Some("a b")).await.is_err());
+    assert_eq!(1, fake.requests().len());
+    let no_secret = self::accounts(&fake.issuer, None);
+    assert!(matches!(
+        no_secret.profile_by_username("sam", None).await,
+        Err(Error::Config(_))
+    ));
+}
