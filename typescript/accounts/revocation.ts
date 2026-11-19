@@ -5,8 +5,10 @@
 // that `verifyAccessToken` consults: the signed `tokens.revoked` webhook (`accounts.handleWebhook`), and a poll
 // of `GET /api/v1/revoked-tokens` at startup and every 30 seconds, the backup for a missed webhook
 // (`accounts.startRevocationPoller`). Entries are kept until their `expires_at` (when the family's last access token
-// has died), so the set stays small. If accounts is unreachable, verification keeps working (fail open) and
-// `onError` hears about each failed poll.
+// has died), so the set stays small. The set is empty until the first poll lands, so `startRevocationPoller` awaits it
+// (retrying quickly) and rejects if it still fails: you decide whether to run without instant logout. After that, if
+// accounts is unreachable, verification keeps working (fail open), `onError` hears about each failed poll, and
+// `poller.lastSuccess()` tells a health check how stale the set is.
 
 import type { WebhookEvent } from "./webhook.ts";
 
@@ -27,16 +29,33 @@ export function unixSeconds(rfc3339: string): number | null {
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
+/** Expired entries are dropped at most this often, so a burst of inserts never rescans the whole set each time. */
+const PRUNE_EVERY_SECONDS = 10;
+
 /** The token families known to be revoked, shared by the webhook handler, the poller and token verification. */
 export class Revocations {
   /** `fam` to the Unix second it stops mattering. */
   #families = new Map<string, number>();
+  #nextPrune = 0;
 
-  /** Records a dead family until `expiresAt` (Unix seconds). Repeats are fine (polls overlap): the later expiry wins. */
+  /**
+   * Records a dead family until `expiresAt` (Unix seconds). Repeats are fine (polls overlap): the later expiry wins.
+   * For many families use `revokeMany`.
+   */
   revoke(fam: string, expiresAt: number): void {
+    this.revokeMany([[fam, expiresAt]]);
+  }
+
+  /** `revoke` for a batch, pruning expired entries at most once per batch (and at most every few seconds). */
+  revokeMany(families: Iterable<readonly [string, number]>): void {
+    for (const [fam, expiresAt] of families) {
+      this.#families.set(fam, Math.max(this.#families.get(fam) ?? expiresAt, expiresAt));
+    }
     const now = nowSeconds();
-    for (const [key, until] of this.#families) if (until <= now) this.#families.delete(key);
-    this.#families.set(fam, Math.max(this.#families.get(fam) ?? expiresAt, expiresAt));
+    if (now >= this.#nextPrune) {
+      for (const [key, until] of this.#families) if (until <= now) this.#families.delete(key);
+      this.#nextPrune = now + PRUNE_EVERY_SECONDS;
+    }
   }
 
   /** Whether `fam` is revoked and its access tokens could still be alive. */
@@ -60,7 +79,7 @@ export class Revocations {
       ? event.data.families.filter((f): f is string => typeof f === "string")
       : [];
     const until = nowSeconds() + WEBHOOK_REVOCATION_TTL_SECONDS;
-    for (const fam of families) this.revoke(fam, until);
+    this.revokeMany(families.map((fam) => [fam, until] as const));
     return families.length;
   }
 }
@@ -69,9 +88,14 @@ export class Revocations {
 export interface RevocationOptions {
   /** Milliseconds between polls. Defaults to 30 seconds. */
   intervalMs?: number;
-  /** Called with each failed poll (the poller retries on its own). Log it. */
+  /** Called with each failed poll (the poller retries on its own). Log it. If it throws, the poller carries on. */
   onError?: (error: unknown) => void;
+  /** Milliseconds before the second startup try; the third waits twice as long. Defaults to 1 second. */
+  startupBackoffMs?: number;
 }
+
+/** Tries at the startup poll before giving up. */
+const STARTUP_TRIES = 3;
 
 /** What the poller needs from the client. */
 interface Pollable {
@@ -82,28 +106,52 @@ interface Pollable {
 export class RevocationPoller {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #stopped = false;
+  #lastSuccess: Date | null = null;
 
   private constructor() {}
 
-  /** One poll now (awaited), then one per interval. A failed poll goes to `onError`. */
+  /**
+   * One poll now (awaited, up to 3 tries with backoff; rejects with the last error if all fail), then one per
+   * interval. A later failed poll goes to `onError`.
+   */
   static async start(accounts: Pollable, options: RevocationOptions = {}): Promise<RevocationPoller> {
     const poller = new RevocationPoller();
     const interval = options.intervalMs ?? REVOCATION_POLL_INTERVAL_MS;
     let cursor: string | null = null;
     const poll = async () => {
-      try {
-        cursor = (await accounts.pollRevocations(cursor)).next;
-      } catch (error) {
-        options.onError?.(error);
-      }
+      cursor = (await accounts.pollRevocations(cursor)).next;
+      poller.#lastSuccess = new Date();
     };
+    let backoff = options.startupBackoffMs ?? 1_000;
+    for (let attempt = 1;; attempt++) {
+      try {
+        await poll();
+        break;
+      } catch (error) {
+        if (attempt >= STARTUP_TRIES) throw error;
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+        backoff *= 2;
+      }
+    }
     const tick = async () => {
-      await poll();
+      try {
+        await poll();
+      } catch (error) {
+        try {
+          options.onError?.(error);
+        } catch {
+          // User code must not be able to end the poll.
+        }
+      }
       if (!poller.#stopped) poller.#timer = setTimeout(tick, interval);
     };
-    await poll();
     poller.#timer = setTimeout(tick, interval);
     return poller;
+  }
+
+  /** When the last poll succeeded (the startup poll counts), or `null`. For a health check: a stale value means only webhooks are protecting you. */
+  lastSuccess(): Date | null {
+    return this.#lastSuccess;
   }
 
   /** Stops polling. */

@@ -367,20 +367,93 @@ Deno.test("the poller polls at startup before resolving, keeps polling, and stop
   assertEquals(f.seen.length, before);
 });
 
+const okPoll = (fam: string): [number, unknown] => [
+  200,
+  { families: [{ fam, expires_at: iso(now() + 600) }], now: iso(now()) },
+];
+const failing = (): [number, unknown] => [500, { error: "server_error", message: "x" }];
+
+Deno.test("a failed startup poll rejects after three tries so the caller decides", async () => {
+  const f = fake(() => failing());
+  const accounts = new Accounts(config, { keys: jwks, fetch: f.fetch });
+  await assertRejects(() => accounts.startRevocationPoller({ intervalMs: 30, startupBackoffMs: 1 }), AccountsError);
+  assert(f.seen.length >= 3, `${f.seen.length} requests`);
+});
+
+Deno.test("a startup poll that fails once is retried and the poller starts", async () => {
+  const f = fake((n) => n < 3 ? failing() : okPoll("late"));
+  const accounts = new Accounts(config, { keys: jwks, fetch: f.fetch });
+  const poller = await accounts.startRevocationPoller({ intervalMs: 30, startupBackoffMs: 1 });
+  assert(accounts.revocations.isRevoked("late"));
+  assert(poller.lastSuccess() !== null);
+  poller.stop();
+});
+
 Deno.test("a failing poll reaches onError, keeps verifying and recovers", async () => {
-  const f = fake((n) =>
-    n < 3
-      ? [500, { error: "server_error", message: "x" }]
-      : [200, { families: [{ fam: "late", expires_at: iso(now() + 600) }], now: iso(now()) }]
-  );
+  const f = fake((n) => n === 0 ? okPoll("first") : n <= 6 ? failing() : okPoll("late"));
   const accounts = new Accounts(config, { keys: jwks, fetch: f.fetch });
   const errors: unknown[] = [];
   const poller = await accounts.startRevocationPoller({ intervalMs: 30, onError: (e) => errors.push(e) });
-  assertEquals(errors.length, 1);
   await accounts.verifyAccessToken(await accessToken({ fam: "late" }));
   await sleep(2_000);
+  assert(errors.length > 0);
   assert(accounts.revocations.isRevoked("late"));
   poller.stop();
+});
+
+Deno.test("a throwing onError does not stop the poller", async () => {
+  const f = fake((n) => n === 0 ? okPoll("first") : n <= 3 ? failing() : okPoll("after"));
+  const accounts = new Accounts(config, { keys: jwks, fetch: f.fetch });
+  let calls = 0;
+  const poller = await accounts.startRevocationPoller({
+    intervalMs: 30,
+    onError: () => {
+      calls++;
+      throw new Error("the hook is broken");
+    },
+  });
+  await sleep(2_000);
+  assert(calls >= 1);
+  assert(accounts.revocations.isRevoked("after"), "the poll died after onError threw");
+  poller.stop();
+});
+
+Deno.test("lastSuccess moves forward with each good poll", async () => {
+  const f = fake((n) => okPoll(`f${n}`));
+  const accounts = new Accounts(config, { keys: jwks, fetch: f.fetch });
+  const poller = await accounts.startRevocationPoller({ intervalMs: 30 });
+  const first = poller.lastSuccess();
+  assert(first !== null);
+  await sleep(150);
+  assert(poller.lastSuccess()!.getTime() > first.getTime());
+  poller.stop();
+});
+
+Deno.test("a mass revocation of 100k families is one pass, not one per family", () => {
+  const set = new Revocations();
+  const until = now() + 600;
+  const started = performance.now();
+  set.revokeMany(Array.from({ length: 100_000 }, (_, i) => [`fam-${i}`, until] as const));
+  for (let i = 0; i < 100_000; i++) set.revoke(`single-${i}`, until);
+  const took = performance.now() - started;
+  assertEquals(set.size, 200_000);
+  assert(set.isRevoked("fam-99999"));
+  assert(took < 5_000, `${took}ms`);
+});
+
+Deno.test("the client secret never appears when the client is inspected or serialized", () => {
+  const accounts = new Accounts({ ...config, clientSecret: "s3cret-value" }, { keys: jwks });
+  assertEquals(accounts.config.clientId, config.clientId);
+  for (
+    const shown of [
+      Deno.inspect(accounts, { showHidden: true }),
+      JSON.stringify(accounts),
+      JSON.stringify(accounts.config),
+    ]
+  ) {
+    assert(!shown.includes("s3cret-value"), shown);
+  }
+  assert(!("clientSecret" in accounts.config));
 });
 
 Deno.test("withRevocationPoller wires the client and the poller; the poller needs the client secret", async () => {

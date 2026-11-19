@@ -550,3 +550,160 @@ async fn conflicts_and_unprocessable_answers_keep_their_meaning() {
         body
     );
 }
+
+/// Signed in as the player `sub` named by `x-player` (never a token): the router must act over the Server API.
+struct PlayerAuth;
+
+impl FriendsAuth for PlayerAuth {
+    fn player_sub(
+        &self,
+        headers: &HeaderMap,
+    ) -> impl Future<Output = Option<(String, Credential)>> + Send {
+        let sub: Option<String> = headers
+            .get("x-player")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let credential: Credential = if headers.contains_key("cookie") {
+            Credential::Cookie(String::new())
+        } else {
+            Credential::Bearer(String::new())
+        };
+        std::future::ready(sub.map(|s| (s, credential)))
+    }
+
+    fn public_origin(&self) -> &str {
+        ORIGIN
+    }
+}
+
+fn player_app(base: &str, secret: Option<&str>) -> Router {
+    let accounts: Accounts = Accounts::new(
+        Config::toddgriffin_at(
+            base,
+            "example",
+            secret.map(str::to_owned),
+            "https://www.example.com/cb",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    friends_router::router(Arc::new(accounts), Arc::new(PlayerAuth))
+}
+
+#[tokio::test]
+async fn a_player_sub_acts_over_the_server_api_with_client_credentials_and_no_token() {
+    let (base, seen) = service(vec![
+        (
+            "GET /api/v1/players/u1/friends",
+            200,
+            json!({ "friends": [person()] }),
+        ),
+        (
+            "POST /api/v1/players/u1/friends/requests/u2/accept",
+            204,
+            Value::Null,
+        ),
+    ])
+    .await;
+    let a: Router = player_app(&base, Some("s3cret"));
+    let (status, body) = send(
+        &a,
+        Method::GET,
+        "/api/v1/friends",
+        &[("x-player", "u1")],
+        None,
+    )
+    .await;
+    assert_eq!(StatusCode::OK, status);
+    assert_eq!(json!({ "friends": [person()] }), body);
+    let (status, _) = send(
+        &a,
+        Method::POST,
+        "/api/v1/friends/requests/u2/accept",
+        &[("x-player", "u1")],
+        None,
+    )
+    .await;
+    assert_eq!(StatusCode::NO_CONTENT, status);
+
+    let requests: Vec<String> = seen.lock().unwrap().clone();
+    assert_eq!(2, requests.len());
+    for request in &requests {
+        // HTTP Basic of `example:s3cret`: the project, not a player's bearer token.
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: basic zxhhbxbsztpzm2nyzxq="),
+            "{request}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_player_cookie_write_still_needs_the_same_origin_check_and_a_guest_gets_401() {
+    let (base, seen) = service(vec![(
+        "POST /api/v1/players/u1/friends/requests/u2/accept",
+        204,
+        Value::Null,
+    )])
+    .await;
+    let a: Router = player_app(&base, Some("s3cret"));
+    let accept = "/api/v1/friends/requests/u2/accept";
+    let (status, _) = send(
+        &a,
+        Method::POST,
+        accept,
+        &[("x-player", "u1"), ("cookie", "s=1")],
+        None,
+    )
+    .await;
+    assert_eq!(StatusCode::FORBIDDEN, status);
+    let (status, _) = send(&a, Method::POST, accept, &[], None).await;
+    assert_eq!(StatusCode::UNAUTHORIZED, status);
+    assert_eq!(0, seen.lock().unwrap().len());
+    let (status, _) = send(
+        &a,
+        Method::POST,
+        accept,
+        &[
+            ("x-player", "u1"),
+            ("cookie", "s=1"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(StatusCode::NO_CONTENT, status);
+}
+
+#[tokio::test]
+async fn server_api_errors_keep_their_meaning_and_a_missing_secret_is_unavailable() {
+    let (base, _) = service(vec![(
+        "POST /api/v1/players/u1/friends/requests/u2/accept",
+        404,
+        json!({ "error": "not_found", "message": "No such request." }),
+    )])
+    .await;
+    let (status, body) = send(
+        &player_app(&base, Some("s3cret")),
+        Method::POST,
+        "/api/v1/friends/requests/u2/accept",
+        &[("x-player", "u1")],
+        None,
+    )
+    .await;
+    assert_eq!(StatusCode::NOT_FOUND, status);
+    assert_eq!(
+        json!({ "error": "not_found", "message": "No such request." }),
+        body
+    );
+    let (status, _) = send(
+        &player_app(&base, None),
+        Method::GET,
+        "/api/v1/friends",
+        &[("x-player", "u1")],
+        None,
+    )
+    .await;
+    assert_eq!(StatusCode::BAD_GATEWAY, status);
+}

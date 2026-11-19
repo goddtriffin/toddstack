@@ -4,9 +4,9 @@
 [![npm](https://img.shields.io/npm/v/toddstack-accounts)](https://www.npmjs.com/package/toddstack-accounts)
 
 Client for Todd Griffin's Projects accounts (`accounts.toddgriffin.me`): what a project's backend needs to sign people
-in, check tokens (locally, with instant logout), verify webhooks, act for players, and send notifications. The TypeScript half of `toddstack-accounts`,
-with the same features as the [Rust crate](../../rust/toddstack_accounts/README.md). Part of
-[toddstack](https://github.com/goddtriffin/toddstack).
+in, check tokens (locally, with instant logout), verify webhooks, act for players, and send notifications. The
+TypeScript half of `toddstack-accounts`, with the same features as the
+[Rust crate](../../rust/toddstack_accounts/README.md). Part of [toddstack](https://github.com/goddtriffin/toddstack).
 
 Web Platform APIs only (`fetch`, WebCrypto): Node 20+, Deno, Bun. No dependencies.
 
@@ -159,31 +159,33 @@ await player.report(other, "harassment");
 ```
 
 Also `relationships(subs)`, `relationship(sub)`, `requests()`, `accept`, `decline`, `cancel`, `remove`, `block`,
-`unblock`, `blocks()`, `inbox(limit)`, `markRead(id)`, `mutes()`, `mute(kind)`, `unmute(kind)` (`ALL_KINDS` is every kind)
-and `setTimeZone(tz)`. `accounts.reportAsPlayer({ reporterSub, sub, reason, note })` is the report with its
+`unblock`, `blocks()`, `inbox(limit)`, `markRead(id)`, `mutes()`, `mute(kind)`, `unmute(kind)` (`ALL_KINDS` is every
+kind) and `setTimeZone(tz)`. `accounts.reportAsPlayer({ reporterSub, sub, reason, note })` is the report with its
 `reporter_sub`.
 
-- **Errors carry the code.** A refusal is an `AccountsError` with `kind: "server"`, `status` and `code`:
-  `not_found`, `suspended`, `scope`, `rate_limited`, `bad_request`, `unprocessable`, ... Match on `code`. Everything but a
-  429 and a 5xx is final. A player who never signed in to your project, a deleted one and one who removed your app are
-  all `not_found`; a suspended player can be read, not written for (`suspended`).
-- **Writes are idempotent and retried.** Each is a no-op success when the state already holds (a repeated block,
-  accept, mute), and an event is deduplicated by its key (`replayed`; the same key with another event is
-  `unprocessable`). Three attempts on a 429, a 5xx or a network failure.
-- Every list shows only people who also use your project. Sending a request may name any account holder; `not_found`
-  is the one answer for everyone who can't be asked.
+- **Errors carry the code.** A refusal is an `AccountsError` with `kind: "server"`, `status` and `code`: `not_found`,
+  `suspended`, `scope`, `rate_limited`, `bad_request`, `unprocessable`, ... Match on `code`. Everything but a 429 and a
+  5xx is final. A player who never signed in to your project, a deleted one and one who removed your app are all
+  `not_found`; a suspended player can be read, not written for (`suspended`).
+- **Writes are idempotent and retried.** Each is a no-op success when the state already holds (a repeated block, accept,
+  mute), and an event is deduplicated by its key (`replayed`; the same key with another event is `unprocessable`). Three
+  attempts on a 429, a 5xx or a network failure.
+- Every list shows only people who also use your project. Sending a request may name any account holder; `not_found` is
+  the one answer for everyone who can't be asked.
 
 ## Local token checks and instant logout
 
 A native app sends its accounts access token to your server, which checks it with no call to accounts:
-`verifyAccessToken` verifies the ES256 signature against the signing keys (fetched from `/oidc/jwks`, cached,
-refetched on an unknown `kid`), `iss`, `aud` (your client id) and `exp` (30 s of skew), and reads `sub` and `fam` (the
-token family). Local checks can't see a sign-out, so accounts pushes revocations and the client refuses a token whose
-`fam` is revoked. Two feeds fill one in-memory set (`accounts.revocations`), deduplicated by `fam` and kept until each
-entry's `expires_at`:
+`verifyAccessToken` verifies the ES256 signature against the signing keys (fetched from `/oidc/jwks`, cached, refetched
+on an unknown `kid`), `iss`, `aud` (your client id) and `exp` (30 s of skew), and reads `sub` and `fam` (the token
+family). Local checks can't see a sign-out, so accounts pushes revocations and the client refuses a token whose `fam` is
+revoked. Two feeds fill one in-memory set (`accounts.revocations`), deduplicated by `fam` and kept until each entry's
+`expires_at`:
 
 ```ts
-// Starts the poll (once now, awaited, then every 30 s) and gives you the client to share.
+// Starts the poll (once now, awaited, then every 30 s) and gives you the client to share. Rejects if the first
+// poll still fails after 3 quick tries (a few seconds): until a poll lands, revoked tokens verify, so you decide
+// whether to boot without instant logout.
 const { accounts, poller } = await Accounts.withRevocationPoller(config, { onError: console.error });
 // at shutdown: poller.stop()
 
@@ -191,15 +193,18 @@ const { accounts, poller } = await Accounts.withRevocationPoller(config, { onErr
 const event = await accounts.handleWebhook(secret, request.headers.get(WEBHOOK_HEADER), rawBody);
 ```
 
-`accounts.startRevocationPoller({ intervalMs, onError })` runs the poll on an existing client. A failed poll goes to
-`onError` and is retried; verification keeps working meanwhile.
+`accounts.startRevocationPoller({ intervalMs, onError, startupBackoffMs })` runs the poll on an existing client. After
+startup, a failed poll goes to `onError` and is retried (a throw in `onError` is swallowed, so the poll never dies);
+verification keeps working meanwhile. `poller.lastSuccess()` is the time of the last good poll, for a health check.
+`accounts.revocations.revokeMany(batch)` records many families in one pass; expired entries are pruned at most every 10
+s.
 
 ## Friends and events (deprecated)
 
 **Deprecated, removed in 0.10.0.** `accounts.friends(token)` and `Friends` call the bearer API with a player's access
-token, which a project server must not hold. Use `accounts.player(sub)` (above): the same method names, with
-`postEvent` taking an idempotency key. `userinfo` is deprecated the same way: use the ID token's claims from
-`finishLogin`, then `player(sub).profile()`.
+token, which a project server must not hold. Use `accounts.player(sub)` (above): the same method names, with `postEvent`
+taking an idempotency key. `userinfo` is deprecated the same way: use the ID token's claims from `finishLogin`, then
+`player(sub).profile()`.
 
 ### The deprecated token-based API
 
@@ -415,10 +420,12 @@ default.
 ## Breaking changes
 
 **0.9.0**: added `accounts.player(sub)` (the Server API), `reportAsPlayer`, `Revocations`, `startRevocationPoller`,
-`withRevocationPoller` and `handleWebhook`, and the `tokens.revoked` webhook type. `verifyAccessToken` now also
-refuses a token whose `fam` is revoked (nothing is revoked until you feed the set). `AccountsErrorKind` gained
-`"server"` (with `code`), so a `switch` checked with `never` needs a case for it; `EventResult` gained `replayed`.
-**Deprecated, removed in 0.10.0:** `accounts.friends(token)`, `Friends` and `userinfo`.
+`withRevocationPoller` and `handleWebhook`, and the `tokens.revoked` webhook type. `verifyAccessToken` now also refuses
+a token whose `fam` is revoked (nothing is revoked until you feed the set). `AccountsErrorKind` gained `"server"` (with
+`code`), so a `switch` checked with `never` needs a case for it; `EventResult` gained `replayed`. **Deprecated, removed
+in 0.10.0:** `accounts.friends(token)`, `Friends` and `userinfo`. `accounts.config` no longer carries `clientSecret` (it
+never shows in logs or inspect output). `startRevocationPoller` now rejects if the first poll fails after 3 quick tries
+(it used to fail open silently).
 
 **0.8.0**: `IdClaims` has a new required `visibility` field, so code that builds an `IdClaims` by hand (a test double,
 say) must add it. Verified tokens always carry it. Added `Visibility`, `visibilityOf`, `isReview` and

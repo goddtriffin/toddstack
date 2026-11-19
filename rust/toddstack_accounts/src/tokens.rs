@@ -15,7 +15,7 @@ use crate::revocation::Revocations;
 use crate::{Error, ISSUER, LOCAL_BASE_URL, Result};
 
 /// Your app's registration with the accounts service.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     /// `https://accounts.toddgriffin.me/oidc` in production.
     pub issuer: String,
@@ -24,6 +24,24 @@ pub struct Config {
     pub client_secret: Option<String>,
     /// Exactly as registered.
     pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                if self.client_secret.is_some() {
+                    &"[redacted]" as &dyn std::fmt::Debug
+                } else {
+                    &None::<&str>
+                },
+            )
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 impl Config {
