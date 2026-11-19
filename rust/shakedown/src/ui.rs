@@ -30,6 +30,9 @@ pub enum Mode {
 pub struct Options {
     /// Screens by name; `all` for every screen. Empty means every screen for a check.
     pub screens: Vec<String>,
+    /// Only these devices (a quick look while working; references are never judged on a subset by accident:
+    /// `update` refuses it).
+    pub devices: Vec<String>,
     /// Run everything this many times and fail if any run differs.
     pub repeat: u32,
     /// Check or update.
@@ -186,27 +189,22 @@ fn select<'a>(config: &'a Config, opts: &Options, refs: &Path) -> Result<Vec<&'a
         .collect())
 }
 
-/// Runs the screens: draws every shot (`repeat` times), then checks or updates.
-///
-/// # Errors
-///
-/// Config or usage problems, a missing environment (Chrome, the server), or a failed check.
-pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Error> {
-    config.require_ui()?;
-    let started = Instant::now();
-    let server = config
-        .server
-        .clone()
-        .ok_or_else(|| Error::Config("no [server]".into()))?;
-    let refs = refs_dir(config, root);
-    let screens = select(config, opts, &refs)?;
-    let ms = now_ms(&server.now)?;
+fn build_jobs(
+    config: &Config,
+    root: &Path,
+    opts: &Options,
+    screens: &[&Screen],
+    ms: i64,
+) -> Result<Vec<Job>, Error> {
     let mut jobs = Vec::new();
-    for s in &screens {
-        let names = s
+    for s in screens {
+        let mut names = s
             .devices
             .clone()
             .unwrap_or_else(|| config.devices.ui.clone());
+        if !opts.devices.is_empty() {
+            names.retain(|n| opts.devices.contains(n));
+        }
         let list: Vec<Device> = devices::pick(&names)?;
         let p = Arc::new(plan(root, s, ms)?);
         for d in &list {
@@ -219,6 +217,40 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
             }
         }
     }
+    Ok(jobs)
+}
+
+/// Runs the screens: draws every shot (`repeat` times), then checks or updates.
+///
+/// # Errors
+///
+/// Config or usage problems, a missing environment (Chrome, the server), or a failed check.
+pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Error> {
+    config.require_ui()?;
+    if opts.mode == Mode::Update && !opts.devices.is_empty() {
+        return Err(Error::Config(
+            "update writes every device of a screen; --devices is for ui only".into(),
+        ));
+    }
+    let known = devices::all();
+    if let Some(bad) = opts
+        .devices
+        .iter()
+        .find(|d| !known.iter().any(|k| &k.name == *d))
+    {
+        return Err(Error::Config(format!(
+            "unknown device {bad:?} (see: shakedown devices)"
+        )));
+    }
+    let started = Instant::now();
+    let server = config
+        .server
+        .clone()
+        .ok_or_else(|| Error::Config("no [server]".into()))?;
+    let refs = refs_dir(config, root);
+    let screens = select(config, opts, &refs)?;
+    let ms = now_ms(&server.now)?;
+    let jobs = build_jobs(config, root, opts, &screens, ms)?;
     let chrome = crate::browser::install()?;
     let out = out_dir(root);
     let _ = std::fs::remove_dir_all(&out);
@@ -243,6 +275,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
             now_ms: ms,
             signin: config.players.as_ref().map(|p| p.signin.clone()),
             ignores,
+            player_limit: config.players.as_ref().map_or(3, |p| p.parallel),
         });
         let profile = std::env::temp_dir().join(format!("shakedown-chrome-{}", std::process::id()));
         let (browser, handler) = capture::launch(&chrome, &profile).await?;
@@ -551,6 +584,7 @@ pub fn lines(outcome: &Outcome, mode: Mode) -> Vec<String> {
 pub fn step(config: &Config, root: &Path) -> (crate::steps::Status, String, String) {
     let opts = Options {
         screens: Vec::new(),
+        devices: Vec::new(),
         repeat: 1,
         mode: Mode::Check,
     };

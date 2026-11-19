@@ -91,6 +91,8 @@ pub struct Env {
     pub signin: Option<String>,
     /// `[layout].ignore` as JSON for the collector.
     pub ignores: String,
+    /// `[players].parallel`.
+    pub player_limit: usize,
 }
 
 /// One screen on one device in one theme.
@@ -189,10 +191,27 @@ pub async fn launch(
 /// Draws every job, `PARALLEL` at a time. Results come back sorted by id.
 pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> Vec<Shot> {
     let gate = Arc::new(Semaphore::new(PARALLEL));
+    // A signed-in player is in at most `player_limit` shots at once: servers cap a person's open connections.
+    let players: HashMap<String, Arc<Semaphore>> = jobs
+        .iter()
+        .filter(|j| j.plan.player != "guest")
+        .map(|j| {
+            (
+                j.plan.player.clone(),
+                Arc::new(Semaphore::new(env.player_limit)),
+            )
+        })
+        .collect();
     let mut tasks = Vec::new();
     for job in jobs {
         let (browser, env, gate) = (browser.clone(), env.clone(), gate.clone());
+        let mine = players.get(&job.plan.player).cloned();
         tasks.push(tokio::spawn(async move {
+            // The player's turn first, then a place among the pages drawn at once.
+            let _turn = match &mine {
+                Some(m) => m.acquire().await.ok(),
+                None => None,
+            };
             let _permit = gate.acquire().await;
             let size = (job.device.width, job.device.height);
             let id = job.id();
@@ -269,6 +288,34 @@ struct Collected {
     findings: Mutex<Vec<Finding>>,
     pending: Mutex<HashSet<String>>,
     served: Mutex<BTreeSet<String>>,
+    /// Request id to a short description, for the requests in flight.
+    urls: Mutex<std::collections::HashMap<String, String>>,
+    /// Requests whose end was heard before their start (the two come on different channels).
+    ended_early: Mutex<HashSet<String>>,
+}
+
+impl Collected {
+    fn started(&self, id: &str, what: String) {
+        if self.ended_early.lock().is_ok_and(|mut e| e.remove(id)) {
+            return;
+        }
+        if let Ok(mut p) = self.pending.lock() {
+            p.insert(id.to_string());
+        }
+        if let Ok(mut u) = self.urls.lock() {
+            u.insert(id.to_string(), what);
+        }
+    }
+
+    fn ended(&self, id: &str) {
+        let was_pending = self.pending.lock().is_ok_and(|mut p| p.remove(id));
+        if let Ok(mut u) = self.urls.lock() {
+            u.remove(id);
+        }
+        if !was_pending && let Ok(mut e) = self.ended_early.lock() {
+            e.insert(id.to_string());
+        }
+    }
 }
 
 impl Collected {
@@ -389,12 +436,15 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
     let before_acts: Vec<layout::Shift> =
         serde_json::from_str(shifts.as_str().unwrap_or("[]")).unwrap_or_default();
 
-    page.execute(EvaluateParams::builder().expression(format!(
-        "(() => {{ const s = document.createElement('style'); s.textContent = {}; document.head.append(s); }})()",
-        serde_json::Value::String(FREEZE.into())
-    )).build().map_err(|e| e.clone())?)
-    .await
-    .map_err(err("freeze"))?;
+    // A constructable stylesheet, not a <style> element: a page's own CSP (style-src 'self') would block that.
+    eval(
+        page,
+        &format!(
+            "(() => {{ const s = new CSSStyleSheet(); s.replaceSync({}); document.adoptedStyleSheets = [...document.adoptedStyleSheets, s]; return true; }})()",
+            serde_json::Value::String(FREEZE.into())
+        ),
+    )
+    .await?;
 
     for action in &job.plan.act {
         if let Err(why) = act(page, action).await {
@@ -463,15 +513,28 @@ async fn wait_loaded(page: &Page) -> Result<(), String> {
 /// No request in flight for 100 ms, then two frames, so late fetches and the renderer's flush have landed.
 async fn idle(page: &Page, c: &Collected) -> Result<(), String> {
     let mut quiet = 0;
-    for _ in 0..500 {
+    for tick in 0..500 {
         tokio::time::sleep(Duration::from_millis(20)).await;
+        // Chrome occasionally never reports the end of a request the page has long finished with. Once a second,
+        // forget requests the page itself says are complete (its resource timing), so a lost event is not a hang.
+        if tick % 50 == 49 && c.pending() > 0 {
+            heal(page, c).await;
+        }
         quiet = if c.pending() == 0 { quiet + 20 } else { 0 };
         if quiet >= 100 {
             break;
         }
     }
     if quiet < 100 {
-        c.note("never-settled", "requests keep running");
+        let mut open: Vec<String> = c
+            .urls
+            .lock()
+            .map_or_else(|_| Vec::new(), |u| u.values().cloned().collect());
+        open.sort();
+        c.note(
+            "never-settled",
+            format!("requests keep running: {}", open.join(", ")),
+        );
     }
     eval(
         page,
@@ -479,6 +542,33 @@ async fn idle(page: &Page, c: &Collected) -> Result<(), String> {
     )
     .await?;
     Ok(())
+}
+
+async fn heal(page: &Page, c: &Collected) {
+    let Ok(done) = eval(
+        page,
+        "JSON.stringify(performance.getEntriesByType('resource').filter((e) => e.responseEnd > 0).map((e) => e.name))",
+    )
+    .await
+    else {
+        return;
+    };
+    let done: Vec<String> = serde_json::from_str(done.as_str().unwrap_or("[]")).unwrap_or_default();
+    let stuck: Vec<String> = c.urls.lock().map_or_else(
+        |_| Vec::new(),
+        |u| {
+            u.iter()
+                .filter(|(_, what)| {
+                    let path = what.split_once(' ').map_or("", |(_, p)| p);
+                    done.iter().any(|d| d.ends_with(path))
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        },
+    );
+    for id in stuck {
+        c.ended(&id);
+    }
 }
 
 async fn watch_console(page: &Page, c: &Arc<Collected>, allow: &[String]) -> Result<(), String> {
@@ -594,6 +684,16 @@ async fn watch_requests(page: &Page, c: &Arc<Collected>) -> Result<(), String> {
         .event_listener::<EventLoadingFailed>()
         .await
         .map_err(err("network"))?;
+    let mut cached = page
+        .event_listener::<network::EventRequestServedFromCache>()
+        .await
+        .map_err(err("network"))?;
+    let c4 = c.clone();
+    tokio::spawn(async move {
+        while let Some(e) = cached.next().await {
+            c4.ended(e.request_id.inner());
+        }
+    });
     let (c1, c2, c3) = (c.clone(), c.clone(), c.clone());
     tokio::spawn(async move {
         while let Some(e) = sent.next().await {
@@ -607,23 +707,22 @@ async fn watch_requests(page: &Page, c: &Arc<Collected>) -> Result<(), String> {
                         | ResourceType::CspViolationReport
                 )
             );
-            if !endless && let Ok(mut p) = c1.pending.lock() {
-                p.insert(e.request_id.inner().clone());
+            if !endless {
+                c1.started(
+                    e.request_id.inner(),
+                    format!("{:?} {}", e.r#type, strip_origin(&e.request.url)),
+                );
             }
         }
     });
     tokio::spawn(async move {
         while let Some(e) = done.next().await {
-            if let Ok(mut p) = c2.pending.lock() {
-                p.remove(e.request_id.inner());
-            }
+            c2.ended(e.request_id.inner());
         }
     });
     tokio::spawn(async move {
         while let Some(e) = failed.next().await {
-            if let Ok(mut p) = c3.pending.lock() {
-                p.remove(e.request_id.inner());
-            }
+            c3.ended(e.request_id.inner());
         }
     });
     Ok(())
@@ -672,7 +771,16 @@ async fn intercept(
                     let _ = page.execute(ContinueRequestParams::new(id)).await;
                 } else if origin != base {
                     // An avatar on a CDN: one flat, fixed image stands in. Anything else off-origin is a failure.
-                    if ev.resource_type == ResourceType::Image {
+                    // (a page icon is requested as type Other, with an image Accept header)
+                    let wants_image = ev.resource_type == ResourceType::Image
+                        || ev
+                            .request
+                            .headers
+                            .inner()
+                            .get("Accept")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|a| a.starts_with("image/"));
+                    if wants_image {
                         let mut f = FulfillRequestParams::new(id, 200_i64);
                         f.response_headers =
                             Some(vec![HeaderEntry::new("Content-Type", "image/png")]);

@@ -506,3 +506,20 @@ Each phase is its own PR with a patch release on crates.io.
    the sweep. Committed references live only in `ui`.
 4. iOS layout data: (a), a tiny `.shakedownText()` modifier.
 5. Tap targets: fail under 24 px on every platform; warn under the platform guidance (44 pt iOS, 48 dp Android).
+
+## Phase 2 notes (2026-11-19, shakedown 0.2.0)
+
+Built as designed, with these differences:
+
+- No `Browser` trait: `capture.rs` talks to chromiumoxide 0.9.1 directly (about 15 calls); it is the only file that
+  would change. Chrome is downloaded with `curl` (no `reqwest`) and unpacked with `ditto`.
+- Workers (the frozen clock reaching a module worker) are not done: no pilot has one. Phase 7 (BDG) needs them.
+- Layout-shift entries are taken whatever `hadRecentInput` says: mobile emulation marks a plain page load as
+  input-driven, and no person is typing. Screens with actions are judged on the shifts before the first action.
+- The freeze style is a constructable stylesheet, not a `<style>` element: a page's own CSP (`style-src 'self'`)
+  blocks the latter. Text covered by a painted element (a dialog, a dropdown) is not "on top"; text over text is.
+- A signed-in player is in at most 3 shots at once (`[players].parallel`): accounts-service caps a person's open
+  event streams at 5.
+- `/favicon.ico` console errors are ignored (new headless Chrome asks for it by itself); off-origin image and icon
+  requests get a flat stand-in, every other off-origin request fails the screen.
+- `loading-indicator` is not implemented yet (it was not in the phase 2 list).
