@@ -12,6 +12,7 @@ mod layout;
 mod pixels;
 mod report;
 mod sheet;
+mod smoke;
 mod steps;
 mod sweep;
 mod ui;
@@ -101,6 +102,11 @@ fn cli() -> Command {
                 .arg(Arg::new("rebase").long("rebase").action(ArgAction::SetTrue).help("Make this run the pixel baseline")),
         )
         .subcommand(
+            Command::new("smoke")
+                .about("Start the production Docker image through the repo's Makefile targets and check it over HTTP")
+                .arg(Arg::new("json").long("json").action(ArgAction::SetTrue).help("Also write target/shakedown/smoke/summary.json")),
+        )
+        .subcommand(
             Command::new("devices")
                 .about("The one device list: list (default), json, or serve (the side-by-side viewer)")
                 .subcommand(Command::new("list").about("The list as text"))
@@ -172,6 +178,10 @@ fn run(m: &ArgMatches) -> Result<(), Error> {
                 .get_many::<String>("only")
                 .map_or_else(Vec::new, |v| v.cloned().collect());
             check(&config, &root, &only, sub.get_flag("json"))
+        }
+        Some(("smoke", sub)) => {
+            let (config, root) = load(explicit)?;
+            smoke::command(&config, &root, sub.get_flag("json"))
         }
         Some(("budgets", _)) => {
             let (config, root) = load(explicit)?;
