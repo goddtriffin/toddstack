@@ -15,6 +15,7 @@ published on its own and documented in its own README.
 | `toddstack-accounts` (**frozen**, security fixes only) | TypeScript | [JSR](https://jsr.io/@todd/toddstack-accounts) `@todd/toddstack-accounts`, [npm](https://www.npmjs.com/package/toddstack-accounts) `toddstack-accounts` | [`typescript/accounts/README.md`](typescript/accounts/README.md) |
 | `toddstack-frontend-engine` | Rust | [crates.io](https://crates.io/crates/toddstack-frontend-engine) | [`rust/toddstack_frontend_engine/README.md`](rust/toddstack_frontend_engine/README.md) |
 | `shakedown` | Rust | [crates.io](https://crates.io/crates/shakedown) | [`rust/shakedown/README.md`](rust/shakedown/README.md) |
+| `toddstack-heavy` | Rust | not yet published | [`rust/toddstack_heavy/README.md`](rust/toddstack_heavy/README.md) |
 | `template-web-server` | Rust | not published; Docker image for several sites | [`rust/template_web_server/`](rust/template_web_server/) |
 
 ## Layout
