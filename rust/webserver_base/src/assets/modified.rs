@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Datelike, Utc};
+use jiff::Timestamp;
 use tracing::error;
 
 /// The newest modification time across everything that determines page output.
@@ -25,20 +25,20 @@ use tracing::error;
 /// Reproducible builds normalise timestamps to the epoch, and a skewed clock
 /// can produce a future date; both are worse than saying nothing.
 #[must_use]
-pub fn content_modified(directories: &[&str]) -> Option<DateTime<Utc>> {
+pub fn content_modified(directories: &[&str]) -> Option<Timestamp> {
     content_modified_in(Path::new(""), directories)
 }
 
 /// [`content_modified`], with `directories` under `root`.
-pub(crate) fn content_modified_in(root: &Path, directories: &[&str]) -> Option<DateTime<Utc>> {
-    let newest: DateTime<Utc> = directories
+pub(crate) fn content_modified_in(root: &Path, directories: &[&str]) -> Option<Timestamp> {
+    let newest: Timestamp = directories
         .iter()
         .filter_map(|directory| newest_mtime(&root.join(directory)))
         .chain(current_exe_mtime())
         .max()?;
 
-    let now: DateTime<Utc> = Utc::now();
-    if newest.year() <= 2000 || newest > now {
+    let now: Timestamp = Timestamp::now();
+    if newest.to_zoned(jiff::tz::TimeZone::UTC).year() <= 2000 || newest > now {
         error!(
             "content modification time is `{newest}`, which is implausible; \
              omitting <lastmod>. Check that the build preserves file timestamps."
@@ -50,12 +50,12 @@ pub(crate) fn content_modified_in(root: &Path, directories: &[&str]) -> Option<D
 }
 
 /// The newest mtime anywhere under `root`.
-fn newest_mtime(root: &Path) -> Option<DateTime<Utc>> {
+fn newest_mtime(root: &Path) -> Option<Timestamp> {
     if !root.is_dir() {
         return None;
     }
 
-    let mut newest: Option<DateTime<Utc>> = None;
+    let mut newest: Option<Timestamp> = None;
     let mut directories: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
 
     while let Some(directory) = directories.pop() {
@@ -71,7 +71,9 @@ fn newest_mtime(root: &Path) -> Option<DateTime<Utc>> {
             let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
                 continue;
             };
-            let modified: DateTime<Utc> = modified.into();
+            let Ok(modified) = Timestamp::try_from(modified) else {
+                continue;
+            };
             if newest.is_none_or(|current| modified > current) {
                 newest = Some(modified);
             }
@@ -82,23 +84,22 @@ fn newest_mtime(root: &Path) -> Option<DateTime<Utc>> {
 }
 
 /// The running binary's mtime, so a code-only change still moves the date.
-fn current_exe_mtime() -> Option<DateTime<Utc>> {
+fn current_exe_mtime() -> Option<Timestamp> {
     let exe: PathBuf = std::env::current_exe().ok()?;
     let modified: SystemTime = std::fs::metadata(exe).ok()?.modified().ok()?;
-    Some(modified.into())
+    Timestamp::try_from(modified).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
 
     use super::{content_modified, newest_mtime};
 
     #[test]
     fn a_directory_that_does_not_exist_contributes_nothing() {
-        let expected: Option<DateTime<Utc>> = None;
-        let actual: Option<DateTime<Utc>> =
-            newest_mtime(std::path::Path::new("/tmp/wsb-no-such-dir"));
+        let expected: Option<Timestamp> = None;
+        let actual: Option<Timestamp> = newest_mtime(std::path::Path::new("/tmp/wsb-no-such-dir"));
         assert_eq!(expected, actual);
     }
 
@@ -106,7 +107,7 @@ mod tests {
     fn the_binarys_own_timestamp_is_enough_to_produce_a_plausible_date() {
         // Even with no content directories, the test binary itself is recent,
         // so this must not fall through to the implausible branch.
-        let actual: Option<DateTime<Utc>> = content_modified(&["/tmp/wsb-no-such-dir"]);
+        let actual: Option<Timestamp> = content_modified(&["/tmp/wsb-no-such-dir"]);
         assert!(actual.is_some());
     }
 }

@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use chrono::{DateTime, Utc};
 use handlebars::{Handlebars, HelperDef, handlebars_helper};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::instrument;
@@ -85,7 +85,7 @@ const RESERVED_HELPERS: [&str; 21] = [
 handlebars_helper!(join: |list: Vec<String>| list.join(","));
 
 // Renders a UTC date as "January 15, 1990".
-handlebars_helper!(pretty_date: |date: DateTime<Utc>| date.format("%B %e, %Y").to_string());
+handlebars_helper!(pretty_date: |date: Timestamp| date.strftime("%B %e, %Y").to_string());
 
 // True when a nav link's `href` should be highlighted on the page at
 // `page_url`: `/` only on the home page, any other href on itself and on every
@@ -301,8 +301,24 @@ mod tests {
 
     use serde_json::json;
 
-    use super::TemplateRegistry;
+    use super::{TemplateRegistry, pretty_date};
     use crate::templates::error::TemplateError;
+
+    #[test]
+    fn pretty_date_renders_a_utc_timestamp_as_month_day_year() {
+        let mut handlebars: handlebars::Handlebars<'_> = handlebars::Handlebars::new();
+        handlebars.register_helper("pretty_date", Box::new(pretty_date));
+
+        let actual: String = handlebars
+            .render_template(
+                "{{pretty_date when}}",
+                &json!({"when": "2026-01-05T23:59:59Z"}),
+            )
+            .expect("renders");
+
+        // `%e` pads a single-digit day with a space, as it always has.
+        assert_eq!("January  5, 2026", actual);
+    }
 
     #[test]
     fn a_registry_holds_the_embedded_layout_before_it_touches_any_file() {

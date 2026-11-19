@@ -9,7 +9,7 @@
 //! There is no `<managingEditor>` or `<webMaster>`: both demand a bare email
 //! address in a document written for scrapers.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesText, Event};
 
@@ -22,7 +22,7 @@ const FORMAT: &str = "RSS";
 pub fn render(
     channel: &Channel,
     entries: &[PreparedEntry],
-    last_build: DateTime<Utc>,
+    last_build: Timestamp,
 ) -> Result<String, FeedError> {
     let mut writer: Writer<Vec<u8>> = Writer::new(Vec::new());
     write(&mut writer, channel, entries, last_build).map_err(|source| FeedError::Write {
@@ -36,7 +36,7 @@ fn write(
     writer: &mut Writer<Vec<u8>>,
     channel: &Channel,
     entries: &[PreparedEntry],
-    last_build: DateTime<Utc>,
+    last_build: Timestamp,
 ) -> std::io::Result<()> {
     let self_url: String = format!("{}{RSS_PATH}", channel.base_url);
 
@@ -132,6 +132,6 @@ fn text(writer: &mut Writer<Vec<u8>>, name: &str, value: &str) -> std::io::Resul
 }
 
 /// RFC 2822, which is what RSS's RFC 822 dates are in practice.
-fn rfc2822(moment: DateTime<Utc>) -> String {
-    moment.to_rfc2822()
+fn rfc2822(moment: Timestamp) -> String {
+    moment.strftime("%a, %d %b %Y %H:%M:%S +0000").to_string()
 }

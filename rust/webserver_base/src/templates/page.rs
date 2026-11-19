@@ -1,6 +1,6 @@
 //! Per-render template data: what this page is, this time.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -15,9 +15,9 @@ use super::robots;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Article {
     /// When the piece was first published.
-    pub published_time: DateTime<Utc>,
+    pub published_time: Timestamp,
     /// When it was last meaningfully revised, if ever.
-    pub modified_time: Option<DateTime<Utc>>,
+    pub modified_time: Option<Timestamp>,
     /// The section it belongs to, e.g. `Engineering`.
     pub section: Option<String>,
     /// Free-form tags.
@@ -27,7 +27,7 @@ pub struct Article {
 impl Article {
     /// An article published at `published_time`, with nothing else set.
     #[must_use]
-    pub const fn new(published_time: DateTime<Utc>) -> Self {
+    pub const fn new(published_time: Timestamp) -> Self {
         Self {
             published_time,
             modified_time: None,
@@ -38,7 +38,7 @@ impl Article {
 
     /// Records a revision date.
     #[must_use]
-    pub const fn with_modified_time(mut self, modified_time: DateTime<Utc>) -> Self {
+    pub const fn with_modified_time(mut self, modified_time: Timestamp) -> Self {
         self.modified_time = Some(modified_time);
         self
     }
@@ -336,7 +336,7 @@ fn normalize_page_url(page_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, TimeZone, Utc};
+    use jiff::Timestamp;
     use serde_json::json;
 
     use super::{Article, PageTemplateData, normalize_page_url};
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn attaching_article_metadata_is_what_makes_the_og_type_an_article() {
-        let published: DateTime<Utc> = Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap();
+        let published: Timestamp = "2026-01-15T00:00:00Z".parse().expect("a real instant");
         let page: PageTemplateData = PageTemplateData::new("blog-post", "A Post", "/blog/a-post")
             .with_article(
                 Article::new(published)

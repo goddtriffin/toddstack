@@ -17,7 +17,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use chrono::{DateTime, Duration, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 use tracing::instrument;
 
 use super::error::CacheBusterError;
@@ -188,9 +188,12 @@ impl CacheBuster {
 
         remove_conditional_headers(headers);
 
-        let one_year: TimeDelta = Duration::days(365);
-        let expires: DateTime<Utc> = Utc::now() + one_year;
-        if let Ok(expires) = HeaderValue::from_str(&expires.to_rfc2822()) {
+        let one_year: SignedDuration = SignedDuration::from_hours(24 * 365);
+        let expires: Option<Timestamp> = Timestamp::now().checked_add(one_year).ok();
+        if let Some(expires) = expires
+            && let Ok(expires) =
+                HeaderValue::from_str(&expires.strftime("%a, %d %b %Y %H:%M:%S +0000").to_string())
+        {
             headers.insert(EXPIRES, expires);
         }
         headers.insert(

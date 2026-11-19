@@ -24,7 +24,7 @@ default = []
 
 # Handlebars registry, the embedded base layout, and the three template-data
 # types.
-templates = ["dep:handlebars", "dep:chrono"]
+templates = ["dep:handlebars", "dep:jiff"]
 
 # First-party proxies for Plausible and the Sentry browser SDK, with
 # true-client-IP resolution. Both are byte relays: nothing is parsed or
@@ -34,12 +34,12 @@ templates = ["dep:handlebars", "dep:chrono"]
 analytics = ["dep:axum", "dep:reqwest", "dep:tokio"]
 
 # sitemap.xml generation.
-sitemap = ["dep:sitemap-rs", "dep:chrono"]
+sitemap = ["dep:sitemap-rs", "dep:jiff"]
 
 # RSS 2.0, Atom 1.0 and JSON Feed 1.1 for a site's one content stream.
 # `md5` is for the ETag: a feed is the most-polled document a site serves, so a
 # strong validator computed once at boot turns every unchanged poll into a 304.
-feed = ["dep:quick-xml", "dep:chrono", "dep:regex", "dep:md5"]
+feed = ["dep:quick-xml", "dep:jiff", "dep:regex", "dep:md5"]
 
 # Sentry + tracing initialisation, in the one order that works.
 observability = ["dep:sentry", "dep:tracing-subscriber"]
@@ -61,7 +61,7 @@ webserver = [
   "dep:metrics",
   "dep:metrics-exporter-prometheus",
   "dep:md5",
-  "dep:chrono",
+  "dep:jiff",
   "dep:resvg",
   "dep:imagesize",
 ]
@@ -124,7 +124,7 @@ imagesize = { workspace = true, optional = true }
 handlebars = { workspace = true, optional = true }
 
 # static assets (cache expiry), templates (copyright year), sitemap (lastmod)
-chrono = { workspace = true, optional = true }
+jiff = { workspace = true, optional = true }
 
 # analytics (proxying), telegram
 reqwest = { workspace = true, optional = true, features = ["multipart"] }
@@ -159,12 +159,11 @@ sentry = { workspace = true, features = ["test"] }
 
 # Feed oracles. `roxmltree` proves well-formedness with a parser that is not the
 # one that wrote the document, because a generator checked by its own parser
-# waves through exactly the emit-and-accept bug the check exists for. `rss` and
-# `atom_syndication` implement the specs, so a round-trip through them proves
-# conformance rather than mere syntax. Dev-only: consumers never build them.
+# waves through exactly the emit-and-accept bug the check exists for. `rss`
+# implements the RSS spec, so a round-trip through it proves conformance rather
+# than mere syntax. Dev-only: consumers never build either.
 roxmltree = { workspace = true }
 rss = { workspace = true }
-atom_syndication = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

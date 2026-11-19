@@ -5,7 +5,7 @@
 //! crawler reads to decide a post actually changed. RSS carries publication
 //! dates only, so a revised post looks untouched.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesText, Event};
 
@@ -18,7 +18,7 @@ const FORMAT: &str = "Atom";
 pub fn render(
     channel: &Channel,
     entries: &[PreparedEntry],
-    updated: DateTime<Utc>,
+    updated: Timestamp,
 ) -> Result<String, FeedError> {
     let mut writer: Writer<Vec<u8>> = Writer::new(Vec::new());
     write(&mut writer, channel, entries, updated).map_err(|source| FeedError::Write {
@@ -32,7 +32,7 @@ fn write(
     writer: &mut Writer<Vec<u8>>,
     channel: &Channel,
     entries: &[PreparedEntry],
-    updated: DateTime<Utc>,
+    updated: Timestamp,
 ) -> std::io::Result<()> {
     let self_url: String = format!("{}{ATOM_PATH}", channel.base_url);
 
