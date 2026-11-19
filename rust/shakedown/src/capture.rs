@@ -127,6 +127,8 @@ pub struct Shot {
     pub findings: Vec<Finding>,
     /// Viewport size.
     pub size: (u32, u32),
+    /// Why the first try failed, when the retry drew it: a flaky shot, always reported.
+    pub flaky: Option<String>,
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -237,19 +239,26 @@ pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> 
             let id = job.id();
             // The browser, not the page, failed (a command timed out on a starved machine): one more try.
             // A page that fails twice is a failure.
+            // A pass on the retry is still reported (`Shot::flaky`): a retry never hides a flake.
             let mut last = String::new();
+            let mut first_failure: Option<String> = None;
             for _ in 0..2 {
                 match tokio::time::timeout(SHOT_TIMEOUT, shoot(&browser, &env, &job)).await {
-                    Ok(Ok(shot)) => return shot,
+                    Ok(Ok(mut shot)) => {
+                        shot.flaky = first_failure;
+                        return shot;
+                    }
                     Ok(Err(why)) => last = why,
                     Err(_) => last = format!("took longer than {}s", SHOT_TIMEOUT.as_secs()),
                 }
+                first_failure.get_or_insert_with(|| last.clone());
             }
             Shot {
                 id,
                 png: Vec::new(),
                 findings: vec![Finding::new("page-failed", last)],
                 size,
+                flaky: None,
             }
         }));
     }
@@ -405,7 +414,7 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
 
     // Listeners first, then switch the domains on.
     watch_console(page, &collected, &job.plan.allow).await?;
-    watch_requests(page, &collected).await?;
+    watch_requests(page, &collected, &env.base).await?;
     intercept(page, env, &job.plan, &collected).await?;
     page.enable_log().await.map_err(err("log"))?;
     page.enable_runtime().await.map_err(err("runtime"))?;
@@ -523,6 +532,7 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
         png,
         findings,
         size: (d.width, d.height),
+        flaky: None,
     })
 }
 
@@ -701,8 +711,27 @@ fn strip_origin(u: &str) -> String {
     )
 }
 
+/// The finding for a WebSocket URL that leaves the machine; `None` for one on the local server (`base` is
+/// `http://127.0.0.1:<port>`; its `ws` twin is the same host and port).
+fn socket_leaves(ws_url: &str, base: &str) -> Option<String> {
+    let local = |u: &url::Url| {
+        let (h, p) = (u.host_str().map(str::to_string), u.port_or_known_default());
+        (h, p)
+    };
+    let b = url::Url::parse(base).ok()?;
+    match url::Url::parse(ws_url) {
+        Ok(u) if matches!(u.scheme(), "ws" | "wss") && local(&u) == local(&b) => None,
+        Ok(u) => Some(format!(
+            "request leaves the machine: {}{}",
+            u.origin().ascii_serialization(),
+            u.path()
+        )),
+        Err(_) => Some(format!("request leaves the machine: {ws_url}")),
+    }
+}
+
 /// Which requests are in flight, so the page is known to be idle. Streams that never end do not count.
-async fn watch_requests(page: &Page, c: &Arc<Collected>) -> Result<(), String> {
+async fn watch_requests(page: &Page, c: &Arc<Collected>, base: &str) -> Result<(), String> {
     page.execute(network::EnableParams::default())
         .await
         .map_err(err("network"))?;
@@ -722,6 +751,19 @@ async fn watch_requests(page: &Page, c: &Arc<Collected>) -> Result<(), String> {
         .event_listener::<network::EventRequestServedFromCache>()
         .await
         .map_err(err("network"))?;
+    // Fetch never pauses WebSockets, so the wall for them is here: one opened off this origin fails the screen.
+    let mut sockets = page
+        .event_listener::<network::EventWebSocketCreated>()
+        .await
+        .map_err(err("network"))?;
+    let (cs, base) = (c.clone(), base.to_string());
+    tokio::spawn(async move {
+        while let Some(e) = sockets.next().await {
+            if let Some(what) = socket_leaves(&e.url, &base) {
+                cs.note("network", what);
+            }
+        }
+    });
     let c4 = c.clone();
     tokio::spawn(async move {
         while let Some(e) = cached.next().await {
@@ -764,6 +806,14 @@ async fn watch_requests(page: &Page, c: &Arc<Collected>) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a request that would leave the machine, and fails the screen for it.
+async fn block(page: &Page, c: &Collected, id: fetch::RequestId, what: String) {
+    c.note("network", format!("request leaves the machine: {what}"));
+    let _ = page
+        .execute(FailRequestParams::new(id, ErrorReason::BlockedByClient))
+        .await;
+}
+
 /// The fake world, and the wall around every world: nothing leaves the machine.
 async fn intercept(
     page: &Page,
@@ -798,13 +848,18 @@ async fn intercept(
             tokio::spawn(async move {
                 let id = ev.request_id.clone();
                 let Ok(u) = url::Url::parse(&ev.request.url) else {
-                    let _ = page.execute(ContinueRequestParams::new(id)).await;
+                    block(&page, &c, id, "unparseable url".into()).await;
                     return;
                 };
                 let origin = u.origin().ascii_serialization();
                 let json_headers = vec![HeaderEntry::new("Content-Type", "application/json")];
-                if !matches!(u.scheme(), "http" | "https") {
+                if matches!(u.scheme(), "data" | "blob" | "about") {
+                    // Made in the page itself: nothing travels.
                     let _ = page.execute(ContinueRequestParams::new(id)).await;
+                } else if !matches!(u.scheme(), "http" | "https") {
+                    // ftp:, file:, anything else a request could carry out: refused. (WebSockets never reach
+                    // Fetch; `watch_requests` fails those.)
+                    block(&page, &c, id, u.scheme().to_string()).await;
                 } else if origin != base {
                     // An avatar on a CDN: one flat, fixed image stands in. Anything else off-origin is a failure.
                     // (a page icon is requested as type Other, with an image Accept header)
@@ -823,13 +878,7 @@ async fn intercept(
                         f.body = Some(image.into());
                         let _ = page.execute(f).await;
                     } else {
-                        c.note(
-                            "network",
-                            format!("request leaves the machine: {origin}{}", u.path()),
-                        );
-                        let _ = page
-                            .execute(FailRequestParams::new(id, ErrorReason::BlockedByClient))
-                            .await;
+                        block(&page, &c, id, format!("{origin}{}", u.path())).await;
                     }
                 } else {
                     let key = format!("{} {}", ev.request.method, u.path());

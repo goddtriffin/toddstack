@@ -6,12 +6,81 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 use crate::config::Server;
 use crate::error::Error;
+
+/// The process group of the running server (0: none), so a signal can stop it from anywhere.
+static GROUP: AtomicU32 = AtomicU32::new(0);
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static WATCH: Once = Once::new();
+
+/// Stops the process group: TERM, a moment to leave, then KILL.
+fn kill_group(pid: u32, mut wait_for: impl FnMut() -> bool) {
+    let group = format!("-{pid}");
+    let signal = |sig: &str| {
+        let _ = Command::new("kill")
+            .args([sig, "--", &group])
+            .stderr(Stdio::null())
+            .status();
+    };
+    signal("-TERM");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if wait_for() {
+            // The shell is gone; anything left in its group gets the same signal.
+            signal("-KILL");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    signal("-KILL");
+}
+
+/// Has SIGINT or SIGTERM arrived since `watch_signals`?
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// Listens for SIGINT and SIGTERM on its own thread, from now on: the server's process group is stopped at once
+/// (even while `start` is still waiting for it to be ready), and `interrupted()` turns true so the run ends.
+pub fn watch_signals() {
+    WATCH.call_once(|| {
+        std::thread::spawn(|| {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async {
+                use tokio::signal::unix::{SignalKind, signal};
+                let (Ok(mut term), Ok(mut int)) = (
+                    signal(SignalKind::terminate()),
+                    signal(SignalKind::interrupt()),
+                ) else {
+                    return;
+                };
+                tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+                INTERRUPTED.store(true, Ordering::SeqCst);
+                let pid = GROUP.load(Ordering::SeqCst);
+                if pid != 0 {
+                    // Not waited for here: the run ends through `interrupted()`, and Drop finishes the job.
+                    let group = format!("-{pid}");
+                    let _ = Command::new("kill")
+                        .args(["-TERM", "--", &group])
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            });
+        });
+    });
+}
 
 /// A running server. Dropping it stops the server and everything it started.
 pub struct Running {
@@ -116,9 +185,13 @@ pub fn start(server: &Server, root: &Path, project: &str, out: &Path) -> Result<
     let child = cmd
         .spawn()
         .map_err(|e| Error::Environment(format!("cannot start the server: {e}")))?;
+    GROUP.store(child.id(), Ordering::SeqCst);
     let mut running = Running { child, base };
     let deadline = Instant::now() + Duration::from_secs(server.timeout);
     loop {
+        if interrupted() {
+            return Err(Error::Failed("interrupted".into()));
+        }
         if let Ok(Some(status)) = running.child.try_wait() {
             return Err(Error::Environment(format!(
                 "the server exited ({status}) before it was ready; end of target/shakedown/web/server.log:\n{}",
@@ -162,25 +235,10 @@ pub fn start(server: &Server, root: &Path, project: &str, out: &Path) -> Result<
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let group = format!("-{}", self.child.id());
-        let signal = |sig: &str| {
-            let _ = Command::new("kill")
-                .args([sig, "--", &group])
-                .stderr(Stdio::null())
-                .status();
-        };
-        signal("-TERM");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                // The shell is gone; anything left in its group gets the same signal.
-                signal("-KILL");
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        signal("-KILL");
+        let pid = self.child.id();
+        kill_group(pid, || matches!(self.child.try_wait(), Ok(Some(_))));
         let _ = self.child.wait();
+        let _ = GROUP.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
