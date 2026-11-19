@@ -94,6 +94,9 @@ start = "make ui_server PORT={port} DB={db}"   # stays in the foreground; {port}
 ready = "/healthz"                              # default "/"; any answer under 500
 world = "fake"                                  # fake (default): every /api call from fixtures. seeded: the real server
 seed  = "make ui_seed DB={db}"                  # optional, runs once the server is ready
+drop_db  = "make ui_db_drop DB={db}"            # drops the run's database on every way a run ends (success, failure, panic, signal)
+list_dbs = "make ui_db_list"                    # prints this machine's throwaway databases; at startup those named
+                                                # shakedown_<project>_<hash>_p<pid> with a dead pid are dropped (never a live run's)
 now   = "2026-01-15T12:00:00Z"                  # fixed clock: SHAKEDOWN_NOW for the server, frozen Date in the page
 api   = "/api/"                                 # fake world: paths under this must be faked
 timeout = 120                                   # seconds to wait for ready
@@ -143,7 +146,7 @@ findings or in the pixel verdict (the compare against run 1). Chrome rescales an
 with an antialiasing race that moves a few edge pixels in about one shot in fifteen; those shots are listed in a
 note, not failed. A difference beyond the tolerance keeps both images and the diff in `target/shakedown/web/repeat/`. As a check step,
 list `ui.web` under `[check].builtin`. Exit codes: 0 pass, 1 a check failed, 2 config or usage, 3 environment
-(Chrome, server, seed). `--devices a,b` limits a `ui` run to some devices for a quick look; `SHAKEDOWN_PARALLEL=N` sets the pages drawn at once (default 8).
+(Chrome, server, seed). `--devices a,b` limits a `ui` run to some devices for a quick look; `SHAKEDOWN_PARALLEL=N` sets the pages drawn at once (default one per core, at most 16; `SHAKEDOWN_BROWSERS=N` sets the Chromes they are spread over, default one per 2 pages).
 
 ## Pixel compare
 
