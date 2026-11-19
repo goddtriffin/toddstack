@@ -53,8 +53,9 @@ impl RetryPolicy {
             .saturating_mul(1u64 << failures.min(32))
             .min(self.cap_ms);
         // Scale by 1 - j .. 1 + j, where j is the jitter fraction.
-        let span: u64 = 2 * self.jitter_permille * u64::from(rand_permille.min(1000)) / 1000;
-        Some(exp * (1000 - self.jitter_permille + span) / 1000)
+        let jitter: u64 = self.jitter_permille.min(1000);
+        let span: u64 = 2 * jitter * u64::from(rand_permille.min(1000)) / 1000;
+        Some(exp * (1000 - jitter + span) / 1000)
     }
 
     /// Network failure (status 0), timeout, rate limit and server errors are worth retrying.
@@ -126,6 +127,17 @@ mod tests {
                 assert!(got >= nominal * 3 / 4 && got <= nominal * 5 / 4);
             }
         }
+    }
+
+    #[test]
+    fn jitter_above_one_thousand_permille_cannot_underflow() {
+        let wild: RetryPolicy = RetryPolicy {
+            jitter_permille: 5000,
+            ..RetryPolicy::read()
+        };
+        assert_eq!(Some(0), wild.delay_ms(0, 0));
+        assert_eq!(Some(500), wild.delay_ms(0, 500));
+        assert_eq!(Some(1000), wild.delay_ms(0, 1000));
     }
 
     #[test]
