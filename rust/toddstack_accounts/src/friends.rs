@@ -1,3 +1,5 @@
+//! **Deprecated, removed in 0.10.0: use [`crate::player`].**
+//!
 //! The friends, events and inbox API, called with a person's access token
 //! (scopes `friends`, and `friends:events` to post events).
 //!
@@ -141,6 +143,11 @@ pub struct Inbox {
 /// What posting an event did.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EventResult {
+    /// The answer to a retry that reused an idempotency key: nothing was sent
+    /// again, and the rest of this is the first answer. Only
+    /// [`crate::player::Player::post_event`] sets it.
+    #[serde(default)]
+    pub replayed: bool,
     /// How many friends' inboxes it reached.
     pub delivered: u64,
     /// Dropped by the runaway guard (over 100 to one player in an hour).
@@ -226,18 +233,33 @@ fn field<T: for<'de> Deserialize<'de>>(mut value: Value, name: &str) -> Result<T
     })
 }
 
-/// The API for one person (their access token).
+/// The API for one person with their access token.
+///
+/// Deprecated: a project server must not hold a player's token. Use
+/// [`crate::player::Player`] (`accounts.player(sub)`). Removed in 0.10.0.
 /// Mutes every event kind from your app.
 pub const ALL_KINDS: &str = "*";
 
+#[deprecated(
+    since = "0.9.0",
+    note = "use `accounts.player(sub)`; removed in 0.10.0"
+)]
 pub struct Friends<'a> {
     accounts: &'a Accounts,
     token: &'a str,
     base: String,
 }
 
+#[expect(
+    deprecated,
+    reason = "the deprecated type's own impl; removed in 0.10.0"
+)]
 impl<'a> Friends<'a> {
     #[must_use]
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub fn new(accounts: &'a Accounts, access_token: &'a str) -> Self {
         let base: String = format!(
             "{}/api/v1",
@@ -270,6 +292,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// The API refused or the request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn list(&self) -> Result<Vec<Person>> {
         field(
             self.call(reqwest::Method::GET, "/friends", None).await?,
@@ -282,6 +308,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// A malformed sub, or the request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn relationships(&self, subs: &[&str]) -> Result<HashMap<String, Relationship>> {
         for sub in subs {
             checked(sub)?;
@@ -316,6 +346,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// A malformed sub, or the request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn relationship(&self, sub: &str) -> Result<Relationship> {
         Ok(self
             .relationships(&[sub])
@@ -326,6 +360,10 @@ impl<'a> Friends<'a> {
 
     /// # Errors
     /// The API refused or the request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn requests(&self) -> Result<Requests> {
         let value: Value = self
             .call(reqwest::Method::GET, "/friends/requests", None)
@@ -340,6 +378,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// Not found (also for blocks and privacy settings), limits, or failure.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn request_by_username(&self, username: &str) -> Result<Sent> {
         field(
             self.call(
@@ -357,6 +399,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// Not found, limits, or failure.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn request_by_code(&self, friend_code: &str) -> Result<Sent> {
         field(
             self.call(
@@ -371,6 +417,10 @@ impl<'a> Friends<'a> {
 
     /// # Errors
     /// No such request, or failure.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn accept(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::POST,
@@ -383,6 +433,10 @@ impl<'a> Friends<'a> {
 
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn decline(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::POST,
@@ -397,6 +451,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn cancel(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::DELETE,
@@ -409,6 +467,10 @@ impl<'a> Friends<'a> {
 
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn remove(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::DELETE,
@@ -423,6 +485,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn block(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::POST,
@@ -435,6 +501,10 @@ impl<'a> Friends<'a> {
 
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn unblock(&self, sub: &str) -> Result<()> {
         self.call(
             reqwest::Method::DELETE,
@@ -449,6 +519,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn blocks(&self) -> Result<Blocks> {
         let value: Value = self.call(reqwest::Method::GET, "/blocks", None).await?;
         serde_json::from_value(value).map_err(|e| Error::Api {
@@ -464,6 +538,10 @@ impl<'a> Friends<'a> {
     /// # Errors
     /// 400 reporting themselves or a bad note, 404 an unknown account or a
     /// guest, 429 too many reports, or the request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn report(&self, sub: &str, reason: Reason, note: Option<&str>) -> Result<()> {
         self.call(
             reqwest::Method::POST,
@@ -478,6 +556,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// Invalid event, rate limit (60 per person per hour per app), or failure.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn post_event(&self, event: &Event) -> Result<u64> {
         let value: Value = serde_json::to_value(event).map_err(|e| Error::Api {
             status: 0,
@@ -495,6 +577,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// As for [`Friends::post_event`].
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn post_event_result(&self, event: &Event) -> Result<EventResult> {
         let value: Value = serde_json::to_value(event).map_err(|e| Error::Api {
             status: 0,
@@ -515,6 +601,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn inbox(&self, limit: u32) -> Result<Vec<InboxItem>> {
         field(
             self.call(reqwest::Method::GET, &format!("/inbox?limit={limit}"), None)
@@ -527,6 +617,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn inbox_with_unread(&self, limit: u32) -> Result<Inbox> {
         let value: Value = self
             .call(reqwest::Method::GET, &format!("/inbox?limit={limit}"), None)
@@ -544,6 +638,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// 400 for a name the service doesn't know, or the request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn set_time_zone(&self, time_zone: &str) -> Result<()> {
         self.call(
             reqwest::Method::PUT,
@@ -556,6 +654,10 @@ impl<'a> Friends<'a> {
 
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn mark_read(&self, id: &str) -> Result<()> {
         self.call(
             reqwest::Method::POST,
@@ -571,6 +673,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn mutes(&self) -> Result<Vec<String>> {
         field(
             self.call(reqwest::Method::GET, "/mutes", None).await?,
@@ -584,6 +690,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// Malformed kind, or the request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn mute(&self, kind: &str) -> Result<()> {
         self.call(
             reqwest::Method::PUT,
@@ -598,6 +708,10 @@ impl<'a> Friends<'a> {
     ///
     /// # Errors
     /// The request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use `accounts.player(sub)`; removed in 0.10.0"
+    )]
     pub async fn unmute(&self, kind: &str) -> Result<()> {
         self.call(
             reqwest::Method::DELETE,
@@ -730,6 +844,7 @@ mod tests {
     #[test]
     fn an_event_answer_carries_dropped_and_counts_when_the_service_sends_them() {
         let expected: EventResult = EventResult {
+            replayed: false,
             delivered: 3,
             dropped: 1,
             counts: Some(Counts {
@@ -749,6 +864,7 @@ mod tests {
         let old: EventResult = serde_json::from_value(json!({ "delivered": 2 })).unwrap();
         assert_eq!(
             EventResult {
+                replayed: false,
                 delivered: 2,
                 dropped: 0,
                 counts: None

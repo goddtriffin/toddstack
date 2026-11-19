@@ -1,6 +1,8 @@
 //! Tokens: exchanging codes, refreshing, revoking, and verifying ID and access
 //! tokens.
 
+use std::sync::Arc;
+
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, Header, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,7 @@ use serde_json::Value;
 use crate::jwks::Keys;
 use crate::login::{PendingLogin, parse_callback};
 use crate::logout::{self, SignOut};
+use crate::revocation::Revocations;
 use crate::{Error, ISSUER, LOCAL_BASE_URL, Result};
 
 /// Your app's registration with the accounts service.
@@ -185,6 +188,12 @@ pub struct AccessClaims {
     pub client_id: String,
     pub scope: String,
     pub exp: i64,
+    /// The token family (`fam`): every token from one sign-in and its
+    /// refreshes. A revoked family is refused by
+    /// [`Accounts::verify_access_token`]. `None` for tokens issued before the
+    /// service added it.
+    #[serde(default)]
+    pub fam: Option<String>,
 }
 
 impl AccessClaims {
@@ -208,6 +217,7 @@ pub struct Accounts {
     config: Config,
     http: reqwest::Client,
     keys: Keys,
+    pub(crate) revoked: Arc<Revocations>,
 }
 
 #[derive(Deserialize)]
@@ -227,6 +237,7 @@ impl Accounts {
             config,
             http: http()?,
             keys,
+            revoked: Arc::default(),
         })
     }
 
@@ -241,6 +252,7 @@ impl Accounts {
             config,
             http: http()?,
             keys: Keys::pinned(keys),
+            revoked: Arc::default(),
         })
     }
 
@@ -453,18 +465,39 @@ impl Accounts {
 
     /// Verifies an access token sent to *your* API (for example by your
     /// native app): signature, `typ: at+jwt`, issuer, audience = your client
-    /// id, expiry. Tokens issued to other apps are refused.
+    /// id, expiry (30 s of clock skew allowed). Tokens issued to other apps
+    /// are refused, and so is a token whose `fam` has been revoked (see
+    /// [`crate::revocation`]; the set is fed by [`Accounts::handle_webhook`]
+    /// and [`Accounts::start_revocation_poller`]). The signing keys are
+    /// fetched from `/oidc/jwks`, cached, and refetched on an unknown `kid`.
+    /// Never calls the accounts service per token.
     ///
     /// # Errors
     /// [`Error::InvalidToken`].
     pub async fn verify_access_token(&self, token: &str) -> Result<AccessClaims> {
-        self.decode(token, Some("at+jwt")).await
+        let claims: AccessClaims = self.decode(token, Some("at+jwt")).await?;
+        if claims
+            .fam
+            .as_deref()
+            .is_some_and(|fam| self.revoked.is_revoked(fam))
+        {
+            return Err(Error::InvalidToken(String::from("token revoked")));
+        }
+        Ok(claims)
     }
 
-    /// The person's profile from `/me`.
+    /// The person's profile from `/me`, with their access token.
+    ///
+    /// Deprecated: a project server must not hold a player's token. Use the
+    /// ID token's claims from [`Accounts::finish_login`], then
+    /// [`Accounts::player`]`(sub)?.profile()`. Removed in 0.10.0.
     ///
     /// # Errors
     /// The token was refused or the request failed.
+    #[deprecated(
+        since = "0.9.0",
+        note = "use the ID token's claims, then `accounts.player(sub)?.profile()`; removed in 0.10.0"
+    )]
     pub async fn userinfo(&self, access_token: &str) -> Result<Value> {
         crate::friends::call(
             self,

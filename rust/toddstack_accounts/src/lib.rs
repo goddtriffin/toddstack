@@ -8,7 +8,13 @@
 //! - [`Accounts`]: token exchange, refresh, revocation, and checking ID and
 //!   access tokens against the published signing keys.
 //! - [`webhook`]: verifying the signed webhooks the accounts service sends.
-//! - [`friends`]: the friends, blocks, events and inbox API.
+//! - [`player`]: [`Accounts::player`], everything your server does for a
+//!   signed-in player (profile, friends, blocks, events, inbox, mutes, time
+//!   zone, reports), as your project, never with the player's token.
+//! - [`revocation`]: verifying access tokens locally and refusing a revoked
+//!   one at once (webhook plus poller).
+//! - [`friends`]: the friends, blocks, events and inbox API with a player's
+//!   token. **Deprecated**: removed in 0.10.0, use [`player`].
 //! - `friends_router` (feature `axum`): in-app friend requests as one mountable axum router.
 //! - [`notifications`]: sending notifications to players from your server, and
 //!   the time zone hint behind `send_at_local`.
@@ -52,9 +58,11 @@ mod links;
 pub mod login;
 pub mod logout;
 pub mod notifications;
+pub mod player;
 pub mod report;
 mod retry;
 pub mod return_to;
+pub mod revocation;
 mod tokens;
 pub mod webhook;
 

@@ -1,6 +1,8 @@
 //! Reporting someone (their username, picture or behaviour) to Todd's review
-//! queue. A signed-in person reports through [`crate::friends::Friends::report`]
-//! with their own token; a guest has no token, so your server reports for them
+//! queue. A signed-in player is reported for by your server with
+//! [`crate::player::Player::report`] (or [`Accounts::report_as_player`]);
+//! the older [`crate::friends::Friends::report`] uses the person's own token and
+//! is deprecated. A guest has no token, so your server reports for them
 //! with [`Accounts::report_as_guest`] and your client credentials.
 //!
 //! Only accounts can be reported, never guests. Reporting is always answered
@@ -46,6 +48,20 @@ pub struct GuestReport {
     /// report for abuse review.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guest_ip: Option<String>,
+}
+
+/// A report your server files for a signed-in player (see
+/// [`Accounts::report_as_player`]).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PlayerReport {
+    /// The player reporting: a `sub` who signed in to your project.
+    pub reporter_sub: String,
+    /// The account being reported.
+    pub sub: String,
+    pub reason: Reason,
+    /// At most [`MAX_NOTE_CHARS`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 pub(crate) fn body(sub: &str, reason: Reason, note: Option<&str>) -> Value {

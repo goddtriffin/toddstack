@@ -215,6 +215,7 @@ Deno.test("every event type the service sends is known, and newer ones still ver
     "friend_request.created",
     "friend_request.cancelled",
     "friend_request.declined",
+    "tokens.revoked",
   ]);
   const body = '{"id":"e3","type":"something.new","created_at":1700000000,"data":{"sub":"u1"}}';
   const event = await verifyWebhook("secret", await sign("secret", 1_700_000_000, body), body, 1_700_000_000);
@@ -989,11 +990,12 @@ Deno.test("the inbox and event answers carry the new fields, and an old service'
   assertEquals([old.items[0].clientId, old.unread], [null, null]);
   const event = { kind: "k", title: "t" };
   assertEquals(await friends.postEventResult(event), {
+    replayed: false,
     delivered: 2,
     dropped: 1,
     counts: { delivered: 2, scheduled: 0, notDelivered: 0, droppedRunaway: 1 },
   });
-  assertEquals(await friends.postEventResult(event), { delivered: 2, dropped: 0, counts: null });
+  assertEquals(await friends.postEventResult(event), { replayed: false, delivered: 2, dropped: 0, counts: null });
 });
 
 Deno.test("accountUrl tags links with the client", () => {

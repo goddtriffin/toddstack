@@ -3380,7 +3380,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "toddstack-accounts"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3388,6 +3388,7 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "jiff 1.0.1",
  "jsonwebtoken",
  "p256",
  "reqwest",

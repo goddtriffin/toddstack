@@ -1,4 +1,5 @@
 //! `Friends` refuses ids that could leave its URL paths, before any request is made.
+#![expect(deprecated, reason = "covers `Friends`, which stays until 0.10.0")]
 
 use toddstack_accounts::friends::Friends;
 use toddstack_accounts::{Accounts, Config, Error};

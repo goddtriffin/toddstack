@@ -118,6 +118,8 @@ export interface Inbox {
 
 /** What posting an event did. */
 export interface EventResult {
+  /** The answer to a retry that reused an idempotency key: nothing was sent again. Only `Player.postEvent` sets it. */
+  replayed: boolean;
   /** How many friends' inboxes it reached. */
   delivered: number;
   /** Dropped by the runaway guard (over 100 to one player in an hour). */
@@ -134,7 +136,7 @@ export function isValidId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,64}$/.test(value);
 }
 
-function checked(value: string): string {
+export function checked(value: string): string {
   if (!isValidId(value)) throw new AccountsError("api", "not a valid id", { status: 400 });
   return value;
 }
@@ -142,7 +144,7 @@ function checked(value: string): string {
 /** Mutes every event kind from your app. */
 export const ALL_KINDS = "*";
 
-interface RawInboxItem {
+export interface RawInboxItem {
   id: string;
   client_id?: string | null;
   from: string | null;
@@ -155,7 +157,7 @@ interface RawInboxItem {
   read_at: string | null;
 }
 
-function eventBody(event: FriendEvent): Record<string, unknown> {
+export function eventBody(event: FriendEvent): Record<string, unknown> {
   const wire: Record<string, unknown> = { kind: event.kind, title: event.title, body: event.body ?? "" };
   if (event.url !== undefined) wire.url = event.url;
   if (event.collapseKey !== undefined) wire.collapse_key = event.collapseKey;
@@ -163,7 +165,7 @@ function eventBody(event: FriendEvent): Record<string, unknown> {
   return wire;
 }
 
-function field<T>(value: unknown, name: string): T {
+export function field<T>(value: unknown, name: string): T {
   const out = (value as Record<string, unknown> | null)?.[name];
   if (out === undefined) {
     throw new AccountsError("api", `accounts API returned 200: missing field \`${name}\``, { status: 200 });
@@ -171,7 +173,7 @@ function field<T>(value: unknown, name: string): T {
   return out as T;
 }
 
-function readItem(i: RawInboxItem): InboxItem {
+export function readItem(i: RawInboxItem): InboxItem {
   return {
     id: i.id,
     clientId: i.client_id ?? null,
@@ -186,7 +188,11 @@ function readItem(i: RawInboxItem): InboxItem {
   };
 }
 
-/** The API for one person (their access token). Get one from `accounts.friends(token)`. */
+/**
+ * The API for one person with their access token. Get one from `accounts.friends(token)`.
+ *
+ * @deprecated A project server must not hold a player's token. Use `accounts.player(sub)`. Removed in 0.10.0.
+ */
 export class Friends {
   #accounts: Accounts;
   #token: string;
@@ -294,6 +300,7 @@ export class Friends {
   async postEventResult(event: FriendEvent): Promise<EventResult> {
     const value = await this.#call("POST", "/events", eventBody(event)) as Record<string, unknown>;
     return {
+      replayed: value.replayed === true,
       delivered: field(value, "delivered"),
       dropped: typeof value.dropped === "number" ? value.dropped : 0,
       counts: value.counts === undefined || value.counts === null ? null : readCounts(value.counts),
