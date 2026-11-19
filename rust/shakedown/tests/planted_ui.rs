@@ -861,3 +861,26 @@ fn an_overlap_below_the_fold_fails() {
         "text-overlap",
     );
 }
+
+const SHELL: &str = "<style>html,body{height:100%;margin:0;overflow:hidden}main{height:100vh;overflow:auto}</style>";
+
+#[test]
+fn a_glyph_behind_text_inside_an_inner_scroller_passes() {
+    passes(
+        "shellok",
+        &format!(
+            "{SHELL}<main><div style=\"height:2000px\"></div><div aria-hidden=\"true\" style=\"position:absolute;top:2000px;left:10px;z-index:0\">Drifting word</div><div style=\"position:absolute;top:2003px;left:15px;z-index:1;background:#fff\">Real text above</div></main>"
+        ),
+    );
+}
+
+#[test]
+fn an_aria_hidden_icon_over_text_inside_an_inner_scroller_fails() {
+    planted(
+        "shellover",
+        &format!(
+            "{OK_BODY}{SHELL}<main><div style=\"height:2000px\"></div><div style=\"position:absolute;top:2000px;left:10px\">Real line of text</div><div aria-hidden=\"true\" style=\"position:absolute;top:2003px;left:15px;z-index:2\">Icon label</div></main>"
+        ),
+        "text-overlap",
+    );
+}
