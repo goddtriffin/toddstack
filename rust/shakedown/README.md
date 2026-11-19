@@ -108,7 +108,7 @@ themes = ["light", "dark"]
 
 [players]                              # seeded local accounts, never production
 accounts = ["ann", "ben"]
-signin = "/__dev/signin?as={player}"   # each shot is its own browser context; a player signs in once per browser
+signin = "/__dev/signin?as={player}"   # each shot is its own browser context; a player signs in once per browser (a shot with `act` signs in fresh in its own context)
 parallel = 3                           # shots one player is in at once (default 3)
 
 [ui]
@@ -127,6 +127,11 @@ act = [{ click = "[data-acct] button" }, { type = { selector = "input", text = "
 allow_console = [{ contains = "expected message", why = "the test plants it" }]
 devices = ["phone"]                    # optional: only these
 ```
+
+A shot with `act` signs in fresh inside its own browser context instead of using the player's cached cookies, so an
+`act` sign-out ends only that shot's own server session. Every shot's server session is still shared with the
+player's other shots, so `act` steps must not end every session ("sign out everywhere"), delete the account or rotate
+sessions server-side: use a dedicated player for those.
 
 The page is made deterministic: fixed clock and seeded random (`collector.js`, injected before any page script),
 timers of a second or more never fire, no intervals, animations and caret frozen, reduced motion, UTC, en-US,

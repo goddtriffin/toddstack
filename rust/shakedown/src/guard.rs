@@ -36,7 +36,7 @@ pub struct Guard {
 
 impl Guard {
     /// Sends the violations of page `page` (a top-level target) and of its frames, workers and popups to `report`.
-    /// Many pages can share one browser context: the page, not the context, says whose violation it is.
+    /// Pages are told apart by target, not by browser context: the page says whose violation it is.
     pub fn register(&self, page: &str, report: Report) {
         if let Ok(mut c) = self.shared.pages.lock() {
             c.insert(page.to_string(), report);
@@ -199,6 +199,9 @@ where
                     // Both maps are pruned when a target detaches, so a long run does not grow them.
                     if let Some((_, target)) = sessions.remove(sid) {
                         roots.remove(&target);
+                        if let Ok(mut a) = shared.armed.lock() {
+                            a.remove(&target);
+                        }
                     }
                 }
             }
