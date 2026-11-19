@@ -864,7 +864,7 @@ where
     let last_modified: HeaderValue = HeaderValue::from_str(
         &feeds
             .last_modified()
-            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .strftime("%a, %d %b %Y %H:%M:%S GMT")
             .to_string(),
     )
     .unwrap_or_else(|_| HeaderValue::from_static(""));

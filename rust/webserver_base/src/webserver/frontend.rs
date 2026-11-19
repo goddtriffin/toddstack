@@ -16,7 +16,6 @@ use crate::templates::{
     SocialImageMetadata,
 };
 use crate::{Environment, TracesSampleRate, env};
-use chrono::Datelike as _;
 
 use super::error::WebServerError;
 use super::not_found::NotFound;
@@ -224,7 +223,7 @@ where
             .into_iter()
             .map(|url| url.map_images(|image| cache_buster.get_file(image)))
             .collect();
-        let last_modified: Option<chrono::DateTime<chrono::Utc>> =
+        let last_modified: Option<jiff::Timestamp> =
             crate::assets::content_modified_in(cache_buster.root(), &["html", "static"]);
         let sitemaps: SitemapSet =
             build_sitemaps(params.base.base_url(), &sitemap_urls, last_modified)
@@ -401,7 +400,11 @@ fn short_hash(input: &str) -> String {
 /// free to drift apart.
 fn feed_site(base: &BaseTemplateData, cache_buster: &CacheBuster) -> FeedSite {
     let absolute = |path: &str| format!("{}{path}", base.base_url());
-    let year: i32 = chrono::Utc::now().year();
+    let year: i32 = i32::from(
+        jiff::Timestamp::now()
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .year(),
+    );
 
     FeedSite {
         base_url: String::from(base.base_url()),

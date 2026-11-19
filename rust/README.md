@@ -28,8 +28,11 @@ webserver-base = { version = "0.2", features = ["pages", "observability", "prese
 
 Nothing is enabled by default.
 
+Every date and time in the API is a [`jiff::Timestamp`](https://docs.rs/jiff) (an instant, always UTC); the
+crate replaced `chrono`, which is unmaintained (RUSTSEC-2026-0543).
+
 Every crate whose types appear in this library's API is re-exported from its
-root — `webserver_base::{axum, axum_extra, chrono, handlebars, serde_json, tokio, tracing,
+root — `webserver_base::{axum, axum_extra, handlebars, jiff, serde_json, tokio, tracing,
 reqwest, sentry}`, each behind the feature that uses it — so a project builds
 against the same version the library does, and never adds one just to call it.
 

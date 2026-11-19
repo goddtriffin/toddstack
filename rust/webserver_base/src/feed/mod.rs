@@ -25,7 +25,7 @@ mod rewrite;
 mod rss;
 mod sanitize;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tracing::{error, instrument};
 
 pub use error::FeedError;
@@ -106,9 +106,9 @@ pub struct FeedEntry {
     pub summary: String,
     /// The rendered post HTML. `None` ships a teaser.
     pub content_html: Option<String>,
-    pub published: DateTime<Utc>,
+    pub published: Timestamp,
     /// Atom requires a per-entry `<updated>`; this falls back to `published`.
-    pub modified: Option<DateTime<Utc>>,
+    pub modified: Option<Timestamp>,
     pub tags: Vec<String>,
     /// The post's own card image, site-relative. Unlike an image inside the
     /// content, this one is *declared*, so an unresolved path fails the boot.
@@ -118,7 +118,7 @@ pub struct FeedEntry {
 impl FeedEntry {
     /// `modified`, or `published` when the post was never revised.
     #[must_use]
-    pub fn updated(&self) -> DateTime<Utc> {
+    pub fn updated(&self) -> Timestamp {
         self.modified.unwrap_or(self.published)
     }
 }
@@ -162,7 +162,7 @@ impl FeedDocument {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedSet {
     documents: Vec<FeedDocument>,
-    last_modified: DateTime<Utc>,
+    last_modified: Timestamp,
 }
 
 impl FeedSet {
@@ -174,7 +174,7 @@ impl FeedSet {
 
     /// The newest entry's date, for `Last-Modified`.
     #[must_use]
-    pub const fn last_modified(&self) -> DateTime<Utc> {
+    pub const fn last_modified(&self) -> Timestamp {
         self.last_modified
     }
 }
@@ -205,8 +205,8 @@ struct PreparedEntry {
     title: String,
     summary: String,
     content_html: Option<String>,
-    published: DateTime<Utc>,
-    updated: DateTime<Utc>,
+    published: Timestamp,
+    updated: Timestamp,
     tags: Vec<String>,
     image_url: Option<String>,
 }
@@ -226,7 +226,7 @@ pub fn build_feeds<F>(site: &FeedSite, feed: &Feed, resolve: F) -> Result<FeedSe
 where
     F: Fn(&str) -> Option<String>,
 {
-    for diagnostic in diagnostics(feed, Utc::now()) {
+    for diagnostic in diagnostics(feed, Timestamp::now()) {
         // Boots and serves, but subscribers get something wrong and nothing
         // else will say so. `warn!` is never seen by anyone.
         error!("{diagnostic}");
@@ -235,14 +235,14 @@ where
     let channel: Channel = channel(site, feed);
     let entries: Vec<PreparedEntry> = prepare(site, feed, &resolve)?;
 
-    let last_modified: DateTime<Utc> = entries
+    let last_modified: Timestamp = entries
         .iter()
         .map(|entry| entry.updated)
         .max()
         // An empty feed still needs a coherent `<updated>`; the site's own
         // epoch is meaningless, so fall back to the start of time rather than
         // to the clock, which would break byte-stability.
-        .unwrap_or_else(|| DateTime::UNIX_EPOCH.to_utc());
+        .unwrap_or(Timestamp::UNIX_EPOCH);
 
     let documents: Vec<FeedDocument> = vec![
         document(
@@ -424,7 +424,7 @@ fn validate_entry(entry: &FeedEntry) -> Result<(), FeedError> {
 /// The `error!`-tier findings: the feed serves, but a human should look.
 ///
 /// Pure and clock-injected so the reporting itself is testable.
-fn diagnostics(feed: &Feed, now: DateTime<Utc>) -> Vec<String> {
+fn diagnostics(feed: &Feed, now: Timestamp) -> Vec<String> {
     let mut findings: Vec<String> = Vec::new();
 
     if feed.entries.is_empty() {
@@ -469,8 +469,8 @@ fn diagnostics(feed: &Feed, now: DateTime<Utc>) -> Vec<String> {
 /// RFC 3339 to the second, with `Z` rather than `+00:00`.
 ///
 /// Shared by Atom and JSON Feed so the two cannot disagree about an instant.
-fn rfc3339(moment: DateTime<Utc>) -> String {
-    moment.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+fn rfc3339(moment: Timestamp) -> String {
+    moment.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// The MIME type an image URL implies, for the one place Atom wants it.
@@ -515,9 +515,9 @@ fn absolute(base_url: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use jiff::Timestamp;
     use std::collections::BTreeMap;
 
-    use chrono::{DateTime, TimeZone, Utc};
     use serde_json::Value;
 
     use super::{
@@ -527,9 +527,9 @@ mod tests {
 
     const BASE: &str = "https://www.example.com";
 
-    fn moment(year: i32, month: u32, day: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(year, month, day, 12, 0, 0)
-            .single()
+    fn moment(year: i32, month: u32, day: u32) -> Timestamp {
+        format!("{year:04}-{month:02}-{day:02}T12:00:00Z")
+            .parse()
             .expect("a real instant")
     }
 
@@ -544,7 +544,7 @@ mod tests {
         }
     }
 
-    fn entry(slug: &str, published: DateTime<Utc>) -> FeedEntry {
+    fn entry(slug: &str, published: Timestamp) -> FeedEntry {
         FeedEntry {
             path: format!("/blog/{slug}"),
             title: format!("Post {slug}"),
@@ -686,42 +686,77 @@ mod tests {
     }
 
     #[test]
-    fn the_atom_document_round_trips_through_an_independent_atom_implementation() {
+    fn the_atom_document_has_the_required_atom_elements() {
         let set: FeedSet = build(&feed(vec![entry("first", moment(2024, 3, 10))]));
-        let parsed: atom_syndication::Feed =
-            atom_syndication::Feed::read_from(body(&set, ATOM_PATH).as_bytes())
-                .expect("valid Atom 1.0");
-
-        assert_eq!("Blog | Todd Everett Griffin", parsed.title().as_str());
-        assert_eq!("https://www.example.com/atom.xml", parsed.id());
+        let document: String = body(&set, ATOM_PATH);
+        let parsed: roxmltree::Document = roxmltree::Document::parse(&document).expect("valid XML");
+        let root: roxmltree::Node = parsed.root_element();
+        assert_eq!("feed", root.tag_name().name());
         assert_eq!(
-            Some("Writing on Rust and WebGPU."),
-            parsed.subtitle().map(atom_syndication::Text::as_str)
-        );
-        assert_eq!(
-            vec![String::from("Todd Everett Griffin")],
-            parsed
-                .authors()
-                .iter()
-                .map(|author| author.name().to_string())
-                .collect::<Vec<String>>()
+            Some("http://www.w3.org/2005/Atom"),
+            root.tag_name().namespace()
         );
 
-        let entry: &atom_syndication::Entry = &parsed.entries()[0];
-        assert_eq!("https://www.example.com/blog/first", entry.id());
-        assert_eq!("Post first", entry.title().as_str());
+        let text = |node: roxmltree::Node, name: &str| -> Option<String> {
+            node.children()
+                .find(|child| child.has_tag_name(name))
+                .and_then(|child| child.text())
+                .map(String::from)
+        };
         assert_eq!(
-            Some("<p>The body of first.</p>"),
-            entry.content().and_then(atom_syndication::Content::value)
+            Some(String::from("Blog | Todd Everett Griffin")),
+            text(root, "title")
         );
         assert_eq!(
-            vec![String::from("rust")],
+            Some(String::from("https://www.example.com/atom.xml")),
+            text(root, "id")
+        );
+        assert_eq!(
+            Some(String::from("Writing on Rust and WebGPU.")),
+            text(root, "subtitle")
+        );
+        let author: roxmltree::Node = root
+            .children()
+            .find(|child| child.has_tag_name("author"))
+            .expect("an author");
+        assert_eq!(
+            Some(String::from("Todd Everett Griffin")),
+            text(author, "name")
+        );
+
+        let entry: roxmltree::Node = root
+            .children()
+            .find(|child| child.has_tag_name("entry"))
+            .expect("an entry");
+        assert_eq!(
+            Some(String::from("https://www.example.com/blog/first")),
+            text(entry, "id")
+        );
+        assert_eq!(Some(String::from("Post first")), text(entry, "title"));
+        assert_eq!(
+            Some(String::from("<p>The body of first.</p>")),
+            text(entry, "content")
+        );
+        assert_eq!(
+            Some("rust"),
             entry
-                .categories()
-                .iter()
-                .map(|category| category.term().to_string())
-                .collect::<Vec<String>>()
+                .children()
+                .find(|child| child.has_tag_name("category"))
+                .and_then(|category| category.attribute("term"))
         );
+    }
+
+    #[test]
+    fn dates_are_written_in_the_exact_documented_formats() {
+        let set: FeedSet = build(&feed(vec![entry("first", moment(2024, 3, 5))]));
+
+        // RSS: RFC 2822, zero-padded day, `+0000`.
+        let rss: String = body(&set, RSS_PATH);
+        assert!(rss.contains("<pubDate>Tue, 05 Mar 2024 12:00:00 +0000</pubDate>"));
+        assert!(rss.contains("<lastBuildDate>Tue, 05 Mar 2024 12:00:00 +0000</lastBuildDate>"));
+
+        // Atom: RFC 3339 to the second, `Z`.
+        assert!(body(&set, ATOM_PATH).contains("<updated>2024-03-05T12:00:00Z</updated>"));
     }
 
     #[test]
@@ -765,7 +800,7 @@ mod tests {
     fn entries_sharing_an_instant_are_ordered_deterministically_not_by_caller_order() {
         // A `HashMap` upstream hands entries over in a different order each
         // run; without a tie-break the bytes — and so the ETag — would move.
-        let same: DateTime<Utc> = moment(2026, 1, 2);
+        let same: Timestamp = moment(2026, 1, 2);
         let forward: FeedSet = build(&feed(vec![
             entry("alpha", same),
             entry("beta", same),
@@ -782,7 +817,7 @@ mod tests {
 
     #[test]
     fn the_feed_date_is_the_newest_entry_rather_than_the_clock() {
-        let newest: DateTime<Utc> = moment(2026, 1, 2);
+        let newest: Timestamp = moment(2026, 1, 2);
         let set: FeedSet = build(&feed(vec![
             entry("old", moment(2020, 1, 1)),
             entry("new", newest),
@@ -817,8 +852,8 @@ mod tests {
             .map(|day| {
                 entry(
                     &format!("post-{day:02}"),
-                    Utc.with_ymd_and_hms(2026, 1, u32::try_from(day).expect("small"), 12, 0, 0)
-                        .single()
+                    format!("2026-01-{day:02}T12:00:00Z")
+                        .parse()
                         .expect("a real instant"),
                 )
             })
@@ -843,15 +878,20 @@ mod tests {
     #[test]
     fn a_post_never_revised_reports_its_publication_date_as_its_update() {
         let set: FeedSet = build(&feed(vec![entry("first", moment(2024, 3, 10))]));
-        let parsed: atom_syndication::Feed =
-            atom_syndication::Feed::read_from(body(&set, ATOM_PATH).as_bytes())
-                .expect("valid Atom");
-
-        let entry: &atom_syndication::Entry = &parsed.entries()[0];
-        assert_eq!(
-            entry.published().map(chrono::DateTime::to_rfc3339),
-            Some(entry.updated().to_rfc3339())
-        );
+        let document: String = body(&set, ATOM_PATH);
+        let parsed: roxmltree::Document = roxmltree::Document::parse(&document).expect("valid XML");
+        let entry: roxmltree::Node = parsed
+            .descendants()
+            .find(|node| node.has_tag_name("entry"))
+            .expect("an entry");
+        let text = |name: &str| -> Option<&str> {
+            entry
+                .children()
+                .find(|child| child.has_tag_name(name))
+                .and_then(|child| child.text())
+        };
+        assert_eq!(Some("2024-03-10T12:00:00Z"), text("published"));
+        assert_eq!(text("published"), text("updated"));
     }
 
     #[test]

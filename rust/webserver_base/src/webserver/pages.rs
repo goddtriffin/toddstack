@@ -13,7 +13,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
 use axum_extra::routing::RouterExt;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::error;
@@ -147,7 +147,7 @@ where
 
     /// Sets `<lastmod>` on the most recently declared page.
     #[must_use]
-    pub fn with_last_modified(mut self, last_modified: DateTime<Utc>) -> Self {
+    pub fn with_last_modified(mut self, last_modified: Timestamp) -> Self {
         self.map_last_urls(|url| url.with_last_modified(last_modified));
         self
     }
@@ -353,8 +353,6 @@ fn has_route_parameter(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use chrono::TimeZone;
-
     use crate::sitemap::SitemapUrl;
     use crate::templates::PageTemplateData;
     use crate::webserver::error::WebServerError;
@@ -453,10 +451,7 @@ mod tests {
 
     #[test]
     fn sitemap_modifiers_apply_to_the_page_just_declared() {
-        let modified: chrono::DateTime<chrono::Utc> = chrono::Utc
-            .with_ymd_and_hms(2026, 3, 4, 5, 6, 7)
-            .single()
-            .expect("a real instant");
+        let modified: jiff::Timestamp = "2026-03-04T05:06:07Z".parse().expect("a real instant");
 
         let pages: Pages = Pages::new()
             .static_page(PageTemplateData::new("home", "Home", "/"), ())
