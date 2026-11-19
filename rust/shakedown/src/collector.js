@@ -48,15 +48,27 @@
     document.documentElement.appendChild(pe);
     // `elementFromPoint` is null outside the viewport: scroll the point into view, probe, and scroll back, so a line
     // below the fold is judged like one above it.
-    const hitAt = (x, y) => {
+    const hitAt = (x, y, el) => {
       const w = de.clientWidth, h = de.clientHeight;
       if (x >= 0 && y >= 0 && x < w && y < h) return document.elementFromPoint(x, y);
-      const ox = window.scrollX, oy = window.scrollY;
-      window.scrollTo({ left: ox + x - w / 2, top: oy + y - h / 2, behavior: 'instant' });
-      const dx = window.scrollX - ox, dy = window.scrollY - oy;
-      const hit = document.elementFromPoint(x - dx, y - dy);
-      window.scrollTo({ left: ox, top: oy, behavior: 'instant' });
-      return hit;
+      // The page may scroll inside an element (an app shell): scroll the element itself into view, then put every
+      // scroller it moved back, in a finally.
+      const saved = [[window, window.scrollX, window.scrollY]];
+      for (let n = el.parentElement; n; n = n.parentElement) saved.push([n, n.scrollLeft, n.scrollTop]);
+      const before = el.getBoundingClientRect();
+      try {
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        const after = el.getBoundingClientRect();
+        const px = x + after.left - before.left, py = y + after.top - before.top;
+        // Still off screen: unknown, so skip it rather than call it covered or clear.
+        if (px < 0 || py < 0 || px >= w || py >= h) return null;
+        return document.elementFromPoint(px, py);
+      } finally {
+        for (const [n, l, t] of saved) {
+          if (n === window) window.scrollTo({ left: l, top: t, behavior: 'instant' });
+          else { n.scrollLeft = l; n.scrollTop = t; }
+        }
+      }
     };
     const label = (e) => `<${e.tagName.toLowerCase()}${typeof e.className === 'string' && e.className.trim() ? ' class="' + e.className.trim() + '"' : ''}>`;
     const marks = (e) => {
@@ -78,7 +90,7 @@
     };
     // Three points along the line: a dropdown over only part of a line covers it too.
     const covered = (e, x, y) => {
-      const hit = hitAt(x, y);
+      const hit = hitAt(x, y, e);
       if (!hit) return null;
       if (e.contains(hit) || hit.contains(e)) return false;
       for (let n = hit; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
@@ -170,7 +182,7 @@
           const x0 = Math.max(r.x, q.x), x1 = Math.min(r.x + r.w, q.x + q.w);
           const y0 = Math.max(r.y, q.y), y1 = Math.min(r.y + r.h, q.y + q.h);
           if (x1 - x0 <= 0 || y1 - y0 <= 0) return false;
-          const hit = hitAt((x0 + x1) / 2, (y0 + y1) / 2);
+          const hit = hitAt((x0 + x1) / 2, (y0 + y1) / 2, e);
           return !!hit && e.contains(hit);
         }));
         if (over) d.top_lines.push(r);
