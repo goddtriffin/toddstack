@@ -467,6 +467,20 @@ Targets, not measured yet:
    `shakedown.toml`.
 4. **Every other project**, one at a time, as each is next touched.
 
+## Acceptance: when shakedown may replace a project's check
+
+A project's existing check (`make test`, `ui-check`, `vitals`, a script) is replaced by shakedown only when both hold:
+
+- **No slower.** Shakedown is no slower than today's equivalent, measured cold (nothing built or cached) and warm
+  (second run), on the same machine and commit. The numbers go in the PR body; a slower result needs the reason and
+  Todd's go-ahead.
+- **Nothing lost.** It covers every check the old one did, and each is proven by a planted-break test: plant a known
+  break (a 1 px shift, an overflow, a blown budget, a missing string) and shakedown must fail; plant a harmless
+  change (sub-threshold drift) and it must pass. A check with no planted-break test does not count as covered.
+
+Planted-break tests live with the code (`rust/shakedown/tests/planted_breaks.rs` for the tool's own checks) or in the
+project, and each phase adds its own before the old check is deleted.
+
 ## 17. Phased plan
 
 | phase | delivers | done when |

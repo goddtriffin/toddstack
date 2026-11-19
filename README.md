@@ -14,6 +14,7 @@ published on its own and documented in its own README.
 | `toddstack-accounts-server-sdk` (formerly `toddstack-accounts`) | Rust | [crates.io](https://crates.io/crates/toddstack-accounts-server-sdk) | [`rust/toddstack_accounts_server_sdk/README.md`](rust/toddstack_accounts_server_sdk/README.md) |
 | `toddstack-accounts` (**frozen**, security fixes only) | TypeScript | [JSR](https://jsr.io/@todd/toddstack-accounts) `@todd/toddstack-accounts`, [npm](https://www.npmjs.com/package/toddstack-accounts) `toddstack-accounts` | [`typescript/accounts/README.md`](typescript/accounts/README.md) |
 | `toddstack-frontend-engine` | Rust | [crates.io](https://crates.io/crates/toddstack-frontend-engine) | [`rust/toddstack_frontend_engine/README.md`](rust/toddstack_frontend_engine/README.md) |
+| `shakedown` | Rust | [crates.io](https://crates.io/crates/shakedown) | [`rust/shakedown/README.md`](rust/shakedown/README.md) |
 | `template-web-server` | Rust | not published; Docker image for several sites | [`rust/template_web_server/`](rust/template_web_server/) |
 
 ## Layout
@@ -24,6 +25,7 @@ rust/              Cargo workspace: every Rust crate
   template_web_server/   a complete site built on it (crate + html/ + static/ + Dockerfile)
   flyball/               keyed rate limiting: one trait, in-memory and mock implementations
   toddstack_accounts_server_sdk/  client for the shared accounts: sign-in, tokens, webhooks, friends
+  shakedown/             the shared local testing tool (binary): check runner, budgets, pixel compare, doctor
   toddstack_frontend_engine/      app-agnostic Elm-style frontend core: NDJSON bridge, effects, dirty-key views, headless harness, wasm and UniFFI glue (+ js/ worker runner)
 typescript/        JSR packages (deno.jsonc is the package config); FROZEN, see below
   webserver-base/        the browser/build-side half of webserver-base
