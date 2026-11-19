@@ -183,6 +183,11 @@ pub async fn launch(
             "--force-color-profile=srgb",
             "--hide-scrollbars",
             "--mute-audio",
+            // Nothing leaves the machine, not even a WebSocket (CDP cannot refuse one before it connects): every
+            // non-loopback request goes to a proxy nobody listens on (port 9, discard) and fails there. Chrome's
+            // implicit `<-loopback>` bypass stays, so the local server is reached directly; do not pass
+            // `--proxy-bypass-list`, which would change that.
+            "--proxy-server=127.0.0.1:9",
             // Same pixels every run: software raster, images decoded before the frame, every compositor stage
             // finished before it is drawn.
             "--disable-gpu",

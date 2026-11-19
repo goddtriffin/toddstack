@@ -484,6 +484,39 @@ fn a_websocket_that_leaves_the_machine_fails() {
     );
 }
 
+/// This machine's address on the network (not loopback), if it has one.
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // A UDP "connect" only picks the route; nothing is sent.
+    s.connect("192.0.2.1:9").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+#[test]
+fn a_request_or_websocket_to_another_host_never_connects() {
+    let Some(ip) = lan_ip() else {
+        eprintln!("no network address: skipped");
+        return;
+    };
+    // A listener posing as the outside world, reachable only through a non-loopback address.
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let site = Site::new("no-connect");
+    site.screen("");
+    site.page(&format!(
+        "{OK_BODY}<script>try{{new WebSocket('ws://{ip}:{port}/live')}}catch(e){{}}fetch('http://{ip}:{port}/x').catch(()=>{{}})</script>"
+    ));
+    let o = site.run(&["update", "--screens", "page"]);
+    assert!(text(&o).contains("network: "), "{}", text(&o));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "Chrome connected to the outside listener"
+    );
+}
+
 #[test]
 fn a_websocket_to_the_local_server_is_allowed() {
     let site = Site::new("websocket-local");
