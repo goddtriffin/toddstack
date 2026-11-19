@@ -278,14 +278,14 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         .build()
         .map_err(|e| Error::Environment(format!("runtime: {e}")))?;
     let repeat = opts.repeat.max(1);
-    let _signals = world::watch_signals();
+    let signals = world::watch_signals();
     let runs: Vec<Vec<Shot>> = runtime.block_on(async {
         let trace = |what: &str| {
             if std::env::var_os("SHAKEDOWN_TRACE").is_some() {
                 eprintln!("trace {what} {}ms", started.elapsed().as_millis());
             }
         };
-        let running = world::start(&server, root, &config.project, &out)?;
+        let running = world::start(&server, root, &config.project, &out, &signals)?;
         trace("server up");
         let env = Arc::new(Env {
             base: running.base.clone(),
@@ -306,7 +306,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         };
         let result = tokio::select! {
             r = work => r,
-            () = async { while !world::interrupted() { tokio::time::sleep(Duration::from_millis(50)).await; } } => Err(Error::Failed("interrupted".into())),
+            () = async { while !signals.interrupted() { tokio::time::sleep(Duration::from_millis(50)).await; } } => Err(Error::Failed("interrupted".into())),
         };
         trace("shots done");
         trace("chrome closed");
