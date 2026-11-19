@@ -36,7 +36,7 @@ pub struct Outcome {
     pub ratio: f64,
     /// Largest share of differing pixels in any block.
     pub block: f64,
-    /// Diff image (grayscale original, differing pixels red); absent on a size change.
+    /// Diff image (grayscale original, differing pixels red); absent on a size change and when nothing differs.
     pub diff: Option<Image>,
 }
 
@@ -92,6 +92,16 @@ pub fn decode(bytes: &[u8]) -> Result<Image, Error> {
 ///
 /// The encoder failed (an image too large for PNG).
 pub fn encode(img: &Image, step: u8) -> Result<Vec<u8>, Error> {
+    encode_with(img, step, png::Compression::High)
+}
+
+/// [`encode`] with a chosen compression: `Fast` for files that are only kept locally (the sweep's baseline), where
+/// the encode time matters and the size does not.
+///
+/// # Errors
+///
+/// The encoder failed (an image too large for PNG).
+pub fn encode_with(img: &Image, step: u8, compression: png::Compression) -> Result<Vec<u8>, Error> {
     let q = |v: u8| -> u8 {
         if step > 1 {
             let s = u32::from(step);
@@ -112,7 +122,7 @@ pub fn encode(img: &Image, step: u8) -> Result<Vec<u8>, Error> {
     let mut enc = png::Encoder::new(&mut out, img.w, img.h);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png::Compression::High);
+    enc.set_compression(compression);
     enc.set_filter(png::Filter::Adaptive);
     let mut writer = enc.write_header().map_err(fail)?;
     writer.write_image_data(&rgb).map_err(fail)?;
@@ -128,6 +138,15 @@ pub fn compare(reference: &Image, actual: &Image) -> Outcome {
             same_size: false,
             ratio: 1.0,
             block: 1.0,
+            diff: None,
+        };
+    }
+    if a.px == b.px {
+        // The same pixels: nothing to count, and no diff image to draw.
+        return Outcome {
+            same_size: true,
+            ratio: 0.0,
+            block: 0.0,
             diff: None,
         };
     }

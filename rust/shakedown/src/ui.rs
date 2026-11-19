@@ -193,7 +193,13 @@ fn select<'a>(config: &'a Config, opts: &Options, refs: &Path) -> Result<Vec<&'a
 }
 
 /// One run: a fresh Chrome draws every job and is thrown away.
-async fn one_run(chrome: &Path, env: &Arc<Env>, jobs: &[Job], n: u32) -> Result<Vec<Shot>, Error> {
+async fn one_run(
+    chrome: &Path,
+    env: &Arc<Env>,
+    jobs: &[Job],
+    n: u32,
+    sink: Option<capture::Sink>,
+) -> Result<Vec<Shot>, Error> {
     let count = capture::browsers().min(jobs.len().max(1));
     let mut chromes = capture::Chromes::default();
     for i in 0..count {
@@ -201,7 +207,7 @@ async fn one_run(chrome: &Path, env: &Arc<Env>, jobs: &[Job], n: u32) -> Result<
             std::env::temp_dir().join(format!("shakedown-chrome-{}-{n}-{i}", std::process::id()));
         chromes.launch(chrome, &profile).await?;
     }
-    let shots = capture::shoot_all(chromes.browsers(), env.clone(), jobs.to_vec()).await;
+    let shots = capture::shoot_all(chromes.browsers(), env.clone(), jobs.to_vec(), sink).await;
     for browser in chromes.take_browsers() {
         if let Ok(mut b) = Arc::try_unwrap(browser) {
             // Nothing in the profile is worth a graceful exit (it is thrown away): a clean close takes seconds.
@@ -276,7 +282,16 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     let jobs = build_jobs(config, root, opts, &screens, ms)?;
     let out = out_dir(root);
     let _ = std::fs::remove_dir_all(&out);
-    let runs = draw_all(config, root, &out, &jobs, opts.repeat.max(1), started, None)?;
+    let runs = draw_all(
+        config,
+        root,
+        &out,
+        &jobs,
+        opts.repeat.max(1),
+        started,
+        None,
+        None,
+    )?;
     let first = runs.first().cloned().unwrap_or_default();
     let mut outcome = Outcome {
         shots: first.len(),
@@ -313,6 +328,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
 /// # Errors
 ///
 /// A missing environment (Chrome, the server), or an interrupt.
+#[expect(clippy::too_many_arguments, reason = "one call site per command")]
 pub fn draw_all(
     config: &Config,
     root: &Path,
@@ -321,6 +337,7 @@ pub fn draw_all(
     repeat: u32,
     started: Instant,
     base: Option<&str>,
+    sink: Option<&capture::Sink>,
 ) -> Result<Vec<Vec<Shot>>, Error> {
     let server = config.server.clone();
     let chrome = crate::browser::install()?;
@@ -365,7 +382,7 @@ pub fn draw_all(
             let mut runs = Vec::new();
             for n in 0..repeat {
                 // A fresh Chrome every run: nothing one run drew (decoded images, caches) can colour the next.
-                runs.push(one_run(&chrome, &env, jobs, n).await?);
+                runs.push(one_run(&chrome, &env, jobs, n, sink.cloned()).await?);
             }
             Ok::<_, Error>(runs)
         };
