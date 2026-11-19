@@ -12,7 +12,7 @@ MODE="${1:-publish}"
 LIBS=(
   "crate webserver-base     rust/webserver_base       rust/Cargo.toml                  webserver-base-v"
   "crate flyball            rust/flyball              rust/flyball/Cargo.toml          flyball-v"
-  "crate toddstack-accounts rust/toddstack_accounts   rust/toddstack_accounts/Cargo.toml toddstack-accounts-v"
+  "crate toddstack-accounts-server-sdk rust/toddstack_accounts_server_sdk rust/toddstack_accounts_server_sdk/Cargo.toml toddstack-accounts-server-sdk-v"
   "jsr   @todd/webserver-base typescript/webserver-base typescript/deno.jsonc        -"
   "jsr   @todd/toddstack-accounts typescript/accounts  typescript/accounts/deno.jsonc toddstack-accounts-v"
   "npm   toddstack-accounts typescript/accounts       typescript/accounts/package.json toddstack-accounts-v"

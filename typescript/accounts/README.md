@@ -1,12 +1,16 @@
 # toddstack-accounts (TypeScript)
 
+> **FROZEN (2026-11-18): security fixes only.** No new features. To be deleted once Swarm-Driven Development's server is
+> ported to Rust. New work uses the Rust crate
+> [`toddstack-accounts-server-sdk`](../../rust/toddstack_accounts_server_sdk/README.md).
+
 [![JSR](https://jsr.io/badges/@todd/toddstack-accounts)](https://jsr.io/@todd/toddstack-accounts)
 [![npm](https://img.shields.io/npm/v/toddstack-accounts)](https://www.npmjs.com/package/toddstack-accounts)
 
 Client for Todd Griffin's Projects accounts (`accounts.toddgriffin.me`): what a project's backend needs to sign people
 in, check tokens (locally, with instant logout), verify webhooks, act for players, and send notifications. The
-TypeScript half of `toddstack-accounts`, with the same features as the
-[Rust crate](../../rust/toddstack_accounts/README.md). Part of [toddstack](https://github.com/goddtriffin/toddstack).
+TypeScript package (frozen; the maintained SDK is the [Rust crate](../../rust/toddstack_accounts_server_sdk/README.md)).
+Part of [toddstack](https://github.com/goddtriffin/toddstack).
 
 Web Platform APIs only (`fetch`, WebCrypto): Node 20+, Deno, Bun. No dependencies.
 
@@ -248,8 +252,8 @@ try {
 
 Also `list`, `requestByCode`, `accept`, `decline`, `cancel`, `remove`, `block`, `unblock`, `blocks`, and
 `relationships(subs)`. Use `Person`, `Requests`, `Blocks`, `Sent` and `Relationship` for the models.
-`signedIn: () => boolean` makes a signed-out call throw `account_required` without a request (the Swift and Kotlin
-clients do this by default). Tests pass `MockFriendsFetch.fetch` as `fetch`, seeding replies per exact call
+`signedIn: () => boolean` makes a signed-out call throw `account_required` without a request (the former Swift and
+Kotlin clients do this by default). Tests pass `MockFriendsFetch.fetch` as `fetch`, seeding replies per exact call
 (`seed({ method, path, body }, { status, body })`) and ending with `assertAllSeedsConsumed()`. Unlike
 `accounts.friends(token)` (server to accounts), this never holds a token. Gap: the router itself is Rust-only; a
 TypeScript server mounts its own routes over `accounts.friends(token)`.

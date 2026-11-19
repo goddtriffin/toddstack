@@ -1,7 +1,7 @@
 # toddstack
 
-Shared code for all of Todd Everett Griffin's projects, in every language they are
-written in. Each language has its own directory; each package inside it is
+Shared code for all of Todd Everett Griffin's projects, in Rust (and a frozen TypeScript
+package). Each language has its own directory; each package inside it is
 published on its own and documented in its own README.
 
 ## Packages
@@ -11,10 +11,8 @@ published on its own and documented in its own README.
 | `webserver-base` | Rust | [crates.io](https://crates.io/crates/webserver-base) | [`rust/README.md`](rust/README.md) |
 | `@todd/webserver-base` | TypeScript | [JSR](https://jsr.io/@todd/webserver-base) | [`typescript/README.md`](typescript/README.md) |
 | `flyball` | Rust | [crates.io](https://crates.io/crates/flyball) | [`rust/flyball/README.md`](rust/flyball/README.md) |
-| `toddstack-accounts` | Rust | [crates.io](https://crates.io/crates/toddstack-accounts) | [`rust/toddstack_accounts/README.md`](rust/toddstack_accounts/README.md) |
-| `toddstack-accounts` | TypeScript | [JSR](https://jsr.io/@todd/toddstack-accounts) `@todd/toddstack-accounts`, [npm](https://www.npmjs.com/package/toddstack-accounts) `toddstack-accounts` | [`typescript/accounts/README.md`](typescript/accounts/README.md) |
-| `ToddstackAccounts` | Swift | SwiftPM, `https://github.com/goddtriffin/toddstack` (product `ToddstackAccounts`) | [`swift/accounts/README.md`](swift/accounts/README.md) |
-| `toddstack-accounts` | Kotlin (Android) | JitPack `com.github.goddtriffin.toddstack:toddstack-accounts` (from the bare tag; Maven Central later; see its README) | [`kotlin/accounts/README.md`](kotlin/accounts/README.md) |
+| `toddstack-accounts-server-sdk` (formerly `toddstack-accounts`) | Rust | [crates.io](https://crates.io/crates/toddstack-accounts-server-sdk) | [`rust/toddstack_accounts_server_sdk/README.md`](rust/toddstack_accounts_server_sdk/README.md) |
+| `toddstack-accounts` (**frozen**, security fixes only) | TypeScript | [JSR](https://jsr.io/@todd/toddstack-accounts) `@todd/toddstack-accounts`, [npm](https://www.npmjs.com/package/toddstack-accounts) `toddstack-accounts` | [`typescript/accounts/README.md`](typescript/accounts/README.md) |
 | `template-web-server` | Rust | not published; Docker image for several sites | [`rust/template_web_server/`](rust/template_web_server/) |
 
 ## Layout
@@ -24,35 +22,26 @@ rust/              Cargo workspace: every Rust crate
   webserver_base/        the web server library
   template_web_server/   a complete site built on it (crate + html/ + static/ + Dockerfile)
   flyball/               keyed rate limiting: one trait, in-memory and mock implementations
-  toddstack_accounts/    client for the shared accounts: sign-in, tokens, webhooks, friends
-swift/             Swift package (Package.swift at the repo root points here): native-app sign-in
-  accounts/              ToddstackAccounts for iOS and macOS apps (client of the project server's /app contract)
-kotlin/            Gradle build: Android libraries (jitpack.yml at the repo root builds it from a tag)
-  accounts/              toddstack-accounts for Android (Auth Tab sign-in through the project's server)
-typescript/        JSR packages (deno.jsonc is the package config)
+  toddstack_accounts_server_sdk/  client for the shared accounts: sign-in, tokens, webhooks, friends
+typescript/        JSR packages (deno.jsonc is the package config); FROZEN, see below
   webserver-base/        the browser/build-side half of webserver-base
-  accounts/              toddstack-accounts for TypeScript (own deno.jsonc + package.json: JSR and npm)
+  accounts/              toddstack-accounts for TypeScript, frozen (own deno.jsonc + package.json: JSR and npm)
 ```
 
-## Parity across languages
+## Rust only
 
-A package that exists in more than one language has **the same features in every language**, so every project
-behaves the same whatever it is written in. Each one is written idiomatically for its language (names, errors,
-async style and internals follow that language), but no language gets a feature the others lack. A change to
-one adds the feature to the others in the same change, or names the gap in both READMEs.
-
-New languages (Kotlin, ...) get their own top-level directory when the
-first project needs one.
+**Rust is the only SDK that gets new features** (Todd, 2026-11-18). The Swift and Kotlin SDKs were deleted (nothing
+used them). The TypeScript packages are **frozen**: security fixes only, to be deleted once Swarm-Driven
+Development's server is ported to Rust. There is no feature parity rule.
 
 ## How a project adds in-app friend requests
 
-1. **Server (Rust):** enable `toddstack-accounts`'s `axum` feature, implement `FriendsAuth` over your sessions (the
+1. **Server (Rust):** enable `toddstack-accounts-server-sdk`'s `axum` feature, implement `FriendsAuth` over your sessions (the
    caller's accounts access token, or `None` for a guest), and `app.merge(friends_router::router(accounts, auth))`.
    Request the `friends` scope at login. Routes: `/api/v1/friends/...` (table in the Rust README).
-2. **Web:** `new FriendsClient()` from `@todd/toddstack-accounts`, then build the lists and buttons in your own UI.
-3. **iOS / Android:** `FriendsClient(accounts:)` (Swift) or `Friends(accounts)` (Kotlin), which sign calls with the
-   session the app already holds. Guests get `account_required`: show the sign-in upsell.
-4. Show `message` from any error to the person as is; it is already worded for them.
+2. **Clients:** call the routes with the session the app already holds. Guests get `account_required`: show the
+   sign-in upsell.
+3. Show `message` from any error to the person as is; it is already worded for them.
 
 ## Working on this repo
 
@@ -66,17 +55,6 @@ Everything runs from the repo root through the `Makefile` (`make help`).
 Rules live in the skills, not here. Invoke `contribution-guide` before any
 change to this repo.
 
-Releases are tagged per package: `webserver-base-vX.Y.Z`, `toddstack-accounts-vX.Y.Z` (tags up to `v0.3.0`
-predate the rename from `goddtriffin/webserver-base`). The **bare `X.Y.Z` tag** (no prefix) is the native SDKs':
-SwiftPM reads it and JitPack builds the Kotlin SDK from it, so the Swift and Kotlin versions always equal the tag.
-
-### How to release Kotlin (and Swift)
-
-1. Set the same new `X.Y.Z` in `kotlin/accounts/build.gradle.kts` (`version`) and
-   `swift/accounts/Sources/ToddstackAccounts/Version.swift` (`toddstackAccountsVersion`); `make lint test`; merge.
-2. `git tag X.Y.Z && git push origin X.Y.Z` on the merge commit.
-3. Open <https://jitpack.io/#goddtriffin/toddstack>, pick the tag, press Get it, and wait for green.
-
-Consumers then use `com.github.goddtriffin.toddstack:toddstack-accounts:X.Y.Z` (JitPack repository
-`https://jitpack.io`). Maven Central (`me.toddgriffin:toddstack-accounts`) comes later, once Todd has the Sonatype
-namespace, DNS TXT record, GPG key and token; the build is already configured for it (see `kotlin/accounts/README.md`).
+Releases are tagged per package: `webserver-base-vX.Y.Z`, `toddstack-accounts-server-sdk-vX.Y.Z`,
+`toddstack-accounts-vX.Y.Z` (the frozen TypeScript package) (tags up to `v0.3.0` predate the rename from
+`goddtriffin/webserver-base`). Bare `X.Y.Z` tags are unused.

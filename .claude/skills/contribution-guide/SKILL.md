@@ -20,15 +20,12 @@ Shipping a finished change is the **rollout** skill, not this one. Read its
 step 0 before assuming a change needs a version bump: what you touched decides
 what shipping costs, and a docs-only change is a commit and nothing else.
 
-## Parity across languages
+## Rust only
 
-A package that exists in several languages (Rust, TypeScript, and later Swift,
-Kotlin, ...) has **the same features in each** (Todd, 2026-11-14). Write each
-one idiomatically for its language; API shape and internals may differ, the
-feature set may not. Adding, changing or removing a feature in one language
-does the same in the others in the same change, or names the gap in every
-affected README. Starting a package in a new language begins from the
-existing one's feature list.
+Rust is the only SDK that gets new features (Todd, 2026-11-18). There is no
+feature-parity rule. The TypeScript SDK is frozen: security fixes only, to be
+deleted once Swarm-Driven Development's server is ported to Rust. Do not add
+features to it.
 
 ## Diagnose before you implement
 
