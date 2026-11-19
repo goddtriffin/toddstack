@@ -658,38 +658,69 @@ fn pack(
 ) -> Result<(), Error> {
     let dir = pack_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| io(&e))?;
-    let mut items = Vec::new();
-    let mut names: Vec<(String, String)> = Vec::new();
-    for (page, _) in pages {
-        for theme in &config.devices.themes {
-            let mut frames = Vec::new();
-            let mut pics = Vec::new();
-            for d in device_list {
-                let id = format!("{}@{}-{theme}", page.name, d.name);
-                let png = pictures.get(&id).cloned().unwrap_or_default();
-                let flagged = records.iter().any(|r| {
-                    r.route == page.name
-                        && r.device == d.name
-                        && &r.theme == theme
-                        && !r.findings.is_empty()
-                });
-                let frame = Frame {
-                    name: d.name.clone(),
-                    w: d.width,
-                    h: d.height,
-                };
-                frames.push(frame.clone());
-                pics.push(Picture {
-                    frame,
-                    png,
-                    flagged,
-                });
-            }
-            let sheet = sheet::layout(&frames, sheet::MAX_EDGE);
-            items.push((sheet::html(&sheet, &pics), sheet.w, sheet.h));
-            names.push((page.name.clone(), theme.clone()));
+    // One sheet per page and theme; their HTML (every picture base64'd) is built on all cores, in sheet order.
+    let sheets: Vec<(&Page, &String)> = pages
+        .iter()
+        .flat_map(|(page, _)| config.devices.themes.iter().map(move |theme| (page, theme)))
+        .collect();
+    let build = |(page, theme): &(&Page, &String)| {
+        let mut frames = Vec::new();
+        let mut pics = Vec::new();
+        for d in device_list {
+            let id = format!("{}@{}-{theme}", page.name, d.name);
+            let png = pictures.get(&id).cloned().unwrap_or_default();
+            let flagged = records.iter().any(|r| {
+                r.route == page.name
+                    && r.device == d.name
+                    && &r.theme == *theme
+                    && !r.findings.is_empty()
+            });
+            let frame = Frame {
+                name: d.name.clone(),
+                w: d.width,
+                h: d.height,
+            };
+            frames.push(frame.clone());
+            pics.push(Picture {
+                frame,
+                png,
+                flagged,
+            });
         }
+        let sheet = sheet::layout(&frames, sheet::MAX_EDGE);
+        (sheet::html(&sheet, &pics), sheet.w, sheet.h)
+    };
+    let workers = capture::parallel().min(sheets.len()).max(1);
+    let mut items: Vec<Option<(String, u32, u32)>> = vec![None; sheets.len()];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|k| {
+                let (sheets, build) = (&sheets, &build);
+                scope.spawn(move || {
+                    sheets
+                        .iter()
+                        .enumerate()
+                        .skip(k)
+                        .step_by(workers)
+                        .map(|(i, s)| (i, build(s)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            for (i, item) in h.join().unwrap_or_default() {
+                items[i] = Some(item);
+            }
+        }
+    });
+    let items: Vec<(String, u32, u32)> = items.into_iter().flatten().collect();
+    if items.len() != sheets.len() {
+        return Err(Error::Failed("a pack sheet could not be built".into()));
     }
+    let names: Vec<(String, String)> = sheets
+        .iter()
+        .map(|(page, theme)| (page.name.clone(), (*theme).clone()))
+        .collect();
     let chrome = crate::browser::install()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

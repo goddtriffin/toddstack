@@ -533,11 +533,33 @@ Built as designed, with these differences:
 `update` rewrites a reference only when the drawn pixels fail the compare against the stored one (raw pixels, not the
 quantized ones, so `update` and `check` agree); a re-run is a no-op in git.
 
+## Sweep speed notes (2026-11-19, shakedown 0.4.0)
+
+An accounts-service sweep (288 shots) was 121 to 133 s. What changed, from a `SHAKEDOWN_TRACE` profile:
+
+- A shot takes its player's turn before a shared slot, and holds neither while it waits for the other. Before, a
+  shot waiting for its player's turn kept its slot (about 4 of 16 slots idle). Pixel-identical clone accounts
+  (`ann2`, ...) are not possible in accounts-service (the username, email and friend code are unique and drawn on the
+  page), so the cap is met another way: `turn = false` on a `[sweep]` route or `[[screen]]` says the page opens none
+  of the connections the server caps per person, so its shots never take a turn (accounts-service: only the
+  friends page opens an event stream). The default stays `true`.
+- Browser contexts are reused. A shot has a context to itself while it runs; afterwards the context is scrubbed
+  (`capture::scrub`: all storage for the server's origin under every loopback name, all cookies of the context, the
+  HTTP cache; `sessionStorage` dies with the page) and handed to the next shot of that browser. A shot that failed,
+  or a context that cannot be scrubbed, is disposed instead. A test (`scrub_tests`) leaves a cookie, local and
+  session storage, an IndexedDB database, a Cache API cache, a service worker registration and a cached response in
+  a context, and shows that the control (no scrub) still sees them and the scrubbed context sees none.
+- Each sweep shot is judged (re-encoded with fast PNG compression, compared, written) the moment it is drawn, on its
+  own thread after its slot is free; identical files skip the compare, identical pixels skip the counting. The
+  baseline and `current/` are fast-compressed (they stay on this machine); older High-compressed baselines still compare.
+  The `ui` references stay High-compressed (they are committed).
+- The pack's sheet HTML is built on all cores and the sheets are captured by several pages at once.
+
 ## Phase 3 notes (2026-11-19, shakedown 0.3.0)
 
 Built as designed, with these differences:
 
-- `[sweep].routes` entries are a path (a guest) or a table `{ path, name, player, routes, allow_console }`; a
+- `[sweep].routes` entries are a path (a guest) or a table `{ path, name, player, turn, routes, allow_console }`; a
   signed-in route names its one account. A group's `players = N` is the number of accounts that take turns: frame
   `i` (the `i`th device, both themes) is `accounts[i mod N]`, and `N` may not exceed `[players].accounts`. The design's
   "at least as many players as frames" is not applicable: a group is drawn on 18 devices, not 18 simultaneous frames.

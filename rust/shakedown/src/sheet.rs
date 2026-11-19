@@ -12,6 +12,9 @@ use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverridePar
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CaptureScreenshotParams,
 };
+use chromiumoxide::cdp::browser_protocol::target::{
+    CreateBrowserContextParams, CreateTargetParams,
+};
 use chromiumoxide::page::ScreenshotParams;
 
 use crate::capture;
@@ -222,43 +225,65 @@ pub async fn capture_all(
     let mut chromes = capture::Chromes::default();
     let browser = chromes.launch(chrome, &profile).await?;
     let result = async {
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| Error::Environment(format!("sheet page: {e}")))?;
         let env = |e: String| Error::Environment(format!("sheet: {e}"));
-        let mut out = Vec::new();
-        for (html, w, h) in items {
-            page.execute(
-                SetDeviceMetricsOverrideParams::builder()
-                    .width(i64::from(*w))
-                    .height(i64::from(*h))
-                    .device_scale_factor(1.0)
-                    .mobile(false)
+        // Several pages of the one browser draw at once; item `i` goes to page `i mod pages`, and the PNGs are put
+        // back in item order, so the result is the same as drawing them one after another.
+        let pages = capture::parallel().min(items.len()).max(1);
+        let worker = |k: usize| {
+            let browser = &browser;
+            async move {
+                // A context of its own: a page in a shared window is hidden behind its siblings and never draws a frame.
+                let ctx = browser
+                    .create_browser_context(CreateBrowserContextParams::default())
+                    .await
+                    .map_err(|e| Error::Environment(format!("sheet context: {e}")))?;
+                let target = CreateTargetParams::builder()
+                    .url("about:blank")
+                    .browser_context_id(ctx)
                     .build()
-                    .map_err(env)?,
-            )
-            .await
-            .map_err(|e| env(e.to_string()))?;
-            page.set_content(html.as_str())
-                .await
-                .map_err(|e| env(e.to_string()))?;
-            // Every picture decoded before the capture.
-            page.evaluate("Promise.all([...document.images].map((i) => i.decode().catch(() => {}))).then(() => true)")
-                .await
-                .map_err(|e| env(e.to_string()))?;
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            let png = page
-                .screenshot(ScreenshotParams::from(
-                    CaptureScreenshotParams::builder()
-                        .format(CaptureScreenshotFormat::Png)
-                        .build(),
-                ))
-                .await
-                .map_err(|e| env(e.to_string()))?;
-            out.push(png);
-        }
-        Ok::<_, Error>(out)
+                    .map_err(Error::Environment)?;
+                let page = browser
+                    .new_page(target)
+                    .await
+                    .map_err(|e| Error::Environment(format!("sheet page: {e}")))?;
+                let mut out = Vec::new();
+                for (i, (html, w, h)) in items.iter().enumerate().skip(k).step_by(pages) {
+                    page.execute(
+                        SetDeviceMetricsOverrideParams::builder()
+                            .width(i64::from(*w))
+                            .height(i64::from(*h))
+                            .device_scale_factor(1.0)
+                            .mobile(false)
+                            .build()
+                            .map_err(env)?,
+                    )
+                    .await
+                    .map_err(|e| env(e.to_string()))?;
+                    page.set_content(html.as_str())
+                        .await
+                        .map_err(|e| env(e.to_string()))?;
+                    // Every picture decoded before the capture.
+                    page.evaluate("Promise.all([...document.images].map((i) => i.decode().catch(() => {}))).then(() => true)")
+                        .await
+                        .map_err(|e| env(e.to_string()))?;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let png = page
+                        .screenshot(ScreenshotParams::from(
+                            CaptureScreenshotParams::builder()
+                                .format(CaptureScreenshotFormat::Png)
+                                .build(),
+                        ))
+                        .await
+                        .map_err(|e| env(e.to_string()))?;
+                    out.push((i, png));
+                }
+                Ok::<_, Error>(out)
+            }
+        };
+        let done = futures::future::try_join_all((0..pages).map(worker)).await?;
+        let mut all: Vec<(usize, Vec<u8>)> = done.into_iter().flatten().collect();
+        all.sort_by_key(|(i, _)| *i);
+        Ok::<_, Error>(all.into_iter().map(|(_, png)| png).collect::<Vec<_>>())
     }
     .await;
     for browser in chromes.take_browsers() {
