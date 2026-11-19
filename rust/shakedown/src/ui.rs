@@ -278,7 +278,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         .build()
         .map_err(|e| Error::Environment(format!("runtime: {e}")))?;
     let repeat = opts.repeat.max(1);
-    world::watch_signals();
+    let _signals = world::watch_signals();
     let runs: Vec<Vec<Shot>> = runtime.block_on(async {
         let trace = |what: &str| {
             if std::env::var_os("SHAKEDOWN_TRACE").is_some() {

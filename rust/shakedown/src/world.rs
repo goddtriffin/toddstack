@@ -6,8 +6,10 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use signal_hook::consts::{SIGINT, SIGTERM};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -18,7 +20,6 @@ use crate::error::Error;
 /// The process group of the running server (0: none), so a signal can stop it from anywhere.
 static GROUP: AtomicU32 = AtomicU32::new(0);
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-static WATCH: Once = Once::new();
 
 /// Stops the process group: TERM, a moment to leave, then KILL.
 fn kill_group(pid: u32, mut wait_for: impl FnMut() -> bool) {
@@ -47,27 +48,55 @@ pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
-/// Listens for SIGINT and SIGTERM on its own thread, from now on: the server's process group is stopped at once
-/// (even while `start` is still waiting for it to be ready), and `interrupted()` turns true so the run ends.
-pub fn watch_signals() {
-    WATCH.call_once(|| {
-        std::thread::spawn(|| {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            rt.block_on(async {
-                use tokio::signal::unix::{SignalKind, signal};
-                let (Ok(mut term), Ok(mut int)) = (
-                    signal(SignalKind::terminate()),
-                    signal(SignalKind::interrupt()),
-                ) else {
-                    return;
-                };
-                tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-                INTERRUPTED.store(true, Ordering::SeqCst);
+/// What one signal does while a world is alive and after it.
+struct Hooks {
+    /// True when the next signal must take its default action (no world is alive, or one signal was seen already).
+    default_now: Arc<AtomicBool>,
+}
+
+fn hooks() -> &'static [Hooks; 2] {
+    static HOOKS: OnceLock<[Hooks; 2]> = OnceLock::new();
+    HOOKS.get_or_init(|| {
+        // Actions run in the order registered: first "take the default if `default_now`", then note the signal,
+        // then "from now on take the default". So the first signal during a world is only noted, and every other
+        // one (a second Ctrl-C, or any signal outside a world) ends the process the way an unhandled one does.
+        let one = |sig: i32| {
+            let default_now = Arc::new(AtomicBool::new(true));
+            let _ = signal_hook::flag::register_conditional_default(sig, default_now.clone());
+            let _ = signal_hook::flag::register(sig, SEEN.clone());
+            let _ = signal_hook::flag::register(sig, default_now.clone());
+            Hooks { default_now }
+        };
+        [one(SIGINT), one(SIGTERM)]
+    })
+}
+
+static SEEN: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+
+/// Guards the signal handling for one world's life: dropping it puts SIGINT and SIGTERM back to their default
+/// action (a signal handler cannot be uninstalled safely, so "back" means the handler takes the default action).
+pub struct Signals {
+    stop: Arc<AtomicBool>,
+    watcher: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Listens for SIGINT and SIGTERM while the returned guard lives: the server's process group is stopped at once
+/// (even while `start` is still waiting for it to be ready), and `interrupted()` turns true so the run ends. The
+/// first signal is caught; a second, or any after the guard is dropped, takes the default action, so Ctrl-C always
+/// ends the process. Every call starts clean, so a library caller can run twice.
+#[must_use = "the signals are only watched while the guard lives"]
+pub fn watch_signals() -> Signals {
+    let hooks = hooks();
+    SEEN.store(false, Ordering::SeqCst);
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    for h in hooks {
+        h.default_now.store(false, Ordering::SeqCst);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let watcher = std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            if SEEN.load(Ordering::SeqCst) && !INTERRUPTED.swap(true, Ordering::SeqCst) {
                 let pid = GROUP.load(Ordering::SeqCst);
                 if pid != 0 {
                     // Not waited for here: the run ends through `interrupted()`, and Drop finishes the job.
@@ -77,9 +106,26 @@ pub fn watch_signals() {
                         .stderr(Stdio::null())
                         .status();
                 }
-            });
-        });
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     });
+    Signals {
+        stop,
+        watcher: Some(watcher),
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        for h in hooks() {
+            h.default_now.store(true, Ordering::SeqCst);
+        }
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(w) = self.watcher.take() {
+            let _ = w.join();
+        }
+    }
 }
 
 /// A running server. Dropping it stops the server and everything it started.
@@ -253,6 +299,127 @@ mod tests {
         assert_ne!(a, db_name("accounts-service", Path::new("/tmp/b")));
         assert!(a.starts_with("shakedown_accounts_service_"));
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    fn send(sig: &str, pid: u32) {
+        let _ = Command::new("kill").args([sig, &pid.to_string()]).status();
+    }
+
+    fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !ok() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Runs the named child test below in its own process, so a signal that takes its default action cannot
+    /// end the test run.
+    fn child(name: &str, mode: &str) -> std::process::Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env("SHAKEDOWN_SIGNAL_CHILD", mode)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn lines(
+        child: &mut std::process::Child,
+    ) -> std::io::Lines<std::io::BufReader<std::process::ChildStdout>> {
+        use std::io::BufRead as _;
+        std::io::BufReader::new(child.stdout.take().unwrap()).lines()
+    }
+
+    fn wait_for_line(
+        lines: &mut std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+        line: &str,
+    ) {
+        loop {
+            let got = lines.next().expect("the child ended early").unwrap();
+            if got.ends_with(line) {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn a_second_run_in_the_same_process_works_after_a_signal_ended_the_first() {
+        // Not a child: it signals itself only while the guard lives, which the guard turns into a flag.
+        let first = watch_signals();
+        send("-TERM", std::process::id());
+        wait_until("the first signal is seen", interrupted);
+        drop(first);
+        let second = watch_signals();
+        assert!(
+            !interrupted(),
+            "a new run starts clean, not already interrupted"
+        );
+        send("-INT", std::process::id());
+        wait_until("the second run sees its own signal", interrupted);
+        drop(second);
+    }
+
+    #[test]
+    fn a_signal_child_for_the_tests_below() {
+        let Ok(mode) = std::env::var("SHAKEDOWN_SIGNAL_CHILD") else {
+            return;
+        };
+        let guard = watch_signals();
+        println!("ready");
+        match mode.as_str() {
+            "after-cleanup" => {
+                drop(guard);
+                println!("cleaned");
+            }
+            "twice" => {
+                wait_until("first signal", interrupted);
+                println!("first");
+            }
+            other => panic!("unknown mode {other}"),
+        }
+        // A bounded wait, so a child that wrongly survives a signal is a failing test, not a hang.
+        std::thread::sleep(Duration::from_secs(8));
+        println!("survived");
+    }
+
+    #[test]
+    fn a_signal_after_cleanup_takes_the_default_action_and_ends_the_process() {
+        use std::os::unix::process::ExitStatusExt as _;
+        for sig in ["-TERM", "-INT"] {
+            let mut c = child(
+                "world::tests::a_signal_child_for_the_tests_below",
+                "after-cleanup",
+            );
+            let mut out = lines(&mut c);
+            wait_for_line(&mut out, "cleaned");
+            send(sig, c.id());
+            let status = c.wait().unwrap();
+            assert!(
+                status.signal().is_some(),
+                "{sig} after cleanup kills the process: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_signal_during_a_run_takes_the_default_action() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut c = child("world::tests::a_signal_child_for_the_tests_below", "twice");
+        let mut out = lines(&mut c);
+        wait_for_line(&mut out, "ready");
+        send("-INT", c.id());
+        wait_for_line(&mut out, "first");
+        send("-INT", c.id());
+        let status = c.wait().unwrap();
+        assert!(
+            status.signal().is_some(),
+            "a second Ctrl-C ends the process: {status:?}"
+        );
     }
 
     #[test]
