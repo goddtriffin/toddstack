@@ -37,6 +37,7 @@ use tokio::sync::Semaphore;
 use crate::config::{Action, ScrollTo, World};
 use crate::devices::Device;
 use crate::error::Error;
+use crate::guard::{self, Guard};
 use crate::layout::{self, Finding, Tree};
 
 /// The fake world's answers arrive after this long, as on a phone, so content that lands after the first frame
@@ -205,6 +206,10 @@ pub async fn launch(
             "--disable-gpu-rasterization",
             "--disable-skia-runtime-opts",
         ])
+        // Sandboxed frames stay in their parent's process: Chrome would otherwise move a sandboxed srcdoc frame to
+        // its own process after its first document started, past any script the page session adds. The key has no
+        // dashes: that is how `chromiumoxide` merges it into its own `--disable-features`.
+        .arg(("disable-features", "IsolateSandboxedIframes"))
         .build()
         .map_err(Error::Environment)?;
     let (browser, mut handler) = Browser::launch(config)
@@ -222,6 +227,24 @@ pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> 
         .filter(|n| *n > 0)
         .unwrap_or(PARALLEL);
     let gate = Arc::new(Semaphore::new(parallel));
+    // Its own connection that arms every frame, popup and worker (see `guard`).
+    let guard = match guard::start(browser.websocket_address()).await {
+        Ok(g) => Arc::new(g),
+        Err(why) => {
+            let mut shots: Vec<Shot> = jobs
+                .iter()
+                .map(|j| Shot {
+                    id: j.id(),
+                    png: Vec::new(),
+                    findings: vec![Finding::new("page-failed", why.clone())],
+                    size: (j.device.width, j.device.height),
+                    flaky: None,
+                })
+                .collect();
+            shots.sort_by(|a, b| a.id.cmp(&b.id));
+            return shots;
+        }
+    };
     // A signed-in player is in at most `player_limit` shots at once: servers cap a person's open connections.
     let players: HashMap<String, Arc<Semaphore>> = jobs
         .iter()
@@ -235,7 +258,8 @@ pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> 
         .collect();
     let mut tasks = Vec::new();
     for job in jobs {
-        let (browser, env, gate) = (browser.clone(), env.clone(), gate.clone());
+        let (browser, env, gate, guard) =
+            (browser.clone(), env.clone(), gate.clone(), guard.clone());
         let mine = players.get(&job.plan.player).cloned();
         tasks.push(tokio::spawn(async move {
             // The player's turn first, then a place among the pages drawn at once.
@@ -252,7 +276,8 @@ pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> 
             let mut last = String::new();
             let mut first_failure: Option<String> = None;
             for _ in 0..2 {
-                match tokio::time::timeout(SHOT_TIMEOUT, shoot(&browser, &env, &job)).await {
+                match tokio::time::timeout(SHOT_TIMEOUT, shoot(&browser, &guard, &env, &job)).await
+                {
                     Ok(Ok(mut shot)) => {
                         shot.flaky = first_failure;
                         return shot;
@@ -301,7 +326,7 @@ async fn eval(page: &Page, expression: &str) -> Result<serde_json::Value, String
     Ok(out.result.result.value.unwrap_or(serde_json::Value::Null))
 }
 
-async fn shoot(browser: &Browser, env: &Env, job: &Job) -> Result<Shot, String> {
+async fn shoot(browser: &Browser, guard: &Guard, env: &Env, job: &Job) -> Result<Shot, String> {
     let ctx = browser
         .create_browser_context(CreateBrowserContextParams {
             // A context does not take the command-line proxy: it needs its own dead one (see `PROXY`).
@@ -315,8 +340,18 @@ async fn shoot(browser: &Browser, env: &Env, job: &Job) -> Result<Shot, String> 
         .browser_context_id(ctx.clone())
         .build()
         .map_err(|e| e.clone())?;
+    let collected = Arc::new(Collected::default());
+    let to = collected.clone();
+    guard.register(
+        ctx.as_ref(),
+        Arc::new(move |rule: &str, message: &str| to.note(rule, message)),
+    );
     let page = browser.new_page(target).await.map_err(err("new page"))?;
-    let outcome = draw(&page, env, job).await;
+    // The page is not drawn before the guard is on it (it waits at the debugger until then).
+    let outcome = match guard.armed(page.target_id().as_ref()).await {
+        Ok(()) => draw(&page, env, job, &collected).await,
+        Err(why) => Err(why),
+    };
     let _ = page.close().await;
     let _ = browser.dispose_browser_context(ctx).await;
     outcome
@@ -373,7 +408,12 @@ impl Collected {
 }
 
 #[expect(clippy::too_many_lines, reason = "one page flow, read top to bottom")]
-async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
+async fn draw(
+    page: &Page,
+    env: &Env,
+    job: &Job,
+    collected: &Arc<Collected>,
+) -> Result<Shot, String> {
     let t0 = std::time::Instant::now();
     let lap = |what: &str| {
         if std::env::var_os("SHAKEDOWN_TRACE").is_some() {
@@ -381,8 +421,6 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
         }
     };
     let d = &job.device;
-    let collected = Arc::new(Collected::default());
-
     // The environment: size, density 1, touch, theme, motion, timezone, locale.
     page.execute(
         SetDeviceMetricsOverrideParams::builder()
@@ -426,9 +464,9 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
         .map_err(err("collector"))?;
 
     // Listeners first, then switch the domains on.
-    watch_console(page, &collected, &job.plan.allow).await?;
-    watch_requests(page, &collected, &env.base).await?;
-    intercept(page, env, &job.plan, &collected).await?;
+    watch_console(page, collected, &job.plan.allow).await?;
+    watch_requests(page, collected, &env.base).await?;
+    intercept(page, env, &job.plan, collected).await?;
     page.enable_log().await.map_err(err("log"))?;
     page.enable_runtime().await.map_err(err("runtime"))?;
 
@@ -469,7 +507,7 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
         waited += 20;
     }
     eval(page, "document.fonts.ready.then(() => true)").await?;
-    idle(page, &collected).await?;
+    idle(page, collected).await?;
     lap("idle");
     // Layout shift: nothing may move once it appears. Taken before the actions, which move things on purpose.
     let shifts = eval(page, "JSON.stringify(window.__shakedown.shifts)").await?;
@@ -492,7 +530,7 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
             break;
         }
     }
-    idle(page, &collected).await?;
+    idle(page, collected).await?;
 
     lap("acted");
     // Settled means several captures in a row, a moment apart, are byte-identical (images decoded and rescaled at
@@ -659,10 +697,7 @@ async fn watch_console(page: &Page, c: &Arc<Collected>, allow: &[String]) -> Res
                     })
                     .collect();
                 let text = text.join(" ");
-                if text.starts_with("__shakedown_webrtc__") {
-                    // Not allow-listable: a page may never open a peer connection.
-                    c1.note("webrtc", "WebRTC is blocked: nothing leaves the machine");
-                } else if ok1(&text) {
+                if ok1(&text) {
                     c1.note("console-error", text);
                 }
             }

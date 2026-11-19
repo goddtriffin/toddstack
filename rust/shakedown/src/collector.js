@@ -19,18 +19,6 @@
   window.setTimeout = (f, ms, ...r) => (ms >= 1000 ? 0 : st(f, ms, ...r));
   window.setInterval = () => 0;
 
-  // WebRTC sends UDP that neither the dead proxy nor Chrome's WebRTC policy flags stop, so nothing may construct a
-  // peer connection. The CDP add-script runs in every frame, a fresh iframe's first document included, so grabbing
-  // the constructor from a child frame finds this stub too. The sentinel line is read by the tool (`capture.rs`).
-  const blockRtc = (n) => {
-    const stub = function () {
-      console.error('__shakedown_webrtc__ ' + n);
-      throw new DOMException('WebRTC is blocked: nothing leaves the machine', 'NotAllowedError');
-    };
-    try { Object.defineProperty(window, n, { value: stub, writable: false, configurable: false }); } catch { /* not there */ }
-  };
-  for (const n of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) blockRtc(n);
-
   const S = (window.__shakedown = { shifts: [] });
   const name = (n) => (n ? `${n.nodeName.toLowerCase()}${n.id ? '#' + n.id : ''}${typeof n.className === 'string' && n.className ? '.' + n.className.trim().split(/\s+/).slice(0, 2).join('.') : ''}` : '?');
   const box = (r) => `${Math.round(r.x)},${Math.round(r.y)} ${Math.round(r.width)}x${Math.round(r.height)}`;

@@ -7,6 +7,7 @@ mod config;
 mod devices;
 mod doctor;
 mod error;
+mod guard;
 mod layout;
 mod pixels;
 mod report;
