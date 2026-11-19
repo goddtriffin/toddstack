@@ -639,7 +639,15 @@ fn pack(
         .enable_all()
         .build()
         .map_err(|e| Error::Environment(format!("runtime: {e}")))?;
-    let pngs = runtime.block_on(sheet::capture_all(&chrome, &items))?;
+    // Dropping the capture on a caught signal drops its Chrome guard: Chrome is killed and its profile removed.
+    let signals = crate::world::watch_signals();
+    let pngs = runtime.block_on(async {
+        tokio::select! {
+            r = sheet::capture_all(&chrome, &items) => r,
+            () = async { while !signals.interrupted() { tokio::time::sleep(std::time::Duration::from_millis(50)).await; } } => Err(Error::Failed("interrupted".into())),
+        }
+    })?;
+    drop(signals);
     let mut files = BTreeMap::new();
     for ((route, theme), png) in names.into_iter().zip(pngs) {
         let file = format!("{route}-{theme}.png");

@@ -165,6 +165,59 @@ fn avatar() -> Vec<u8> {
     crate::pixels::encode(&crate::pixels::Image { w: 64, h: 64, px }, 1).unwrap_or_default()
 }
 
+/// The Chromes of one run and their temp profiles. Dropping it (an error, a panic, a failed launch of a later
+/// Chrome, a future dropped on a caught signal) kills every browser launched so far (chromiumoxide kills the child
+/// on drop), stops the handlers and removes the profiles.
+#[derive(Default)]
+pub struct Chromes {
+    browsers: Vec<Arc<Browser>>,
+    handlers: Vec<tokio::task::JoinHandle<()>>,
+    profiles: Vec<std::path::PathBuf>,
+}
+
+impl Chromes {
+    /// Launches one Chrome with `profile` and keeps it under this guard.
+    ///
+    /// # Errors
+    ///
+    /// Chrome is missing or does not start.
+    pub async fn launch(
+        &mut self,
+        chrome: &std::path::Path,
+        profile: &std::path::Path,
+    ) -> Result<Arc<Browser>, Error> {
+        // Recorded before the launch: a failed launch may already have made the profile.
+        self.profiles.push(profile.to_path_buf());
+        let (browser, handler) = launch(chrome, profile).await?;
+        let browser = Arc::new(browser);
+        self.browsers.push(browser.clone());
+        self.handlers.push(handler);
+        Ok(browser)
+    }
+
+    /// Every browser launched so far.
+    pub fn browsers(&self) -> Vec<Arc<Browser>> {
+        self.browsers.clone()
+    }
+
+    /// Hands the browsers over (to be closed), leaving the profiles and handlers to the drop.
+    pub fn take_browsers(&mut self) -> Vec<Arc<Browser>> {
+        std::mem::take(&mut self.browsers)
+    }
+}
+
+impl Drop for Chromes {
+    fn drop(&mut self) {
+        for h in &self.handlers {
+            h.abort();
+        }
+        self.browsers.clear();
+        for p in &self.profiles {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
 /// The dead proxy (port 9 is discard; nothing listens) every browser context and the browser itself use.
 const PROXY: &str = "127.0.0.1:9";
 
@@ -1266,5 +1319,131 @@ mod launch_tests {
                 "{f} in {features:?}"
             );
         }
+    }
+}
+
+/// The collector as `devices serve` runs it: inside an iframe (cross-origin and same-origin) of a tall parent page.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    fn serve() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut c in listener.incoming().flatten() {
+                // A thread per connection: Chrome opens spare connections that never send a request.
+                std::thread::spawn(move || {
+                    let mut buf = [0_u8; 4096];
+                    let n = c.read(&mut buf).unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = head.split(' ').nth(1).unwrap_or("/").to_string();
+                    let body = if path.starts_with("/child") {
+                        // A tall page: real text far below the fold, a decorative icon painted over it.
+                        format!(
+                            "<!doctype html><meta charset=utf-8><body style=\"margin:0;height:3000px;font:16px sans-serif\">\
+<div style=\"position:absolute;top:2000px;left:10px\">Real line of text</div>\
+<div aria-hidden=\"true\" style=\"position:absolute;top:2003px;left:15px;z-index:2;pointer-events:none\">Icon label</div>\
+<script>{}</script><script>addEventListener('load',()=>setTimeout(()=>parent.postMessage({{ frame: true, y: scrollY, x: scrollX }}, '*'), 1500));</script>",
+                            crate::viewer::frame_js("[]")
+                        )
+                    } else {
+                        let host = path.trim_start_matches("/parent/");
+                        format!(
+                            "<!doctype html><meta charset=utf-8><body style=\"margin:0;height:5000px\"><iframe style=\"position:absolute;top:1500px;left:0;width:400px;height:300px;border:0\" src=\"http://{host}:{port}/child\"></iframe>\
+<script>window.__m=[];addEventListener('message',(e)=>window.__m.push(e.data));addEventListener('load',()=>scrollTo(0,1450));</script>"
+                        )
+                    };
+                    let _ = write!(
+                        c,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        port
+    }
+
+    async fn run(child_host: &str) {
+        let port = serve();
+        let profile = std::env::temp_dir().join(format!(
+            "shakedown-frame-{}-{}",
+            std::process::id(),
+            child_host.replace('.', "-")
+        ));
+        let mut chromes = Chromes::default();
+        let browser = chromes
+            .launch(&crate::browser::binary(), &profile)
+            .await
+            .unwrap();
+        // A cross-origin frame runs in its own process, paused until the guard (as in a real run) resumes it.
+        let guard = guard::start(browser.websocket_address()).await.unwrap();
+        let page = browser.new_page("about:blank").await.unwrap();
+        guard.armed(page.target_id().as_ref()).await.unwrap();
+        page.goto(format!("http://localhost:{port}/parent/{child_host}"))
+            .await
+            .unwrap();
+        let mut got = serde_json::Value::Null;
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let v: serde_json::Value = page
+                .evaluate("JSON.stringify({ m: window.__m || [], y: scrollY, x: scrollX })")
+                .await
+                .unwrap()
+                .into_value::<String>()
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            if v["m"].as_array().is_some_and(|m| {
+                m.iter().any(|e| e["frame"] == true) && m.iter().any(|e| e["shakedown"] == "loaded")
+            }) {
+                got = v;
+                break;
+            }
+        }
+        assert!(!got.is_null(), "the frame never reported ({child_host})");
+        let msgs = got["m"].as_array().unwrap();
+        let loaded = msgs.iter().find(|e| e["shakedown"] == "loaded").unwrap();
+        let nodes = loaded["tree"]["nodes"].as_array().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n["decor"] == true
+                    && n["top_lines"].as_array().is_some_and(|l| !l.is_empty())),
+            "ariafold must be caught inside a frame ({child_host}): {nodes:?}"
+        );
+        let frame = msgs.iter().find(|e| e["frame"] == true).unwrap();
+        assert_eq!(
+            frame["y"], 0,
+            "the frame's scroll must be restored ({child_host})"
+        );
+        assert_eq!(frame["x"], 0);
+        assert_eq!(
+            got["y"], 1450,
+            "the parent's scroll must be restored ({child_host})"
+        );
+        assert_eq!(got["x"], 0);
+    }
+
+    #[tokio::test]
+    async fn an_aria_hidden_icon_below_the_fold_is_caught_in_a_cross_origin_frame_and_nothing_scrolls()
+     {
+        if !crate::browser::installed() {
+            eprintln!("pinned Chrome not installed: skipped");
+            return;
+        }
+        run("127.0.0.1").await;
+    }
+
+    #[tokio::test]
+    async fn the_same_holds_in_a_same_origin_frame() {
+        if !crate::browser::installed() {
+            eprintln!("pinned Chrome not installed: skipped");
+            return;
+        }
+        run("localhost").await;
     }
 }

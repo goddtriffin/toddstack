@@ -55,21 +55,41 @@
     const hitAt = (x, y, el) => {
       const w = de.clientWidth, h = de.clientHeight;
       if (x >= 0 && y >= 0 && x < w && y < h) return document.elementFromPoint(x, y);
-      // The page may scroll inside an element (an app shell): scroll the element itself into view, then put every
-      // scroller it moved back, in a finally.
-      const saved = [[window, window.scrollX, window.scrollY]];
-      for (let n = el.parentElement; n; n = n.parentElement) saved.push([n, n.scrollLeft, n.scrollTop]);
+      // The page may scroll inside an element (an app shell): scroll the element itself into view, then put back
+      // every scroller that moved. In `devices serve` this runs inside an iframe, and `scrollIntoView` scrolls every
+      // ancestor too: this page's scrollers, then each parent window and the parent's scrollers. Same-origin
+      // parents are saved and restored here; a cross-origin parent cannot be reached, so `container: 'nearest'`
+      // (Chrome 140+) keeps the scroll inside the nearest scroller to begin with.
+      const saved = [];
+      let reach = true;
+      for (let win = window, node = el; win;) {
+        saved.push([win, win.scrollX, win.scrollY]);
+        for (let n = node && node.parentElement; n; n = n.parentElement) saved.push([n, n.scrollLeft, n.scrollTop]);
+        let frame = null;
+        try { frame = win.frameElement; } catch { reach = false; /* cross-origin parent */ }
+        // A cross-origin parent also reads as `null` here: only the top window is truly the end of the chain.
+        if (!frame) { if (win !== win.top) reach = false; break; }
+        win = frame.ownerDocument.defaultView;
+        node = frame;
+      }
       const before = el.getBoundingClientRect();
-      try {
-        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      const probe = (opts) => {
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant', ...opts });
         const after = el.getBoundingClientRect();
-        const px = x + after.left - before.left, py = y + after.top - before.top;
+        return [x + after.left - before.left, y + after.top - before.top];
+      };
+      const off = (px, py) => px < 0 || py < 0 || px >= w || py >= h;
+      try {
+        let [px, py] = probe({ container: 'nearest' });
+        // Nested scrollers: the nearest one alone may not bring it into view. Scroll them all (restored below), but
+        // only when every parent can be restored.
+        if (off(px, py) && reach) [px, py] = probe({});
         // Still off screen: unknown, so skip it rather than call it covered or clear.
-        if (px < 0 || py < 0 || px >= w || py >= h) return null;
+        if (off(px, py)) return null;
         return document.elementFromPoint(px, py);
       } finally {
         for (const [n, l, t] of saved) {
-          if (n === window) window.scrollTo({ left: l, top: t, behavior: 'instant' });
+          if (n.scrollTo && n.window === n) n.scrollTo({ left: l, top: t, behavior: 'instant' });
           else { n.scrollLeft = l; n.scrollTop = t; }
         }
       }
