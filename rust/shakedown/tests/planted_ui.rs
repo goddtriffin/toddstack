@@ -484,6 +484,14 @@ fn a_websocket_that_leaves_the_machine_fails() {
     );
 }
 
+/// A listener posing as the outside world, in python3 (the sites here already need it): it prints its port, then
+/// "connected" or "none" once stdin closes.
+const LISTENER: &str = "import select, socket, sys\n\
+s = socket.socket(); s.bind((sys.argv[1], 0)); s.listen(5)\n\
+print(s.getsockname()[1], flush=True)\n\
+ready = select.select([s, sys.stdin], [], [], 120)[0]\n\
+print('connected' if s in ready else 'none')\n";
+
 /// This machine's address on the network (not loopback), if it has one.
 fn lan_ip() -> Option<std::net::IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -499,13 +507,7 @@ fn a_request_or_websocket_to_another_host_never_connects() {
         eprintln!("no network address: skipped");
         return;
     };
-    // A listener posing as the outside world, reachable only through a non-loopback address. It runs in python3
-    // (the sites here already need it): it prints its port, then "connected" or "none" once stdin closes.
-    const LISTENER: &str = "import select, socket, sys\n\
-s = socket.socket(); s.bind((sys.argv[1], 0)); s.listen(5)\n\
-print(s.getsockname()[1], flush=True)\n\
-ready = select.select([s, sys.stdin], [], [], 120)[0]\n\
-print('connected' if s in ready else 'none')\n";
+    // Reachable only through a non-loopback address.
     let mut listener = Command::new("python3")
         .args(["-c", LISTENER, &ip.to_string()])
         .stdin(std::process::Stdio::piped())
