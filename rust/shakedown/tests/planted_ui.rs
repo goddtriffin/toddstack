@@ -839,3 +839,25 @@ fn a_real_overlap_and_clip_still_fail_beside_hidden_ones() {
         "text-overlap",
     );
 }
+
+#[test]
+fn a_pointer_events_none_icon_painted_over_text_still_fails() {
+    planted(
+        "decornone",
+        &format!(
+            "{OK_BODY}<div style=\"position:absolute;top:200px;left:10px\">Real line of text</div><div aria-hidden=\"true\" style=\"position:absolute;top:203px;left:15px;z-index:2;pointer-events:none\">Icon label</div>"
+        ),
+        "text-overlap",
+    );
+}
+
+#[test]
+fn an_overlap_below_the_fold_fails() {
+    planted(
+        "belowfold",
+        &format!(
+            "{OK_BODY}<div style=\"height:3000px\"></div><div style=\"position:absolute;top:2000px;left:10px\">First line of text</div><div style=\"position:absolute;top:2005px;left:20px\">Second line of text</div>"
+        ),
+        "text-overlap",
+    );
+}
