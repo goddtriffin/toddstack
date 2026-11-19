@@ -107,6 +107,7 @@ pub fn plan(root: &Path, s: &Screen, now_ms: i64) -> Result<Plan, Error> {
         name: s.name.clone(),
         path: s.path.clone(),
         player: s.player.clone(),
+        turn: s.turn,
         routes,
         act: s.act.clone(),
         allow: s.allow_console.iter().map(|a| a.contains.clone()).collect(),

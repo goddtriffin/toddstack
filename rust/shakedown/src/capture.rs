@@ -77,6 +77,8 @@ pub struct Plan {
     pub path: String,
     /// `guest` or an account.
     pub player: String,
+    /// Whether the shot takes one of the player's turns (see `[players].parallel`).
+    pub turn: bool,
     /// `"METHOD /path"` to its answer.
     pub routes: HashMap<String, Fixture>,
     /// Steps before the shot.
@@ -325,7 +327,7 @@ pub async fn shoot_all(browsers: Vec<Arc<Browser>>, env: Arc<Env>, jobs: Vec<Job
     // A signed-in player is in at most `player_limit` shots at once: servers cap a person's open connections.
     let players: HashMap<String, Arc<Semaphore>> = jobs
         .iter()
-        .filter(|j| j.plan.player != "guest")
+        .filter(|j| j.plan.player != "guest" && j.plan.turn)
         .map(|j| {
             (
                 j.plan.player.clone(),
@@ -343,10 +345,18 @@ pub async fn shoot_all(browsers: Vec<Arc<Browser>>, env: Arc<Env>, jobs: Vec<Job
             gate.clone(),
             guards[at].clone(),
         );
-        let mine = players.get(&job.plan.player).cloned();
+        let mine = if job.plan.turn {
+            players.get(&job.plan.player).cloned()
+        } else {
+            None
+        };
         tasks.push(tokio::spawn(async move {
-            // A place among the pages open at once. The player's turn comes later, inside `shoot`, once the page is
-            // ready: only drawing opens the server's connections, so only drawing counts against the player's cap.
+            // The player's turn first, then a place among the pages open at once: a shot waiting for its player's
+            // turn holds no place, so the places go to shots that can run. Both are kept across the retry.
+            let _turn = match &mine {
+                Some(t) => t.clone().acquire_owned().await.ok(),
+                None => None,
+            };
             let _permit = gate.acquire().await;
             let size = (job.device.width, job.device.height);
             let id = job.id();
@@ -356,7 +366,7 @@ pub async fn shoot_all(browsers: Vec<Arc<Browser>>, env: Arc<Env>, jobs: Vec<Job
             let mut last = String::new();
             let mut first_failure: Option<String> = None;
             for _ in 0..2 {
-                match shoot(&browser, &guard, &env, &job, mine.as_ref()).await {
+                match shoot(&browser, &guard, &env, &job).await {
                     Ok(mut shot) => {
                         shot.flaky = first_failure;
                         return shot;
@@ -409,7 +419,6 @@ async fn shoot(
     guard: &Guard,
     env: &Env,
     job: &Job,
-    turn: Option<&Arc<Semaphore>>,
 ) -> Result<Shot, String> {
     let t0 = std::time::Instant::now();
     let lap = |what: &str| {
@@ -432,8 +441,6 @@ async fn shoot(
         ctx.as_ref(),
         Arc::new(move |rule: &str, message: &str| to.note(rule, message)),
     );
-    // Starting the page (a new renderer process) is the slow part of a shot; it happens before the player's turn,
-    // so while a player's turns are all taken the next pages are already warm.
     let prepared = tokio::time::timeout(SHOT_TIMEOUT, async {
         let target = CreateTargetParams::builder()
             .url("about:blank")
@@ -455,10 +462,6 @@ async fn shoot(
     lap("page ready");
     let outcome = match prepared {
         Ok(page) => {
-            let _turn = match turn {
-                Some(t) => t.acquire().await.ok(),
-                None => None,
-            };
             let outcome = tokio::time::timeout(SHOT_TIMEOUT, draw(&page, env, job, &collected))
                 .await
                 .unwrap_or_else(|_| Err(slow()));

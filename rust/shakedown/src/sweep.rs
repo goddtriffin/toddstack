@@ -230,13 +230,14 @@ fn pages(config: &Config, only: &[String]) -> Result<Vec<(Page, Arc<Screen>)>, E
     let sweep = config.sweep.clone().unwrap_or_default();
     let mut all: Vec<(Page, Arc<Screen>)> = Vec::new();
     for r in &sweep.routes {
-        let (path, name, player, routes, allow) = match r {
+        let (path, name, player, routes, allow, turn) = match r {
             SweepRoute::Path(p) => (
                 p.clone(),
                 None,
                 "guest".to_string(),
                 BTreeMap::new(),
                 Vec::new(),
+                true,
             ),
             SweepRoute::Page(p) => (
                 p.path.clone(),
@@ -244,6 +245,7 @@ fn pages(config: &Config, only: &[String]) -> Result<Vec<(Page, Arc<Screen>)>, E
                 p.player.clone(),
                 p.routes.clone(),
                 p.allow_console.clone(),
+                p.turn,
             ),
         };
         let name = page_name(name.as_deref(), &path);
@@ -251,6 +253,7 @@ fn pages(config: &Config, only: &[String]) -> Result<Vec<(Page, Arc<Screen>)>, E
             name: name.clone(),
             path: path.clone(),
             player: player.clone(),
+            turn,
             routes,
             act: Vec::new(),
             devices: None,
@@ -274,6 +277,7 @@ fn pages(config: &Config, only: &[String]) -> Result<Vec<(Page, Arc<Screen>)>, E
             name: page_name(Some(&g.name), &g.path),
             path: g.path.clone(),
             player: "group".into(),
+            turn: true,
             routes: g.routes.clone(),
             act: Vec::new(),
             devices: None,

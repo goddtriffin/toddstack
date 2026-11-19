@@ -177,6 +177,11 @@ pub struct SweepPage {
     /// `guest` (default) or one of `[players].accounts`.
     #[serde(default = "default_player")]
     pub player: String,
+    /// Whether the page counts against the player's `[players].parallel` turns (default true). Set `false` for a
+    /// page that opens none of the connections the server caps per person (accounts-service: only its friends page
+    /// opens an event stream), so its shots never wait for a turn.
+    #[serde(default = "default_turn")]
+    pub turn: bool,
     /// Fixtures, fake worlds only (as in a screen).
     #[serde(default)]
     pub routes: BTreeMap<String, Route>,
@@ -281,6 +286,11 @@ pub struct Screen {
     /// `guest` (default) or one of `[players].accounts`.
     #[serde(default = "default_player")]
     pub player: String,
+    /// Whether the page counts against the player's `[players].parallel` turns (default true). Set `false` for a
+    /// page that opens none of the connections the server caps per person (accounts-service: only its friends page
+    /// opens an event stream), so its shots never wait for a turn.
+    #[serde(default = "default_turn")]
+    pub turn: bool,
     /// `"METHOD /path"` (or with `?query`) to the fixture that answers it.
     #[serde(default)]
     pub routes: BTreeMap<String, Route>,
@@ -292,6 +302,10 @@ pub struct Screen {
     /// Console messages that are expected, with the reason.
     #[serde(default)]
     pub allow_console: Vec<AllowConsole>,
+}
+
+const fn default_turn() -> bool {
+    true
 }
 
 fn default_player() -> String {
