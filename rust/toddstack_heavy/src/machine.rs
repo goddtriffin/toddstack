@@ -1,6 +1,6 @@
 //! Probing the machine: capacity, live samples, process liveness, network and VRAM counters.
 //!
-//! `HEAVY_CAPACITY` (`cpu=8,mem=16G,vram=0,disk=100G`) and `HEAVY_LIVE` (`load=0.5,mem_pct=10,disk_free=50G,nonheavy_cpu=200,nonheavy_mem=8G,nonheavy_vram=0`)
+//! `HEAVY_CAPACITY` (`cpu=8,mem=16G,vram=0,disk=100G`) and `HEAVY_LIVE` (`load=0.5,load5=0.5,mem_pct=10,disk_free=50G,nonheavy_cpu=200,nonheavy_mem=8G,nonheavy_vram=0`)
 //! override probed numbers; the tests use them.
 
 use std::collections::HashMap;
@@ -142,6 +142,53 @@ fn whole(x: f32) -> u64 {
     format!("{:.0}", x.max(0.0)).parse().unwrap_or(0)
 }
 
+fn child_map(sys: &System) -> HashMap<Pid, Vec<Pid>> {
+    let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
+    for (pid, p) in sys.processes() {
+        if let Some(parent) = p.parent() {
+            children.entry(parent).or_default().push(*pid);
+        }
+    }
+    children
+}
+
+/// Live usage of the process tree rooted at `root` (the one accounting used for running jobs and for the
+/// peaks recorded in history).
+fn tree_usage(sys: &System, children: &HashMap<Pid, Vec<Pid>>, root: u32, gpu: &[(u32, u64)]) -> Usage {
+    let mut total = Usage::default();
+    let mut stack = vec![Pid::from_u32(root)];
+    while let Some(pid) = stack.pop() {
+        if let Some(p) = sys.process(pid) {
+            total.cpu += whole(p.cpu_usage());
+            total.mem += p.memory();
+            total.vram += gpu.iter().filter(|(g, _)| *g == pid.as_u32()).map(|(_, m)| m).sum::<u64>();
+        }
+        stack.extend(children.get(&pid).into_iter().flatten().copied());
+    }
+    total
+}
+
+/// Keeps one `System` between samples so per-process CPU percentages are valid from the second sample on.
+pub struct TreeSampler {
+    sys: System,
+    root: u32,
+}
+
+impl TreeSampler {
+    /// # Errors
+    /// Fails when the system cannot be probed.
+    pub fn new(root: u32) -> Result<Self, Error> {
+        Ok(Self { sys: System::new()?, root })
+    }
+
+    /// Current CPU (centi-cores) and RSS of the whole process tree.
+    pub fn sample(&mut self) -> Usage {
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        let children = child_map(&self.sys);
+        tree_usage(&self.sys, &children, self.root, &[])
+    }
+}
+
 /// Machine-wide usage and the live usage of each running job's process tree, over a short window.
 fn measure(jobs: &[Job], cpu_count: u32, want_vram: bool) -> Result<(Usage, Vec<(String, Usage)>), Error> {
     let mut sys = System::new()?;
@@ -163,28 +210,8 @@ fn measure(jobs: &[Job], cpu_count: u32, want_vram: bool) -> Result<(Usage, Vec<
         mem: sys.total_memory().saturating_sub(sys.available_memory()),
         vram: if want_vram { vram().map_or(0, |(_, used)| used) } else { 0 },
     };
-    let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
-    for (pid, p) in sys.processes() {
-        if let Some(parent) = p.parent() {
-            children.entry(parent).or_default().push(*pid);
-        }
-    }
-    let per_job = jobs
-        .iter()
-        .map(|j| {
-            let mut total = Usage::default();
-            let mut stack = vec![Pid::from_u32(j.pid)];
-            while let Some(pid) = stack.pop() {
-                if let Some(p) = sys.process(pid) {
-                    total.cpu += whole(p.cpu_usage());
-                    total.mem += p.memory();
-                    total.vram += gpu.iter().filter(|(g, _)| *g == pid.as_u32()).map(|(_, m)| m).sum::<u64>();
-                }
-                stack.extend(children.get(&pid).into_iter().flatten().copied());
-            }
-            (j.id.clone(), total)
-        })
-        .collect();
+    let children = child_map(&sys);
+    let per_job = jobs.iter().map(|j| (j.id.clone(), tree_usage(&sys, &children, j.pid, &gpu))).collect();
     Ok((machine, per_job))
 }
 
@@ -199,6 +226,11 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
     let load1 = match get(&o, "load") {
         Some(v) => v.parse().map_err(|_| bad("load", v))?,
         None => System::load_average()?.one,
+    };
+    let load5 = match get(&o, "load5") {
+        Some(v) => v.parse().map_err(|_| bad("load5", v))?,
+        None if get(&o, "load").is_some() => load1,
+        None => System::load_average()?.five,
     };
     let mem_used_pct = if let Some(v) = get(&o, "mem_pct") {
         v.parse().map_err(|_| bad("mem_pct", v))?
@@ -222,7 +254,7 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         let trees = per_job.iter().fold(Usage::default(), |a, (_, u)| Usage { cpu: a.cpu + u.cpu, mem: a.mem + u.mem, vram: a.vram + u.vram });
         (non_heavy(machine, trees), per_job)
     };
-    Ok(Live { load1, mem_used_pct, disk_free, non_heavy, per_job })
+    Ok(Live { load1, load5, mem_used_pct, disk_free, non_heavy, per_job })
 }
 
 /// The start time of a live process (seconds since the epoch), or `None` when it does not exist.

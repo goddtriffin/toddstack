@@ -12,7 +12,7 @@ use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
 use crate::error::Error;
-use crate::job::Job;
+use crate::job::{Job, START_UNKNOWN};
 use crate::machine::process_start;
 
 #[derive(Debug, Clone)]
@@ -100,9 +100,21 @@ impl StateDir {
         jobs
     }
 
-    /// Reads the jobs and deletes the files of dead ones (call with the lock held).
+    /// Removes leftover `.tmp` files of writers that died mid-write. Writers hold the lock, so with the lock
+    /// held every `.tmp` file is stale.
+    fn sweep_tmp(&self) {
+        let Ok(rd) = fs::read_dir(self.jobs_dir()) else { return };
+        for e in rd.filter_map(Result::ok) {
+            if e.file_name().to_str().is_some_and(|n| n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "tmp")) {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+
+    /// Reads the jobs and deletes the files of dead ones and stale `.tmp` files (call with the lock held).
     #[must_use]
     pub fn live_jobs(&self) -> Vec<Job> {
+        self.sweep_tmp();
         let (alive, dead): (Vec<Job>, Vec<Job>) = self.read_jobs().into_iter().partition(is_alive);
         for j in dead {
             self.remove_job(&j.id);
@@ -111,7 +123,8 @@ impl StateDir {
     }
 }
 
-/// A job is alive when its pid exists and that process started when the job file says.
+/// A job is alive when its pid exists and that process started when the job file says. A failed probe of
+/// the process start (here or when the file was written) never makes a live job look dead.
 #[must_use]
 pub fn is_alive(job: &Job) -> bool {
     let Ok(pid) = i32::try_from(job.pid) else { return false };
@@ -119,7 +132,10 @@ pub fn is_alive(job: &Job) -> bool {
         Ok(()) | Err(nix::errno::Errno::EPERM) => {}
         Err(_) => return false,
     }
-    process_start(job.pid).is_some_and(|t| t == job.start_time)
+    match process_start(job.pid) {
+        Some(t) => job.start_time == START_UNKNOWN || t == job.start_time,
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +168,16 @@ mod tests {
         let ids: Vec<String> = s.live_jobs().into_iter().map(|j| j.id).collect();
         assert_eq!(ids, vec!["alive".to_string()]);
         assert_eq!(s.read_jobs().len(), 1, "dead files are deleted from disk");
+    }
+
+    #[test]
+    fn unknown_start_time_is_alive_while_the_pid_exists_and_tmp_files_are_swept() {
+        let (_t, s) = dir();
+        s.write_job(&job("unknown", std::process::id(), START_UNKNOWN, State::Running)).unwrap();
+        std::fs::write(s.jobs_dir().join(".stale.tmp"), "{").unwrap();
+        let ids: Vec<String> = s.live_jobs().into_iter().map(|j| j.id).collect();
+        assert_eq!(ids, vec!["unknown".to_string()]);
+        assert!(!s.jobs_dir().join(".stale.tmp").exists());
     }
 
     #[test]

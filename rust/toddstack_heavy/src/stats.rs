@@ -23,8 +23,14 @@ pub struct Stats {
     pub cpu_sys_ms: u64,
     /// Average cores used, times 100 (cpu time over wall time).
     pub centi_cores: u64,
-    /// The largest single process.
+    /// The largest single process (`ru_maxrss`).
     pub peak_rss: u64,
+    /// Peak of the whole process tree's RSS, sampled while the job ran.
+    #[serde(default)]
+    pub peak_tree_rss: u64,
+    /// Peak cores (times 100) the whole process tree used at once, sampled while the job ran.
+    #[serde(default)]
+    pub peak_centi_cores: u64,
     pub blocks_in: u64,
     pub blocks_out: u64,
     /// Machine-wide, not just this job.
@@ -91,11 +97,14 @@ fn secs(ms: u64) -> String {
 pub fn format_stats(s: &Stats) -> String {
     let timing = if s.queued_ms >= SIGNIFICANT_QUEUE_MS { format!("queued {}, ran {}", secs(s.queued_ms), secs(s.run_ms)) } else { format!("ran {}", secs(s.run_ms)) };
     let mut out = format!(
-        "heavy: {timing}\nheavy: cpu {} user + {} sys, avg {}.{:02} cores\nheavy: peak rss {} (largest process), disk blocks read {} written {}\nheavy: network (machine-wide) in {} out {}",
+        "heavy: {timing}\nheavy: cpu {} user + {} sys, avg {}.{:02} cores, peak {}.{:02} cores\nheavy: peak rss {} (whole process tree) / {} (largest process), disk blocks read {} written {}\nheavy: network (machine-wide) in {} out {}",
         secs(s.cpu_user_ms),
         secs(s.cpu_sys_ms),
         s.centi_cores / 100,
         s.centi_cores % 100,
+        s.peak_centi_cores / 100,
+        s.peak_centi_cores % 100,
+        fmt_size(s.peak_tree_rss),
         fmt_size(s.peak_rss),
         s.blocks_in,
         s.blocks_out,
@@ -131,11 +140,12 @@ mod tests {
 
     #[test]
     fn formats_report() {
-        let s = Stats { queued_ms: 1500, run_ms: 4000, cpu_user_ms: 6000, cpu_sys_ms: 2000, centi_cores: 250, peak_rss: 1 << 30, blocks_in: 5, blocks_out: 7, net_in: 2048, net_out: 0, peak_vram: Some(1 << 30), steal_ms: Some(300), timed_out: true };
+        let s = Stats { queued_ms: 1500, run_ms: 4000, cpu_user_ms: 6000, cpu_sys_ms: 2000, centi_cores: 250, peak_rss: 1 << 30, peak_tree_rss: 3 << 30, peak_centi_cores: 450, blocks_in: 5, blocks_out: 7, net_in: 2048, net_out: 0, peak_vram: Some(1 << 30), steal_ms: Some(300), timed_out: true };
         let text = format_stats(&s);
         assert!(text.contains("queued 1.5s, ran 4.0s"), "{text}");
         assert!(text.contains("avg 2.50 cores"), "{text}");
-        assert!(text.contains("peak rss 1.0G"), "{text}");
+        assert!(text.contains("peak 4.50 cores"), "{text}");
+        assert!(text.contains("peak rss 3.0G (whole process tree) / 1.0G (largest process)"), "{text}");
         assert!(text.contains("network (machine-wide) in 2.0K out 0B"), "{text}");
         assert!(text.contains("peak vram (machine-wide) 1.0G"), "{text}");
         assert!(text.contains("steal (machine-wide) 0.3s"), "{text}");

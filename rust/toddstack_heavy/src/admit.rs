@@ -21,6 +21,8 @@ pub const SMOOTH_WINDOW: usize = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Start,
+    /// The job can never run here (the disk is too full even with nothing else running): exit at once.
+    Fail(String),
     /// `live` is true when live data is the blocker, so waiting re-samples on a timer; otherwise a job
     /// finishing (a file event) is what unblocks it.
     Wait { reason: String, live: bool },
@@ -91,18 +93,31 @@ pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live) -> Usage {
     ceiling(cap).saturating_sub(live.non_heavy).saturating_sub(held)
 }
 
-/// Live guards, a veto only.
+/// The disk cannot hold the request even with no heavy job running: waiting would never help.
 #[must_use]
-pub fn guard_block(req: Weights, cap: &Capacity, live: &Live) -> Option<String> {
-    if live.load1 >= f64::from(cap.cpu) {
-        return Some(format!("load {:.1} >= {} cores", live.load1, cap.cpu));
+pub fn disk_full(req: Weights, cap: &Capacity, live: &Live) -> Option<String> {
+    let need = u128::from(req.disk) + u128::from(cap.disk_total) / 10;
+    (u128::from(live.disk_free) < need).then(|| {
+        format!(
+            "the disk is full: {} free, need {} (the request plus 10% of the disk). Clean up, or ask Todd",
+            crate::sizes::fmt_size(live.disk_free),
+            crate::sizes::fmt_size(u64::try_from(need).unwrap_or(u64::MAX))
+        )
+    })
+}
+
+/// Live guards, a veto only. Load is judged over 1 and 5 minutes, each under 2 x cores (macOS load reads high).
+#[must_use]
+pub fn guard_block(cap: &Capacity, live: &Live) -> Option<String> {
+    let limit = 2.0 * f64::from(cap.cpu);
+    if live.load1 >= limit {
+        return Some(format!("1-minute load {:.1} >= {limit:.0} (2 x {} cores)", live.load1, cap.cpu));
+    }
+    if live.load5 >= limit {
+        return Some(format!("5-minute load {:.1} >= {limit:.0} (2 x {} cores)", live.load5, cap.cpu));
     }
     if live.mem_used_pct >= PCT {
         return Some(format!("memory {}% used", live.mem_used_pct));
-    }
-    let need = u128::from(req.disk) + u128::from(cap.disk_total) / 10;
-    if u128::from(live.disk_free) < need {
-        return Some("not enough free disk".to_string());
     }
     None
 }
@@ -118,7 +133,7 @@ fn blocker(w: Weights, running: &[&Job], cap: &Capacity, live: &Live) -> Option<
             return Some(("no headroom (other programs and running jobs use the machine)".to_string(), true));
         }
     }
-    guard_block(w, cap, live).map(|why| (why, true))
+    guard_block(cap, live).map(|why| (why, true))
 }
 
 /// Can `job` start now, given every job file (already pruned of dead ones)?
@@ -128,16 +143,26 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
     let mut queued: Vec<&Job> = jobs.iter().filter(|j| j.state == State::Queued).collect();
     queued.sort_by(|a, b| (a.enqueued_ms, &a.id).cmp(&(b.enqueued_ms, &b.id)));
 
+    if let Some(why) = disk_full(job.weights, cap, live) {
+        return Decision::Fail(why);
+    }
     if let Some(head) = queued.first().filter(|h| h.id != job.id) {
-        if now_ms - head.enqueued_ms >= BACKFILL_WINDOW_MS {
-            return wait(format!("queued behind {} (waited over 60 s)", head.id), false);
-        }
         if blocker(head.weights, &running, cap, live).is_none() {
-            return wait("queued behind a job that fits now", false);
-        }
-        let (a, h) = (job.weights, head.weights);
-        if a.cpu > h.cpu || a.mem > h.mem || a.vram > h.vram {
-            return wait("queued behind a smaller-or-equal head", false);
+            // The head could start now: this job may go first only if the head still fits next to it.
+            let me = Job { state: State::Running, ..job.clone() };
+            let mut with_me = running.clone();
+            with_me.push(&me);
+            if blocker(head.weights, &with_me, cap, live).is_some() {
+                return wait("queued behind a job that fits now", false);
+            }
+        } else {
+            if now_ms - head.enqueued_ms >= BACKFILL_WINDOW_MS {
+                return wait(format!("queued behind {} (waited over 60 s)", head.id), false);
+            }
+            let (a, h) = (job.weights, head.weights);
+            if a.cpu > h.cpu || a.mem > h.mem || a.vram > h.vram {
+                return wait("queued behind a smaller-or-equal head", false);
+            }
         }
     }
     match blocker(job.weights, &running, cap, live) {
@@ -245,8 +270,12 @@ mod tests {
     #[test]
     fn guards_veto() {
         let me = job("a", 1, 1, State::Queued, 0);
-        let busy = Live { load1: 12.0, ..calm() };
+        let busy = Live { load1: 21.0, ..calm() };
         assert!(matches!(evaluate(&me, std::slice::from_ref(&me), &cap(), &busy, 0), Decision::Wait { live: true, .. }));
+        let calm_1m = Live { load1: 19.0, ..calm() };
+        assert_eq!(evaluate(&me, std::slice::from_ref(&me), &cap(), &calm_1m, 0), Decision::Start, "macOS load reads high: 2 x cores");
+        let busy5 = Live { load5: 20.5, ..calm() };
+        assert!(matches!(evaluate(&me, std::slice::from_ref(&me), &cap(), &busy5, 0), Decision::Wait { live: true, .. }));
         let mem = Live { mem_used_pct: 95, ..calm() };
         assert!(waits(&evaluate(&me, std::slice::from_ref(&me), &cap(), &mem, 0)));
     }
@@ -256,7 +285,7 @@ mod tests {
         let mut me = job("a", 1, 1, State::Queued, 0);
         me.weights.disk = 500 * G;
         let low = Live { disk_free: 550 * G, ..calm() };
-        assert!(waits(&evaluate(&me, std::slice::from_ref(&me), &cap(), &low, 0)));
+        assert!(matches!(evaluate(&me, std::slice::from_ref(&me), &cap(), &low, 0), Decision::Fail(m) if m.contains("disk is full")));
         let ok = Live { disk_free: 600 * G, ..calm() };
         assert_eq!(evaluate(&me, std::slice::from_ref(&me), &cap(), &ok, 0), Decision::Start);
     }
@@ -280,12 +309,27 @@ mod tests {
     }
 
     #[test]
-    fn head_goes_first_when_it_fits() {
+    fn follower_starts_when_it_fits_together_with_the_head() {
         let head = job("h", 5, 10, State::Queued, 1);
         let small = job("s", 1, 5, State::Queued, 2);
         let all = [head.clone(), small.clone()];
-        assert!(waits(&evaluate(&small, &all, &cap(), &calm(), 3)));
+        assert_eq!(evaluate(&small, &all, &cap(), &calm(), 3), Decision::Start);
         assert_eq!(evaluate(&head, &all, &cap(), &calm(), 3), Decision::Start);
+    }
+
+    #[test]
+    fn follower_waits_when_it_would_stop_the_head_fitting() {
+        // The ceiling is 9 cores: head 5 fits alone, but 5 + 5 does not.
+        let head = job("h", 5, 10, State::Queued, 1);
+        let other = job("o", 5, 10, State::Queued, 2);
+        let all = [head.clone(), other.clone()];
+        assert!(waits(&evaluate(&other, &all, &cap(), &calm(), 3)));
+        assert_eq!(evaluate(&head, &all, &cap(), &calm(), 3), Decision::Start);
+        // Same with a running job: head fits (5 + 3), a follower of 2 would push it over 9.
+        let run = job("r", 3, 10, State::Running, 0);
+        let follow = job("f", 2, 1, State::Queued, 3);
+        let all = [run, head.clone(), follow.clone()];
+        assert!(waits(&evaluate(&follow, &all, &cap(), &calm(), 4)));
     }
 
     #[test]

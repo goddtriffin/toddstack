@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Marker in `start_time` when the process start could not be probed: liveness then checks the pid only.
+pub const START_UNKNOWN: u64 = u64::MAX;
+
 /// What a job reserves. Disk is free space it needs left over, not a sum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Weights {
@@ -56,6 +59,7 @@ impl Usage {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Live {
     pub load1: f64,
+    pub load5: f64,
     pub mem_used_pct: u64,
     pub disk_free: u64,
     /// Machine-wide usage minus the process trees of running heavy jobs (smoothed by the caller).

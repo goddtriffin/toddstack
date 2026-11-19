@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use nix::sys::signal::{Signal, killpg};
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, kill, killpg};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -18,10 +20,11 @@ use crate::admit::{Decision, Smoother, evaluate};
 use crate::cli::Flags;
 use crate::error::Error;
 use crate::history::{self, Entry};
-use crate::job::{Capacity, Job, State, Weights};
-use crate::machine::{self, cpu_times, net_bytes, process_start, vram};
+use crate::job::{Capacity, Job, START_UNKNOWN, State, Usage, Weights};
+use crate::machine::{self, TreeSampler, cpu_times, net_bytes, process_start, vram};
 use crate::state::{StateDir, is_alive};
 use crate::stats::{children_usage, compute, format_stats};
+use crate::tty::{Terminal, TerminalGuard};
 
 const DEFAULT_CPU: u32 = 4;
 const DEFAULT_MEM: u64 = 4 << 30;
@@ -31,6 +34,10 @@ const LIVE_RESAMPLE: Duration = Duration::from_secs(10);
 const SWEEP: Duration = Duration::from_secs(30);
 const DEFAULT_GRACE_MS: u64 = 10_000;
 const TIMEOUT_EXIT: u8 = 124;
+/// `EX_TEMPFAIL`: the disk is full, retry after cleaning up.
+const DISK_FULL_EXIT: u8 = 75;
+/// How often the process tree's peak CPU and RSS are sampled while a job runs (monitoring).
+const TREE_SAMPLE: Duration = Duration::from_millis(500);
 
 enum Event {
     Fs,
@@ -44,9 +51,13 @@ struct Sig {
     last: AtomicI32,
 }
 
+/// Sends `sig` to the group, then SIGCONT so a stopped group can act on it.
 fn forward(pgid: i32, sig: i32) {
     if let Ok(s) = Signal::try_from(sig) {
         let _ = killpg(Pid::from_raw(pgid), s);
+        if s != Signal::SIGKILL {
+            let _ = killpg(Pid::from_raw(pgid), Signal::SIGCONT);
+        }
     }
 }
 
@@ -127,7 +138,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
     let mut job = Job {
         id: format!("{enqueued_ms:013}-{pid}"),
         pid,
-        start_time: process_start(pid).unwrap_or(0),
+        start_time: probe_start(pid),
         weights,
         cmd: cmd.to_vec(),
         cwd: cwd_str,
@@ -143,10 +154,26 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
     match acquire(state, &cwd, &cap, &mut job, &rx) {
         Ok(()) => {}
         Err(Error::Interrupted(s)) => return Ok(u8::try_from(128 + s).unwrap_or(130)),
+        Err(Error::DiskFull(why)) => {
+            eprintln!("heavy: {why}");
+            return Ok(DISK_FULL_EXIT);
+        }
         Err(e) => return Err(e),
     }
     let queued_ms = u64::try_from(now_ms() - enqueued_ms).unwrap_or(0);
     execute(state, &cap, &job, &sig, flags.timeout(), queued_ms)
+}
+
+/// The process start time, retried; when it cannot be read, the marker that makes liveness check the pid only
+/// (never 0 or a wrong time, which would let other processes delete a live job's file).
+fn probe_start(pid: u32) -> u64 {
+    for _ in 0..5 {
+        if let Some(t) = process_start(pid) {
+            return t;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    START_UNKNOWN
 }
 
 fn watch(dir: &Path, tx: Sender<Event>) -> Result<notify::RecommendedWatcher, Error> {
@@ -177,7 +204,11 @@ fn acquire(state: &StateDir, cwd: &Path, cap: &Capacity, job: &mut Job, rx: &Rec
             }
             d
         };
-        let Decision::Wait { reason, live: live_blocked } = decision else { return Ok(()) };
+        let (reason, live_blocked) = match decision {
+            Decision::Start => return Ok(()),
+            Decision::Fail(why) => return Err(Error::DiskFull(why)),
+            Decision::Wait { reason, live } => (reason, live),
+        };
         if said != reason {
             eprintln!("heavy: waiting ({reason})");
             said = reason;
@@ -213,6 +244,47 @@ fn vram_sampler(cap: &Capacity) -> Option<(Sender<()>, std::thread::JoinHandle<u
     Some((stop_tx, handle))
 }
 
+/// Samples the whole process tree (heavy's own pid down) while the job runs; returns the peak CPU and RSS.
+/// Uses the same sampler as the live accounting of running jobs.
+fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<Usage>)> {
+    let mut sampler = TreeSampler::new(root).ok()?;
+    let (stop_tx, stop_rx) = channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let mut peak = Usage::default();
+        loop {
+            peak = peak.max(sampler.sample());
+            if !matches!(stop_rx.recv_timeout(TREE_SAMPLE), Err(RecvTimeoutError::Timeout)) {
+                return peak;
+            }
+        }
+    });
+    Some((stop_tx, handle))
+}
+
+/// Waits for the child, also noticing when it stops (Ctrl-Z, SIGTTIN, SIGSTOP). A stopped child stops
+/// heavy too (the shell then sees one stopped job and gets the terminal back); when heavy is continued
+/// (`fg`), it hands the terminal to the child again and sends it SIGCONT.
+fn wait_child(pid: Pid, term: Option<Terminal>) -> Result<ExitStatus, nix::Error> {
+    loop {
+        match waitpid(pid, Some(WaitPidFlag::WUNTRACED)) {
+            Ok(WaitStatus::Exited(_, code)) => return Ok(ExitStatus::from_raw(code << 8)),
+            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(ExitStatus::from_raw(sig as i32)),
+            Ok(WaitStatus::Stopped(..)) => {
+                if let Some(t) = term {
+                    t.take_back();
+                }
+                let _ = kill(Pid::this(), Signal::SIGSTOP);
+                if let Some(t) = term {
+                    t.give_to_child();
+                }
+                let _ = killpg(pid, Signal::SIGCONT);
+            }
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn execute(dir: &StateDir, cap: &Capacity, job: &Job, sig: &Sig, timeout: Duration, queued_ms: u64) -> Result<u8, Error> {
     let (first, rest) = job.cmd.split_first().ok_or_else(|| Error::Usage("no command".into()))?;
     let mut command = Command::new(first);
@@ -222,6 +294,7 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, sig: &Sig, timeout: Durati
     let net_before = net_bytes();
     let steal_before = cpu_times().map(|t| t.steal);
     let sampler = vram_sampler(cap);
+    let tree = tree_sampler(job.pid);
     let started = Instant::now();
     let child = match command.spawn() {
         Ok(c) => c,
@@ -237,10 +310,11 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, sig: &Sig, timeout: Durati
         forward(pgid, pending);
     }
 
+    let term = Terminal::claim(Pid::from_raw(pgid));
+    let tty = TerminalGuard(term);
     let (wtx, wrx) = channel();
     std::thread::spawn(move || {
-        let mut child = child;
-        let _ = wtx.send(child.wait());
+        let _ = wtx.send(wait_child(Pid::from_raw(pgid), term));
     });
     let grace = Duration::from_millis(std::env::var("HEAVY_KILL_GRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_GRACE_MS));
     let (result, timed_out) = if let Ok(r) = wrx.recv_timeout(timeout) {
@@ -254,6 +328,9 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, sig: &Sig, timeout: Durati
         });
         (r, true)
     };
+    // Whatever way the child ended, nothing it left behind may keep running (or hold our pipes open).
+    forward(pgid, 9);
+    drop(tty);
     let exit = result?;
     let run_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -266,6 +343,13 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, sig: &Sig, timeout: Durati
         drop(stop);
         h.join().ok().filter(|v| *v > 0)
     });
+    if let Some(peak) = tree.and_then(|(stop, h)| {
+        drop(stop);
+        h.join().ok()
+    }) {
+        stats.peak_tree_rss = peak.mem;
+        stats.peak_centi_cores = peak.cpu;
+    }
     stats.timed_out = timed_out;
     eprintln!("{}", format_stats(&stats));
 

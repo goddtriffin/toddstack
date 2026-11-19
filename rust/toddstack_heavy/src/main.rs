@@ -11,6 +11,7 @@ mod sizes;
 mod state;
 mod stats;
 mod status;
+mod tty;
 
 use std::process::ExitCode;
 
