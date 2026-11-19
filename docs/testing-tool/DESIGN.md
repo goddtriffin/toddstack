@@ -471,7 +471,7 @@ Targets, not measured yet:
 
 | phase | delivers | done when |
 |---|---|---|
-| 0 | this design; Todd answers the open questions | merged |
+| 0 | this design; open questions decided | merged |
 | 1 | crate skeleton, config, `check` step runner, `budgets sizes`, `pixels` (ported, with tests on synthetic images), report, `doctor` | accounts-service `make test` runs through `shakedown check` |
 | 2 | pinned Chrome, CDP session, fake and seeded worlds, collector, layout rules in Rust, `ui web`, `update` | accounts-service web references committed; repeat-5 run identical |
 | 3 | `sweep` with players, layout shift, baseline diffs, `--pack`, the `shakedown-review` skill, `devices serve` | accounts-service swept on all devices with a Sonnet review; infra's Python viewer retired |
@@ -482,16 +482,12 @@ Targets, not measured yet:
 
 Each phase is its own PR with a patch release on crates.io.
 
-## Open questions for Todd
+## Decided (2026-11-19)
 
-1. Name: `shakedown`, or another?
-2. Pilot order: accounts-service first is web only. Do you want a native project earlier than phase 5 (the scratch
-   counter app covers the harnesses without touching BDG)?
-3. Sweep pixel diffs compare against the last sweep of the merge base, kept locally in `target/` (not committed:
-   22 device forms x 2 themes x every route is too many references). They show changes for review; only layout
-   rules and shifts fail the sweep. Agreed?
-4. iOS layout data: SwiftUI hides font size and truncation. Options: (a) a tiny `.shakedownText()` modifier in the
-   app's text style that records size and truncation; (b) skip `text-min-size` and `clipped-text` on iOS and rely on
-   the Sonnet review. Recommend (a).
-5. Tap targets: fail at 24 px everywhere and warn under the platform guidance (44 pt iOS, 48 dp Android), or fail at
-   the platform guidance on native?
+1. Name: `shakedown` (Todd).
+2. Pilot order: accounts-service first (web only); the first native project is BDG after its store release. Phase 5
+   uses the counter example, never BDG.
+3. Sweep pixel diffs compare against a local, uncommitted baseline in `target/`; only layout rules and shifts fail
+   the sweep. Committed references live only in `ui`.
+4. iOS layout data: (a), a tiny `.shakedownText()` modifier.
+5. Tap targets: fail under 24 px on every platform; warn under the platform guidance (44 pt iOS, 48 dp Android).
