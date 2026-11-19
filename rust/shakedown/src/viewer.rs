@@ -158,55 +158,34 @@ pub fn host_allowed(host: &str) -> bool {
     name == "localhost" || name == "127.0.0.1" || name.ends_with(".localhost")
 }
 
-/// Where a tag goes: right after the doctype (leading whitespace and comments allowed before it), so the page stays in standards mode.
-fn after_doctype(lower: &str) -> usize {
-    let mut at = 0;
-    loop {
-        let rest = &lower[at..];
-        let trimmed = rest.trim_start();
-        let skipped = rest.len() - trimmed.len();
-        if trimmed.starts_with("<!--") {
-            match trimmed.find("-->") {
-                Some(end) => at += skipped + end + 3,
-                None => return 0,
-            }
-        } else if trimmed.starts_with("<!doctype") {
-            return match trimmed.find('>') {
-                Some(end) => at + skipped + end + 1,
-                None => 0,
-            };
-        } else {
-            return 0;
-        }
-    }
-}
-
-/// The end of the first `<name ...>` tag at or after `from`, when `name` is the whole tag name.
-fn tag_end(lower: &str, from: usize, name: &str) -> Option<usize> {
-    let open = format!("<{name}");
-    let mut i = from;
-    while let Some(j) = lower[i..].find(&open) {
-        let start = i + j;
-        let next = lower.as_bytes().get(start + open.len()).copied();
-        if matches!(
-            next,
-            Some(b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
-        ) {
-            return lower[start..].find('>').map(|k| start + k + 1);
-        }
-        i = start + open.len();
-    }
-    None
-}
-
-/// Inserts the script tag after the doctype and right after `<head ...>`, else after `<html ...>`, else straight after the doctype
-/// (or first thing). Never before the doctype: that would put the page in quirks mode.
+/// Inserts the script tag after the doctype, never searching for `<head` or `<html` (those can sit inside comments,
+/// script strings or quoted attributes). Scans from the start: skips a UTF-8 BOM, then whitespace and complete comments.
+/// A case-insensitive `<!doctype` there is skipped to its `>` and the tag goes right after it; otherwise the tag goes at
+/// the scan position (the page is quirks mode anyway, and a script before `<html>` lands in head). The BOM stays first.
 pub fn inject(html: &str, tag: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let base = after_doctype(&lower);
-    let at = tag_end(&lower, base, "head")
-        .or_else(|| tag_end(&lower, base, "html"))
-        .unwrap_or(base);
+    let mut at = if html.starts_with('\u{feff}') { 3 } else { 0 };
+    loop {
+        let rest = &html[at..];
+        let trimmed = rest.trim_start();
+        let ws = rest.len() - trimmed.len();
+        if let Some(body) = trimmed.strip_prefix("<!--") {
+            match body.find("-->") {
+                Some(end) => at += ws + 4 + end + 3,
+                None => break,
+            }
+        } else if trimmed
+            .get(..9)
+            .is_some_and(|p| p.eq_ignore_ascii_case("<!doctype"))
+        {
+            if let Some(end) = trimmed.find('>') {
+                at += ws + end + 1;
+            }
+            break;
+        } else {
+            at += ws;
+            break;
+        }
+    }
     format!("{}{tag}{}", &html[..at], &html[at..])
 }
 
@@ -320,9 +299,10 @@ const links = () => [...document.querySelectorAll('a[href]')].map((a) => {{ try 
 const lead = () => up({{ shakedown: 'lead' }});\n\
 addEventListener('click', (e) => {{ if (e.target.closest && e.target.closest('a[href],button,input[type=submit]')) lead(); }}, true);\n\
 addEventListener('submit', lead, true);\n\
-let timer = 0;\n\
-const report = () => {{ clearTimeout(timer); timer = setTimeout(() => {{ let tree = null; try {{ tree = window.__shakedown.tree(IGN); }} catch {{ return; }} up({{ shakedown: 'loaded', path: location.pathname + location.search, links: links(), tree }}); }}, 500); }};\n\
+let timer = 0, tries = 0;\n\
+const report = () => {{ clearTimeout(timer); timer = setTimeout(() => {{ let tree = null; try {{ tree = window.__shakedown.tree(IGN); }} catch {{ if (++tries < 6) report(); return; }} up({{ shakedown: 'loaded', path: location.pathname + location.search, links: links(), tree }}); }}, 500); }};\n\
 addEventListener('load', report); addEventListener('resize', report);\n\
+if (document.readyState === 'complete') report();\n\
 }})();"
     )
 }
@@ -619,53 +599,39 @@ mod tests {
     }
 
     #[test]
-    fn the_script_goes_right_after_head() {
-        let tag = "<script src=x></script>";
-        assert_eq!(
-            inject("<html><head lang=en><title>t</title></head>", tag),
-            "<html><head lang=en><script src=x></script><title>t</title></head>"
-        );
-        assert_eq!(inject("<p>hi</p>", tag), "<script src=x></script><p>hi</p>");
-        assert!(inject("<HTML><HEAD></HEAD>", tag).contains("<HEAD><script"));
-    }
-
-    #[test]
-    fn the_script_never_goes_before_the_doctype() {
+    fn the_script_goes_after_the_doctype_and_never_searches_for_head_or_html() {
         let t = "<script src=x></script>";
         let cases = [
-            // (page, expected)
             (
-                "<!doctype html><meta charset=utf-8><body>x",
-                "<!doctype html><script src=x></script><meta charset=utf-8><body>x",
+                "\u{feff}<!doctype html><body>x",
+                "\u{feff}<!doctype html><script src=x></script><body>x",
+            ),
+            (
+                "<!-- a > b --><!-- <!doctype html> -->\n<!doctype html><p>x",
+                "<!-- a > b --><!-- <!doctype html> -->\n<!doctype html><script src=x></script><p>x",
             ),
             (
                 "<!DOCTYPE html>\n<body>x",
                 "<!DOCTYPE html><script src=x></script>\n<body>x",
             ),
+            ("<p>hi</p>", "<script src=x></script><p>hi</p>"),
             (
-                "  \n\t<!doctype html><body>x",
-                "  \n\t<!doctype html><script src=x></script><body>x",
+                "\u{feff} <!-- c -->\n<p>hi",
+                "\u{feff} <!-- c -->\n<script src=x></script><p>hi",
             ),
             (
-                "<!-- a > b --><!-- c -->\n<!DocType html><p>x",
-                "<!-- a > b --><!-- c -->\n<!DocType html><script src=x></script><p>x",
+                "<!doctype html><html lang=\"x\" data-a=\"a>b\"><head></head>",
+                "<!doctype html><script src=x></script><html lang=\"x\" data-a=\"a>b\"><head></head>",
             ),
             (
-                "<!doctype html><html lang=en class=\"a>b\"><body>x",
-                "<!doctype html><html lang=en class=\"a><script src=x></script>b\"><body>x",
+                "<!doctype html><body><script>var a = \"<html>\";</script>",
+                "<!doctype html><script src=x></script><body><script>var a = \"<html>\";</script>",
             ),
             (
-                "<!doctype html>\n<html lang=en>\n<body>x",
-                "<!doctype html>\n<html lang=en><script src=x></script>\n<body>x",
+                "<!doctype html><!-- <head> --><body>x",
+                "<!doctype html><script src=x></script><!-- <head> --><body>x",
             ),
-            (
-                "<!DOCTYPE html><HTML><HEAD lang=en><title>t",
-                "<!DOCTYPE html><HTML><HEAD lang=en><script src=x></script><title>t",
-            ),
-            (
-                "<!doctype html><header>h</header>",
-                "<!doctype html><script src=x></script><header>h</header>",
-            ),
+            ("<!-- open", "<script src=x></script><!-- open"),
         ];
         for (page, want) in cases {
             assert_eq!(inject(page, t), want, "{page}");

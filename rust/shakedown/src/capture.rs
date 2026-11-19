@@ -1370,6 +1370,16 @@ mod frame_tests {
     /// The viewer path: an app serves a page with a doctype and no `<head>`; the viewer proxy injects the collector; a frame loads it.
     #[tokio::test]
     async fn the_viewer_keeps_a_headless_doctype_page_in_standards_mode_and_catches_ariafold() {
+        viewer_case(0).await;
+    }
+
+    /// Same, with the frame far below the fold at load time and nobody scrolling or reloading.
+    #[tokio::test]
+    async fn a_frame_that_starts_offscreen_still_reports_without_a_reload() {
+        viewer_case(4000).await;
+    }
+
+    async fn viewer_case(top: u32) {
         if !crate::browser::installed() {
             eprintln!("pinned Chrome not installed: skipped");
             return;
@@ -1388,7 +1398,7 @@ mod frame_tests {
                     let path = head.split(' ').nth(1).unwrap_or("/").to_string();
                     let body = if path.starts_with("/parent") {
                         format!(
-                            "<!doctype html><body><iframe style=\"width:1000px;height:900px;border:0\" src=\"http://127.0.0.1:{proxy_port}/fold\"></iframe>\
+                            "<!doctype html><body style=\"height:6000px\"><iframe style=\"margin-top:{top}px;width:1000px;height:900px;border:0\" src=\"http://127.0.0.1:{proxy_port}/fold\"></iframe>\
 <script>window.__m=[];addEventListener('message',(e)=>window.__m.push(e.data));</script>"
                         )
                     } else {
@@ -1417,8 +1427,10 @@ mod frame_tests {
         std::thread::spawn(move || {
             let _ = crate::viewer::serve(&settings);
         });
-        let profile =
-            std::env::temp_dir().join(format!("shakedown-frame-viewer-{}", std::process::id()));
+        let profile = std::env::temp_dir().join(format!(
+            "shakedown-frame-viewer-{}-{top}",
+            std::process::id()
+        ));
         let mut chromes = Chromes::default();
         let browser = chromes
             .launch(&crate::browser::binary(), &profile)
@@ -1461,6 +1473,75 @@ mod frame_tests {
                     && n["top_lines"].as_array().is_some_and(|l| !l.is_empty())),
             "ariafold must be caught through the viewer: {nodes:?}"
         );
+    }
+
+    /// The real viewer page with every device frame (most start below the fold): each must show a verdict without a Reload.
+    #[tokio::test]
+    async fn every_viewer_frame_reports_without_a_reload_even_below_the_fold() {
+        if !crate::browser::installed() {
+            eprintln!("pinned Chrome not installed: skipped");
+            return;
+        }
+        let app = TcpListener::bind("127.0.0.1:0").unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        let free = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = free.local_addr().unwrap().port();
+        drop(free);
+        std::thread::spawn(move || {
+            for mut c in app.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut buf = [0_u8; 4096];
+                    let _ = c.read(&mut buf);
+                    let body = "<!doctype html><meta charset=utf-8><body style=\"margin:0;font:16px sans-serif\"><p>Hello</p>";
+                    let _ = write!(
+                        c,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let settings = crate::viewer::Settings {
+            port: proxy_port,
+            target: format!("127.0.0.1:{app_port}"),
+            routes_file: None,
+            config_routes: Vec::new(),
+            players: None,
+            ignores: "[]".into(),
+        };
+        std::thread::spawn(move || {
+            let _ = crate::viewer::serve(&settings);
+        });
+        let profile =
+            std::env::temp_dir().join(format!("shakedown-all-frames-{}", std::process::id()));
+        let mut chromes = Chromes::default();
+        let browser = chromes
+            .launch(&crate::browser::binary(), &profile)
+            .await
+            .unwrap();
+        let page = browser.new_page("about:blank").await.unwrap();
+        page.goto(format!("http://localhost:{proxy_port}/__devices"))
+            .await
+            .unwrap();
+        let mut last = String::new();
+        let mut done = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            last = page
+                .evaluate(
+                    "JSON.stringify([...document.querySelectorAll('.st')].map(e => e.textContent))",
+                )
+                .await
+                .unwrap()
+                .into_value::<String>()
+                .unwrap_or_default();
+            let v: Vec<String> = serde_json::from_str(&last).unwrap_or_default();
+            if v.len() > 5 && v.iter().all(|t| !t.is_empty()) {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "some frames never reported: {last}");
     }
 
     async fn run(child_host: &str) {
