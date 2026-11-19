@@ -71,6 +71,7 @@ fn cli() -> Command {
                 .about("Draw every screen on every ui device and theme: layout rules, then pixels against the approved references")
                 .arg(Arg::new("platform").value_parser(["web"]).default_value("web").help("Only web in this version"))
                 .arg(Arg::new("screens").long("screens").value_delimiter(',').help("Only these screens (comma separated); default: all"))
+                .arg(Arg::new("devices").long("devices").value_delimiter(',').help("Only these devices (comma separated), for a quick look"))
                 .arg(Arg::new("repeat").long("repeat").value_parser(value_parser!(u32)).default_value("1").help("Run everything N times and fail if any run differs"))
                 .arg(Arg::new("json").long("json").action(ArgAction::SetTrue).help("Also write target/shakedown/summary.json")),
         )
@@ -345,8 +346,14 @@ fn ui_cmd(config: &Config, root: &Path, m: &ArgMatches, mode: ui::Mode) -> Resul
         .flatten()
         .copied()
         .unwrap_or(1);
+    let devices: Vec<String> = m
+        .try_get_many::<String>("devices")
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |v| v.cloned().collect());
     let opts = ui::Options {
         screens,
+        devices,
         repeat,
         mode,
     };

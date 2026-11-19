@@ -105,6 +105,7 @@ themes = ["light", "dark"]
 [players]                              # seeded local accounts, never production
 accounts = ["ann", "ben"]
 signin = "/__dev/signin?as={player}"   # each shot is its own browser context, so its own player
+parallel = 3                           # shots one player is in at once (default 3)
 
 [ui]
 refs = "ui/refs"                       # references live in <refs>/web/<screen>@<device>-<theme>.png, plus env.json

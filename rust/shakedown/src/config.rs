@@ -131,6 +131,13 @@ pub struct Players {
     pub accounts: Vec<String>,
     /// A path on the server that signs the browser in; `{player}` is the account.
     pub signin: String,
+    /// How many shots one signed-in player is in at once (default 3): servers cap a person's open connections.
+    #[serde(default = "default_parallel")]
+    pub parallel: usize,
+}
+
+const fn default_parallel() -> usize {
+    3
 }
 
 /// `[ui]`.
@@ -493,6 +500,11 @@ impl Config {
                     ig.rule
                 ));
             }
+        }
+        if let Some(p) = &self.players
+            && p.parallel == 0
+        {
+            return bad("[players].parallel must be at least 1".into());
         }
         if let Some(p) = &self.players
             && !p.signin.contains("{player}")

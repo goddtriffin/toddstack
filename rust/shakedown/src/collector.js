@@ -60,15 +60,21 @@
       const bg = getComputedStyle(n).backgroundColor;
       return (bg && bg !== 'transparent' && !/,\s*0\)$/.test(bg)) || n.matches('img,video,canvas,svg');
     };
-    const top = (e, r) => {
-      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-      if (!hit) return false;
-      if (e.contains(hit) || hit.contains(e)) return true;
+    // Three points along the line: a dropdown over only part of a line covers it too.
+    const covered = (e, x, y) => {
+      const hit = document.elementFromPoint(x, y);
+      if (!hit) return null;
+      if (e.contains(hit) || hit.contains(e)) return false;
       for (let n = hit; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
         if (n.contains(e)) break;
-        if (painted(n)) return false;
+        if (painted(n)) return true;
       }
-      return true;
+      return false;
+    };
+    const top = (e, r) => {
+      const y = r.top + r.height / 2;
+      if (covered(e, r.left + r.width / 2, y) !== false) return false;
+      return [r.left + 1, r.right - 1].every((x) => covered(e, x, y) !== true);
     };
     const walk = (parent, path, inherited, scrollX) => {
       const kids = parent.children;
