@@ -173,6 +173,7 @@ pub async fn launch(
     profile: &std::path::Path,
 ) -> Result<(Browser, tokio::task::JoinHandle<()>), Error> {
     let _ = std::fs::remove_dir_all(profile);
+    let proxy_flag = format!("--proxy-server={PROXY}");
     let config = BrowserConfig::builder()
         .chrome_executable(chrome)
         .new_headless_mode()
@@ -187,14 +188,10 @@ pub async fn launch(
             "--hide-scrollbars",
             "--mute-audio",
             // Nothing leaves the machine, not even a WebSocket (CDP cannot refuse one before it connects): every
-            // non-loopback request goes to a proxy nobody listens on and fails there. Chrome's implicit
-            // `<-loopback>` bypass stays, so the local server is reached directly; no `--proxy-bypass-list`
-            // is passed, which would change that.
-            "--proxy-server=127.0.0.1:9",
-            // Nothing leaves the machine, not even a WebSocket (CDP cannot refuse one before it connects): every
             // non-loopback request goes to a proxy nobody listens on (port 9, discard) and fails there. Chrome's
             // implicit `<-loopback>` bypass stays, so the local server is reached directly; do not pass
             // `--proxy-bypass-list`, which would change that.
+            proxy_flag.as_str(),
             // Same pixels every run: software raster, images decoded before the frame, every compositor stage
             // finished before it is drawn.
             "--disable-gpu",
@@ -522,7 +519,8 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
             png = again;
         }
         if i == 30 {
-            collected.note("never-settled", "screenshots keep changing");
+            // An Err, not a finding: the retry draws the shot again, and a pass there is reported as flaky.
+            return Err("never-settled: screenshots keep changing".into());
         }
     }
     lap("settled");
@@ -583,10 +581,11 @@ async fn idle(page: &Page, c: &Collected) -> Result<(), String> {
             .lock()
             .map_or_else(|_| Vec::new(), |u| u.values().cloned().collect());
         open.sort();
-        c.note(
-            "never-settled",
-            format!("requests keep running: {}", open.join(", ")),
-        );
+        // An Err, not a finding: the retry draws the shot again, and a pass there is reported as flaky.
+        return Err(format!(
+            "never-settled: requests keep running: {}",
+            open.join(", ")
+        ));
     }
     eval(
         page,
@@ -660,7 +659,10 @@ async fn watch_console(page: &Page, c: &Arc<Collected>, allow: &[String]) -> Res
                     })
                     .collect();
                 let text = text.join(" ");
-                if ok1(&text) {
+                if text.starts_with("__shakedown_webrtc__") {
+                    // Not allow-listable: a page may never open a peer connection.
+                    c1.note("webrtc", "WebRTC is blocked: nothing leaves the machine");
+                } else if ok1(&text) {
                     c1.note("console-error", text);
                 }
             }
