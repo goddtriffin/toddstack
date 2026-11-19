@@ -108,7 +108,7 @@ themes = ["light", "dark"]
 
 [players]                              # seeded local accounts, never production
 accounts = ["ann", "ben"]
-signin = "/__dev/signin?as={player}"   # each shot is its own browser context, so its own player
+signin = "/__dev/signin?as={player}"   # each shot is its own browser context; a player signs in once per browser
 parallel = 3                           # shots one player is in at once (default 3)
 
 [ui]

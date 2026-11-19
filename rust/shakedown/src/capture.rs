@@ -23,13 +23,13 @@ use chromiumoxide::cdp::browser_protocol::input::{
 };
 use chromiumoxide::cdp::browser_protocol::log::{EventEntryAdded, LogEntryLevel};
 use chromiumoxide::cdp::browser_protocol::network::{
-    self, ErrorReason, EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
-    ResourceType,
+    self, Cookie, CookieParam, ErrorReason, EventLoadingFailed, EventLoadingFinished,
+    EventRequestWillBeSent, ResourceType, TimeSinceEpoch,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CaptureScreenshotParams,
 };
-use chromiumoxide::cdp::browser_protocol::storage::ClearDataForOriginParams;
+use chromiumoxide::cdp::browser_protocol::storage::{GetCookiesParams, SetCookiesParams};
 use chromiumoxide::cdp::browser_protocol::target::{
     CreateBrowserContextParams, CreateTargetParams,
 };
@@ -117,9 +117,6 @@ pub struct Job {
     pub device: Device,
     /// `light` or `dark`.
     pub theme: String,
-    /// May share the player's browser context with other shots (the sweep's plain shots); otherwise the shot gets
-    /// a context of its own.
-    pub shared: bool,
 }
 
 impl Job {
@@ -243,6 +240,8 @@ pub async fn launch(
     let config = BrowserConfig::builder()
         .chrome_executable(chrome)
         .new_headless_mode()
+        // Backstop for the per-page overrides: the process itself is in UTC and en-US.
+        .env("TZ", "UTC")
         .user_data_dir(profile)
         .viewport(None)
         .request_timeout(Duration::from_secs(30))
@@ -252,6 +251,7 @@ pub async fn launch(
         // already in its headless and default sets. Chrome reads only the last `--disable-features`, so every
         // feature is one entry: `chromiumoxide` merges same-key values into one flag.
         .args([
+            "lang=en-US".to_string(),
             "font-render-hinting=none".to_string(),
             "disable-lcd-text".to_string(),
             // Nothing leaves the machine, not even a WebSocket (CDP cannot refuse one before it connects): every
@@ -392,7 +392,15 @@ pub async fn shoot_all(
             let mut first_failure: Option<String> = None;
             let mut done = None;
             for _ in 0..2 {
-                match shoot(&browser, &guard, &pool, &env, &job).await {
+                let cookies = match pool.cookies(&browser, &guard, &env, &job.plan.player).await {
+                    Ok(c) => c,
+                    Err(why) => {
+                        last = why;
+                        first_failure.get_or_insert_with(|| last.clone());
+                        continue;
+                    }
+                };
+                match shoot(&browser, &guard, &cookies, &env, &job).await {
                     Ok(mut shot) => {
                         shot.flaky = first_failure;
                         done = Some(shot);
@@ -400,10 +408,10 @@ pub async fn shoot_all(
                     }
                     Err(why) => last = why,
                 }
-                // A failure that is not a timeout may have left the player's context in a bad state (a sign-in
-                // that never took, storage half written): the retry starts with a new context and a new sign-in.
+                // A failure that is not a timeout may mean the player's cookies are bad (a sign-in that never
+                // took): the retry signs in again, unless another shot already did (`ptr_eq`).
                 if !last.starts_with("took longer") {
-                    pool.reset(&job.plan.player);
+                    pool.reset(&job.plan.player, &cookies);
                 }
                 first_failure.get_or_insert_with(|| last.clone());
             }
@@ -456,37 +464,101 @@ async fn eval(page: &Page, expression: &str) -> Result<serde_json::Value, String
     Ok(out.result.result.value.unwrap_or(serde_json::Value::Null))
 }
 
-/// One player's place in one browser: a single browser context for the whole run (the player's cookies and storage
-/// build up and are never wiped between shots), signed in once. Every device and theme of the player is a tab in it,
-/// with its own emulation. A context ends with the browser at the end of the run.
-#[derive(Default)]
-struct PlayerSlot {
-    ctx: tokio::sync::OnceCell<BrowserContextId>,
-    signed_in: tokio::sync::OnceCell<()>,
-}
+/// A player's sign-in cookies in one browser.
+type SignIn = Arc<tokio::sync::OnceCell<Arc<Vec<Cookie>>>>;
 
-/// A browser's players.
+/// A browser's players. Each shot is a browser context of its own (nothing carries over from one shot to the next),
+/// given a copy of the player's sign-in cookies. The player signs in once per browser, in a context used only for
+/// that, which is disposed once the cookies are taken.
 #[derive(Default)]
 struct Players {
-    slots: Mutex<HashMap<String, Arc<PlayerSlot>>>,
+    cells: Mutex<HashMap<String, SignIn>>,
 }
 
 impl Players {
-    fn slot(&self, player: &str) -> Arc<PlayerSlot> {
-        match self.slots.lock() {
+    fn cell(&self, player: &str) -> SignIn {
+        match self.cells.lock() {
             Ok(mut m) => m.entry(player.to_string()).or_default().clone(),
             Err(_) => Arc::default(),
         }
     }
-}
 
-impl Players {
-    /// Forgets the player's context and sign-in: the next shot makes new ones.
-    fn reset(&self, player: &str) {
-        if let Ok(mut m) = self.slots.lock() {
+    /// The player's sign-in cookies, signing in first when this browser has not yet (a guest has none).
+    async fn cookies(
+        &self,
+        browser: &Browser,
+        guard: &Guard,
+        env: &Env,
+        player: &str,
+    ) -> Result<Arc<Vec<Cookie>>, String> {
+        if player == "guest" {
+            return Ok(Arc::default());
+        }
+        let cell = self.cell(player);
+        cell.get_or_try_init(|| async {
+            let Some(template) = &env.signin else {
+                return Err("no [players].signin".to_string());
+            };
+            let path = template.replace("{player}", player);
+            let ctx = new_context(browser).await?;
+            let got = tokio::time::timeout(SHOT_TIMEOUT, sign_in(browser, guard, env, &ctx, &path))
+                .await
+                .unwrap_or_else(|_| Err(format!("took longer than {}s", SHOT_TIMEOUT.as_secs())));
+            let _ = browser.dispose_browser_context(ctx).await;
+            got.map(Arc::new)
+        })
+        .await
+        .cloned()
+    }
+
+    /// Forgets the player's cookies, but only if they are still the ones the failed shot used: a shot that began
+    /// after another already signed in again keeps the newer ones.
+    fn reset(&self, player: &str, used: &Arc<Vec<Cookie>>) {
+        if let Ok(mut m) = self.cells.lock()
+            && m.get(player)
+                .and_then(|c| c.get())
+                .is_some_and(|c| Arc::ptr_eq(c, used))
+        {
             m.remove(player);
         }
     }
+}
+
+/// Signs in inside `ctx` and returns the context's cookies.
+async fn sign_in(
+    browser: &Browser,
+    guard: &Guard,
+    env: &Env,
+    ctx: &BrowserContextId,
+    path: &str,
+) -> Result<Vec<Cookie>, String> {
+    let target = CreateTargetParams::builder()
+        .url("about:blank")
+        .browser_context_id(ctx.clone())
+        .new_window(true)
+        .build()
+        .map_err(|e| e.clone())?;
+    let page = browser
+        .new_page(target)
+        .await
+        .map_err(err("sign-in page"))?;
+    let done = async {
+        guard.armed(page.target_id().as_ref()).await?;
+        page.goto(format!("{}{path}", env.base))
+            .await
+            .map_err(err("sign-in"))?;
+        wait_loaded(&page).await?;
+        let got = browser
+            .execute(GetCookiesParams {
+                browser_context_id: Some(ctx.clone()),
+            })
+            .await
+            .map_err(err("read cookies"))?;
+        Ok(got.result.cookies)
+    }
+    .await;
+    let _ = page.close().await;
+    done
 }
 
 /// `items` in an order made by `seed` (the same seed, the same order): `SHAKEDOWN_SHUFFLE=<seed>` draws the shots in
@@ -513,22 +585,10 @@ async fn new_context(browser: &Browser) -> Result<BrowserContextId, String> {
         .map_err(err("context"))
 }
 
-/// Every kind of origin storage but cookies: sign-in survives, nothing else carries over from the last shot.
-const STORAGE_TYPES: &str = "local_storage,session_storage,indexeddb,websql,cache_storage,service_workers,file_systems,shader_cache,storage_buckets,interest_groups,shared_storage,cache";
-
-/// A command that fails only because the setting already holds (tabs of one renderer share it) has still done its job.
-fn already_in_effect<T>(r: Result<T, impl std::fmt::Display>, what: &str) -> Result<(), String> {
-    match r {
-        Ok(_) => Ok(()),
-        Err(e) if e.to_string().contains("already in effect") => Ok(()),
-        Err(e) => Err(format!("{what}: {e}")),
-    }
-}
-
 async fn shoot(
     browser: &Browser,
     guard: &Guard,
-    players: &Players,
+    cookies: &Arc<Vec<Cookie>>,
     env: &Env,
     job: &Job,
 ) -> Result<Shot, String> {
@@ -539,26 +599,11 @@ async fn shoot(
         }
     };
     let slow = || format!("took longer than {}s", SHOT_TIMEOUT.as_secs());
-    // A shot that acts (it may sign out, write storage) or is not a plain sweep shot gets a context of its own;
-    // the others share the player's. Either way sign-in happens once per context.
-    let own = !job.shared || !job.plan.act.is_empty();
-    let mine = if own {
-        Arc::default()
-    } else {
-        players.slot(&job.plan.player)
-    };
-    let ctx = if own {
-        new_context(browser).await?
-    } else {
-        mine.ctx
-            .get_or_try_init(|| new_context(browser))
-            .await?
-            .clone()
-    };
-    let outcome = shoot_in(browser, guard, env, job, &mine, &ctx, &lap, &slow).await;
-    if own {
-        let _ = browser.dispose_browser_context(ctx).await;
-    }
+    // A context of its own for every shot, disposed on every way out (that also closes a page a timed-out
+    // `new_page` left behind). A shot that signs out affects only its own context.
+    let ctx = new_context(browser).await?;
+    let outcome = shoot_in(browser, guard, cookies, env, job, &ctx, &lap, &slow).await;
+    let _ = browser.dispose_browser_context(ctx).await;
     outcome
 }
 
@@ -566,14 +611,24 @@ async fn shoot(
 async fn shoot_in(
     browser: &Browser,
     guard: &Guard,
+    cookies: &[Cookie],
     env: &Env,
     job: &Job,
-    mine: &PlayerSlot,
     ctx: &BrowserContextId,
     lap: &impl Fn(&str),
     slow: &impl Fn() -> String,
 ) -> Result<Shot, String> {
     let collected = Arc::new(Collected::default());
+    if !cookies.is_empty() {
+        let params: Vec<CookieParam> = cookies.iter().map(cookie_param).collect();
+        browser
+            .execute(SetCookiesParams {
+                cookies: params,
+                browser_context_id: Some(ctx.clone()),
+            })
+            .await
+            .map_err(err("set cookies"))?;
+    }
     // Each tab has a window of its own: a background tab in a shared window draws no frames, and the screenshot
     // then times out.
     let target = CreateTargetParams::builder()
@@ -594,34 +649,20 @@ async fn shoot_in(
     // The page handle lives out here, so every way out of the setup or the drawing closes the tab and forgets it.
     let outcome = async {
         tokio::time::timeout(SHOT_TIMEOUT, async {
-            // The context is shared: a service worker an earlier shot installed must not answer for this one.
-            page.execute(network::SetBypassServiceWorkerParams::new(true))
-                .await
-                .map_err(err("service worker bypass"))?;
             // Every tab is told it is in front.
             page.execute(SetFocusEmulationEnabledParams::new(true))
                 .await
                 .map_err(err("focus"))?;
             let _ = page.bring_to_front().await;
-            // Nothing but the sign-in (cookies) carries over from the shots before.
-            page.execute(ClearDataForOriginParams::new(
-                env.base.clone(),
-                STORAGE_TYPES,
-            ))
-            .await
-            .map_err(err("clear storage"))?;
             // The page is not drawn before the guard is on it (it waits at the debugger until then).
             guard.armed(page.target_id().as_ref()).await
         })
         .await
         .unwrap_or_else(|_| Err(slow()))?;
         lap("page ready");
-        let drawn = tokio::time::timeout(
-            SHOT_TIMEOUT,
-            draw(&page, env, job, &collected, &mine.signed_in),
-        )
-        .await
-        .unwrap_or_else(|_| Err(slow()));
+        let drawn = tokio::time::timeout(SHOT_TIMEOUT, draw(&page, env, job, &collected))
+            .await
+            .unwrap_or_else(|_| Err(slow()));
         lap("drawn");
         drawn
     }
@@ -629,6 +670,24 @@ async fn shoot_in(
     guard.unregister(page.target_id().as_ref());
     let _ = page.close().await;
     outcome
+}
+
+/// A cookie read from one context, as a cookie to set in another.
+fn cookie_param(c: &Cookie) -> CookieParam {
+    let mut p = CookieParam::new(c.name.clone(), c.value.clone());
+    p.domain = Some(c.domain.clone());
+    p.path = Some(c.path.clone());
+    p.secure = Some(c.secure);
+    p.http_only = Some(c.http_only);
+    p.same_site.clone_from(&c.same_site);
+    p.priority = Some(c.priority.clone());
+    p.source_scheme = Some(c.source_scheme.clone());
+    p.source_port = Some(c.source_port);
+    p.partition_key.clone_from(&c.partition_key);
+    if !c.session {
+        p.expires = Some(TimeSinceEpoch::new(c.expires));
+    }
+    p
 }
 
 /// What the page's event streams collect.
@@ -687,7 +746,6 @@ async fn draw(
     env: &Env,
     job: &Job,
     collected: &Arc<Collected>,
-    signed_in: &tokio::sync::OnceCell<()>,
 ) -> Result<Shot, String> {
     let t0 = std::time::Instant::now();
     let lap = |what: &str| {
@@ -720,17 +778,16 @@ async fn draw(
     })
     .await
     .map_err(err("media"))?;
-    already_in_effect(
-        page.execute(SetTimezoneOverrideParams::new("UTC")).await,
-        "timezone",
-    )?;
-    already_in_effect(
-        page.execute(SetLocaleOverrideParams {
-            locale: Some("en-US".into()),
-        })
-        .await,
-        "locale",
-    )?;
+    // A context of its own has a renderer of its own, so neither is ever "already in effect": if Chrome says so,
+    // something shared a renderer and that is a failure.
+    page.execute(SetTimezoneOverrideParams::new("UTC"))
+        .await
+        .map_err(err("timezone"))?;
+    page.execute(SetLocaleOverrideParams {
+        locale: Some("en-US".into()),
+    })
+    .await
+    .map_err(err("locale"))?;
 
     lap("emulation set");
     // The deterministic page and the collector, before any page script.
@@ -750,21 +807,6 @@ async fn draw(
     page.enable_runtime().await.map_err(err("runtime"))?;
 
     lap("listeners on");
-    if job.plan.player != "guest" {
-        let Some(template) = &env.signin else {
-            return Err("no [players].signin".into());
-        };
-        let path = template.replace("{player}", &job.plan.player);
-        // Signed in once per player and browser, by the first shot to get here; the others wait for it.
-        signed_in
-            .get_or_try_init(|| async {
-                page.goto(format!("{}{path}", env.base))
-                    .await
-                    .map_err(err("sign-in"))?;
-                wait_loaded(page).await
-            })
-            .await?;
-    }
     page.goto(format!("{}{}", env.base, job.plan.path))
         .await
         .map_err(err("navigation"))?;
