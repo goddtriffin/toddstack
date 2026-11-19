@@ -176,6 +176,8 @@ pub struct Running {
     child: Child,
     /// `http://127.0.0.1:<port>`.
     pub base: String,
+    /// After `child` is stopped (see `Drop`), this goes: the database drop.
+    _database: Database,
 }
 
 /// A free local port (best effort: another process could take it before the server does).
@@ -186,10 +188,8 @@ fn free_port() -> Result<u16, Error> {
         .map_err(|e| Error::Environment(format!("no free port: {e}")))
 }
 
-/// The per-checkout database name: the project plus a short hash of the checkout path, so two worktrees never
-/// share a database (a shared one keeps the migrations another branch applied).
-pub fn db_name(project: &str, root: &Path) -> String {
-    let clean: String = project
+fn clean_project(project: &str) -> String {
+    project
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -198,7 +198,22 @@ pub fn db_name(project: &str, root: &Path) -> String {
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+fn db_prefix(project: &str) -> String {
+    format!("shakedown_{}_", clean_project(project))
+}
+
+/// The throwaway database name: the project, a short hash of the checkout path (two worktrees never share a
+/// database: a shared one keeps the migrations another branch applied) and this process's id (two runs in one
+/// checkout never share one either, and a leftover names the process that owned it, so it can be told from a live
+/// run's).
+pub fn db_name(project: &str, root: &Path) -> String {
+    db_name_for(project, root, std::process::id())
+}
+
+fn db_name_for(project: &str, root: &Path, pid: u32) -> String {
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let digest = Sha256::digest(canon.to_string_lossy().as_bytes());
     let short = digest.iter().take(4).fold(String::new(), |mut acc, b| {
@@ -206,7 +221,92 @@ pub fn db_name(project: &str, root: &Path) -> String {
         let _ = write!(acc, "{b:02x}");
         acc
     });
-    format!("shakedown_{clean}_{short}")
+    format!("{}{short}_p{pid}", db_prefix(project))
+}
+
+/// The pid in a name this tool made for `project`, or `None` for any other database (never touched).
+fn owner_of(project: &str, db: &str) -> Option<u32> {
+    let rest = db.strip_prefix(&db_prefix(project))?;
+    let (hash, pid) = rest.split_once("_p")?;
+    if hash.len() != 8 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Is a process with this id running (`kill -0`; EPERM still means alive)?
+fn alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::piped())
+        .output()
+        .is_ok_and(|o| {
+            o.status.success() || String::from_utf8_lossy(&o.stderr).contains("ermitted")
+        })
+}
+
+/// Runs `drop_db` for `db`. A failure is only noted: the next run's sweep tries again.
+fn drop_db(server: &Server, root: &Path, db: &str) {
+    let Some(cmd) = &server.drop_db else { return };
+    let ok = Command::new("sh")
+        .arg("-c")
+        .arg(fill(cmd, 0, db))
+        .current_dir(root)
+        .env("SHAKEDOWN_DB", db)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("warning: could not drop the throwaway database {db}; the next run drops it");
+    }
+}
+
+/// Drops the leftover databases of runs that are gone: the `list_dbs` names that this tool made for `project`
+/// and whose process is dead. Anything else (another project's, an old-format name, a live run's) is left alone.
+fn sweep(server: &Server, root: &Path, project: &str) {
+    let Some(list) = &server.list_dbs else { return };
+    let Ok(o) = Command::new("sh")
+        .arg("-c")
+        .arg(list)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !o.status.success() {
+        return;
+    }
+    let me = std::process::id();
+    for name in String::from_utf8_lossy(&o.stdout).lines() {
+        let name = name.trim();
+        if let Some(pid) = owner_of(project, name)
+            && pid != me
+            && !alive(pid)
+        {
+            drop_db(server, root, name);
+        }
+    }
+}
+
+/// Drops the run's database when it goes out of scope: success, failure, panic (unwinding) and a caught signal
+/// (the run ends through `interrupted()`) all end here.
+struct Database {
+    server: Server,
+    root: PathBuf,
+    name: String,
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        drop_db(&self.server, &self.root, &self.name);
+    }
 }
 
 fn fill(template: &str, port: u16, db: &str) -> String {
@@ -252,7 +352,14 @@ pub fn start(
     std::fs::create_dir_all(out)
         .map_err(|e| Error::Environment(format!("{}: {e}", out.display())))?;
     let port = free_port()?;
+    sweep(server, root, project);
     let db = db_name(project, root);
+    // Dropped last, after the server has stopped (fields drop in order: `child` is stopped by `Running::drop`).
+    let database = Database {
+        server: server.clone(),
+        root: root.to_path_buf(),
+        name: db.clone(),
+    };
     let base = format!("http://127.0.0.1:{port}");
     let log: PathBuf = out.join("server.log");
     let log_file = std::fs::File::create(&log)
@@ -281,7 +388,11 @@ pub fn start(
         .spawn()
         .map_err(|e| Error::Environment(format!("cannot start the server: {e}")))?;
     track_group(child.id());
-    let mut running = Running { child, base };
+    let mut running = Running {
+        child,
+        base,
+        _database: database,
+    };
     let deadline = Instant::now() + Duration::from_secs(server.timeout);
     loop {
         if signals.interrupted() {
@@ -347,7 +458,15 @@ mod tests {
         assert_eq!(a, db_name("accounts-service", Path::new("/tmp/a")));
         assert_ne!(a, db_name("accounts-service", Path::new("/tmp/b")));
         assert!(a.starts_with("shakedown_accounts_service_"));
+        assert_eq!(owner_of("accounts-service", &a), Some(std::process::id()));
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    /// Tests that watch signals in this process must not overlap the one that signals the process itself.
+    static SIGNALS: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SIGNALS.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn send(sig: &str, pid: u32) {
@@ -399,6 +518,7 @@ mod tests {
     #[test]
     fn a_second_run_in_the_same_process_works_after_a_signal_ended_the_first() {
         // Not a child: it signals itself only while the guard lives, which the guard turns into a flag.
+        let _serial = serial();
         let first = watch_signals();
         send("-TERM", std::process::id());
         wait_until("the first signal is seen", || first.interrupted());
@@ -514,6 +634,118 @@ mod tests {
             status.signal().is_some(),
             "a second Ctrl-C ends the process: {status:?}"
         );
+    }
+
+    /// A real throwaway "database": a directory entry the commands create and remove, so every exit path can be
+    /// seen without Postgres.
+    fn fake_server(dir: &Path, seed: &str) -> Server {
+        let d = dir.display();
+        toml::from_str(&format!(
+            "start = \"python3 -m http.server {{port}} --bind 127.0.0.1\"\nseed = {seed:?}\n\
+             drop_db = \"rm -f {d}/{{db}}\"\nlist_dbs = \"ls {d}\"\n"
+        ))
+        .unwrap()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("shakedown-world-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The seed command creates the database, as the project's start command does for real.
+    fn seed_creating(dir: &Path, then: &str) -> String {
+        format!("touch {}/$SHAKEDOWN_DB && {then}", dir.display())
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_database_is_gone_after_a_normal_run() {
+        let _serial = serial();
+        let dir = scratch("normal");
+        let server = fake_server(&dir, &seed_creating(&dir, "true"));
+        let signals = watch_signals();
+        let running = start(&server, &dir, "demo", &dir.join("out"), &signals).unwrap();
+        assert_eq!(
+            leftovers(&dir).len(),
+            2,
+            "the database exists while the run lives (and out/)"
+        );
+        drop(running);
+        assert_eq!(leftovers(&dir), vec!["out".to_string()]);
+        drop(signals);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_database_is_gone_after_a_failing_run() {
+        let _serial = serial();
+        let dir = scratch("failing");
+        let server = fake_server(&dir, &seed_creating(&dir, "false"));
+        let signals = watch_signals();
+        let failed = start(&server, &dir, "demo", &dir.join("out"), &signals);
+        assert!(failed.is_err(), "the seed fails the run");
+        assert_eq!(leftovers(&dir), vec!["out".to_string()]);
+        drop(signals);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_database_is_gone_after_a_panic() {
+        let _serial = serial();
+        let dir = scratch("panic");
+        let server = fake_server(&dir, &seed_creating(&dir, "true"));
+        let signals = watch_signals();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _running = start(&server, &dir, "demo", &dir.join("out"), &signals).unwrap();
+            panic!("the run panics");
+        }));
+        assert!(caught.is_err());
+        assert_eq!(leftovers(&dir), vec!["out".to_string()]);
+        drop(signals);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_start_sweeps_dead_runs_only() {
+        let dir = scratch("sweep");
+        let mut gone = Command::new("true").spawn().unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let mut live = Command::new("sleep").arg("30").spawn().unwrap();
+        let name = |pid: u32| db_name_for("demo", Path::new("/tmp/x"), pid);
+        let keep = [
+            name(live.id()),
+            "shakedown_demo_74191f67".to_string(),
+            "shakedown_other_74191f67_p1".to_string(),
+            "accounts".to_string(),
+            "shakedown_demo_xyz_p1".to_string(),
+        ];
+        for k in keep.iter().chain([&name(dead)]) {
+            std::fs::write(dir.join(k), "").unwrap();
+        }
+        let server = fake_server(&dir, "true");
+        sweep(&server, &dir, "demo");
+        let mut expected = keep.to_vec();
+        expected.sort();
+        assert_eq!(
+            leftovers(&dir),
+            expected,
+            "only the dead run's database goes"
+        );
+        let _ = live.kill();
+        let _ = live.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -56,6 +56,13 @@ pub struct Server {
     pub world: World,
     /// Runs once the server is ready (seeded worlds). Same placeholders as `start`.
     pub seed: Option<String>,
+    /// Drops the throwaway database `{db}` (idempotent: a missing one is not an error). Run after the server stops on
+    /// every way a run can end, and for each leftover `list_dbs` names. Needed whenever `start` creates the database.
+    pub drop_db: Option<String>,
+    /// Prints the names of this machine's throwaway databases, one per line. At startup, the ones named
+    /// `shakedown_<project>_<hash>_p<pid>` whose process is dead are dropped with `drop_db`: leftovers of a run
+    /// that was killed. A run alive (its pid is running) is never touched.
+    pub list_dbs: Option<String>,
     /// The fixed clock, RFC 3339 (given to the server and frozen in the page).
     #[serde(default = "default_now")]
     pub now: String,
