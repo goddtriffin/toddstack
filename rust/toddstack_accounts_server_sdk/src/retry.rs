@@ -2,8 +2,12 @@
 //!
 //! This is the canonical retry rule (infra `docs/canonical-pattern.md` 6d): at
 //! most 3 retries (4 attempts in all), waiting 0.5 s, 1 s and 2 s with +-25%
-//! jitter. Only a `GET` is ever retried, and only on an intermittent failure:
-//! a connect error, a timeout, a 5xx, a 408 or a 429. Anything else is an
+//! jitter. The whole call, attempts and waits together, never takes longer than
+//! 15 s (every policy's `budget`), because it runs inside a caller's HTTP
+//! request handler: a retry starts only if it can finish inside that budget.
+//! Only a `GET` is ever retried, and only on an intermittent failure:
+//! a connect error, a timeout, a 5xx, a 408 or a 429 (see
+//! [`RetryPolicy::retry_429_without_hint`] for the hourly-limited calls). Anything else is an
 //! answer, and asking again would get the same one. After the last retry the
 //! caller gets the plain last outcome (this crate has no Sentry).
 //!
@@ -38,13 +42,24 @@ pub(crate) struct RetryPolicy {
     /// waiting it out would stall the caller, and retrying sooner ignores it.
     /// 5 s: twice the longest backoff, so a short hint is honoured.
     pub(crate) max_retry_after: Duration,
-    /// No retry starts once this much time has passed, so the total is at
-    /// most this plus one `attempt_timeout`.
+    /// The cap on the whole call, 15 s for every policy: a retry starts only
+    /// if its wait plus its own `attempt_timeout` still fits, so the total
+    /// never exceeds this.
     pub(crate) budget: Duration,
+    /// Whether a 429 with no `Retry-After` is retried (with backoff). The
+    /// server's write and notification limits are hourly, so backing off a
+    /// few seconds cannot clear one and retrying only burns the caller's time:
+    /// for those policies a 429 is retried only when it carries a
+    /// `Retry-After` within `max_retry_after`, and is otherwise final. Reads
+    /// have short limits and keep retrying a bare 429.
+    pub(crate) retry_429_without_hint: bool,
 }
 
 /// The rule's ceiling on retries.
 pub(crate) const MAX_RETRIES: u32 = 3;
+
+/// The cap on a whole call, every policy.
+const BUDGET: Duration = Duration::from_secs(15);
 
 /// The longest a `Retry-After` is waited out.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
@@ -55,11 +70,16 @@ impl RetryPolicy {
         attempt_timeout: Duration::from_secs(3),
         base_delay: Duration::from_millis(500),
         max_retry_after: MAX_RETRY_AFTER,
-        budget: Duration::from_secs(25),
+        budget: BUDGET,
+        retry_429_without_hint: true,
     };
 
-    /// A notification status read: the same as [`Self::READ`].
-    pub(crate) const NOTIFICATION_STATUS: Self = Self::READ;
+    /// A notification status read: the same as [`Self::READ`], except that
+    /// the notification limit is hourly, so a bare 429 is final.
+    pub(crate) const NOTIFICATION_STATUS: Self = Self {
+        retry_429_without_hint: false,
+        ..Self::READ
+    };
 
     /// A notification send that carries an idempotency key. Its deadline is
     /// the client's own, since a send to one player is delivered inline.
@@ -68,7 +88,8 @@ impl RetryPolicy {
         attempt_timeout: Duration::from_secs(10),
         base_delay: Duration::from_millis(500),
         max_retry_after: MAX_RETRY_AFTER,
-        budget: Duration::from_secs(55),
+        budget: BUDGET,
+        retry_429_without_hint: false,
     };
 
     /// The wait before retry number `retry` (1 is the first): `base_delay`
@@ -104,6 +125,9 @@ impl RetryPolicy {
                 match retry_after(response) {
                     Some(wait) if wait > self.max_retry_after => None,
                     Some(wait) => Some(wait),
+                    None if response.status().as_u16() == 429 && !self.retry_429_without_hint => {
+                        None
+                    }
                     None => Some(self.backoff(retry)),
                 }
             }
@@ -165,6 +189,17 @@ async fn run(
     policy: &RetryPolicy,
     retry_writes: bool,
 ) -> reqwest::Result<Response> {
+    run_counting(client, request, policy, retry_writes, &mut 0).await
+}
+
+/// [`run`], also reporting how many attempts were made.
+async fn run_counting(
+    client: &Client,
+    request: Request,
+    policy: &RetryPolicy,
+    retry_writes: bool,
+    attempts: &mut u32,
+) -> reqwest::Result<Response> {
     if request.method() != Method::GET && !retry_writes {
         return client.execute(request).await;
     }
@@ -177,10 +212,11 @@ async fn run(
         };
         *attempt.timeout_mut() = Some(policy.attempt_timeout);
         let outcome: reqwest::Result<Response> = client.execute(attempt).await;
+        *attempts += 1;
         let Some(wait) = policy.delay(retry, &outcome) else {
             return outcome;
         };
-        if started.elapsed() + wait > policy.budget {
+        if started.elapsed() + wait + policy.attempt_timeout > policy.budget {
             return outcome;
         }
         tokio::time::sleep(wait).await;
@@ -205,6 +241,7 @@ pub(crate) mod tests {
         base_delay: Duration::from_millis(10),
         max_retry_after: Duration::from_secs(2),
         budget: Duration::from_secs(4),
+        retry_429_without_hint: true,
     };
 
     /// A scripted server: request `n` gets reply `n` (the last one repeats),
@@ -281,11 +318,59 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_keyed_post_is_retried_on_a_429() {
-        let server: Scripted = Scripted::start(vec![(429, "", NOW), (200, "", NOW)]).await;
+    async fn a_keyed_post_is_retried_on_a_429_with_a_short_retry_after() {
+        let server: Scripted =
+            Scripted::start(vec![(429, "retry-after: 1\r\n", NOW), (200, "", NOW)]).await;
 
         assert_eq!(200, keyed_post_status(&server).await);
         assert_eq!(2, server.hits());
+    }
+
+    #[tokio::test]
+    async fn a_hourly_limited_429_without_a_retry_after_is_final() {
+        let server: Scripted = Scripted::start(vec![(429, "", NOW), (200, "", NOW)]).await;
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client
+            .post(&server.url)
+            .json(&serde_json::json!({ "idempotency_key": "k1" }))
+            .build()
+            .unwrap();
+        let hourly: RetryPolicy = RetryPolicy {
+            retry_429_without_hint: false,
+            ..FAST
+        };
+
+        let status: u16 = super::execute_keyed(&client, request, &hourly)
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+
+        assert_eq!(429, status);
+        assert_eq!(1, server.hits());
+    }
+
+    #[tokio::test]
+    async fn a_read_429_without_a_retry_after_is_retried() {
+        let server: Scripted = Scripted::start(vec![(429, "", NOW), (200, "", NOW)]).await;
+
+        assert_eq!(200, status_of(&server, reqwest::Method::GET).await);
+        assert_eq!(2, server.hits());
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_cannot_finish_inside_the_budget_is_not_started() {
+        let server: Scripted = Scripted::start(vec![(503, "", NOW)]).await;
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client.get(&server.url).build().unwrap();
+        let tight: RetryPolicy = RetryPolicy {
+            budget: Duration::from_millis(400),
+            ..FAST
+        };
+
+        super::execute(&client, request, &tight).await.unwrap();
+
+        assert_eq!(1, server.hits());
     }
 
     #[tokio::test]
@@ -393,6 +478,7 @@ pub(crate) mod tests {
             assert_eq!(3, policy.max_retries);
             assert_eq!(Duration::from_millis(500), policy.base_delay);
             assert!(policy.max_retry_after <= Duration::from_secs(5));
+            assert_eq!(Duration::from_secs(15), policy.budget);
         }
     }
 
@@ -422,10 +508,12 @@ pub(crate) mod tests {
         drop(listener);
         let client: reqwest::Client = reqwest::Client::new();
         let request: reqwest::Request = client.get(&url).build().unwrap();
+        let mut attempts: u32 = 0;
 
-        let outcome = super::execute(&client, request, &FAST).await;
+        let outcome = super::run_counting(&client, request, &FAST, false, &mut attempts).await;
 
         assert!(outcome.unwrap_err().is_connect());
+        assert_eq!(4, attempts);
     }
 
     #[tokio::test]
