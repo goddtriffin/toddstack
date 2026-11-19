@@ -1367,6 +1367,102 @@ mod frame_tests {
         port
     }
 
+    /// The viewer path: an app serves a page with a doctype and no `<head>`; the viewer proxy injects the collector; a frame loads it.
+    #[tokio::test]
+    async fn the_viewer_keeps_a_headless_doctype_page_in_standards_mode_and_catches_ariafold() {
+        if !crate::browser::installed() {
+            eprintln!("pinned Chrome not installed: skipped");
+            return;
+        }
+        let app = TcpListener::bind("127.0.0.1:0").unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        let free = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = free.local_addr().unwrap().port();
+        drop(free);
+        std::thread::spawn(move || {
+            for mut c in app.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut buf = [0_u8; 4096];
+                    let n = c.read(&mut buf).unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = head.split(' ').nth(1).unwrap_or("/").to_string();
+                    let body = if path.starts_with("/parent") {
+                        format!(
+                            "<!doctype html><body><iframe style=\"width:1000px;height:900px;border:0\" src=\"http://127.0.0.1:{proxy_port}/fold\"></iframe>\
+<script>window.__m=[];addEventListener('message',(e)=>window.__m.push(e.data));</script>"
+                        )
+                    } else {
+                        // The old ariafold fixture: a doctype, no head, an aria-hidden icon over text below the fold.
+                        "<!doctype html><meta charset=utf-8><body style=\"margin:0;font:16px sans-serif;height:3000px\">\
+<p style=\"position:absolute;top:2000px;left:50px;margin:0\">Score text</p>\
+<span aria-hidden=\"true\" style=\"position:absolute;top:2000px;left:50px;z-index:2\">ICON</span>\
+<script>addEventListener('load',()=>setTimeout(()=>parent.postMessage({ mode: document.compatMode }, '*'), 1500));</script>".to_string()
+                    };
+                    let _ = write!(
+                        c,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let settings = crate::viewer::Settings {
+            port: proxy_port,
+            target: format!("127.0.0.1:{app_port}"),
+            routes_file: None,
+            config_routes: Vec::new(),
+            players: None,
+            ignores: "[]".into(),
+        };
+        std::thread::spawn(move || {
+            let _ = crate::viewer::serve(&settings);
+        });
+        let profile =
+            std::env::temp_dir().join(format!("shakedown-frame-viewer-{}", std::process::id()));
+        let mut chromes = Chromes::default();
+        let browser = chromes
+            .launch(&crate::browser::binary(), &profile)
+            .await
+            .unwrap();
+        let page = browser.new_page("about:blank").await.unwrap();
+        page.goto(format!("http://localhost:{app_port}/parent"))
+            .await
+            .unwrap();
+        let mut msgs = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let v: Vec<serde_json::Value> = page
+                .evaluate("JSON.stringify(window.__m || [])")
+                .await
+                .unwrap()
+                .into_value::<String>()
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            if v.iter().any(|e| e["mode"].is_string())
+                && v.iter().any(|e| e["shakedown"] == "loaded")
+            {
+                msgs = v;
+                break;
+            }
+        }
+        assert!(!msgs.is_empty(), "the frame never reported");
+        let mode = msgs.iter().find(|e| e["mode"].is_string()).unwrap();
+        assert_eq!(
+            mode["mode"], "CSS1Compat",
+            "the page must stay in standards mode"
+        );
+        let loaded = msgs.iter().find(|e| e["shakedown"] == "loaded").unwrap();
+        let nodes = loaded["tree"]["nodes"].as_array().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n["decor"] == true
+                    && n["top_lines"].as_array().is_some_and(|l| !l.is_empty())),
+            "ariafold must be caught through the viewer: {nodes:?}"
+        );
+    }
+
     async fn run(child_host: &str) {
         let port = serve();
         let profile = std::env::temp_dir().join(format!(
