@@ -237,15 +237,42 @@ fn owner_of(project: &str, db: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-/// Is a process with this id running (`kill -0`; EPERM still means alive)?
-fn alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::piped())
-        .output()
-        .is_ok_and(|o| {
-            o.status.success() || String::from_utf8_lossy(&o.stderr).contains("ermitted")
-        })
+/// Where the per-run lock files live: on this host, under the shakedown cache.
+fn lock_dir() -> PathBuf {
+    crate::browser::cache_dir().join("locks")
+}
+
+fn lock_path(dir: &Path, db: &str) -> PathBuf {
+    dir.join(format!("{db}.lock"))
+}
+
+/// Takes the run's exclusive advisory lock, held for as long as the returned file lives (the OS releases it when
+/// the process ends, however it ends). The lock exists before the database does.
+fn hold_lock(dir: &Path, db: &str) -> Result<std::fs::File, Error> {
+    let path = lock_path(dir, db);
+    let fail = |e: &dyn std::fmt::Display| Error::Environment(format!("{}: {e}", path.display()));
+    std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| fail(&e))?;
+    file.try_lock().map_err(|e| fail(&e))?;
+    Ok(file)
+}
+
+/// Is this run certainly dead? Only when its lock file is on this host and can be taken: a live run holds it, and a
+/// database with no lock file here (another machine or container) is never ours to judge. Any error means "not
+/// certain". Returns the lock (kept while the database is dropped) when the run is dead.
+fn dead_run_lock(dir: &Path, db: &str) -> Option<std::fs::File> {
+    let path = lock_path(dir, db);
+    if !path.try_exists().unwrap_or(false) {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(&path).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 /// Runs `drop_db` for `db`. A failure is only noted: the next run's sweep tries again.
@@ -267,8 +294,12 @@ fn drop_db(server: &Server, root: &Path, db: &str) {
 }
 
 /// Drops the leftover databases of runs that are gone: the `list_dbs` names that this tool made for `project`
-/// and whose process is dead. Anything else (another project's, an old-format name, a live run's) is left alone.
+/// and whose run is certainly dead (its lock file here can be taken). Anything else (another project's, an old-format name, a live run's) is left alone.
 fn sweep(server: &Server, root: &Path, project: &str) {
+    sweep_in(&lock_dir(), server, root, project);
+}
+
+fn sweep_in(locks: &Path, server: &Server, root: &Path, project: &str) {
     let Some(list) = &server.list_dbs else { return };
     let Ok(o) = Command::new("sh")
         .arg("-c")
@@ -288,9 +319,11 @@ fn sweep(server: &Server, root: &Path, project: &str) {
         let name = name.trim();
         if let Some(pid) = owner_of(project, name)
             && pid != me
-            && !alive(pid)
+            && let Some(lock) = dead_run_lock(locks, name)
         {
             drop_db(server, root, name);
+            let _ = std::fs::remove_file(lock_path(locks, name));
+            drop(lock);
         }
     }
 }
@@ -301,11 +334,15 @@ struct Database {
     server: Server,
     root: PathBuf,
     name: String,
+    /// The run's lock, held until the database is dropped, then released.
+    lock: std::fs::File,
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
         drop_db(&self.server, &self.root, &self.name);
+        let _ = std::fs::remove_file(lock_path(&lock_dir(), &self.name));
+        let _ = self.lock.unlock();
     }
 }
 
@@ -352,13 +389,15 @@ pub fn start(
     std::fs::create_dir_all(out)
         .map_err(|e| Error::Environment(format!("{}: {e}", out.display())))?;
     let port = free_port()?;
-    sweep(server, root, project);
     let db = db_name(project, root);
+    let lock = hold_lock(&lock_dir(), &db)?;
+    sweep(server, root, project);
     // Dropped last, after the server has stopped (fields drop in order: `child` is stopped by `Running::drop`).
     let database = Database {
         server: server.clone(),
         root: root.to_path_buf(),
         name: db.clone(),
+        lock,
     };
     let base = format!("http://127.0.0.1:{port}");
     let log: PathBuf = out.join("server.log");
@@ -717,34 +756,51 @@ mod tests {
     }
 
     #[test]
-    fn a_start_sweeps_dead_runs_only() {
+    fn a_start_sweeps_unlocked_leftovers_only() {
         let dir = scratch("sweep");
-        let mut gone = Command::new("true").spawn().unwrap();
-        let dead = gone.id();
-        gone.wait().unwrap();
-        let mut live = Command::new("sleep").arg("30").spawn().unwrap();
+        let locks = dir.join("locks");
         let name = |pid: u32| db_name_for("demo", Path::new("/tmp/x"), pid);
+        let (live, leftover, unknown) = (name(1_000_001), name(1_000_002), name(1_000_003));
+        // A live run holds its lock; a leftover has a lock file nobody holds; an unknown-host database has none.
+        let _held = hold_lock(&locks, &live).unwrap();
+        drop(hold_lock(&locks, &leftover).unwrap());
         let keep = [
-            name(live.id()),
+            live.clone(),
+            unknown.clone(),
             "shakedown_demo_74191f67".to_string(),
             "shakedown_other_74191f67_p1".to_string(),
             "accounts".to_string(),
             "shakedown_demo_xyz_p1".to_string(),
         ];
-        for k in keep.iter().chain([&name(dead)]) {
+        for k in keep.iter().chain([&leftover]) {
             std::fs::write(dir.join(k), "").unwrap();
         }
         let server = fake_server(&dir, "true");
-        sweep(&server, &dir, "demo");
+        sweep_in(&locks, &server, &dir, "demo");
         let mut expected = keep.to_vec();
+        expected.push("locks".to_string());
         expected.sort();
         assert_eq!(
             leftovers(&dir),
             expected,
-            "only the dead run's database goes"
+            "only the unlocked leftover goes: not the live run's, not an unknown host's"
         );
-        let _ = live.kill();
-        let _ = live.wait();
+        assert!(lock_path(&locks, &live).exists());
+        assert!(!lock_path(&locks, &leftover).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unlockable_lock_file_means_not_swept() {
+        let dir = scratch("sweep-err");
+        let locks = dir.join("locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let db = db_name_for("demo", Path::new("/tmp/x"), 1_000_004);
+        // A directory where the lock file should be: opening it for writing fails, so the run is not "certainly dead".
+        std::fs::create_dir(lock_path(&locks, &db)).unwrap();
+        std::fs::write(dir.join(&db), "").unwrap();
+        sweep_in(&locks, &fake_server(&dir, "true"), &dir, "demo");
+        assert!(dir.join(&db).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

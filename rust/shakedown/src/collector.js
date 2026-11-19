@@ -47,6 +47,7 @@
     const pe = new CSSStyleSheet();
     pe.replaceSync('*,*::before,*::after{pointer-events:auto!important}');
     document.adoptedStyleSheets = [...document.adoptedStyleSheets, pe];
+    try {
     // `elementFromPoint` is null outside the viewport: scroll the point into view, probe, and scroll back, so a line
     // below the fold is judged like one above it.
     const hitAt = (x, y, el) => {
@@ -189,7 +190,9 @@
         if (over) d.top_lines.push(r);
       }
     }
-    document.adoptedStyleSheets = document.adoptedStyleSheets.filter((x) => x !== pe);
+    } finally {
+      document.adoptedStyleSheets = document.adoptedStyleSheets.filter((x) => x !== pe);
+    }
     return {
       viewport_w: de.clientWidth, viewport_h: de.clientHeight, content_w: de.scrollWidth,
       nodes, shifts: S.shifts, bad_ignores: bad,
