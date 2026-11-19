@@ -507,6 +507,45 @@ fn a_websocket_to_localhost_on_the_servers_port_is_allowed() {
     assert!(!text(&o).contains("leaves the machine"), "{}", text(&o));
 }
 
+/// A server that drops the first two requests for `/page.html` (Chrome itself retries a dropped GET once), then serves the page: the browser
+/// fails the first try and the retry passes.
+const FLAKY_SERVER: &str = r"
+import functools, http.server, sys
+seen = []
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/page.html' and len(seen) < 2:
+            seen.append(1)
+            self.connection.close()
+            return
+        super().do_GET()
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), functools.partial(H, directory='site')).serve_forever()
+";
+
+#[test]
+fn a_shot_that_fails_once_and_passes_on_the_retry_is_reported_as_flaky() {
+    let site = Site::new("flaky");
+    site.fixture("flaky.py", FLAKY_SERVER);
+    site.page(OK_BODY);
+    site.file("ok.html", "ok");
+    site.raw(
+        "[server]\nstart = \"python3 flaky.py {port}\"\nready = \"/ok.html\"\n[devices]\nui = [\"phone\"]\nthemes = [\"light\"]\n[[screen]]\nname = \"page\"\npath = \"/page.html\"\n",
+    );
+    let o = site.run(&["update", "--screens", "page"]);
+    assert!(o.status.success(), "the retry passes: {}", text(&o));
+    assert!(text(&o).contains("warning: flaky"), "{}", text(&o));
+    let o = site.run(&["ui", "web", "--json"]);
+    assert_eq!(code(&o), 0, "{}", text(&o));
+    let all = text(&o);
+    assert!(all.contains("warning: flaky"), "{all}");
+    let json = std::fs::read_to_string(site.dir.join("target/shakedown/summary.json")).unwrap();
+    assert!(
+        json.contains("\"flaky\"") && json.contains("page@phone-light"),
+        "{json}"
+    );
+}
+
 #[test]
 fn a_request_with_another_scheme_fails() {
     planted(
