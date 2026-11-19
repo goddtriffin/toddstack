@@ -174,7 +174,7 @@ pub async fn launch(
     profile: &std::path::Path,
 ) -> Result<(Browser, tokio::task::JoinHandle<()>), Error> {
     let _ = std::fs::remove_dir_all(profile);
-    let proxy_flag = format!("--proxy-server={PROXY}");
+    let proxy_flag = format!("proxy-server={PROXY}");
     let config = BrowserConfig::builder()
         .chrome_executable(chrome)
         .new_headless_mode()
@@ -182,34 +182,36 @@ pub async fn launch(
         .viewport(None)
         .request_timeout(Duration::from_secs(30))
         .launch_timeout(Duration::from_secs(30))
+        // `chromiumoxide` writes `--` itself, so every key here has no dashes: `"--x"` would reach Chrome as
+        // `----x`, which Chrome ignores. `hide-scrollbars`, `mute-audio` and `force-color-profile=srgb` are
+        // already in its headless and default sets. Chrome reads only the last `--disable-features`, so every
+        // feature is one entry: `chromiumoxide` merges same-key values into one flag.
         .args([
-            "--font-render-hinting=none",
-            "--disable-lcd-text",
-            "--force-color-profile=srgb",
-            "--hide-scrollbars",
-            "--mute-audio",
+            "font-render-hinting=none".to_string(),
+            "disable-lcd-text".to_string(),
             // Nothing leaves the machine, not even a WebSocket (CDP cannot refuse one before it connects): every
             // non-loopback request goes to a proxy nobody listens on (port 9, discard) and fails there. Chrome's
             // implicit `<-loopback>` bypass stays, so the local server is reached directly; do not pass
             // `--proxy-bypass-list`, which would change that.
-            proxy_flag.as_str(),
+            proxy_flag,
             // Same pixels every run: software raster, images decoded before the frame, every compositor stage
             // finished before it is drawn.
-            "--disable-gpu",
-            "--disable-gpu-compositing",
-            "--disable-features=Vulkan,SkiaGraphite",
-            "--disable-checker-imaging",
-            "--run-all-compositor-stages-before-draw",
-            "--disable-partial-raster",
-            "--num-raster-threads=1",
-            "--disable-oop-rasterization",
-            "--disable-gpu-rasterization",
-            "--disable-skia-runtime-opts",
+            "disable-gpu".to_string(),
+            "disable-gpu-compositing".to_string(),
+            "disable-checker-imaging".to_string(),
+            "run-all-compositor-stages-before-draw".to_string(),
+            "disable-partial-raster".to_string(),
+            "num-raster-threads=1".to_string(),
+            "disable-oop-rasterization".to_string(),
+            "disable-gpu-rasterization".to_string(),
+            "disable-skia-runtime-opts".to_string(),
+            // Sandboxed frames stay in their parent's process: Chrome would otherwise move a sandboxed srcdoc
+            // frame to its own process after its first document started, past any script the page session adds.
         ])
-        // Sandboxed frames stay in their parent's process: Chrome would otherwise move a sandboxed srcdoc frame to
-        // its own process after its first document started, past any script the page session adds. The key has no
-        // dashes: that is how `chromiumoxide` merges it into its own `--disable-features`.
-        .arg(("disable-features", "IsolateSandboxedIframes"))
+        .arg((
+            "disable-features",
+            &["Vulkan", "SkiaGraphite", "IsolateSandboxedIframes"][..],
+        ))
         .build()
         .map_err(Error::Environment)?;
     let (browser, mut handler) = Browser::launch(config)
@@ -1132,6 +1134,67 @@ mod tests {
             "ws://localhost.example.com:5555/live",
         ] {
             assert!(socket_leaves(url, base).is_some(), "{url}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    /// Every intended flag reaches the real Chrome, spelled once with two dashes (a `----flag` is ignored).
+    #[tokio::test]
+    async fn every_launch_flag_reaches_chrome_well_formed() {
+        if !crate::browser::installed() {
+            eprintln!("pinned Chrome not installed: skipped");
+            return;
+        }
+        let profile = std::env::temp_dir().join(format!("shakedown-flags-{}", std::process::id()));
+        let (mut browser, task) = launch(&crate::browser::binary(), &profile).await.unwrap();
+        let line = browser
+            .execute(
+                chromiumoxide::cdp::browser_protocol::browser::GetBrowserCommandLineParams::default(
+                ),
+            )
+            .await
+            .unwrap();
+        let _ = browser.close().await;
+        task.abort();
+        let _ = std::fs::remove_dir_all(&profile);
+        let args = line.result.arguments;
+        for a in &args {
+            assert!(!a.starts_with("---"), "malformed flag {a}");
+        }
+        let count = |flag: &str| args.iter().filter(|a| a.as_str() == flag).count();
+        for flag in [
+            "--font-render-hinting=none",
+            "--disable-lcd-text",
+            "--force-color-profile=srgb",
+            "--hide-scrollbars",
+            "--mute-audio",
+            "--proxy-server=127.0.0.1:9",
+            "--disable-gpu",
+            "--disable-gpu-compositing",
+            "--disable-checker-imaging",
+            "--run-all-compositor-stages-before-draw",
+            "--disable-partial-raster",
+            "--num-raster-threads=1",
+            "--disable-oop-rasterization",
+            "--disable-gpu-rasterization",
+            "--disable-skia-runtime-opts",
+        ] {
+            assert_eq!(count(flag), 1, "{flag} in {args:?}");
+        }
+        let features: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("--disable-features="))
+            .collect();
+        assert_eq!(features.len(), 1, "one --disable-features: {features:?}");
+        for f in ["Vulkan", "SkiaGraphite", "IsolateSandboxedIframes"] {
+            assert!(
+                features[0].split(['=', ',']).any(|x| x == f),
+                "{f} in {features:?}"
+            );
         }
     }
 }
