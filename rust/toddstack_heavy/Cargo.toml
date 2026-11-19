@@ -1,0 +1,34 @@
+[package]
+name = "toddstack-heavy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+description = "heavy: a machine-wide admission queue for heavy jobs (builds, tests, GPU work). Reserves cores, RAM, VRAM and disk, runs jobs when they fit, and prints what each one used."
+license-file.workspace = true
+keywords = ["queue", "scheduler", "build", "resources", "toddstack"]
+categories = ["development-tools", "command-line-utilities"]
+include = ["**/*.rs", "Cargo.toml", "LICENSE", "README.md"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "heavy"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jiff = { workspace = true }
+signal-hook = "0.4.6"
+nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "resource", "signal"] }
+sysinfo = { version = "0.40.4", default-features = false, features = ["system", "network"] }
+notify = { version = "8.2.2", default-features = false, features = ["macos_kqueue"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
