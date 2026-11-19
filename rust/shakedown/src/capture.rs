@@ -711,16 +711,25 @@ fn strip_origin(u: &str) -> String {
     )
 }
 
-/// The finding for a WebSocket URL that leaves the machine; `None` for one on the local server (`base` is
-/// `http://127.0.0.1:<port>`; its `ws` twin is the same host and port).
-fn socket_leaves(ws_url: &str, base: &str) -> Option<String> {
-    let local = |u: &url::Url| {
-        let (h, p) = (u.host_str().map(str::to_string), u.port_or_known_default());
-        (h, p)
+/// Is `u` (a `ws`/`wss` URL) on the local server (`base` is `http://127.0.0.1:<port>`) under any loopback name
+/// (localhost, 127.0.0.1, [::1])? Another port, even on loopback, is not the page's world.
+fn on_the_local_server(u: &url::Url, base: &url::Url) -> bool {
+    let loopback = match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(a)) => a.is_loopback(),
+        Some(url::Host::Ipv6(a)) => a.is_loopback(),
+        None => false,
     };
+    matches!(u.scheme(), "ws" | "wss")
+        && loopback
+        && u.port_or_known_default() == base.port_or_known_default()
+}
+
+/// The finding for a WebSocket URL that leaves the machine; `None` for one on the local server.
+fn socket_leaves(ws_url: &str, base: &str) -> Option<String> {
     let b = url::Url::parse(base).ok()?;
     match url::Url::parse(ws_url) {
-        Ok(u) if matches!(u.scheme(), "ws" | "wss") && local(&u) == local(&b) => None,
+        Ok(u) if on_the_local_server(&u, &b) => None,
         Ok(u) => Some(format!(
             "request leaves the machine: {}{}",
             u.origin().ascii_serialization(),
@@ -751,7 +760,9 @@ async fn watch_requests(page: &Page, c: &Arc<Collected>, base: &str) -> Result<(
         .event_listener::<network::EventRequestServedFromCache>()
         .await
         .map_err(err("network"))?;
-    // Fetch never pauses WebSockets, so the wall for them is here: one opened off this origin fails the screen.
+    // Fetch never pauses WebSockets, and `Network.setBlockedURLs` does not stop them either (tried with allow
+    // and block patterns: the socket still connects), so a socket cannot be refused before it connects: one
+    // opened off this origin fails the screen here instead.
     let mut sockets = page
         .event_listener::<network::EventWebSocketCreated>()
         .await
@@ -1048,5 +1059,26 @@ mod tests {
     #[test]
     fn origins_never_reach_messages() {
         assert_eq!(strip_origin("http://127.0.0.1:5555/a.js?x=1"), "/a.js?x=1");
+    }
+
+    #[test]
+    fn every_loopback_name_on_the_servers_port_is_on_the_machine() {
+        let base = "http://127.0.0.1:5555";
+        for url in [
+            "ws://localhost:5555/live",
+            "ws://127.0.0.1:5555/live",
+            "ws://[::1]:5555/live",
+            "wss://LOCALHOST:5555/live",
+        ] {
+            assert_eq!(socket_leaves(url, base), None, "{url}");
+        }
+        for url in [
+            "wss://example.com/live",
+            "ws://localhost:6666/live",
+            "ws://192.168.1.5:5555/live",
+            "ws://localhost.example.com:5555/live",
+        ] {
+            assert!(socket_leaves(url, base).is_some(), "{url}");
+        }
     }
 }

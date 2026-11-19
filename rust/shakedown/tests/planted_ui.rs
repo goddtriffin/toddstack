@@ -497,6 +497,17 @@ fn a_websocket_to_the_local_server_is_allowed() {
 }
 
 #[test]
+fn a_websocket_to_localhost_on_the_servers_port_is_allowed() {
+    let site = Site::new("websocket-localhost");
+    site.screen("");
+    site.page(&format!(
+        "{OK_BODY}<script>try{{new WebSocket('ws://localhost:'+location.port+'/live')}}catch(e){{}}</script>"
+    ));
+    let o = site.run(&["update", "--screens", "page"]);
+    assert!(!text(&o).contains("leaves the machine"), "{}", text(&o));
+}
+
+#[test]
 fn a_request_with_another_scheme_fails() {
     planted(
         "ftp",
