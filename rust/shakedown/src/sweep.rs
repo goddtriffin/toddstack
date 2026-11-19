@@ -4,12 +4,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::json;
 
-use crate::capture::{Job, Shot};
+use crate::capture::{self, Job, Shot};
 use crate::config::{Config, Screen, SweepRoute};
 use crate::devices::{self, Device};
 use crate::error::Error;
@@ -110,6 +110,10 @@ pub fn judge(baseline: Option<&[u8]>, current: &[u8]) -> Change {
     let Some(baseline) = baseline else {
         return Change::New;
     };
+    if baseline == current {
+        // The very same file: nothing to decode, nothing to compare.
+        return Change::Same;
+    }
     let (Ok(before), Ok(after)) = (pixels::decode(baseline), pixels::decode(current)) else {
         return Change::NoImage;
     };
@@ -417,7 +421,12 @@ fn png_of(shot: &Shot) -> Result<Vec<u8>, Error> {
     if shot.png.is_empty() {
         return Ok(Vec::new());
     }
-    pixels::encode(&pixels::decode(&shot.png)?, pixels::REF_STEP)
+    // The sweep's pictures stay on this machine (the baseline, `current/`, the pack): speed over size.
+    pixels::encode_with(
+        &pixels::decode(&shot.png)?,
+        pixels::REF_STEP,
+        png::Compression::Fast,
+    )
 }
 
 /// Runs the sweep.
@@ -451,6 +460,18 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     if opts.pack {
         let _ = std::fs::remove_dir_all(pack_dir(root));
     }
+    std::fs::create_dir_all(dir.join("baseline")).map_err(|e| io(&e))?;
+    // Each shot is judged on its own thread the moment it is drawn, while the others are still being drawn.
+    let judged: Arc<Mutex<Vec<Result<Judged, Error>>>> = Arc::default();
+    let sink: capture::Sink = {
+        let (dir, judged, rebase) = (dir.clone(), judged.clone(), opts.rebase);
+        Arc::new(move |shot: &Shot| {
+            let r = judge_shot(&dir, shot, rebase);
+            if let Ok(mut j) = judged.lock() {
+                j.push(r);
+            }
+        })
+    };
     let runs = ui::draw_all(
         config,
         root,
@@ -459,6 +480,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         1,
         started,
         base.as_deref(),
+        Some(&sink),
     )?;
     let shots = runs.into_iter().next().unwrap_or_default();
 
@@ -477,7 +499,12 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
             flaky.join("; ")
         ));
     }
-    let (records, pictures) = judge_all(&dir, &shots, opts.rebase)?;
+    let judged = std::mem::take(
+        &mut *judged
+            .lock()
+            .map_err(|_| Error::Failed("judge lock".into()))?,
+    );
+    let (records, pictures) = collect(judged, shots.len())?;
     outcome.new = records.iter().filter(|r| r.change == Change::New).count();
     outcome.changed = records.iter().filter(|r| r.change.line().is_some()).count();
     outcome.failed = records
@@ -503,48 +530,73 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
 
 type Pictures = BTreeMap<String, Vec<u8>>;
 
+/// One judged shot: its record and its (re-encoded) picture.
+struct Judged {
+    record: Record,
+    id: String,
+    png: Vec<u8>,
+}
+
 /// Writes `current/`, compares with `baseline/`, and keeps the baseline (new shots, or all of them on `rebase`).
-fn judge_all(dir: &Path, shots: &[Shot], rebase: bool) -> Result<(Vec<Record>, Pictures), Error> {
+/// Shots are independent: this runs for each as soon as it is drawn.
+fn judge_shot(dir: &Path, shot: &Shot, rebase: bool) -> Result<Judged, Error> {
     let (current, baseline, diff) = (dir.join("current"), dir.join("baseline"), dir.join("diff"));
-    for d in [&current, &baseline] {
-        std::fs::create_dir_all(d).map_err(|e| io(&e))?;
+    std::fs::create_dir_all(&current).map_err(|e| io(&e))?;
+    let (route, device, theme) =
+        split_id(&shot.id).ok_or_else(|| Error::Environment(format!("shot id {:?}", shot.id)))?;
+    let png = png_of(shot)?;
+    let old_path = baseline.join(format!("{}.png", shot.id));
+    let old = std::fs::read(&old_path).ok();
+    let change = judge(old.as_deref(), &png);
+    if !png.is_empty() {
+        std::fs::write(current.join(format!("{}.png", shot.id)), &png).map_err(|e| io(&e))?;
+        if old.is_none() || rebase {
+            std::fs::write(&old_path, &png).map_err(|e| io(&e))?;
+        }
     }
-    let mut records = Vec::new();
-    let mut pictures = Pictures::new();
-    for shot in shots {
-        let (route, device, theme) = split_id(&shot.id)
-            .ok_or_else(|| Error::Environment(format!("shot id {:?}", shot.id)))?;
-        let png = png_of(shot)?;
-        let old_path = baseline.join(format!("{}.png", shot.id));
-        let old = std::fs::read(&old_path).ok();
-        let change = judge(old.as_deref(), &png);
-        if !png.is_empty() {
-            std::fs::write(current.join(format!("{}.png", shot.id)), &png).map_err(|e| io(&e))?;
-            if old.is_none() || rebase {
-                std::fs::write(&old_path, &png).map_err(|e| io(&e))?;
-            }
-        }
-        if let (Change::Changed { .. }, Some(old)) = (&change, &old)
-            && let (Ok(a), Ok(b)) = (pixels::decode(old), pixels::decode(&png))
-            && let Some(d) = pixels::compare(&a, &b).diff
-        {
-            std::fs::create_dir_all(&diff).map_err(|e| io(&e))?;
-            std::fs::write(
-                diff.join(format!("{}.png", shot.id)),
-                pixels::encode(&d, 1)?,
-            )
-            .map_err(|e| io(&e))?;
-        }
-        let mut findings: Vec<String> = shot.findings.iter().map(Finding::line).collect();
-        findings.sort();
-        records.push(Record {
+    if let (Change::Changed { .. }, Some(old)) = (&change, &old)
+        && let (Ok(a), Ok(b)) = (pixels::decode(old), pixels::decode(&png))
+        && let Some(d) = pixels::compare(&a, &b).diff
+    {
+        std::fs::create_dir_all(&diff).map_err(|e| io(&e))?;
+        std::fs::write(
+            diff.join(format!("{}.png", shot.id)),
+            pixels::encode(&d, 1)?,
+        )
+        .map_err(|e| io(&e))?;
+    }
+    let mut findings: Vec<String> = shot.findings.iter().map(Finding::line).collect();
+    findings.sort();
+    Ok(Judged {
+        record: Record {
             route: route.into(),
             device: device.into(),
             theme: theme.into(),
             findings,
             change,
-        });
-        pictures.insert(shot.id.clone(), png);
+        },
+        id: shot.id.clone(),
+        png,
+    })
+}
+
+/// The judged shots as sorted records and the pictures by id.
+fn collect(
+    judged: Vec<Result<Judged, Error>>,
+    shots: usize,
+) -> Result<(Vec<Record>, Pictures), Error> {
+    let mut records = Vec::new();
+    let mut pictures = Pictures::new();
+    for j in judged {
+        let j = j?;
+        pictures.insert(j.id, j.png);
+        records.push(j.record);
+    }
+    if records.len() != shots {
+        return Err(Error::Failed(format!(
+            "{} of {shots} shots were judged",
+            records.len()
+        )));
     }
     records.sort_by(|a, b| (&a.route, &a.device, &a.theme).cmp(&(&b.route, &b.device, &b.theme)));
     Ok((records, pictures))
