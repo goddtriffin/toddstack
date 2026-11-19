@@ -181,7 +181,7 @@ pub struct Running {
 }
 
 /// A free local port (best effort: another process could take it before the server does).
-fn free_port() -> Result<u16, Error> {
+pub fn free_port() -> Result<u16, Error> {
     TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
@@ -488,7 +488,7 @@ impl Drop for Running {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -504,7 +504,7 @@ mod tests {
     /// Tests that watch signals in this process must not overlap the one that signals the process itself.
     static SIGNALS: Mutex<()> = Mutex::new(());
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
         SIGNALS.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

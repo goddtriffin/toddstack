@@ -584,3 +584,27 @@ Built as designed, with these differences:
   cannot be given a different `prefers-color-scheme`, so dark mode is checked exactly only by `sweep`.
 - Not done: the viewer's per-frame "own player" sign-in is a button that loads `[players].signin` (it needs a
   `shakedown.toml`); `loading-indicator` is still not implemented.
+
+## Phase 4 notes (2026-11-21, shakedown 0.4.2)
+
+`shakedown smoke` is built as section 10 describes, with these differences:
+
+- Step 5 (the sweep against the container) is wired. `smoke::sweep_container` calls `sweep::run` with
+  `base = http://127.0.0.1:{port}` (no world of its own, no pack, no rebase) on the project's `[sweep]` pages;
+  layout findings fail the step, pixel changes against the dev-server baseline stay reported by `shakedown sweep`
+  only. `run_on` takes the sweeper as a parameter, so the tests inject findings without Chrome. A config without a
+  `[sweep]` section reports `skip smoke.sweep` (a skip is not a pass: it is on the output line). A sweep that cannot
+  run (no Chrome) fails the step. `routes` of `[smoke]` do not select sweep pages: the whole `[sweep]` list is drawn.
+- One extra optional key, `logs`: a third `make` target that prints the container's output. Docker stays behind the
+  Makefile, and a container run with `--rm` that crashes at boot leaves nothing for `docker logs`, so the repo's
+  `smoke_up` attaches the run to a log file and `smoke_logs` prints it. `down` and `logs` take `{port}` like `up`
+  (container, database and network names carry the port, so two runs never share them).
+- Other keys: `ready` (default `/`), `timeout` (30 s), `routes` (the paths the built-in checks cover, besides the
+  `checks` paths), `headers`, `min_cache`, `log_ignore`.
+- The up target must print the image digest (`sha256:` and 64 hex digits); a run without one fails, so the push
+  step can always confirm the same image shipped. The digest is in the output, `summary.json` and `smoke.up`'s line.
+- The HTTP client is about 40 lines over `std::net` (loopback, HTTP/1.0, no redirects, no TLS): no new dependency.
+- Security headers default to CSP, `X-Content-Type-Options` and `Referrer-Policy`. HSTS is left to the edge
+  (accounts-service sends none; Cloudflare adds it).
+- Planted breaks proven on accounts-service: a crashing image (bad env var) fails `smoke.ready` with the container's
+  log shown, and a page that references a missing asset fails `smoke.http`.

@@ -6,12 +6,12 @@ local only (macOS). Design record: [`docs/testing-tool/DESIGN.md`](../../docs/te
 
 Shipped: the `check` step runner, `budgets sizes`, `pixels` compare, the report, `doctor` (phase 1); the pinned
 Chrome, `ui web` with layout rules and approved references, `update`, fake and seeded worlds, `include` (phase 2).
-`sweep` with the review pack and `devices serve`, the interactive viewer (phase 3). Smoke tests and simulators arrive in later phases.
+`sweep` with the review pack and `devices serve`, the interactive viewer (phase 3). `smoke`, the production-image smoke test (phase 4). Simulators arrive in a later phase.
 
 ## Install
 
 ```sh
-cargo install shakedown@0.4.1 --locked          # from crates.io
+cargo install shakedown@0.4.2 --locked          # from crates.io
 cargo install --path rust/shakedown --locked    # from a toddstack checkout
 shakedown doctor                                # what is installed, what is missing, and the fix for each miss
 ```
@@ -30,6 +30,7 @@ Pin the version in each project's `shakedown.toml`; a mismatch stops with the ex
 | `shakedown update --screens a,b` | rewrites only the named references, and only the files whose pixels changed. `all` only for a first generation |
 | `shakedown browser install` / `path` | the pinned Chrome for Testing 149.0.7827.55 (macOS arm64 or Linux x86_64; sha256 checked, unpacked with `ditto` or, on Linux, `unzip` into `~/Library/Caches/shakedown/chrome/` or `~/.cache/shakedown/chrome/`; Linux Chrome needs `sudo apt install libnss3 libnspr4 libasound2t64`). `ui` installs it on first use |
 | `shakedown sweep [--base URL] [--routes a,b] [--pack] [--rebase]` | every `[sweep]` page on every sweep device and theme, headless: layout rules and shift fail it; pixels are diffed against a local baseline and only reported. `--pack` writes the review pack |
+| `shakedown smoke [--json]` | starts the production Docker image through the repo's own `make` targets and checks it over HTTP; always stops it (`[smoke]`, below) |
 | `shakedown devices [list\|json\|serve]` | the one device list (18 devices, portrait and landscape); `serve` is the interactive side-by-side viewer |
 | `shakedown doctor` | checks Rust, a shell, `strip`, Xcode, simulator runtimes, Java, the Android SDK, the pinned Chrome and disk use |
 
@@ -47,7 +48,7 @@ Exit codes: 0 pass, 1 a check failed, 2 config or usage error, 3 environment mis
 At the repo root.
 
 ```toml
-shakedown = "0.2.0"        # the tool version this repo expects (exact)
+shakedown = "0.4.2"        # the tool version this repo expects (exact)
 project   = "example"
 
 [check]
@@ -82,7 +83,7 @@ that ran.
 hold one `*` for hashed names and must then match exactly one file. Ceilings, all in exact bytes: `raw`, `gzip`
 (level 9), `brotli` (quality 11), and `max` (raw size, or the size after `strip -S -x` when `strip = true`).
 
-Sections of later phases (`[smoke]`, ...) are accepted and ignored with a note; typos inside the
+Sections of later phases are accepted and ignored with a note; typos inside the
 sections below are errors.
 
 ## UI checks
@@ -213,3 +214,50 @@ layout shift, a 1 px move, a colour change just over the threshold and a missing
 to fail naming it; harmless drift, an ignore with a reason and a clean `--repeat 3` must pass. They need the pinned
 Chrome (installed on first use). `tests/planted_sweep.rs` sweeps a small site: a page that scrolls sideways fails,
 pixel changes are only reported, `--pack` writes a manifest and sheets within 1568 px, and a non-local `--base` is refused.
+
+## `shakedown smoke`
+
+The exact image that will ship, run the way production runs it. The tool never runs `docker`: `up` and `down` are
+the repo's `make` targets (they run the already-built image with `--rm`, the repo label, `127.0.0.1` only, fake
+local secrets and a throwaway database). Build the image from the commit that will land first, then smoke it.
+
+```toml
+[smoke]
+up     = "make smoke_up PORT={port}"    # starts the image, prints its digest (sha256: and 64 hex digits)
+down   = "make smoke_down PORT={port}"  # removes everything up made; safe after a half-finished up
+logs   = "make smoke_logs PORT={port}"  # optional: prints the container's output (kept even after a crash)
+ready  = "/health"                      # answers below 500 once the container is up (default "/")
+timeout = 30                            # seconds to wait for ready (default 30)
+routes = ["/sign-in", "/health"]        # pages the built-in checks cover, besides the paths of `checks`
+checks = [
+  { path = "/", status = 303, location = "/sign-in" },
+  { path = "/sign-in", contains = "Sign in", content_type = "text/html", max_bytes = 60000 },
+]
+headers   = ["content-security-policy", "x-content-type-options", "referrer-policy"]  # the default; [] turns off
+min_cache = 86400                       # least max-age an asset must grant (default; 0 turns off)
+log_ignore = ["known noisy text"]       # log lines (substrings) left out of the error scan
+sweep = true                            # the layout sweep against the container (the `[sweep]` pages); skipped when there is no `[sweep]` section
+```
+
+Steps, one output line each: `smoke.up` (records the digest), `smoke.ready`, `smoke.http`, `smoke.checks`,
+`smoke.sweep`, `smoke.logs`, `smoke.down`.
+
+- `smoke.sweep` (with `sweep = true`): every `[sweep]` page on every sweep device and theme, drawn by `shakedown sweep`'s
+  code against `http://127.0.0.1:{port}` with no world of its own. A layout finding fails the step; pixel changes
+  against the dev-server baseline are left to `shakedown sweep`. Signed-in pages sign in through `[players].signin`,
+  so the production image must serve that path (or keep those pages out of `[sweep]`).
+
+- `smoke.http`, on every route and every `checks` path: no 5xx; the `headers` present; no `localhost`, `127.0.0.1`,
+  `0.0.0.0` or `[::1]` in served HTML, JSON or XML; and every script, stylesheet, icon, image and media file the
+  HTML loads from the container answers 200 with `max-age` of at least `min_cache` (or `immutable`).
+  Assets on other hosts are not fetched.
+- `smoke.checks`: `status` (default 200; redirects are not followed), `contains` (body), `location` (the
+  `Location` header, as a path or a full URL), `content_type` (substring), `max_bytes`.
+- `smoke.logs`: a log line with the word `error`, `panic`, `panicked` or `fatal` fails the step.
+- `smoke.down` runs on every exit: a pass, a failed check, a panic, a failed `up`, and the first Ctrl-C or SIGTERM.
+  A second signal ends the process at once, as in `ui`. A `down` that fails is a failure.
+
+Exit codes: 0 pass, 1 a step failed (including `up` and `down`), 2 no `[smoke]` section or an `up` that names a
+`make` target the Makefile does not have, 3 a tool `up` needs is not installed. `--json` writes
+`target/shakedown/smoke/summary.json` (with the digest); `up.log`, `down.log`, `container.log` and, on failure,
+`report.html` are in the same folder.
