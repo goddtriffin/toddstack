@@ -459,12 +459,12 @@ Targets, not measured yet:
    steps are deleted.
 2. **The interactive viewer.** `shakedown devices serve` reaches parity with `scripts/devices/devices.py`; infra's
    README then points to it and the Python script is deleted.
-3. **Boggledygook, before its store release** (BDG #74), done by the BDG session, which owns the repo. Each check
-   moves only when it passes the Acceptance rule below. `ui/web/screens.mjs` becomes `[[screen]]` entries; the existing references carry over unchanged (same
-   compare, same quantization, same names); `ui/*.mjs`, `png.mjs`, `report.mjs`, `layout.mjs`, `core_size.py` and
-   the vitals scripts are deleted; the Kotlin and Swift `UiCheck` tests are replaced by the vendored harnesses,
-   which add the layout tree. Everything game-specific (screens, fixtures, budgets) stays in BDG's own
-   `shakedown.toml`.
+3. **Boggledygook, before its store release** (BDG #74), done by the BDG session, which owns the repo. Each check moves
+   only when it passes the Acceptance rule below. `ui/web/screens.mjs` becomes `[[screen]]` entries; the existing
+   references carry over unchanged (same compare, same quantization, same names); `ui/*.mjs`, `png.mjs`, `report.mjs`,
+   `layout.mjs`, `core_size.py` and the vitals scripts are deleted; the Kotlin and Swift `UiCheck` tests are replaced by
+   the vendored harnesses, which add the layout tree. Everything game-specific (screens, fixtures, budgets) stays in
+   BDG's own `shakedown.toml`.
 4. **Every other project**, one at a time, as each is next touched.
 
 ## Acceptance: when shakedown may replace a project's check
