@@ -1370,16 +1370,38 @@ mod frame_tests {
     /// The viewer path: an app serves a page with a doctype and no `<head>`; the viewer proxy injects the collector; a frame loads it.
     #[tokio::test]
     async fn the_viewer_keeps_a_headless_doctype_page_in_standards_mode_and_catches_ariafold() {
-        viewer_case(0).await;
+        viewer_case(0, "", "<!doctype html>", "CSS1Compat").await;
+    }
+
+    /// Whatever starts the document, the appended collector leaves the document mode alone.
+    #[tokio::test]
+    async fn the_viewer_never_changes_the_document_mode_whatever_the_page_starts_with() {
+        let cases = [
+            ("\u{feff}", "<!doctype html>", "CSS1Compat"),
+            ("<?xml version=\"1.0\"?>", "<!doctype html>", "CSS1Compat"),
+            ("<!-->", "<!doctype html>", "CSS1Compat"),
+            // Stray text before the doctype is quirks mode on its own; injecting must not change that either way.
+            ("--!>", "<!doctype html>", "BackCompat"),
+            ("<!-- a > b -->\n", "<!DOCTYPE HTML>", "CSS1Compat"),
+            ("<!-- <!doctype html> -->", "", "BackCompat"),
+            (
+                "",
+                "<!doctype html><script>var a = \"<html>\";</script>",
+                "CSS1Compat",
+            ),
+        ];
+        for (i, (prefix, doctype, mode)) in cases.into_iter().enumerate() {
+            viewer_case(100 + u32::try_from(i).unwrap(), prefix, doctype, mode).await;
+        }
     }
 
     /// Same, with the frame far below the fold at load time and nobody scrolling or reloading.
     #[tokio::test]
     async fn a_frame_that_starts_offscreen_still_reports_without_a_reload() {
-        viewer_case(4000).await;
+        viewer_case(4000, "", "<!doctype html>", "CSS1Compat").await;
     }
 
-    async fn viewer_case(top: u32) {
+    async fn viewer_case(top: u32, prefix: &'static str, doctype: &'static str, want: &str) {
         if !crate::browser::installed() {
             eprintln!("pinned Chrome not installed: skipped");
             return;
@@ -1403,10 +1425,12 @@ mod frame_tests {
                         )
                     } else {
                         // The old ariafold fixture: a doctype, no head, an aria-hidden icon over text below the fold.
-                        "<!doctype html><meta charset=utf-8><body style=\"margin:0;font:16px sans-serif;height:3000px\">\
+                        format!(
+                            "{prefix}{doctype}<meta charset=utf-8><body style=\"margin:0;font:16px sans-serif;height:3000px\">\
 <p style=\"position:absolute;top:2000px;left:50px;margin:0\">Score text</p>\
 <span aria-hidden=\"true\" style=\"position:absolute;top:2000px;left:50px;z-index:2\">ICON</span>\
-<script>addEventListener('load',()=>setTimeout(()=>parent.postMessage({ mode: document.compatMode }, '*'), 1500));</script>".to_string()
+<script>addEventListener('load',()=>setTimeout(()=>parent.postMessage({{ mode: document.compatMode }}, '*'), 1500));</script>"
+                        )
                     };
                     let _ = write!(
                         c,
@@ -1461,17 +1485,16 @@ mod frame_tests {
         assert!(!msgs.is_empty(), "the frame never reported");
         let mode = msgs.iter().find(|e| e["mode"].is_string()).unwrap();
         assert_eq!(
-            mode["mode"], "CSS1Compat",
-            "the page must stay in standards mode"
+            mode["mode"], want,
+            "the page must keep its document mode ({prefix:?})"
         );
         let loaded = msgs.iter().find(|e| e["shakedown"] == "loaded").unwrap();
         let nodes = loaded["tree"]["nodes"].as_array().unwrap();
         assert!(
-            nodes
-                .iter()
-                .any(|n| n["decor"] == true
+            want != "CSS1Compat"
+                || nodes.iter().any(|n| n["decor"] == true
                     && n["top_lines"].as_array().is_some_and(|l| !l.is_empty())),
-            "ariafold must be caught through the viewer: {nodes:?}"
+            "ariafold must be caught through the viewer ({prefix:?}, {doctype:?}): {nodes:?}"
         );
     }
 
@@ -1536,12 +1559,121 @@ mod frame_tests {
                 .into_value::<String>()
                 .unwrap_or_default();
             let v: Vec<String> = serde_json::from_str(&last).unwrap_or_default();
-            if v.len() > 5 && v.iter().all(|t| !t.is_empty()) {
+            if v.len() > 5 && v.iter().all(|t| !t.is_empty() && !t.contains("checking")) {
                 done = true;
                 break;
             }
         }
         assert!(done, "some frames never reported: {last}");
+    }
+
+    /// An app that drops every connection for some frames and hangs for another: the page must never say clean.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines)]
+    async fn frames_that_never_report_are_listed_and_the_summary_is_never_clean() {
+        if !crate::browser::installed() {
+            eprintln!("pinned Chrome not installed: skipped");
+            return;
+        }
+        let app = TcpListener::bind("127.0.0.1:0").unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        let free = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = free.local_addr().unwrap().port();
+        drop(free);
+        std::thread::spawn(move || {
+            for mut c in app.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut buf = [0_u8; 4096];
+                    let n = c.read(&mut buf).unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                    let host = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("host: "))
+                        .unwrap_or("")
+                        .to_string();
+                    if host.starts_with("p3.") || host.starts_with("p7.") {
+                        return; // dropped
+                    }
+                    if host.starts_with("p5.") {
+                        std::thread::sleep(Duration::from_secs(120));
+                        return; // never answers
+                    }
+                    let body = "<!doctype html><meta charset=utf-8><body style=\"margin:0;font:16px sans-serif\"><p>Hello</p>";
+                    let _ = write!(
+                        c,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let settings = crate::viewer::Settings {
+            port: proxy_port,
+            target: format!("127.0.0.1:{app_port}"),
+            routes_file: None,
+            config_routes: Vec::new(),
+            players: None,
+            ignores: "[]".into(),
+        };
+        std::thread::spawn(move || {
+            let _ = crate::viewer::serve(&settings);
+        });
+        let profile =
+            std::env::temp_dir().join(format!("shakedown-silent-frames-{}", std::process::id()));
+        let mut chromes = Chromes::default();
+        let browser = chromes
+            .launch(&crate::browser::binary(), &profile)
+            .await
+            .unwrap();
+        let page = browser.new_page("about:blank").await.unwrap();
+        page.goto(format!(
+            "http://localhost:{proxy_port}/__devices?timeout=6000"
+        ))
+        .await
+        .unwrap();
+        let mut last = String::new();
+        let mut done = false;
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            last = page
+                .evaluate(
+                    "JSON.stringify({ st: [...document.querySelectorAll('.st')].map(e => e.textContent), report: document.querySelector('#report').textContent, retry: document.querySelectorAll('.st button').length })",
+                )
+                .await
+                .unwrap()
+                .into_value::<String>()
+                .unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_str(&last).unwrap_or_default();
+            let st = v["st"].as_array().cloned().unwrap_or_default();
+            let summary = v["report"].as_str().unwrap_or("");
+            assert!(
+                !summary.contains("no problems found"),
+                "a run with silent frames said clean: {last}"
+            );
+            if st.len() > 5
+                && st
+                    .iter()
+                    .all(|t| !t.as_str().unwrap_or("").contains("checking"))
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "frames stayed undecided: {last}");
+        let v: serde_json::Value = serde_json::from_str(&last).unwrap();
+        let silent = v["st"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t.as_str().unwrap_or("").starts_with("no report:"))
+            .count();
+        assert!(silent >= 3, "{last}");
+        assert_eq!(v["retry"].as_u64().unwrap(), silent as u64, "{last}");
+        let summary = v["report"].as_str().unwrap();
+        assert!(
+            summary.contains(&format!("{silent} frames did not report")),
+            "{last}"
+        );
     }
 
     async fn run(child_host: &str) {

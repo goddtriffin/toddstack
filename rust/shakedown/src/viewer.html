@@ -37,6 +37,9 @@ const $=s=>document.querySelector(s);
 const S={path:new URLSearchParams(location.search).get("path")||"/",theme:"light",show:new Set()};
 let DEVICES=[],ROUTES=[],CONFIG={players:[],signin:""};
 const BACK=[],SEEN=new Set();
+// Every frame must report. A frame that has not reported (or got a 502) is "no report", never clean.
+const TMO=+new URLSearchParams(location.search).get("timeout")||25000;
+const ST={},TIMERS=new Map();
 // Desktop and tablets are scaled down to fit; phones show at real size.
 const scaleOf=d=>{const a=d.width*d.height;return a>800000?.55:a>500000?.8:1};
 const hostOf=i=>`${location.protocol}//p${i+1}.localhost:${location.port}`;
@@ -65,29 +68,44 @@ const LEAD=new Map();
 // differ per frame never do, so frames cannot chase each other); a loaded page reports its layout tree.
 addEventListener("message",async e=>{const d=e.data;if(!d||!d.shakedown)return;const fr=frameOf(e.source);if(!fr)return;
   if(d.shakedown==="lead"){LEAD.set(fr,Date.now());return}
+  if(d.shakedown==="failed"){noreport(fr,String(d.reason||"the app did not answer"));return}
   if(d.shakedown!=="loaded")return;
   for(const p of d.links||[])SEEN.add(p);fillPages();
-  if(fr.dataset.signing){delete fr.dataset.signing;fr.src=src(+fr.dataset.index,S.path);return}
+  if(fr.dataset.signing){delete fr.dataset.signing;load(fr,S.path);return}
   const led=Date.now()-(LEAD.get(fr)||0)<15000;LEAD.delete(fr);
-  if(led&&$("#sync").checked&&setPath(d.path)){for(const o of document.querySelectorAll("#frames iframe"))if(o!==fr)o.src=src(+o.dataset.index,d.path)}
+  if(led&&$("#sync").checked&&setPath(d.path)){for(const o of document.querySelectorAll("#frames iframe"))if(o!==fr)load(o,d.path)}
   try{const r=await fetch("/__devices/check",{method:"POST",body:JSON.stringify(d.tree)});status(fr,await r.json())}catch{status(fr,["could not check"])}});
-function status(fr,problems){const st=document.getElementById("st-"+fr.dataset.id);if(!st)return;
-  st.textContent=problems.length?`${problems.length} problem(s)`:"ok";st.className="st"+(problems.length?" bad":"");st.title=problems.join("\n");
-  window.__problems=window.__problems||{};window.__problems[fr.dataset.id]=problems;
-  const all=Object.values(window.__problems).flat().length;$("#report").textContent=all?`${all} problem(s), hover a device`:"no problems found"}
+function load(fr,p){fr.src=src(+fr.dataset.index,p);arm(fr)}
+function arm(fr){clearTimeout(TIMERS.get(fr));ST[fr.dataset.id]={k:"pending"};paint(fr);
+  TIMERS.set(fr,setTimeout(()=>noreport(fr,"timed out"),TMO));summary()}
+function noreport(fr,reason){clearTimeout(TIMERS.get(fr));ST[fr.dataset.id]={k:"none",reason};paint(fr);summary()}
+function status(fr,problems){clearTimeout(TIMERS.get(fr));ST[fr.dataset.id]={k:problems.length?"bad":"ok",problems};paint(fr);
+  window.__problems=window.__problems||{};window.__problems[fr.dataset.id]=problems;summary()}
+function paint(fr){const st=document.getElementById("st-"+fr.dataset.id);if(!st)return;const v=ST[fr.dataset.id]||{k:"pending"};st.textContent="";st.title="";
+  if(v.k==="pending"){st.textContent="checking...";st.className="st"}
+  else if(v.k==="none"){st.className="st bad";st.textContent="no report: "+v.reason+" ";
+    const b=document.createElement("button");b.textContent="retry";b.onclick=()=>load(fr,S.path);st.append(b)}
+  else{st.textContent=v.k==="bad"?`${v.problems.length} problem(s)`:"ok";st.className="st"+(v.k==="bad"?" bad":"");st.title=v.problems.join("\n")}}
+// Clean only when every frame has reported clean.
+function summary(){const v=Object.values(ST),none=v.filter(x=>x.k==="none").length,wait=v.filter(x=>x.k==="pending").length,
+  probs=v.reduce((n,x)=>n+(x.problems?x.problems.length:0),0),parts=[];
+  if(probs)parts.push(`${probs} problem(s), hover a device`);
+  if(none)parts.push(none===1?"1 frame did not report":`${none} frames did not report`);
+  if(!parts.length)parts.push(wait?`checking ${wait} frame(s)...`:v.length?"no problems found":"");
+  $("#report").textContent=parts.join(", ")}
 $("#signin").onclick=()=>{const n=CONFIG.players.length;if(!n)return;
-  document.querySelectorAll("#frames iframe").forEach((f,k)=>{const i=+f.dataset.index;f.dataset.signing="1";f.src=src(i,CONFIG.signin.replace("{player}",CONFIG.players[k%n]))})};
+  document.querySelectorAll("#frames iframe").forEach((f,k)=>{const i=+f.dataset.index;f.dataset.signing="1";f.src=src(i,CONFIG.signin.replace("{player}",CONFIG.players[k%n]));arm(f)})};
 function render(){
   [...$("#themes").querySelectorAll("button")].forEach(b=>b.setAttribute("aria-pressed",b.textContent===S.theme));
   [...$("#sizes").querySelectorAll("button")].forEach((b,i)=>b.setAttribute("aria-pressed",S.show.has(DEVICES[i].name)));
-  const m=$("#frames");m.textContent="";window.__problems={};
+  const m=$("#frames");m.textContent="";window.__problems={};for(const t of TIMERS.values())clearTimeout(t);TIMERS.clear();for(const k of Object.keys(ST))delete ST[k];
   DEVICES.forEach((d,i)=>{if(!S.show.has(d.name))return;
     const f=document.createElement("figure"),c=document.createElement("figcaption"),box=document.createElement("div"),fr=document.createElement("iframe"),s=scaleOf(d);
     c.innerHTML=`<b></b><span>${d.width}×${d.height}</span><span class="st" id="st-${d.name}"></span><a target="_blank" rel="noopener">open</a>`;
     c.querySelector("b").textContent=d.label;c.querySelector("a").href=hostOf(i)+S.path;
     box.className="box"+(d.mobile?"":" desk");box.style.width=d.width*s+"px";box.style.height=d.height*s+"px";
     fr.width=d.width;fr.height=d.height;fr.style.transform=`scale(${s})`;fr.style.colorScheme=S.theme;fr.dataset.id=d.name;fr.dataset.index=i;fr.src=src(i,S.path);
-    box.append(fr);f.append(c,box);m.append(f)})}
+    box.append(fr);f.append(c,box);m.append(f);arm(fr)});summary()}
 async function start(){
   DEVICES=await (await fetch("/__devices/devices.json")).json();
   S.show=new Set(DEVICES.map(d=>d.name));
