@@ -1,12 +1,18 @@
 //! shakedown: one local testing tool for every project. See the README for the commands and `shakedown.toml`.
 
+mod browser;
 mod budgets;
+mod capture;
 mod config;
+mod devices;
 mod doctor;
 mod error;
+mod layout;
 mod pixels;
 mod report;
 mod steps;
+mod ui;
+mod world;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,6 +26,7 @@ use crate::report::PixelFailure;
 use crate::steps::{Job, Node, Status};
 
 const SIZES: &str = "budgets.sizes";
+const UI_WEB: &str = "ui.web";
 
 fn cli() -> Command {
     Command::new("shakedown")
@@ -59,6 +66,28 @@ fn cli() -> Command {
                         .arg(Arg::new("step").long("step").value_parser(value_parser!(u8)).default_value("8").help("Rounding step; 1 keeps every value")),
                 ),
         )
+        .subcommand(
+            Command::new("ui")
+                .about("Draw every screen on every ui device and theme: layout rules, then pixels against the approved references")
+                .arg(Arg::new("platform").value_parser(["web"]).default_value("web").help("Only web in this version"))
+                .arg(Arg::new("screens").long("screens").value_delimiter(',').help("Only these screens (comma separated); default: all"))
+                .arg(Arg::new("repeat").long("repeat").value_parser(value_parser!(u32)).default_value("1").help("Run everything N times and fail if any run differs"))
+                .arg(Arg::new("json").long("json").action(ArgAction::SetTrue).help("Also write target/shakedown/summary.json")),
+        )
+        .subcommand(
+            Command::new("update")
+                .about("Rewrite the named references (only the files whose pixels changed)")
+                .arg(Arg::new("screens").long("screens").required(true).value_delimiter(',').help("The screens to update; `all` only for a first generation"))
+                .arg(Arg::new("platform").long("platform").value_parser(["web"]).default_value("web")),
+        )
+        .subcommand(
+            Command::new("browser")
+                .about("The pinned Chrome for Testing")
+                .subcommand_required(true)
+                .subcommand(Command::new("install").about("Download and verify the pinned Chrome (once; shared by every project)"))
+                .subcommand(Command::new("path").about("Print the pinned Chrome's executable")),
+        )
+        .subcommand(Command::new("devices").about("The one device list"))
         .subcommand(Command::new("doctor").about("Check the tools the platforms need, and print the fix for each miss"))
 }
 
@@ -81,6 +110,35 @@ fn run(m: &ArgMatches) -> Result<(), Error> {
     let explicit = m.get_one::<PathBuf>("config").map(PathBuf::as_path);
     match m.subcommand() {
         Some(("doctor", _)) => doctor_cmd(),
+        Some(("devices", _)) => {
+            println!("{}", devices::table());
+            Ok(())
+        }
+        Some(("browser", sub)) => match sub.subcommand() {
+            Some(("install", _)) => {
+                let bin = browser::install()?;
+                println!("ok chrome {} {}", browser::CHROME_VERSION, bin.display());
+                Ok(())
+            }
+            _ => {
+                if browser::installed() {
+                    println!("{}", browser::binary().display());
+                    Ok(())
+                } else {
+                    Err(Error::Environment(
+                        "the pinned Chrome is not installed; run: shakedown browser install".into(),
+                    ))
+                }
+            }
+        },
+        Some(("ui", sub)) => {
+            let (config, root) = load(explicit)?;
+            ui_cmd(&config, &root, sub, ui::Mode::Check)
+        }
+        Some(("update", sub)) => {
+            let (config, root) = load(explicit)?;
+            ui_cmd(&config, &root, sub, ui::Mode::Update)
+        }
         Some(("pixels", sub)) => pixels_cmd(sub),
         Some(("check", sub)) => {
             let (config, root) = load(explicit)?;
@@ -157,12 +215,14 @@ fn check(config: &Config, root: &Path, only: &[String], json: bool) -> Result<()
         );
     }
     let builtin_listed = config.check.builtin.iter().any(|b| b == SIZES);
+    let ui_listed = config.check.builtin.iter().any(|b| b == UI_WEB);
     let known: Vec<&str> = config
         .check
         .steps
         .iter()
         .map(|s| s.name.as_str())
         .chain(builtin_listed.then_some(SIZES))
+        .chain(ui_listed.then_some(UI_WEB))
         .collect();
     if let Some(bad) = only.iter().find(|o| !known.contains(&o.as_str())) {
         return Err(Error::Config(format!(
@@ -197,12 +257,14 @@ fn check(config: &Config, root: &Path, only: &[String], json: bool) -> Result<()
             job: Job::Shell(s.run.clone()),
         })
         .collect();
-    if builtin_listed && wanted(SIZES, false) {
-        nodes.push(Node {
-            name: SIZES.into(),
-            after: Vec::new(),
-            job: Job::Builtin(SIZES.into()),
-        });
+    for (name, listed) in [(SIZES, builtin_listed), (UI_WEB, ui_listed)] {
+        if listed && wanted(name, false) {
+            nodes.push(Node {
+                name: name.into(),
+                after: Vec::new(),
+                job: Job::Builtin(name.into()),
+            });
+        }
     }
     if nodes.is_empty() {
         return Err(Error::Config(
@@ -210,10 +272,17 @@ fn check(config: &Config, root: &Path, only: &[String], json: bool) -> Result<()
         ));
     }
     let dir = out_dir(root).join("check");
-    let results = steps::run(&nodes, root, &dir, &|_| sizes_status(config, root));
+    let results = steps::run(&nodes, root, &dir, &|name| {
+        if name == UI_WEB {
+            ui::step(config, root)
+        } else {
+            sizes_status(config, root)
+        }
+    });
     print_results(&results);
     if json {
-        let rows = if builtin_listed {
+        let sizes_ran = results.iter().any(|r| r.name == SIZES);
+        let rows = if sizes_ran {
             budgets::check(&config.budgets.sizes, root)
         } else {
             Vec::new()
@@ -258,11 +327,55 @@ fn print_results(results: &[steps::StepResult]) {
             r.name,
             lines.len() - tail,
             lines.len(),
-            r.name
+            steps::log_name(&r.name)
         );
         for l in &lines[tail..] {
             println!("{l}");
         }
+    }
+}
+
+fn ui_cmd(config: &Config, root: &Path, m: &ArgMatches, mode: ui::Mode) -> Result<(), Error> {
+    let screens: Vec<String> = m
+        .get_many::<String>("screens")
+        .map_or_else(Vec::new, |v| v.cloned().collect());
+    let repeat = m
+        .try_get_one::<u32>("repeat")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(1);
+    let opts = ui::Options {
+        screens,
+        repeat,
+        mode,
+    };
+    let outcome = ui::run(config, root, &opts)?;
+    for line in ui::lines(&outcome, mode) {
+        println!("{line}");
+    }
+    if m.try_get_one::<bool>("json")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false)
+    {
+        let dir = out_dir(root);
+        std::fs::create_dir_all(&dir).map_err(|e| Error::Environment(e.to_string()))?;
+        std::fs::write(
+            dir.join("summary.json"),
+            ui::summary_json(&config.project, &outcome),
+        )
+        .map_err(|e| Error::Environment(format!("cannot write summary.json: {e}")))?;
+    }
+    if outcome.failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Failed(format!(
+            "{} of {} shots did not pass",
+            outcome.failures.len(),
+            outcome.shots
+        )))
     }
 }
 
@@ -279,8 +392,17 @@ fn sizes_cmd(config: &Config, root: &Path) -> Result<(), Error> {
         .iter()
         .filter(|r| matches!(r.verdict, Verdict::Over { .. }))
         .count();
+    let skipped = rows
+        .iter()
+        .filter(|r| matches!(r.verdict, Verdict::Skipped(_)))
+        .count();
     if over > 0 {
         return Err(Error::Failed(format!("{over} over budget")));
+    }
+    if skipped > 0 {
+        return Err(Error::Failed(format!(
+            "{skipped} not built (a skipped artifact is never a pass)"
+        )));
     }
     Ok(())
 }
@@ -365,6 +487,9 @@ fn pixels_cmd(matches: &ArgMatches) -> Result<(), Error> {
                 reference: Some(copy(&reference, &format!("{name}.reference.png"))?),
                 actual: Some(copy(&actual, &format!("{name}.actual.png"))?),
                 diff,
+                notes: Vec::new(),
+                boxes: Vec::new(),
+                size: None,
             };
             std::fs::write(out.join("report.html"), report::pixels_html(&[failure]))
                 .map_err(|e| Error::Environment(e.to_string()))?;

@@ -149,12 +149,28 @@ pub fn run(
             }
             if let Ok((i, r)) = rx.recv() {
                 running -= 1;
-                let _ = std::fs::write(log_dir.join(format!("{}.log", r.name)), &r.output);
+                let _ = std::fs::write(
+                    log_dir.join(format!("{}.log", log_name(&r.name))),
+                    &r.output,
+                );
                 results[i] = Some(r);
             }
         }
     });
     results.into_iter().flatten().collect()
+}
+
+/// A step name made safe for a file name (`a/b` would otherwise be a path).
+pub fn log_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn execute(
@@ -195,13 +211,32 @@ fn shell(cmd: &str, root: &Path) -> (Status, String, String) {
             );
         }
     };
-    let mut output = String::new();
+    // Read on a thread: a background process that inherited the pipe keeps it open after the step is done, and
+    // must not hang the run. After the child exits, wait a moment for the rest, then stop reading.
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let (done_tx, done_rx) = mpsc::channel::<()>();
     if let Some(mut out) = child.stdout.take() {
-        let mut bytes = Vec::new();
-        let _ = out.read_to_end(&mut bytes);
-        output = String::from_utf8_lossy(&bytes).into_owned();
+        let buf = buf.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0_u8; 8192];
+            while let Ok(n) = out.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut b) = buf.lock() {
+                    b.extend_from_slice(&chunk[..n]);
+                }
+            }
+            let _ = done_tx.send(());
+        });
     }
-    match child.wait() {
+    let waited = child.wait();
+    let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    let output = buf.lock().map_or_else(
+        |_| String::new(),
+        |b| String::from_utf8_lossy(&b).into_owned(),
+    );
+    match waited {
         Ok(s) if s.success() => (Status::Ok, String::new(), output),
         Ok(s) => {
             let why = s
@@ -273,6 +308,37 @@ mod tests {
         let r = run(&nodes, &d, &d.join("logs"), &no_builtin);
         assert_eq!(r[1].status, Status::Ok);
         assert!(r[0].output.contains("err"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_background_process_holding_the_pipe_does_not_hang_the_step() {
+        let d = tmp("bg");
+        let started = Instant::now();
+        let r = run(
+            &[node("bg", &[], "echo out; sleep 30 &")],
+            &d,
+            &d.join("logs"),
+            &no_builtin,
+        );
+        assert_eq!(r[0].status, Status::Ok);
+        assert!(r[0].output.contains("out"));
+        assert!(started.elapsed().as_secs() < 15);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn step_names_become_safe_log_names() {
+        assert_eq!(log_name("a/b c"), "a_b_c");
+        let d = tmp("slash");
+        let r = run(
+            &[node("a/b", &[], "true")],
+            &d,
+            &d.join("logs"),
+            &no_builtin,
+        );
+        assert_eq!(r[0].status, Status::Ok);
+        assert!(d.join("logs/a_b.log").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 
