@@ -478,15 +478,16 @@ Targets, not measured yet:
 | 4 | `smoke` | accounts-service's production image smoke-tested before a deploy |
 | 5 | `sims`, Android and iOS harnesses with layout trees, native rules | a scratch app (frontend engine's counter example) checked on all three platforms |
 | 6 | `vitals` and `budgets timing` | timing budgets enforced for one project |
-| 7 | BDG migration, after its store release | BDG's `ui/` and scripts deleted, same references pass |
+| 7 | BDG migration, before its store release (Todd) | BDG's `ui/` and scripts deleted, same references pass |
 
 Each phase is its own PR with a patch release on crates.io.
 
 ## Decided (2026-11-19)
 
 1. Name: `shakedown` (Todd).
-2. Pilot order: accounts-service first (web only); the first native project is BDG after its store release. Phase 5
-   uses the counter example, never BDG.
+2. Pilot order: accounts-service first for the web phases (1-4). BDG moves onto shakedown BEFORE its store
+   release (Todd, 2026-11-19): native phases (5) are built against BDG's harnesses, and the BDG migration is part
+   of the pre-release work, not after it.
 3. Sweep pixel diffs compare against a local, uncommitted baseline in `target/`; only layout rules and shifts fail
    the sweep. Committed references live only in `ui`.
 4. iOS layout data: (a), a tiny `.shakedownText()` modifier.
