@@ -884,3 +884,21 @@ fn an_aria_hidden_icon_over_text_inside_an_inner_scroller_fails() {
         "text-overlap",
     );
 }
+
+#[test]
+fn a_strict_csp_page_gets_no_console_error_from_the_probe() {
+    let site = Site::new("csp");
+    site.screen("");
+    site.file(
+        "page.html",
+        "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"style-src 'self'\"><title>t</title><body><h1>Hello</h1><p>Some text here.</p>",
+    );
+    site.approve();
+    let o = site.run(&["ui", "web"]);
+    assert_eq!(
+        code(&o),
+        0,
+        "no CSP violation from shakedown itself: {}",
+        text(&o)
+    );
+}

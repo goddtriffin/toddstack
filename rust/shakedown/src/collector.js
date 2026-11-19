@@ -43,9 +43,10 @@
     const de = document.documentElement;
     const nodes = [], bad = [];
     // Probing must see decoration too: `pointer-events:none` elements are skipped by hit tests otherwise.
-    const pe = document.createElement('style');
-    pe.textContent = '*,*::before,*::after{pointer-events:auto!important}';
-    document.documentElement.appendChild(pe);
+    // A constructable stylesheet, not a <style> element: a page's Content-Security-Policy blocks inline styles.
+    const pe = new CSSStyleSheet();
+    pe.replaceSync('*,*::before,*::after{pointer-events:auto!important}');
+    document.adoptedStyleSheets = [...document.adoptedStyleSheets, pe];
     // `elementFromPoint` is null outside the viewport: scroll the point into view, probe, and scroll back, so a line
     // below the fold is judged like one above it.
     const hitAt = (x, y, el) => {
@@ -188,7 +189,7 @@
         if (over) d.top_lines.push(r);
       }
     }
-    pe.remove();
+    document.adoptedStyleSheets = document.adoptedStyleSheets.filter((x) => x !== pe);
     return {
       viewport_w: de.clientWidth, viewport_h: de.clientHeight, content_w: de.scrollWidth,
       nodes, shifts: S.shifts, bad_ignores: bad,
