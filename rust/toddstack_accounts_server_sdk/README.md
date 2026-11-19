@@ -418,11 +418,12 @@ it's open succeeds and changes nothing, so always show the same thanks.
 This is the canonical retry rule: at most 3 retries (4 attempts), waiting 0.5 s, 1 s and 2 s with +-25% jitter. Reads
 from the accounts service (the signing keys, `userinfo`, and every friends `GET`) are retried on an intermittent
 failure: a connection error, a timeout, a 5xx, a 408 or a 429. Each attempt has its own deadline (3 s for a read). A
-`Retry-After` of up to 5 s is waited out in place of the backoff; a longer one ends the retries. No retry starts after
-25 s. A 4xx other than 408 and 429 is an answer and is never retried. After the last retry you get the plain error.
+`Retry-After` of up to 5 s is waited out in place of the backoff; a longer one ends the retries. A retry starts only
+if it can finish within 15 s of the first attempt. A 4xx other than 408 and 429 is an answer and is never retried. After the last retry you get the plain error.
 
 Server API calls (`accounts.player(sub)`, `report_as_player`) retry writes as well as reads, because every one is
-idempotent (3 retries, 10 s deadline each for a write, no retry after 55 s).
+idempotent (3 retries, 10 s deadline each for a write, all within 15 s). Write limits are hourly, so a write's 429 is
+retried only when it carries a `Retry-After` of at most 5 s.
 
 A notification send is retried too, but only when it carries an `idempotency_key` (same schedule, each attempt with a
 10 s deadline): the service replays the recorded send, so a retry cannot notify twice. Without a key it is sent once.
@@ -451,7 +452,8 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 **0.9.3** (behaviour change, nothing breaks): retries now follow the canonical rule. Was: reads made 3 attempts (2 retries)
 after full-jitter backoff from 200 ms capped at 1 s, `Retry-After` cap 2 s, budget 6 s, 408 final, and 429 final on
 notification calls. Now: 3 retries (4 attempts), 0.5 s, 1 s, 2 s with +-25% jitter, 408 and 429 retried everywhere,
-`Retry-After` cap 5 s, budget 25 s (55 s for keyed sends).
+`Retry-After` cap 5 s, budget 15 s for every policy; on writes and notification sends a 429 is retried only with a
+`Retry-After` of at most 5 s.
 
 **0.9.2** (additive, nothing breaks): `Accounts::profile_by_sub`, `Accounts::profile_by_username` and `player::PublicProfile`. A blank sub or username is `not_found` locally, with no request.
 
