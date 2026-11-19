@@ -191,43 +191,17 @@ fn select<'a>(config: &'a Config, opts: &Options, refs: &Path) -> Result<Vec<&'a
         .collect())
 }
 
-/// The Chromes of one run and their temp profiles. Dropping it (an error, a panic, a failed launch of a later
-/// Chrome) kills every browser launched so far (chromiumoxide kills the child on drop), stops the handlers and
-/// removes the profiles.
-#[derive(Default)]
-struct Chromes {
-    browsers: Vec<Arc<chromiumoxide::Browser>>,
-    handlers: Vec<tokio::task::JoinHandle<()>>,
-    profiles: Vec<PathBuf>,
-}
-
-impl Drop for Chromes {
-    fn drop(&mut self) {
-        for h in &self.handlers {
-            h.abort();
-        }
-        self.browsers.clear();
-        for p in &self.profiles {
-            let _ = std::fs::remove_dir_all(p);
-        }
-    }
-}
-
 /// One run: a fresh Chrome draws every job and is thrown away.
 async fn one_run(chrome: &Path, env: &Arc<Env>, jobs: &[Job], n: u32) -> Result<Vec<Shot>, Error> {
     let count = capture::browsers().min(jobs.len().max(1));
-    let mut chromes = Chromes::default();
+    let mut chromes = capture::Chromes::default();
     for i in 0..count {
         let profile =
             std::env::temp_dir().join(format!("shakedown-chrome-{}-{n}-{i}", std::process::id()));
-        // Recorded before the launch: a failed launch may already have made the profile.
-        chromes.profiles.push(profile.clone());
-        let (browser, handler) = capture::launch(chrome, &profile).await?;
-        chromes.browsers.push(Arc::new(browser));
-        chromes.handlers.push(handler);
+        chromes.launch(chrome, &profile).await?;
     }
-    let shots = capture::shoot_all(chromes.browsers.clone(), env.clone(), jobs.to_vec()).await;
-    for browser in std::mem::take(&mut chromes.browsers) {
+    let shots = capture::shoot_all(chromes.browsers(), env.clone(), jobs.to_vec()).await;
+    for browser in chromes.take_browsers() {
         if let Ok(mut b) = Arc::try_unwrap(browser) {
             // Nothing in the profile is worth a graceful exit (it is thrown away): a clean close takes seconds.
             let _ = b.kill().await;

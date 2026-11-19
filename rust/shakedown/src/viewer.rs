@@ -265,7 +265,7 @@ fn respond(out: &mut impl Write, status: &str, kind: &str, body: &[u8]) {
 }
 
 /// The collector for frames: no frozen clock, and it reports up to the viewer.
-fn frame_js(ignores: &str) -> String {
+pub(crate) fn frame_js(ignores: &str) -> String {
     let collector = COLLECTOR
         .replace("__FIXED__", "false")
         .replace("__AT__", "0")

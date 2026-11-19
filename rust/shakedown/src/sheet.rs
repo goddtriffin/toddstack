@@ -5,6 +5,7 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
@@ -216,7 +217,10 @@ pub async fn capture_all(
     items: &[(String, u32, u32)],
 ) -> Result<Vec<Vec<u8>>, Error> {
     let profile = std::env::temp_dir().join(format!("shakedown-sheets-{}", std::process::id()));
-    let (mut browser, handler) = capture::launch(chrome, &profile).await?;
+    // Dropping the guard (an error, or the caller dropping this future on a caught signal) kills Chrome and removes
+    // the profile.
+    let mut chromes = capture::Chromes::default();
+    let browser = chromes.launch(chrome, &profile).await?;
     let result = async {
         let page = browser
             .new_page("about:blank")
@@ -257,10 +261,12 @@ pub async fn capture_all(
         Ok::<_, Error>(out)
     }
     .await;
-    let _ = browser.kill().await;
-    let _ = browser.wait().await;
-    handler.abort();
-    let _ = std::fs::remove_dir_all(&profile);
+    for browser in chromes.take_browsers() {
+        if let Ok(mut b) = Arc::try_unwrap(browser) {
+            let _ = b.kill().await;
+            let _ = b.wait().await;
+        }
+    }
     result
 }
 
