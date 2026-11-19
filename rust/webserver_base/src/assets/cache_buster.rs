@@ -191,8 +191,7 @@ impl CacheBuster {
         let one_year: SignedDuration = SignedDuration::from_hours(24 * 365);
         let expires: Option<Timestamp> = Timestamp::now().checked_add(one_year).ok();
         if let Some(expires) = expires
-            && let Ok(expires) =
-                HeaderValue::from_str(&expires.strftime("%a, %d %b %Y %H:%M:%S +0000").to_string())
+            && let Ok(expires) = HeaderValue::from_str(&expires_date(expires))
         {
             headers.insert(EXPIRES, expires);
         }
@@ -240,9 +239,23 @@ fn remove_conditional_headers(headers: &mut HeaderMap) {
     headers.remove(IF_UNMODIFIED_SINCE);
 }
 
+/// An `Expires` value: RFC 2822 in UTC, written `+0000`.
+fn expires_date(moment: Timestamp) -> String {
+    moment.strftime("%a, %d %b %Y %H:%M:%S +0000").to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CacheBuster;
+    use jiff::Timestamp;
+
+    use super::{CacheBuster, expires_date};
+
+    #[test]
+    fn the_expires_header_is_rfc_2822_in_utc() {
+        let moment: Timestamp = "2027-03-05T04:05:06Z".parse().expect("a real instant");
+
+        assert_eq!("Fri, 05 Mar 2027 04:05:06 +0000", expires_date(moment));
+    }
 
     #[test]
     fn an_empty_cache_buster_returns_paths_unchanged() {

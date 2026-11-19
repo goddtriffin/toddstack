@@ -12,8 +12,9 @@
 //! index at the boundary — invalidates that submission at exactly the moment
 //! the site matters most.
 
-use jiff::tz::TimeZone;
-use jiff::{Timestamp, Zoned};
+use jiff::Timestamp;
+use jiff_02::Zoned;
+use jiff_02::tz::TimeZone;
 use sitemap_rs::image::Image;
 use sitemap_rs::sitemap::Sitemap;
 use sitemap_rs::sitemap_index::SitemapIndex;
@@ -304,12 +305,13 @@ fn render_url_set(
     Ok(rendered)
 }
 
-/// Converts a `<lastmod>` date to the type `sitemap-rs` takes. UTC in, UTC
-/// out, so it is written with a `+00:00` offset.
+/// Converts a `<lastmod>` date to the type `sitemap-rs` takes, which is a
+/// jiff 0.2 `Zoned`: that crate is the only user of jiff 0.2 here, so the
+/// conversion goes through unix seconds. UTC in, UTC out, so it is written with
+/// a `+00:00` offset. Whole seconds only: `<lastmod>` never carried a fraction.
 fn to_zoned(date: Timestamp) -> Zoned {
-    // Whole seconds only, as before: `<lastmod>` never carried a fraction.
-    Timestamp::new(date.as_second(), 0)
-        .unwrap_or(date)
+    jiff_02::Timestamp::new(date.as_second(), 0)
+        .unwrap_or(jiff_02::Timestamp::UNIX_EPOCH)
         .to_zoned(TimeZone::UTC)
 }
 
@@ -417,6 +419,17 @@ mod tests {
         ];
         let actual: Vec<String> = set.paths();
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn a_timestamp_converts_to_the_sitemap_crates_zoned_without_shifting_the_instant() {
+        let date: Timestamp = "2026-01-02T03:04:05.678Z".parse().expect("a real instant");
+
+        let zoned: super::Zoned = super::to_zoned(date);
+
+        assert_eq!(date.as_second(), zoned.timestamp().as_second());
+        assert_eq!(0, zoned.timestamp().subsec_nanosecond());
+        assert_eq!("2026-01-02T03:04:05+00:00[UTC]", zoned.to_string());
     }
 
     #[test]

@@ -113,7 +113,10 @@ imagesize = "0.15.0"
 sitemap-rs = "0.7.1"
 # dates and times: the one time library in the tree. `sitemap-rs` already depends
 # on it, `serde` lets templates take a `Timestamp` straight from JSON.
-jiff = { version = "0.2.43", features = ["serde"] }
+jiff = { version = "1.0.1", features = ["serde"] }
+# `sitemap-rs` 0.7.1 (the latest) takes jiff 0.2 types. Kept private and
+# renamed; converted to at that one boundary, never exposed.
+jiff_02 = { package = "jiff", version = "0.2.43" }
 
 # feeds: writes RSS/Atom. `BytesText::new` escapes element text, and feed
 # content is arbitrary post HTML, where one unescaped `&` makes every reader

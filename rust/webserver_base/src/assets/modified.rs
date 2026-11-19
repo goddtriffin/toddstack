@@ -38,7 +38,7 @@ pub(crate) fn content_modified_in(root: &Path, directories: &[&str]) -> Option<T
         .max()?;
 
     let now: Timestamp = Timestamp::now();
-    if newest.to_zoned(jiff::tz::TimeZone::UTC).year() <= 2000 || newest > now {
+    if newest.to_zoned_datetime(jiff::tz::TimeZone::UTC).year() <= 2000 || newest > now {
         error!(
             "content modification time is `{newest}`, which is implausible; \
              omitting <lastmod>. Check that the build preserves file timestamps."
