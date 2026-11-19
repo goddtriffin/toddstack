@@ -74,6 +74,10 @@ pub enum Kind {
 
 /// One visible element.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the collector's JSON node, one flag per rule input"
+)]
 pub struct Node {
     /// Stable across captures: the child-index path from the body (`0.3.1`).
     pub id: String,
@@ -104,6 +108,9 @@ pub struct Node {
     /// A link inside running text (exempt from the tap size rule).
     #[serde(default)]
     pub inline: bool,
+    /// Inside an `aria-hidden="true"` subtree (decoration): two such nodes never count as overlapping.
+    #[serde(default)]
+    pub decor: bool,
     /// Rules switched off for this node, with the reason given.
     #[serde(default)]
     pub ignore: Vec<Ignored>,
@@ -311,7 +318,7 @@ fn overlaps(tree: &Tree, out: &mut Vec<Finding>) {
         .collect();
     for (i, a) in texts.iter().enumerate() {
         for b in &texts[i + 1..] {
-            if related(&a.id, &b.id) {
+            if related(&a.id, &b.id) || (a.decor && b.decor) {
                 continue;
             }
             let hit = a.top_lines.iter().find_map(|r| {
@@ -363,6 +370,7 @@ mod tests {
             clipped: false,
             scroll_x: false,
             inline: false,
+            decor: false,
             ignore: Vec::new(),
         }
     }
