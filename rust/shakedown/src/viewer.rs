@@ -158,35 +158,12 @@ pub fn host_allowed(host: &str) -> bool {
     name == "localhost" || name == "127.0.0.1" || name.ends_with(".localhost")
 }
 
-/// Inserts the script tag after the doctype, never searching for `<head` or `<html` (those can sit inside comments,
-/// script strings or quoted attributes). Scans from the start: skips a UTF-8 BOM, then whitespace and complete comments.
-/// A case-insensitive `<!doctype` there is skipped to its `>` and the tag goes right after it; otherwise the tag goes at
-/// the scan position (the page is quirks mode anyway, and a script before `<html>` lands in head). The BOM stays first.
+/// Appends the script tag at the very end of the page. Nothing in the document is parsed: whatever follows `</html>`
+/// is parsed into the body, so the document mode (standards or quirks) can never change, and the tag cannot land in a
+/// comment or a string unless the page itself ends inside an unclosed comment or script (a broken page anyway).
+/// The collector does not depend on running early: it reports on load, or at once when the page already loaded.
 pub fn inject(html: &str, tag: &str) -> String {
-    let mut at = if html.starts_with('\u{feff}') { 3 } else { 0 };
-    loop {
-        let rest = &html[at..];
-        let trimmed = rest.trim_start();
-        let ws = rest.len() - trimmed.len();
-        if let Some(body) = trimmed.strip_prefix("<!--") {
-            match body.find("-->") {
-                Some(end) => at += ws + 4 + end + 3,
-                None => break,
-            }
-        } else if trimmed
-            .get(..9)
-            .is_some_and(|p| p.eq_ignore_ascii_case("<!doctype"))
-        {
-            if let Some(end) = trimmed.find('>') {
-                at += ws + end + 1;
-            }
-            break;
-        } else {
-            at += ws;
-            break;
-        }
-    }
-    format!("{}{tag}{}", &html[..at], &html[at..])
+    format!("{html}{tag}")
 }
 
 /// `frame-ancestors` may name the viewer's own origins and nobody else.
@@ -432,25 +409,17 @@ fn internal(
     true
 }
 
-fn proxy(
-    mut client: TcpStream,
+const ATTEMPTS: u32 = 4;
+
+/// Connects to the app and reads the answer head, retrying with a short backoff (a busy app drops connections when
+/// many frames load at once). A request with a side effect is retried only while nothing was sent.
+fn upstream(
     method: &str,
     target: &str,
     head: &Head,
     body: &[u8],
     s: &Settings,
-) {
-    let Ok(mut up) = TcpStream::connect(&s.target) else {
-        respond(
-            &mut client,
-            "502 Bad Gateway",
-            "text/plain",
-            format!("the app at {} is not answering", s.target).as_bytes(),
-        );
-        return;
-    };
-    let _ = up.set_read_timeout(Some(Duration::from_secs(60)));
-    // HTTP/1.0 and no compression: the answer is either sized or ends when the connection does.
+) -> Result<(TcpStream, Head, Vec<u8>), String> {
     let mut req = format!("{method} {target} HTTP/1.0\r\n");
     for (k, v) in &head.headers {
         let lk = k.to_ascii_lowercase();
@@ -463,14 +432,74 @@ fn proxy(
         let _ = write!(req, "Content-Length: {}\r\n", body.len());
     }
     req.push_str("Connection: close\r\n\r\n");
-    if up.write_all(req.as_bytes()).is_err() || up.write_all(body).is_err() {
-        return;
+    let safe = matches!(method, "GET" | "HEAD" | "OPTIONS");
+    let mut why = String::new();
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(100 << (attempt - 1)));
+        }
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&s.target)
+            .ok()
+            .and_then(|mut a| a.next());
+        let Some(Ok(mut up)) = addr.map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(5)))
+        else {
+            why = format!("the app at {} is not answering", s.target);
+            continue;
+        };
+        let _ = up.set_read_timeout(Some(Duration::from_secs(60)));
+        if up.write_all(req.as_bytes()).is_err() || up.write_all(body).is_err() {
+            why = format!("the app at {} dropped the request", s.target);
+            if safe {
+                continue;
+            }
+            break;
+        }
+        let answered = read_head(&mut up).and_then(|(raw, rest)| Some((Head::parse(&raw)?, rest)));
+        if let Some((answer, rest)) = answered {
+            return Ok((up, answer, rest));
+        }
+        why = format!(
+            "the app at {} closed the connection without an answer",
+            s.target
+        );
+        if !safe {
+            break;
+        }
     }
-    let Some((raw, mut rest)) = read_head(&mut up) else {
-        return;
-    };
-    let Some(answer) = Head::parse(&raw) else {
-        return;
+    Err(why)
+}
+
+/// A failed upstream: a 502 whose page tells the viewer (the frame's parent) that this frame will not report.
+fn bad_gateway(client: &mut TcpStream, why: &str) {
+    let safe: String = why
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || " :.-_/".contains(*c))
+        .collect();
+    let page = format!(
+        "<!doctype html><meta charset=utf-8><body>502: {safe}<script>try{{parent.postMessage({{shakedown:'failed',reason:'{safe}'}},'*')}}catch(e){{}}</script>"
+    );
+    respond(
+        client,
+        "502 Bad Gateway",
+        "text/html; charset=utf-8",
+        page.as_bytes(),
+    );
+}
+
+fn proxy(
+    mut client: TcpStream,
+    method: &str,
+    target: &str,
+    head: &Head,
+    body: &[u8],
+    s: &Settings,
+) {
+    let (mut up, answer, mut rest) = match upstream(method, target, head, body, s) {
+        Ok(v) => v,
+        Err(why) => {
+            bad_gateway(&mut client, &why);
+            return;
+        }
     };
     let is_html = answer
         .get("content-type")
@@ -599,43 +628,94 @@ mod tests {
     }
 
     #[test]
-    fn the_script_goes_after_the_doctype_and_never_searches_for_head_or_html() {
+    fn the_script_is_appended_and_nothing_is_parsed() {
         let t = "<script src=x></script>";
-        let cases = [
-            (
-                "\u{feff}<!doctype html><body>x",
-                "\u{feff}<!doctype html><script src=x></script><body>x",
-            ),
-            (
-                "<!-- a > b --><!-- <!doctype html> -->\n<!doctype html><p>x",
-                "<!-- a > b --><!-- <!doctype html> -->\n<!doctype html><script src=x></script><p>x",
-            ),
-            (
-                "<!DOCTYPE html>\n<body>x",
-                "<!DOCTYPE html><script src=x></script>\n<body>x",
-            ),
-            ("<p>hi</p>", "<script src=x></script><p>hi</p>"),
-            (
-                "\u{feff} <!-- c -->\n<p>hi",
-                "\u{feff} <!-- c -->\n<script src=x></script><p>hi",
-            ),
-            (
-                "<!doctype html><html lang=\"x\" data-a=\"a>b\"><head></head>",
-                "<!doctype html><script src=x></script><html lang=\"x\" data-a=\"a>b\"><head></head>",
-            ),
-            (
-                "<!doctype html><body><script>var a = \"<html>\";</script>",
-                "<!doctype html><script src=x></script><body><script>var a = \"<html>\";</script>",
-            ),
-            (
-                "<!doctype html><!-- <head> --><body>x",
-                "<!doctype html><script src=x></script><!-- <head> --><body>x",
-            ),
-            ("<!-- open", "<script src=x></script><!-- open"),
-        ];
-        for (page, want) in cases {
-            assert_eq!(inject(page, t), want, "{page}");
+        for page in [
+            "\u{feff}<!doctype html><body>x",
+            "<?xml version=\"1.0\"?><!doctype html><p>x",
+            "<!--><!doctype html><p>x",
+            "--!><!DOCTYPE html><p>x",
+            "<!-- a > b --><!-- <!doctype html> -->\n<!doctype html><p>x",
+            "<!doctype html><html lang=\"x\" data-a=\"a>b\"><head></head>",
+            "<!doctype html><body><script>var a = \"<html>\";</script>",
+            "<p>hi</p>",
+            "",
+        ] {
+            assert_eq!(inject(page, t), format!("{page}{t}"), "{page}");
         }
+    }
+
+    fn app_that(
+        handler: impl Fn(usize, TcpStream) + Send + Sync + 'static,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let i = n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                handler(i, c);
+            }
+        });
+        (addr, n)
+    }
+
+    fn through_proxy(target: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let settings = Settings {
+            port,
+            target: target.into(),
+            routes_file: None,
+            config_routes: Vec::new(),
+            players: None,
+            ignores: "[]".into(),
+        };
+        std::thread::spawn(move || serve_on(&listener, &settings));
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _ = write!(c, "GET / HTTP/1.1\r\nHost: p1.localhost\r\n\r\n");
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        out
+    }
+
+    #[test]
+    fn a_connection_the_app_drops_is_retried_and_then_answered() {
+        let (addr, hits) = app_that(|i, mut c| {
+            if i < 2 {
+                return; // dropped without an answer
+            }
+            let _ = read_head(&mut c);
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\n\r\nhi"
+            );
+        });
+        let out = through_proxy(&addr);
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(
+            out.contains("hi<script src=\"/__devices/frame.js\">"),
+            "{out}"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn an_app_that_never_answers_gets_a_502_that_tells_the_viewer() {
+        let (addr, hits) = app_that(|_, _| {});
+        let out = through_proxy(&addr);
+        assert!(out.starts_with("HTTP/1.1 502"), "{out}");
+        assert!(out.contains("shakedown:'failed'"), "{out}");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            ATTEMPTS as usize
+        );
+        // Nothing is listening at all.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = l.local_addr().unwrap().to_string();
+        drop(l);
+        assert!(through_proxy(&dead).starts_with("HTTP/1.1 502"));
     }
 
     #[test]
