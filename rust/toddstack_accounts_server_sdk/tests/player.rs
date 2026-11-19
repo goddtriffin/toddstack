@@ -236,7 +236,7 @@ async fn a_suspended_players_write_is_final_with_its_code() {
 }
 
 #[tokio::test]
-async fn a_write_is_retried_after_a_server_error_because_every_write_is_idempotent() {
+async fn a_keyless_write_is_not_retried_after_a_server_error_and_returns_the_error() {
     let fake: Fake = Fake::start(|n, _| {
         if n == 0 {
             (
@@ -248,14 +248,15 @@ async fn a_write_is_retried_after_a_server_error_because_every_write_is_idempote
         }
     })
     .await;
-    accounts(&fake.issuer, Some("s3cret"))
+    let error: Error = accounts(&fake.issuer, Some("s3cret"))
         .player(SUB)
         .unwrap()
         .block(OTHER)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(Some("server_error"), error.code());
     let methods: Vec<String> = fake.requests().into_iter().map(|s| s.method).collect();
-    assert_eq!(vec![String::from("PUT"), String::from("PUT")], methods);
+    assert_eq!(vec![String::from("PUT")], methods);
 }
 
 #[tokio::test]
