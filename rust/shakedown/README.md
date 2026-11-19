@@ -128,10 +128,10 @@ allow_console = [{ contains = "expected message", why = "the test plants it" }]
 devices = ["phone"]                    # optional: only these
 ```
 
-A shot with `act` signs in fresh inside its own browser context instead of using the player's cached cookies, so an
-`act` sign-out ends only that shot's own server session. Every shot's server session is still shared with the
-player's other shots, so `act` steps must not end every session ("sign out everywhere"), delete the account or rotate
-sessions server-side: use a dedicated player for those.
+A shot with `act` signs in fresh instead of using the player's cached cookies, in a context of its own that is
+disposed before the shot starts, so the sign-in page's storage and service workers never reach the shot. Every shot
+still signs in as the same account as the player's other shots, so act steps must not end every session, delete the
+account, or rotate sessions server-side; use a dedicated player for those.
 
 The page is made deterministic: fixed clock and seeded random (`collector.js`, injected before any page script),
 timers of a second or more never fire, no intervals, animations and caret frozen, reduced motion, UTC, en-US,

@@ -392,10 +392,13 @@ pub async fn shoot_all(
             let mut first_failure: Option<String> = None;
             let mut done = None;
             for _ in 0..2 {
-                // An `act` shot signs in fresh inside its own context (see `shoot`), so it takes no cached cookies.
+                // An `act` shot signs in fresh (outside its own context, so the sign-in page's storage and workers do not
+                // leak into the shot), so it takes no cached cookies. Every shot still signs in as the same account as the
+                // player's other shots, so act steps must not end every session, delete the account, or rotate
+                // sessions server-side; use a dedicated player for those.
                 let own_signin = !job.plan.act.is_empty() && job.plan.player != "guest";
                 let got = if own_signin {
-                    Ok(Arc::default())
+                    fresh_cookies(&browser, &guard, &env, &job.plan.player).await
                 } else {
                     pool.cookies(&browser, &guard, &env, &job.plan.player).await
                 };
@@ -506,20 +509,9 @@ impl Players {
             return Ok(Arc::default());
         }
         let cell = self.cell(player);
-        cell.get_or_try_init(|| async {
-            let Some(template) = &env.signin else {
-                return Err("no [players].signin".to_string());
-            };
-            let path = template.replace("{player}", player);
-            let ctx = new_context(browser).await?;
-            let got = tokio::time::timeout(SHOT_TIMEOUT, sign_in(browser, guard, env, &ctx, &path))
-                .await
-                .unwrap_or_else(|_| Err(format!("took longer than {}s", SHOT_TIMEOUT.as_secs())));
-            let _ = browser.dispose_browser_context(ctx).await;
-            non_empty(got, player).map(Arc::new)
-        })
-        .await
-        .cloned()
+        cell.get_or_try_init(|| fresh_cookies(browser, guard, env, player))
+            .await
+            .cloned()
     }
 
     /// Forgets the player's cookies, but only if they are still the ones the failed shot used: a shot that began
@@ -533,6 +525,25 @@ impl Players {
             m.remove(player);
         }
     }
+}
+
+/// Signs in as `player` in a context used only for that, disposes it, and returns its cookies.
+async fn fresh_cookies(
+    browser: &Browser,
+    guard: &Guard,
+    env: &Env,
+    player: &str,
+) -> Result<Arc<Vec<Cookie>>, String> {
+    let Some(template) = &env.signin else {
+        return Err("no [players].signin".to_string());
+    };
+    let path = template.replace("{player}", player);
+    let ctx = new_context(browser).await?;
+    let got = tokio::time::timeout(SHOT_TIMEOUT, sign_in(browser, guard, env, &ctx, &path))
+        .await
+        .unwrap_or_else(|_| Err(format!("took longer than {}s", SHOT_TIMEOUT.as_secs())));
+    let _ = browser.dispose_browser_context(ctx).await;
+    non_empty(got, player).map(Arc::new)
 }
 
 /// Signs in inside `ctx` and returns the context's cookies.
@@ -621,24 +632,6 @@ async fn shoot(
     // A context of its own for every shot, disposed on every way out (that also closes a page a timed-out
     // `new_page` left behind).
     let ctx = new_context(browser).await?;
-    // An `act` shot signs in fresh in its own context, so a sign-out ends only its own server session. (Every
-    // shot's server session is shared with the player's other shots: act steps must not end every session, delete
-    // the account or rotate sessions server-side. Use a dedicated player for those.)
-    if !job.plan.act.is_empty() && job.plan.player != "guest" {
-        let signed = match &env.signin {
-            Some(t) => {
-                let path = t.replace("{player}", &job.plan.player);
-                tokio::time::timeout(SHOT_TIMEOUT, sign_in(browser, guard, env, &ctx, &path))
-                    .await
-                    .unwrap_or_else(|_| Err(slow()))
-            }
-            None => Err("no [players].signin".to_string()),
-        };
-        if let Err(why) = non_empty(signed, &job.plan.player) {
-            let _ = browser.dispose_browser_context(ctx).await;
-            return Err(why);
-        }
-    }
     let outcome = shoot_in(browser, guard, cookies, env, job, &ctx, &lap, &slow).await;
     let _ = browser.dispose_browser_context(ctx).await;
     outcome

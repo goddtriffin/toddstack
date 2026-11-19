@@ -199,6 +199,7 @@ where
                     // Both maps are pruned when a target detaches, so a long run does not grow them.
                     if let Some((_, target)) = sessions.remove(sid) {
                         roots.remove(&target);
+                        arming.retain(|_, t| t != &target);
                         if let Ok(mut a) = shared.armed.lock() {
                             a.remove(&target);
                         }
