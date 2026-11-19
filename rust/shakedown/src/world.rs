@@ -6,8 +6,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::time::{Duration, Instant};
@@ -16,10 +16,6 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Server;
 use crate::error::Error;
-
-/// The process group of the running server (0: none), so a signal can stop it from anywhere.
-static GROUP: AtomicU32 = AtomicU32::new(0);
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// Stops the process group: TERM, a moment to leave, then KILL.
 fn kill_group(pid: u32, mut wait_for: impl FnMut() -> bool) {
@@ -43,14 +39,9 @@ fn kill_group(pid: u32, mut wait_for: impl FnMut() -> bool) {
     signal("-KILL");
 }
 
-/// Has SIGINT or SIGTERM arrived since `watch_signals`?
-pub fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
-}
-
-/// What one signal does while a world is alive and after it.
+/// What one signal does while a run is alive and after it.
 struct Hooks {
-    /// True when the next signal must take its default action (no world is alive, or one signal was seen already).
+    /// True when the next signal must take its default action (no run is alive, or one signal was seen already).
     default_now: Arc<AtomicBool>,
 }
 
@@ -58,8 +49,8 @@ fn hooks() -> &'static [Hooks; 2] {
     static HOOKS: OnceLock<[Hooks; 2]> = OnceLock::new();
     HOOKS.get_or_init(|| {
         // Actions run in the order registered: first "take the default if `default_now`", then note the signal,
-        // then "from now on take the default". So the first signal during a world is only noted, and every other
-        // one (a second Ctrl-C, or any signal outside a world) ends the process the way an unhandled one does.
+        // then "from now on take the default". So the first signal during a run is only noted, and every other
+        // one (a second Ctrl-C, or any signal outside a run) ends the process the way an unhandled one does.
         let one = |sig: i32| {
             let default_now = Arc::new(AtomicBool::new(true));
             let _ = signal_hook::flag::register_conditional_default(sig, default_now.clone());
@@ -73,59 +64,111 @@ fn hooks() -> &'static [Hooks; 2] {
 
 static SEEN: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
-/// Guards the signal handling for one world's life: dropping it puts SIGINT and SIGTERM back to their default
-/// action (a signal handler cannot be uninstalled safely, so "back" means the handler takes the default action).
-pub struct Signals {
-    stop: Arc<AtomicBool>,
-    watcher: Option<std::thread::JoinHandle<()>>,
+/// Counts the signals that were caught, so each run can tell "one arrived since I started" without a flag that
+/// another run's start could reset.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Every live run shares this: how many there are, the server process groups they own, and the one thread that
+/// turns a caught signal into stopping all of those groups.
+struct Registry {
+    live: usize,
+    groups: Vec<u32>,
+    watcher: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
 }
 
-/// Listens for SIGINT and SIGTERM while the returned guard lives: the server's process group is stopped at once
-/// (even while `start` is still waiting for it to be ready), and `interrupted()` turns true so the run ends. The
-/// first signal is caught; a second, or any after the guard is dropped, takes the default action, so Ctrl-C always
-/// ends the process. Every call starts clean, so a library caller can run twice.
+static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
+    live: 0,
+    groups: Vec::new(),
+    watcher: None,
+});
+
+fn registry() -> std::sync::MutexGuard<'static, Registry> {
+    REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Guards the signal handling for one run's life. Dropping the last live guard puts SIGINT and SIGTERM back to
+/// their default action (a signal handler cannot be uninstalled safely, so "back" means the handler takes the
+/// default action).
+pub struct Signals {
+    /// The signal count when this run started: a bigger count now means a signal arrived during this run.
+    since: u64,
+}
+
+/// Listens for SIGINT and SIGTERM while a returned guard lives. Runs may overlap: the handling is installed when
+/// the first guard is created and removed when the last one is dropped. A caught signal stops every registered
+/// server group at once (even while `start` is still waiting for one to be ready) and `interrupted()` turns true
+/// for every live run. The first signal is caught; a second, or any with no guard alive, takes the default
+/// action, so Ctrl-C always ends the process.
 #[must_use = "the signals are only watched while the guard lives"]
 pub fn watch_signals() -> Signals {
     let hooks = hooks();
-    SEEN.store(false, Ordering::SeqCst);
-    INTERRUPTED.store(false, Ordering::SeqCst);
-    for h in hooks {
-        h.default_now.store(false, Ordering::SeqCst);
-    }
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = stop.clone();
-    let watcher = std::thread::spawn(move || {
-        while !flag.load(Ordering::SeqCst) {
-            if SEEN.load(Ordering::SeqCst) && !INTERRUPTED.swap(true, Ordering::SeqCst) {
-                let pid = GROUP.load(Ordering::SeqCst);
-                if pid != 0 {
-                    // Not waited for here: the run ends through `interrupted()`, and Drop finishes the job.
-                    let group = format!("-{pid}");
-                    let _ = Command::new("kill")
-                        .args(["-TERM", "--", &group])
-                        .stderr(Stdio::null())
-                        .status();
-                }
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    let mut reg = registry();
+    let since = EPOCH.load(Ordering::SeqCst);
+    if reg.live == 0 {
+        SEEN.store(false, Ordering::SeqCst);
+        for h in hooks {
+            h.default_now.store(false, Ordering::SeqCst);
         }
-    });
-    Signals {
-        stop,
-        watcher: Some(watcher),
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                if SEEN.swap(false, Ordering::SeqCst) {
+                    EPOCH.fetch_add(1, Ordering::SeqCst);
+                    // Not waited for here: runs end through `interrupted()`, and each Drop finishes the job.
+                    let groups = registry().groups.clone();
+                    for pid in groups {
+                        let group = format!("-{pid}");
+                        let _ = Command::new("kill")
+                            .args(["-TERM", "--", &group])
+                            .stderr(Stdio::null())
+                            .status();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        reg.watcher = Some((stop, handle));
+    }
+    reg.live += 1;
+    Signals { since }
+}
+
+impl Signals {
+    /// Has SIGINT or SIGTERM arrived since this run started?
+    pub fn interrupted(&self) -> bool {
+        EPOCH.load(Ordering::SeqCst) > self.since
     }
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        for h in hooks() {
-            h.default_now.store(true, Ordering::SeqCst);
-        }
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(w) = self.watcher.take() {
-            let _ = w.join();
+        let watcher = {
+            let mut reg = registry();
+            reg.live = reg.live.saturating_sub(1);
+            if reg.live > 0 {
+                return;
+            }
+            for h in hooks() {
+                h.default_now.store(true, Ordering::SeqCst);
+            }
+            reg.watcher.take()
+        };
+        // Joined outside the lock: the thread takes it too.
+        if let Some((stop, handle)) = watcher {
+            stop.store(true, Ordering::SeqCst);
+            let _ = handle.join();
         }
     }
+}
+
+/// Lets a caught signal stop this server process group.
+fn track_group(pid: u32) {
+    registry().groups.push(pid);
+}
+
+fn untrack_group(pid: u32) {
+    registry().groups.retain(|g| *g != pid);
 }
 
 /// A running server. Dropping it stops the server and everything it started.
@@ -199,7 +242,13 @@ fn tail(path: &Path, lines: usize) -> String {
 /// # Errors
 ///
 /// The server exits or is not ready in time (with the end of its log), or the seed fails.
-pub fn start(server: &Server, root: &Path, project: &str, out: &Path) -> Result<Running, Error> {
+pub fn start(
+    server: &Server,
+    root: &Path,
+    project: &str,
+    out: &Path,
+    signals: &Signals,
+) -> Result<Running, Error> {
     std::fs::create_dir_all(out)
         .map_err(|e| Error::Environment(format!("{}: {e}", out.display())))?;
     let port = free_port()?;
@@ -231,11 +280,11 @@ pub fn start(server: &Server, root: &Path, project: &str, out: &Path) -> Result<
     let child = cmd
         .spawn()
         .map_err(|e| Error::Environment(format!("cannot start the server: {e}")))?;
-    GROUP.store(child.id(), Ordering::SeqCst);
+    track_group(child.id());
     let mut running = Running { child, base };
     let deadline = Instant::now() + Duration::from_secs(server.timeout);
     loop {
-        if interrupted() {
+        if signals.interrupted() {
             return Err(Error::Failed("interrupted".into()));
         }
         if let Ok(Some(status)) = running.child.try_wait() {
@@ -284,7 +333,7 @@ impl Drop for Running {
         let pid = self.child.id();
         kill_group(pid, || matches!(self.child.try_wait(), Ok(Some(_))));
         let _ = self.child.wait();
-        let _ = GROUP.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+        untrack_group(pid);
     }
 }
 
@@ -352,15 +401,17 @@ mod tests {
         // Not a child: it signals itself only while the guard lives, which the guard turns into a flag.
         let first = watch_signals();
         send("-TERM", std::process::id());
-        wait_until("the first signal is seen", interrupted);
+        wait_until("the first signal is seen", || first.interrupted());
         drop(first);
         let second = watch_signals();
         assert!(
-            !interrupted(),
+            !second.interrupted(),
             "a new run starts clean, not already interrupted"
         );
         send("-INT", std::process::id());
-        wait_until("the second run sees its own signal", interrupted);
+        wait_until("the second run sees its own signal", || {
+            second.interrupted()
+        });
         drop(second);
     }
 
@@ -376,8 +427,28 @@ mod tests {
                 drop(guard);
                 println!("cleaned");
             }
+            "overlap" => {
+                // Two runs overlap, the first ends, and the second must still catch a signal and clean up.
+                let second = watch_signals();
+                let mut server = Command::new("sleep")
+                    .arg("300")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap();
+                track_group(server.id());
+                drop(guard);
+                println!("first-dropped");
+                wait_until("the second run sees the signal", || second.interrupted());
+                wait_until("the server group is stopped", || {
+                    matches!(server.try_wait(), Ok(Some(_)))
+                });
+                untrack_group(server.id());
+                println!("caught");
+                drop(second);
+                println!("cleaned");
+            }
             "twice" => {
-                wait_until("first signal", interrupted);
+                wait_until("first signal", || guard.interrupted());
                 println!("first");
             }
             other => panic!("unknown mode {other}"),
@@ -404,6 +475,28 @@ mod tests {
                 "{sig} after cleanup kills the process: {status:?}"
             );
         }
+    }
+
+    #[test]
+    fn overlapping_runs_share_the_signal_handling() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut c = child(
+            "world::tests::a_signal_child_for_the_tests_below",
+            "overlap",
+        );
+        let mut out = lines(&mut c);
+        wait_for_line(&mut out, "first-dropped");
+        send("-INT", c.id());
+        // The process lives, and the second run stopped its server.
+        wait_for_line(&mut out, "caught");
+        wait_for_line(&mut out, "cleaned");
+        // Both runs are over: the default action is back.
+        send("-TERM", c.id());
+        let status = c.wait().unwrap();
+        assert!(
+            status.signal().is_some(),
+            "a signal after both runs ended kills the process: {status:?}"
+        );
     }
 
     #[test]
