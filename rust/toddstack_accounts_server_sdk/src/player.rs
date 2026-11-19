@@ -97,6 +97,14 @@ fn bad_request(message: &str) -> Error {
     }
 }
 
+fn not_found() -> Error {
+    Error::Server {
+        status: 404,
+        code: String::from("not_found"),
+        message: String::from("Not found."),
+    }
+}
+
 fn checked(value: &str) -> Result<&str> {
     if is_valid_id(value) {
         Ok(value)
@@ -199,10 +207,13 @@ impl Accounts {
     ///
     /// # Errors
     /// [`Error::Config`] without a client secret, [`Error::Server`]
-    /// (`bad_request` for a malformed sub or viewer; `not_found`, the same for
+    /// (`bad_request` for a malformed sub or viewer; a blank sub or username is `not_found` locally, with no request; `not_found`, the same for
     /// an unknown, suspended, review or deleted account and for a block), or
     /// the request failed.
     pub async fn profile_by_sub(&self, sub: &str, viewer: Option<&str>) -> Result<PublicProfile> {
+        if sub.trim().is_empty() {
+            return Err(not_found());
+        }
         self.lookup(&format!("/profiles/{}", checked(sub)?), viewer)
             .await
     }
@@ -216,6 +227,9 @@ impl Accounts {
         username: &str,
         viewer: Option<&str>,
     ) -> Result<PublicProfile> {
+        if username.trim().is_empty() {
+            return Err(not_found());
+        }
         let name: String = url::form_urlencoded::byte_serialize(username.trim().as_bytes())
             .collect::<String>()
             .replace('+', "%20");

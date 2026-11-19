@@ -452,3 +452,16 @@ async fn a_profile_lookup_that_is_not_found_is_final_and_bad_ids_never_go_out() 
         Err(Error::Config(_))
     ));
 }
+
+#[tokio::test]
+async fn a_blank_profile_lookup_is_not_found_without_a_request() {
+    let fake: Fake = Fake::start(|_, _| ok(&json!({}))).await;
+    let accounts = accounts(&fake.issuer, Some("s3cret"));
+    for blank in ["", "   "] {
+        let by_sub = accounts.profile_by_sub(blank, None).await.unwrap_err();
+        assert_eq!(Some("not_found"), by_sub.code());
+        let by_name = accounts.profile_by_username(blank, Some(SUB)).await;
+        assert_eq!(Some("not_found"), by_name.unwrap_err().code());
+    }
+    assert!(fake.requests().is_empty());
+}

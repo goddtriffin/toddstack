@@ -445,9 +445,11 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 
 **Issuer match:** the issuer must exactly match the local server's `ACCOUNTS_BASE_URL`. If you run accounts on `http://localhost:8790` (needed for passkeys), use `toddgriffin_at("http://localhost:8790", ..)`, not the `127.0.0.1` default.
 
-## Breaking changes
+## Added
 
-**0.9.2**: additive: `Accounts::profile_by_sub`, `Accounts::profile_by_username` and `player::PublicProfile`.
+**0.9.2** (additive, nothing breaks): `Accounts::profile_by_sub`, `Accounts::profile_by_username` and `player::PublicProfile`. A blank sub or username is `not_found` locally, with no request.
+
+## Breaking changes
 
 **0.9.0**: added `Accounts::player` (the Server API), `report_as_player`, `revocation` (`Revocations`, the poller,
 `Accounts::handle_webhook`) and `EventKind::TokensRevoked`. `verify_access_token` now also refuses a token whose
