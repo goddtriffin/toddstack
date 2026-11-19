@@ -36,7 +36,9 @@ pub struct Config {
     /// The screens.
     #[serde(default)]
     pub screen: Vec<Screen>,
-    /// Sections owned by later phases (`sweep`, `smoke`, ...).
+    /// The sweep's routes and groups.
+    pub sweep: Option<Sweep>,
+    /// Sections owned by later phases (`smoke`, ...).
     #[serde(flatten)]
     pub unused: BTreeMap<String, toml::Value>,
 }
@@ -105,9 +107,8 @@ pub struct Devices {
     /// Devices with committed references.
     #[serde(default = "default_ui_devices")]
     pub ui: Vec<String>,
-    /// Devices the sweep covers (read by a later phase; accepted now so the file need not change).
-    #[serde(rename = "sweep")]
-    pub _sweep: Option<String>,
+    /// Devices the sweep covers: `"all"` (default) or a list of names.
+    pub sweep: Option<DeviceSet>,
     /// `light` and `dark`.
     #[serde(default = "default_themes")]
     pub themes: Vec<String>,
@@ -117,10 +118,89 @@ impl Default for Devices {
     fn default() -> Self {
         Self {
             ui: default_ui_devices(),
-            _sweep: None,
+            sweep: None,
             themes: default_themes(),
         }
     }
+}
+
+/// `"all"`, or named devices.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DeviceSet {
+    /// Only `"all"` is valid.
+    Word(String),
+    /// Named devices.
+    List(Vec<String>),
+}
+
+impl Devices {
+    /// The devices the sweep draws, by name.
+    pub fn sweep_names(&self) -> Vec<String> {
+        match &self.sweep {
+            Some(DeviceSet::List(l)) => l.clone(),
+            _ => crate::devices::all().into_iter().map(|d| d.name).collect(),
+        }
+    }
+}
+
+/// `[sweep]`: what `shakedown sweep` draws on every device and theme.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sweep {
+    /// Pages: a path, or a table to set the player, fixtures and expected console messages.
+    #[serde(default)]
+    pub routes: Vec<SweepRoute>,
+    /// Pages every frame of which is its own player (one lobby or game seen from several accounts).
+    #[serde(default)]
+    pub groups: Vec<SweepGroup>,
+}
+
+/// One swept page.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SweepRoute {
+    /// A path, as a guest.
+    Path(String),
+    /// A path with options.
+    Page(SweepPage),
+}
+
+/// A swept page with options.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SweepPage {
+    /// The path to open.
+    pub path: String,
+    /// Its name in the pack (default: made from the path).
+    pub name: Option<String>,
+    /// `guest` (default) or one of `[players].accounts`.
+    #[serde(default = "default_player")]
+    pub player: String,
+    /// Fixtures, fake worlds only (as in a screen).
+    #[serde(default)]
+    pub routes: BTreeMap<String, Route>,
+    /// Console messages that are expected, with the reason.
+    #[serde(default)]
+    pub allow_console: Vec<AllowConsole>,
+}
+
+/// A swept page shown to several signed-in players.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SweepGroup {
+    /// Its name in the pack.
+    pub name: String,
+    /// The path to open.
+    pub path: String,
+    /// How many accounts take turns (frame `i` is `accounts[i mod players]`).
+    pub players: usize,
+    /// Fixtures, fake worlds only.
+    #[serde(default)]
+    pub routes: BTreeMap<String, Route>,
+    /// Console messages that are expected, with the reason.
+    #[serde(default)]
+    pub allow_console: Vec<AllowConsole>,
 }
 
 fn default_ui_devices() -> Vec<String> {
@@ -508,6 +588,7 @@ impl Config {
                 ));
             }
         }
+        self.validate_sweep()?;
         if let Some(p) = &self.players
             && p.parallel == 0
         {
@@ -520,6 +601,97 @@ impl Config {
         }
         if self.check.builtin.iter().any(|b| b == "ui.web") {
             self.require_ui()?;
+        }
+        Ok(())
+    }
+
+    fn validate_sweep(&self) -> Result<(), Error> {
+        let bad = |m: String| Err(Error::Config(m));
+        match &self.devices.sweep {
+            Some(DeviceSet::Word(w)) if w != "all" => {
+                return bad(format!(
+                    "[devices].sweep {w:?}: use \"all\" or a list of device names"
+                ));
+            }
+            Some(DeviceSet::List(l)) => {
+                if l.is_empty() {
+                    return bad("[devices].sweep is empty".into());
+                }
+                crate::devices::pick(l)?;
+            }
+            _ => {}
+        }
+        let Some(sweep) = &self.sweep else {
+            return Ok(());
+        };
+        let mut names = BTreeSet::new();
+        let known = |player: &str| {
+            player == "guest"
+                || self
+                    .players
+                    .as_ref()
+                    .is_some_and(|p| p.accounts.iter().any(|a| a == player))
+        };
+        for r in &sweep.routes {
+            let (path, name, player, allow) = match r {
+                SweepRoute::Path(p) => (p.as_str(), None, "guest", &[][..]),
+                SweepRoute::Page(p) => (
+                    p.path.as_str(),
+                    p.name.as_deref(),
+                    p.player.as_str(),
+                    p.allow_console.as_slice(),
+                ),
+            };
+            if !path.starts_with('/') {
+                return bad(format!("[sweep] route {path:?}: path must start with /"));
+            }
+            if !known(player) {
+                return bad(format!(
+                    "[sweep] route {path:?}: player {player:?} is not in [players].accounts"
+                ));
+            }
+            if allow.iter().any(|c| c.why.trim().is_empty()) {
+                return bad(format!("[sweep] route {path:?}: allow_console needs a why"));
+            }
+            let name = crate::sweep::page_name(name, path);
+            if !names.insert(name.clone()) {
+                return bad(format!(
+                    "[sweep] two pages are named {name:?}: give one a name"
+                ));
+            }
+        }
+        for g in &sweep.groups {
+            if !g.path.starts_with('/') {
+                return bad(format!(
+                    "[sweep] group {:?}: path must start with /",
+                    g.name
+                ));
+            }
+            let accounts = self.players.as_ref().map_or(0, |p| p.accounts.len());
+            if g.players == 0 || g.players > accounts {
+                return bad(format!(
+                    "[sweep] group {:?}: players = {} but [players].accounts has {accounts} (every frame needs its own account, so a group cannot ask for more than there are)",
+                    g.name, g.players
+                ));
+            }
+            let name = crate::sweep::page_name(Some(&g.name), &g.path);
+            if !names.insert(name.clone()) {
+                return bad(format!("[sweep] two pages are named {name:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `sweep` without `--base` needs a server.
+    ///
+    /// # Errors
+    ///
+    /// There is no `[server]`.
+    pub fn require_server(&self) -> Result<(), Error> {
+        if self.server.is_none() {
+            return Err(Error::Config(
+                "sweep needs a [server] section in shakedown.toml (or --base URL of a running local server)".into(),
+            ));
         }
         Ok(())
     }
@@ -646,15 +818,15 @@ steps = [
 builtin = ["budgets.sizes"]
 [budgets.sizes]
 "x gzip" = { file = "a.js", gzip = 10 }
-[sweep]
-routes = ["/"]
+[smoke]
+checks = []
 "#;
 
     #[test]
     fn parses_and_reports_unused() {
         let c = Config::parse(OK, "0.2.0").unwrap();
         assert_eq!(c.check.steps.len(), 2);
-        assert_eq!(c.unused_sections(), vec!["sweep"]);
+        assert_eq!(c.unused_sections(), vec!["smoke"]);
     }
 
     #[test]

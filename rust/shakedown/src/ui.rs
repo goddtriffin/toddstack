@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::capture::{self, Env, Fixture, Job, Plan, Shot};
-use crate::config::{Config, Route, Screen};
+use crate::config::{Config, Route, Screen, World};
 use crate::devices::{self, Device};
 use crate::error::Error;
 use crate::layout::Finding;
@@ -88,7 +88,7 @@ fn read_fixture(root: &Path, file: &str, now_ms: i64) -> Result<String, Error> {
     Ok(text.replace("\"$now\"", &now_ms.to_string()))
 }
 
-fn plan(root: &Path, s: &Screen, now_ms: i64) -> Result<Plan, Error> {
+pub fn plan(root: &Path, s: &Screen, now_ms: i64) -> Result<Plan, Error> {
     let mut routes = std::collections::HashMap::new();
     for (key, route) in &s.routes {
         let (file, status) = match route {
@@ -113,7 +113,7 @@ fn plan(root: &Path, s: &Screen, now_ms: i64) -> Result<Plan, Error> {
     })
 }
 
-fn now_ms(now: &str) -> Result<i64, Error> {
+pub fn now_ms(now: &str) -> Result<i64, Error> {
     now.parse::<jiff::Timestamp>()
         .map(jiff::Timestamp::as_millisecond)
         .map_err(|e| {
@@ -299,51 +299,9 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     let screens = select(config, opts, &refs)?;
     let ms = now_ms(&server.now)?;
     let jobs = build_jobs(config, root, opts, &screens, ms)?;
-    let chrome = crate::browser::install()?;
     let out = out_dir(root);
     let _ = std::fs::remove_dir_all(&out);
-    let ignores = serde_json::to_string(&config.layout.ignore).unwrap_or_else(|_| "[]".into());
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Environment(format!("runtime: {e}")))?;
-    let repeat = opts.repeat.max(1);
-    let signals = world::watch_signals();
-    let runs: Vec<Vec<Shot>> = runtime.block_on(async {
-        let trace = |what: &str| {
-            if std::env::var_os("SHAKEDOWN_TRACE").is_some() {
-                eprintln!("trace {what} {}ms", started.elapsed().as_millis());
-            }
-        };
-        let running = world::start(&server, root, &config.project, &out, &signals)?;
-        trace("server up");
-        let env = Arc::new(Env {
-            base: running.base.clone(),
-            api: server.api.clone(),
-            world: server.world,
-            now_ms: ms,
-            signin: config.players.as_ref().map(|p| p.signin.clone()),
-            ignores,
-            player_limit: config.players.as_ref().map_or(3, |p| p.parallel),
-        });
-        let work = async {
-            let mut runs = Vec::new();
-            for n in 0..repeat {
-                // A fresh Chrome every run: nothing one run drew (decoded images, caches) can colour the next.
-                runs.push(one_run(&chrome, &env, &jobs, n).await?);
-            }
-            Ok::<_, Error>(runs)
-        };
-        let result = tokio::select! {
-            r = work => r,
-            () = async { while !signals.interrupted() { tokio::time::sleep(Duration::from_millis(50)).await; } } => Err(Error::Failed("interrupted".into())),
-        };
-        trace("shots done");
-        trace("chrome closed");
-        drop(running);
-        trace("server down");
-        result
-    })?;
+    let runs = draw_all(config, root, &out, &jobs, opts.repeat.max(1), started, None)?;
     let first = runs.first().cloned().unwrap_or_default();
     let mut outcome = Outcome {
         shots: first.len(),
@@ -372,6 +330,79 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     outcome.failures.sort_by(|a, b| a.id.cmp(&b.id));
     outcome.secs = started.elapsed().as_secs_f64();
     Ok(outcome)
+}
+
+/// Starts the world (or uses `base`, an already running local server), draws every job `repeat` times, each run in
+/// a fresh Chrome, and tears everything down. One list of shots per run, each sorted by id.
+///
+/// # Errors
+///
+/// A missing environment (Chrome, the server), or an interrupt.
+pub fn draw_all(
+    config: &Config,
+    root: &Path,
+    out: &Path,
+    jobs: &[Job],
+    repeat: u32,
+    started: Instant,
+    base: Option<&str>,
+) -> Result<Vec<Vec<Shot>>, Error> {
+    let server = config.server.clone();
+    let chrome = crate::browser::install()?;
+    let ignores = serde_json::to_string(&config.layout.ignore).unwrap_or_else(|_| "[]".into());
+    let ms = now_ms(
+        server
+            .as_ref()
+            .map_or("2026-01-15T12:00:00Z", |s| s.now.as_str()),
+    )?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Environment(format!("runtime: {e}")))?;
+    let signals = world::watch_signals();
+    runtime.block_on(async {
+        let trace = |what: &str| {
+            if std::env::var_os("SHAKEDOWN_TRACE").is_some() {
+                eprintln!("trace {what} {}ms", started.elapsed().as_millis());
+            }
+        };
+        let running = match (base, &server) {
+            (Some(_), _) => None,
+            (None, Some(s)) => Some(world::start(s, root, &config.project, out, &signals)?),
+            (None, None) => return Err(Error::Config("no [server]".into())),
+        };
+        trace("server up");
+        let env = Arc::new(Env {
+            base: base.map_or_else(
+                || running.as_ref().map_or_else(String::new, |r| r.base.clone()),
+                str::to_string,
+            ),
+            api: server
+                .as_ref()
+                .map_or_else(|| "/api".into(), |s| s.api.clone()),
+            world: server.as_ref().map_or(World::Seeded, |s| s.world),
+            now_ms: ms,
+            signin: config.players.as_ref().map(|p| p.signin.clone()),
+            ignores,
+            player_limit: config.players.as_ref().map_or(3, |p| p.parallel),
+        });
+        let work = async {
+            let mut runs = Vec::new();
+            for n in 0..repeat {
+                // A fresh Chrome every run: nothing one run drew (decoded images, caches) can colour the next.
+                runs.push(one_run(&chrome, &env, jobs, n).await?);
+            }
+            Ok::<_, Error>(runs)
+        };
+        let result = tokio::select! {
+            r = work => r,
+            () = async { while !signals.interrupted() { tokio::time::sleep(Duration::from_millis(50)).await; } } => Err(Error::Failed("interrupted".into())),
+        };
+        trace("shots done");
+        drop(running);
+        trace("server down");
+        result
+    })
 }
 
 /// Shots that failed once and passed on the retry are reported, never passed silently.

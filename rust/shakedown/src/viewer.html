@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Device preview</title>
+<style>
+:root{--bg:#e9e9e6;--fg:#111;--muted:#666;--bar:#fff;--line:#ccc;--on:#111;--onfg:#fff;--bad:#c62828}
+@media (prefers-color-scheme:dark){:root{--bg:#1b1b1b;--fg:#eee;--muted:#999;--bar:#262626;--line:#444;--on:#eee;--onfg:#111}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 -apple-system,Helvetica,sans-serif}
+header{position:sticky;top:0;z-index:2;background:var(--bar);border-bottom:1px solid var(--line);padding:8px 12px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
+header select{font:inherit;max-width:260px;padding:4px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bar);color:inherit}
+header input:not([type]){font:inherit;width:min(420px,100%);padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit}
+.g{display:flex;gap:4px;align-items:center;flex-wrap:wrap}.g span{color:var(--muted);margin-right:2px}
+button{font:inherit;padding:4px 9px;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit;cursor:pointer}
+button[aria-pressed=true]{background:var(--on);color:var(--onfg);border-color:var(--on)}
+main{display:flex;flex-wrap:wrap;gap:24px;padding:16px;align-items:flex-start}
+figure{margin:0}figcaption{display:flex;gap:8px;justify-content:space-between;color:var(--muted);margin-bottom:6px}
+figcaption b{color:var(--fg);font-weight:600}.bad{color:var(--bad);font-weight:600}
+.box{box-sizing:content-box;overflow:hidden;border:10px solid #111;border-radius:28px;background:#fff}
+.box.desk{border-width:6px;border-radius:8px}
+iframe{border:0;display:block;transform-origin:0 0;background:#fff}
+</style></head><body>
+<header>
+  <div class="g"><span>Page</span><select id="pages" aria-label="Pages"></select><button id="back" title="Previous page">Back</button></div>
+  <div class="g"><span>Path</span><input id="path" value="/" spellcheck="false"><button id="go">Load</button><button id="reload">Reload</button></div>
+  <div class="g"><label><input type="checkbox" id="sync" checked> Frames follow each other</label></div>
+  <div class="g" id="players" hidden><button id="signin" title="Each frame signs in as its own account and has its own cookies">Sign frames in as players</button></div>
+  <div class="g" id="themes"><span>Theme</span></div>
+  <div class="g" id="sizes"><span>Show</span></div>
+  <div class="g"><span id="report"></span></div>
+</header>
+<main id="frames"></main>
+<script>
+// Every frame loads from its own host (p1.localhost, p2.localhost, ...): Chrome keeps cookies per host, so each
+// frame has its own sign-in. The frames are cross-origin to this page: the proxy injects the collector into each
+// page, the page posts its layout tree up, and the shakedown rules (the same Rust ones the sweep runs) judge it.
+// Frames are iframes of fixed size; the browser window is never resized.
+const $=s=>document.querySelector(s);
+const S={path:new URLSearchParams(location.search).get("path")||"/",theme:"light",show:new Set()};
+let DEVICES=[],ROUTES=[],CONFIG={players:[],signin:""};
+const BACK=[],SEEN=new Set();
+// Desktop and tablets are scaled down to fit; phones show at real size.
+const scaleOf=d=>{const a=d.width*d.height;return a>800000?.55:a>500000?.8:1};
+const hostOf=i=>`${location.protocol}//p${i+1}.localhost:${location.port}`;
+const src=(i,p)=>hostOf(i)+p;
+function btn(parent,label,pressed,on){const b=document.createElement("button");b.textContent=label;b.setAttribute("aria-pressed",pressed);b.onclick=on;parent.append(b);return b}
+function setPath(p,{push=true}={}){if(p===S.path)return false;if(push)BACK.push(S.path);S.path=p;$("#path").value=p;
+  history.replaceState(null,"","?path="+encodeURIComponent(p));
+  for(const a of document.querySelectorAll("figcaption a"))a.setAttribute("href",hostOf(0)+p);$("#back").disabled=!BACK.length;fillPages();return true}
+function go(p){setPath(p);render()}
+$("#go").onclick=()=>go($("#path").value||"/");
+$("#back").onclick=()=>{if(BACK.length){setPath(BACK.pop(),{push:false});render()}};$("#back").disabled=true;
+$("#pages").onchange=e=>{if(e.target.value)go(e.target.value)};
+$("#path").onkeydown=e=>{if(e.key==="Enter")$("#go").click()};
+$("#reload").onclick=()=>render();
+function fillPages(){const sel=$("#pages");sel.textContent="";
+  const add=(parent,v,label)=>{const o=document.createElement("option");o.value=v;o.textContent=label||v;o.selected=v===S.path;parent.append(o)};
+  add(sel,"","Go to page...");
+  const groups=new Map();for(const r of ROUTES){if(!groups.has(r.group))groups.set(r.group,[]);groups.get(r.group).push(r)}
+  for(const[g,rs]of groups){const og=document.createElement("optgroup");og.label=g||"Pages";for(const r of rs)add(og,r.path,r.label?`${r.label}  ${r.path}`:r.path);sel.append(og)}
+  const listed=new Set(ROUTES.map(r=>r.path)),extra=[...SEEN].filter(p=>!listed.has(p)).sort();
+  if(extra.length){const og=document.createElement("optgroup");og.label="Links found on pages";for(const p of extra)add(og,p);sel.append(og)}
+  if(![...sel.options].some(o=>o.selected))sel.options[0].selected=true}
+const frameOf=w=>[...document.querySelectorAll("#frames iframe")].find(f=>f.contentWindow===w);
+const LEAD=new Map();
+// Messages from the injected collector: a click or submit made inside a frame leads the others (redirects that
+// differ per frame never do, so frames cannot chase each other); a loaded page reports its layout tree.
+addEventListener("message",async e=>{const d=e.data;if(!d||!d.shakedown)return;const fr=frameOf(e.source);if(!fr)return;
+  if(d.shakedown==="lead"){LEAD.set(fr,Date.now());return}
+  if(d.shakedown!=="loaded")return;
+  for(const p of d.links||[])SEEN.add(p);fillPages();
+  if(fr.dataset.signing){delete fr.dataset.signing;fr.src=src(+fr.dataset.index,S.path);return}
+  const led=Date.now()-(LEAD.get(fr)||0)<15000;LEAD.delete(fr);
+  if(led&&$("#sync").checked&&setPath(d.path)){for(const o of document.querySelectorAll("#frames iframe"))if(o!==fr)o.src=src(+o.dataset.index,d.path)}
+  try{const r=await fetch("/__devices/check",{method:"POST",body:JSON.stringify(d.tree)});status(fr,await r.json())}catch{status(fr,["could not check"])}});
+function status(fr,problems){const st=document.getElementById("st-"+fr.dataset.id);if(!st)return;
+  st.textContent=problems.length?`${problems.length} problem(s)`:"ok";st.className="st"+(problems.length?" bad":"");st.title=problems.join("\n");
+  window.__problems=window.__problems||{};window.__problems[fr.dataset.id]=problems;
+  const all=Object.values(window.__problems).flat().length;$("#report").textContent=all?`${all} problem(s), hover a device`:"no problems found"}
+$("#signin").onclick=()=>{const n=CONFIG.players.length;if(!n)return;
+  document.querySelectorAll("#frames iframe").forEach((f,k)=>{const i=+f.dataset.index;f.dataset.signing="1";f.src=src(i,CONFIG.signin.replace("{player}",CONFIG.players[k%n]))})};
+function render(){
+  [...$("#themes").querySelectorAll("button")].forEach(b=>b.setAttribute("aria-pressed",b.textContent===S.theme));
+  [...$("#sizes").querySelectorAll("button")].forEach((b,i)=>b.setAttribute("aria-pressed",S.show.has(DEVICES[i].name)));
+  const m=$("#frames");m.textContent="";window.__problems={};
+  DEVICES.forEach((d,i)=>{if(!S.show.has(d.name))return;
+    const f=document.createElement("figure"),c=document.createElement("figcaption"),box=document.createElement("div"),fr=document.createElement("iframe"),s=scaleOf(d);
+    c.innerHTML=`<b></b><span>${d.width}×${d.height}</span><span class="st" id="st-${d.name}"></span><a target="_blank" rel="noopener">open</a>`;
+    c.querySelector("b").textContent=d.label;c.querySelector("a").href=hostOf(i)+S.path;
+    box.className="box"+(d.mobile?"":" desk");box.style.width=d.width*s+"px";box.style.height=d.height*s+"px";
+    fr.width=d.width;fr.height=d.height;fr.style.transform=`scale(${s})`;fr.style.colorScheme=S.theme;fr.dataset.id=d.name;fr.dataset.index=i;fr.src=src(i,S.path);
+    box.append(fr);f.append(c,box);m.append(f)})}
+async function start(){
+  DEVICES=await (await fetch("/__devices/devices.json")).json();
+  S.show=new Set(DEVICES.map(d=>d.name));
+  try{ROUTES=await (await fetch("/__devices/routes")).json()}catch{}
+  try{CONFIG=await (await fetch("/__devices/config")).json()}catch{}
+  if(CONFIG.players.length)$("#players").hidden=false;
+  for(const t of ["light","dark"])btn($("#themes"),t,S.theme===t,()=>{S.theme=t;render()});
+  for(const d of DEVICES)btn($("#sizes"),d.label,true,()=>{S.show.has(d.name)?S.show.delete(d.name):S.show.add(d.name);render()});
+  $("#path").value=S.path;fillPages();render()}
+start();
+</script></body></html>
