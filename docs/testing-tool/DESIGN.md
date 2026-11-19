@@ -543,12 +543,14 @@ An accounts-service sweep (288 shots) was 121 to 133 s. What changed, from a `SH
   page), so the cap is met another way: `turn = false` on a `[sweep]` route or `[[screen]]` says the page opens none
   of the connections the server caps per person, so its shots never take a turn (accounts-service: only the
   friends page opens an event stream). The default stays `true`.
-- Browser contexts are reused. A shot has a context to itself while it runs; afterwards the context is scrubbed
-  (`capture::scrub`: all storage for the server's origin under every loopback name, all cookies of the context, the
-  HTTP cache; `sessionStorage` dies with the page) and handed to the next shot of that browser. A shot that failed,
-  or a context that cannot be scrubbed, is disposed instead. A test (`scrub_tests`) leaves a cookie, local and
-  session storage, an IndexedDB database, a Cache API cache, a service worker registration and a cached response in
-  a context, and shows that the control (no scrub) still sees them and the scrubbed context sees none.
+- One browser context per player and browser, for the whole run, signed in once by the first shot that needs it
+  (the others wait for it). Every device and theme of the player is a tab in that context with its own emulation;
+  nothing is wiped between shots, and the contexts end with the browser. Each tab is told it has focus
+  (`Emulation.setFocusEmulationEnabled`), or a tab behind its siblings draws no frames. The guard now attributes a
+  violation to the top-level page that holds the frame, worker or popup, not to the context (tabs share it).
+  The gate is order independence: `SHAKEDOWN_SHUFFLE=<seed>` draws the shots in a seeded order, and two sweeps with
+  different seeds must show no pixel change against the baseline of an unshuffled run before this change. A shot
+  found to depend on order is isolated in a context of its own; none was.
 - Each sweep shot is judged (re-encoded with fast PNG compression, compared, written) the moment it is drawn, on its
   own thread after its slot is free; identical files skip the compare, identical pixels skip the counting. The
   baseline and `current/` are fast-compressed (they stay on this machine); older High-compressed baselines still compare.

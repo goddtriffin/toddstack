@@ -1,5 +1,5 @@
-//! Drawing screens in the pinned Chrome over CDP: each shot has a browser context to itself while it runs (own cookies
-//! and storage, so each shot is its own player); a finished shot's context is scrubbed and handed to the next, a deterministic page, the fake world's `/api` answers, the settled screenshot
+//! Drawing screens in the pinned Chrome over CDP: one browser context per player (own cookies and storage, signed in
+//! once; every device and theme of the player is a tab in it), a deterministic page, the fake world's `/api` answers, the settled screenshot
 //! and the layout tree. Nothing here decides pass or fail; it returns pixels and findings.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -9,8 +9,9 @@ use std::time::Duration;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
 use chromiumoxide::cdp::browser_protocol::emulation::{
-    MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams, SetLocaleOverrideParams,
-    SetTimezoneOverrideParams, SetTouchEmulationEnabledParams,
+    MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
+    SetFocusEmulationEnabledParams, SetLocaleOverrideParams, SetTimezoneOverrideParams,
+    SetTouchEmulationEnabledParams,
 };
 use chromiumoxide::cdp::browser_protocol::fetch::{
     self, ContinueRequestParams, EventRequestPaused, FailRequestParams, FulfillRequestParams,
@@ -28,7 +29,6 @@ use chromiumoxide::cdp::browser_protocol::network::{
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CaptureScreenshotParams,
 };
-use chromiumoxide::cdp::browser_protocol::storage::{ClearCookiesParams, ClearDataForOriginParams};
 use chromiumoxide::cdp::browser_protocol::target::{
     CreateBrowserContextParams, CreateTargetParams,
 };
@@ -305,12 +305,20 @@ pub fn browsers() -> usize {
 /// Called with each shot the moment it is finished (on its own thread, after its slot is free).
 pub type Sink = Arc<dyn Fn(&Shot) + Send + Sync>;
 
+#[expect(clippy::too_many_lines, reason = "one fan-out, read top to bottom")]
 pub async fn shoot_all(
     browsers: Vec<Arc<Browser>>,
     env: Arc<Env>,
     jobs: Vec<Job>,
     sink: Option<Sink>,
 ) -> Vec<Shot> {
+    let mut jobs = jobs;
+    if let Some(seed) = std::env::var("SHAKEDOWN_SHUFFLE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        shuffle(&mut jobs, seed);
+    }
     let parallel = parallel();
     let gate = Arc::new(Semaphore::new(parallel));
     // Each browser has its own connection that arms every frame, popup and worker (see `guard`).
@@ -334,7 +342,7 @@ pub async fn shoot_all(
             }
         }
     }
-    let pools: Vec<Arc<Contexts>> = browsers.iter().map(|_| Arc::default()).collect();
+    let pools: Vec<Arc<Players>> = browsers.iter().map(|_| Arc::default()).collect();
     // A signed-in player is in at most `player_limit` shots at once: servers cap a person's open connections.
     let players: HashMap<String, Arc<Semaphore>> = jobs
         .iter()
@@ -439,76 +447,47 @@ async fn eval(page: &Page, expression: &str) -> Result<serde_json::Value, String
     Ok(out.result.result.value.unwrap_or(serde_json::Value::Null))
 }
 
-/// A browser's finished contexts, scrubbed and waiting for the next shot.
+/// One player's place in one browser: a single browser context for the whole run (the player's cookies and storage
+/// build up and are never wiped between shots), signed in once. Every device and theme of the player is a tab in it,
+/// with its own emulation. A context ends with the browser at the end of the run.
 #[derive(Default)]
-struct Contexts {
-    idle: Mutex<Vec<BrowserContextId>>,
+struct PlayerSlot {
+    ctx: tokio::sync::OnceCell<BrowserContextId>,
+    signed_in: tokio::sync::OnceCell<()>,
 }
 
-impl Contexts {
-    fn take(&self) -> Option<BrowserContextId> {
-        self.idle.lock().ok().and_then(|mut i| i.pop())
-    }
-    fn give(&self, ctx: BrowserContextId) {
-        if let Ok(mut i) = self.idle.lock() {
-            i.push(ctx);
+/// A browser's players.
+#[derive(Default)]
+struct Players {
+    slots: Mutex<HashMap<String, Arc<PlayerSlot>>>,
+}
+
+impl Players {
+    fn slot(&self, player: &str) -> Arc<PlayerSlot> {
+        match self.slots.lock() {
+            Ok(mut m) => m.entry(player.to_string()).or_default().clone(),
+            Err(_) => Arc::default(),
         }
     }
 }
 
-/// Every storage type of the storage API (cookies, local storage, `IndexedDB`, caches, service workers, ...).
-const ALL_STORAGE: &str = "all";
-
-/// The origins a page of the local server can touch: the server's own port under every loopback name.
-fn local_origins(base: &str) -> Vec<String> {
-    let port = url::Url::parse(base)
-        .ok()
-        .and_then(|u| u.port_or_known_default())
-        .map_or_else(String::new, |p| format!(":{p}"));
-    let mut v = vec![base.to_string()];
-    for host in ["127.0.0.1", "localhost", "[::1]"] {
-        let o = format!("http://{host}{port}");
-        if !v.contains(&o) {
-            v.push(o);
-        }
+/// `items` in an order made by `seed` (the same seed, the same order): `SHAKEDOWN_SHUFFLE=<seed>` draws the shots in
+/// another order, to show that no shot depends on what ran before it.
+fn shuffle<T>(items: &mut [T], seed: u64) {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    for i in (1..items.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let j = usize::try_from(x % (i as u64 + 1)).unwrap_or(0);
+        items.swap(i, j);
     }
-    v
-}
-
-/// Leaves a context as new for the next shot: the page's storage of every kind, the cookies of the whole context,
-/// the HTTP cache and the service workers. `page` is a page of that context (its session reaches the context's
-/// storage). Any error means the context must not be reused.
-///
-/// # Errors
-///
-/// A command failed.
-pub async fn scrub(
-    browser: &Browser,
-    page: &Page,
-    ctx: &BrowserContextId,
-    base: &str,
-) -> Result<(), String> {
-    for origin in local_origins(base) {
-        page.execute(ClearDataForOriginParams::new(origin, ALL_STORAGE))
-            .await
-            .map_err(err("clear storage"))?;
-    }
-    browser
-        .execute(ClearCookiesParams {
-            browser_context_id: Some(ctx.clone()),
-        })
-        .await
-        .map_err(err("clear cookies"))?;
-    page.execute(network::ClearBrowserCacheParams::default())
-        .await
-        .map_err(err("clear cache"))?;
-    Ok(())
 }
 
 async fn shoot(
     browser: &Browser,
     guard: &Guard,
-    pool: &Contexts,
+    players: &Players,
     env: &Env,
     job: &Job,
 ) -> Result<Shot, String> {
@@ -519,23 +498,22 @@ async fn shoot(
         }
     };
     let slow = || format!("took longer than {}s", SHOT_TIMEOUT.as_secs());
-    let ctx = match pool.take() {
-        Some(ctx) => ctx,
-        None => browser
-            .create_browser_context(CreateBrowserContextParams {
-                // A context does not take the command-line proxy: it needs its own dead one (see `PROXY`).
-                proxy_server: Some(PROXY.into()),
-                ..CreateBrowserContextParams::default()
-            })
-            .await
-            .map_err(err("context"))?,
-    };
+    let mine = players.slot(&job.plan.player);
+    let ctx = mine
+        .ctx
+        .get_or_try_init(|| async {
+            browser
+                .create_browser_context(CreateBrowserContextParams {
+                    // A context does not take the command-line proxy: it needs its own dead one (see `PROXY`).
+                    proxy_server: Some(PROXY.into()),
+                    ..CreateBrowserContextParams::default()
+                })
+                .await
+                .map_err(err("context"))
+        })
+        .await?
+        .clone();
     let collected = Arc::new(Collected::default());
-    let to = collected.clone();
-    guard.register(
-        ctx.as_ref(),
-        Arc::new(move |rule: &str, message: &str| to.note(rule, message)),
-    );
     let prepared = tokio::time::timeout(SHOT_TIMEOUT, async {
         let target = CreateTargetParams::builder()
             .url("about:blank")
@@ -543,6 +521,15 @@ async fn shoot(
             .build()
             .map_err(|e| e.clone())?;
         let page = browser.new_page(target).await.map_err(err("new page"))?;
+        let to = collected.clone();
+        guard.register(
+            page.target_id().as_ref(),
+            Arc::new(move |rule: &str, message: &str| to.note(rule, message)),
+        );
+        // Tabs share a window: a tab behind the others would draw no frames. Every tab is told it is in front.
+        page.execute(SetFocusEmulationEnabledParams::new(true))
+            .await
+            .map_err(err("focus"))?;
         // The page is not drawn before the guard is on it (it waits at the debugger until then).
         match guard.armed(page.target_id().as_ref()).await {
             Ok(()) => Ok(page),
@@ -555,30 +542,21 @@ async fn shoot(
     .await
     .unwrap_or_else(|_| Err(slow()));
     lap("page ready");
-    let outcome = match prepared {
+    match prepared {
         Ok(page) => {
-            let outcome = tokio::time::timeout(SHOT_TIMEOUT, draw(&page, env, job, &collected))
-                .await
-                .unwrap_or_else(|_| Err(slow()));
+            let outcome = tokio::time::timeout(
+                SHOT_TIMEOUT,
+                draw(&page, env, job, &collected, &mine.signed_in),
+            )
+            .await
+            .unwrap_or_else(|_| Err(slow()));
             lap("drawn");
-            // A clean shot's context is scrubbed and kept; one that failed, or cannot be scrubbed, is thrown away.
-            let clean = outcome.is_ok()
-                && tokio::time::timeout(SHOT_TIMEOUT, scrub(browser, &page, &ctx, &env.base))
-                    .await
-                    .is_ok_and(|r| r.is_ok());
+            guard.unregister(page.target_id().as_ref());
             let _ = page.close().await;
-            if clean {
-                pool.give(ctx);
-                lap("context scrubbed");
-                return outcome;
-            }
             outcome
         }
         Err(why) => Err(why),
-    };
-    let _ = browser.dispose_browser_context(ctx).await;
-    lap("context disposed");
-    outcome
+    }
 }
 
 /// What the page's event streams collect.
@@ -637,6 +615,7 @@ async fn draw(
     env: &Env,
     job: &Job,
     collected: &Arc<Collected>,
+    signed_in: &tokio::sync::OnceCell<()>,
 ) -> Result<Shot, String> {
     let t0 = std::time::Instant::now();
     let lap = |what: &str| {
@@ -701,10 +680,15 @@ async fn draw(
             return Err("no [players].signin".into());
         };
         let path = template.replace("{player}", &job.plan.player);
-        page.goto(format!("{}{path}", env.base))
-            .await
-            .map_err(err("sign-in"))?;
-        wait_loaded(page).await?;
+        // Signed in once per player and browser, by the first shot to get here; the others wait for it.
+        signed_in
+            .get_or_try_init(|| async {
+                page.goto(format!("{}{path}", env.base))
+                    .await
+                    .map_err(err("sign-in"))?;
+                wait_loaded(page).await
+            })
+            .await?;
     }
     page.goto(format!("{}{}", env.base, job.plan.path))
         .await
@@ -1334,6 +1318,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_seed_makes_one_order_and_every_item_stays() {
+        let base: Vec<u32> = (0..50).collect();
+        let (mut a, mut b, mut c) = (base.clone(), base.clone(), base.clone());
+        shuffle(&mut a, 1);
+        shuffle(&mut b, 1);
+        shuffle(&mut c, 2);
+        assert_eq!(a, b, "the same seed, the same order");
+        assert_ne!(a, c, "another seed, another order");
+        assert_ne!(a, base);
+        a.sort_unstable();
+        assert_eq!(a, base, "nothing lost or doubled");
+    }
+
+    #[test]
     fn base64_matches_the_standard() {
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");
@@ -1427,135 +1425,6 @@ mod launch_tests {
                 "{f} in {features:?}"
             );
         }
-    }
-}
-
-/// A context handed from shot to shot carries nothing over: the same checks, with and without the scrub.
-#[cfg(test)]
-mod scrub_tests {
-    use super::*;
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// `/set` leaves state of every kind behind (the service worker's script never loads in this Chrome setup, so its
-    /// registration stays pending: it is still a registration, and the scrub must remove it), `/get` reports what is there, `/count` is cacheable and counts hits.
-    fn serve() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let hits = Arc::new(AtomicUsize::new(0));
-        std::thread::spawn(move || {
-            for mut c in listener.incoming().flatten() {
-                let hits = hits.clone();
-                std::thread::spawn(move || {
-                    let mut buf = [0_u8; 4096];
-                    let n = c.read(&mut buf).unwrap_or(0);
-                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let path = head.split(' ').nth(1).unwrap_or("/").to_string();
-                    let (kind, extra, body) = match path.as_str() {
-                        "/set" => ("text/html", "Set-Cookie: leak=1; Path=/\r\n", "<!doctype html><script>localStorage.setItem('leak','1');sessionStorage.setItem('leak','1');const r=indexedDB.open('leak');r.onupgradeneeded=()=>r.result.createObjectStore('s');r.onsuccess=()=>{r.result.close();caches.open('leak').then(()=>{return Promise.race([navigator.serviceWorker.register('/sw.js'),new Promise((r)=>setTimeout(r,3000))])}).then(()=>fetch('/count').then(x=>x.text())).then(t=>{window.__done=t}).catch(e=>{window.__done='error '+e})}</script>".to_string()),
-                        "/sw.js" => ("text/javascript", "", "self.addEventListener('fetch',()=>{});".to_string()),
-                        "/count" => {
-                            let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
-                            ("text/plain", "Cache-Control: max-age=3600\r\n", n.to_string())
-                        }
-                        _ => ("text/html", "", "<!doctype html><script>window.__state=(async()=>JSON.stringify({cookie:document.cookie,local:localStorage.length,session:sessionStorage.length,idb:(await indexedDB.databases()).length,caches:(await caches.keys()).length,workers:(await navigator.serviceWorker.getRegistrations()).length,count:await fetch('/count').then(x=>x.text())}))()</script>".to_string()),
-                    };
-                    let _ = write!(
-                        c,
-                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                });
-            }
-        });
-        port
-    }
-
-    async fn page_in(browser: &Browser, ctx: &BrowserContextId) -> Page {
-        let target = CreateTargetParams::builder()
-            .url("about:blank")
-            .browser_context_id(ctx.clone())
-            .build()
-            .unwrap();
-        browser.new_page(target).await.unwrap()
-    }
-
-    /// Opens `path`, waits for the page's promise `window.<name>`, returns its value.
-    async fn open(page: &Page, base: &str, path: &str, name: &str) -> String {
-        page.goto(format!("{base}{path}")).await.unwrap();
-        eval(page, &format!("window.{name}"))
-            .await
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string()
-    }
-
-    #[tokio::test]
-    async fn a_scrubbed_context_carries_no_state_to_the_next_shot_and_an_unscrubbed_one_does() {
-        if !crate::browser::installed() {
-            eprintln!("pinned Chrome not installed: skipped");
-            return;
-        }
-        let base = format!("http://127.0.0.1:{}", serve());
-        let profile = std::env::temp_dir().join(format!("shakedown-scrub-{}", std::process::id()));
-        let (mut browser, task) = launch(&crate::browser::binary(), &profile).await.unwrap();
-        let ctx = browser
-            .create_browser_context(CreateBrowserContextParams {
-                proxy_server: Some(PROXY.into()),
-                ..CreateBrowserContextParams::default()
-            })
-            .await
-            .unwrap();
-        // One shot leaves state of every kind in the context, then ends; the next shot in the same context reads.
-        let leave = |ctx: BrowserContextId| {
-            let (browser, base) = (&browser, base.clone());
-            async move {
-                let page = page_in(browser, &ctx).await;
-                page.goto(format!("{base}/set")).await.unwrap();
-                let done = eval(&page, "new Promise((r)=>{let n=0;const t=setInterval(()=>{if(window.__done!==undefined||++n>250){clearInterval(t);r(String(window.__done))}},20)})").await.unwrap();
-                assert!(!done.as_str().unwrap().starts_with("error"), "{done}");
-                page
-            }
-        };
-        let read = |ctx: BrowserContextId| {
-            let (browser, base) = (&browser, base.clone());
-            async move {
-                let page = page_in(browser, &ctx).await;
-                let state = open(&page, &base, "/get", "__state").await;
-                let _ = page.close().await;
-                serde_json::from_str::<serde_json::Value>(&state).unwrap()
-            }
-        };
-        // Control: without the scrub the state is still there (so the checks below can fail).
-        let first = leave(ctx.clone()).await;
-        first.close().await.unwrap();
-        let leaked = read(ctx.clone()).await;
-        assert_eq!(leaked["cookie"], "leak=1", "{leaked}");
-        assert_eq!(leaked["local"], 1, "{leaked}");
-        assert_eq!(leaked["idb"], 1, "{leaked}");
-        assert_eq!(leaked["caches"], 1, "{leaked}");
-        assert_eq!(leaked["workers"], 1, "{leaked}");
-        assert_eq!(leaked["count"], "1", "served from the cache: {leaked}");
-        // The scrub: nothing of any kind reaches the next shot.
-        let page = leave(ctx.clone()).await;
-        scrub(&browser, &page, &ctx, &base).await.unwrap();
-        page.close().await.unwrap();
-        let clean = read(ctx.clone()).await;
-        assert_eq!(clean["cookie"], "", "{clean}");
-        assert_eq!(clean["local"], 0, "{clean}");
-        assert_eq!(clean["session"], 0, "{clean}");
-        assert_eq!(clean["idb"], 0, "{clean}");
-        assert_eq!(clean["caches"], 0, "{clean}");
-        assert_eq!(clean["workers"], 0, "{clean}");
-        assert_ne!(
-            clean["count"], "1",
-            "the HTTP cache was not cleared: {clean}"
-        );
-        let _ = browser.close().await;
-        task.abort();
-        let _ = std::fs::remove_dir_all(&profile);
     }
 }
 

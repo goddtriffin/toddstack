@@ -12,7 +12,7 @@ use async_tungstenite::tungstenite::Message;
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 
-/// Receives `(rule, message)` for a violation in one browser context.
+/// Receives `(rule, message)` for a violation in one page (and its frames, workers and popups).
 pub type Report = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// How long a new page waits to be armed.
@@ -25,8 +25,8 @@ const BROWSER: &str = "browser";
 struct Shared {
     /// Targets whose guard is in place and which have been resumed (and `BROWSER` once attached to the browser).
     armed: Mutex<HashSet<String>>,
-    /// Browser context id to where its violations go.
-    contexts: Mutex<HashMap<String, Report>>,
+    /// A page's target id to where the violations of it and everything under it go.
+    pages: Mutex<HashMap<String, Report>>,
 }
 
 /// A running guard.
@@ -35,10 +35,18 @@ pub struct Guard {
 }
 
 impl Guard {
-    /// Sends the violations of the targets in browser context `context` to `report`.
-    pub fn register(&self, context: &str, report: Report) {
-        if let Ok(mut c) = self.shared.contexts.lock() {
-            c.insert(context.to_string(), report);
+    /// Sends the violations of page `page` (a top-level target) and of its frames, workers and popups to `report`.
+    /// Many pages can share one browser context: the page, not the context, says whose violation it is.
+    pub fn register(&self, page: &str, report: Report) {
+        if let Ok(mut c) = self.shared.pages.lock() {
+            c.insert(page.to_string(), report);
+        }
+    }
+
+    /// Forgets page `page` (it is closed).
+    pub fn unregister(&self, page: &str) {
+        if let Ok(mut c) = self.shared.pages.lock() {
+            c.remove(page);
         }
     }
 
@@ -82,6 +90,7 @@ fn script() -> String {
     include_str!("guard.js").replace("__BINDING__", BINDING)
 }
 
+#[expect(clippy::too_many_lines, reason = "one event loop")]
 async fn run<S>(ws: S, shared: Arc<Shared>)
 where
     S: futures::Stream<Item = Result<Message, async_tungstenite::tungstenite::Error>>
@@ -90,7 +99,10 @@ where
 {
     let (mut sink, mut stream) = ws.split();
     let mut next_id: u64 = 0;
-    let mut sessions: HashMap<String, Option<String>> = HashMap::new();
+    // Session id to the top-level page it belongs to (a frame or worker belongs to the page that holds it).
+    let mut sessions: HashMap<String, String> = HashMap::new();
+    // Target id to its top-level page.
+    let mut roots: HashMap<String, String> = HashMap::new();
     // Command id of a final `runIfWaitingForDebugger` to the target it arms (`BROWSER` for the first command).
     let mut arming: HashMap<u64, String> = HashMap::new();
     let source = script();
@@ -142,11 +154,21 @@ where
                 };
                 let target = info["targetId"].as_str().unwrap_or_default().to_string();
                 let kind = info["type"].as_str().unwrap_or_default();
-                let context = info["browserContextId"].as_str().map(String::from);
-                sessions.insert(sid.to_string(), context.clone());
+                let opener = info["openerId"].as_str().map(String::from);
+                // A frame or worker is held by the page whose session announced it; a popup by its opener.
+                let root = session_of
+                    .and_then(|s| sessions.get(s).cloned())
+                    .or_else(|| {
+                        opener
+                            .as_ref()
+                            .map(|o| roots.get(o).cloned().unwrap_or(o.clone()))
+                    })
+                    .unwrap_or_else(|| target.clone());
+                sessions.insert(sid.to_string(), root.clone());
+                roots.insert(target.clone(), root.clone());
                 if kind == "page" && info.get("openerId").is_some() {
                     // A popup: never resumed, so it never runs; closed at once.
-                    report(&shared, context.as_deref(), "popup");
+                    report(&shared, Some(&root), "popup");
                     out.push((
                         None,
                         "Target.closeTarget",
@@ -178,23 +200,21 @@ where
                 }
             }
             Some("Runtime.bindingCalled") if p["name"] == BINDING => {
-                let context = session_of
-                    .and_then(|s| sessions.get(s))
-                    .and_then(|c| c.as_deref());
-                report(&shared, context, p["payload"].as_str().unwrap_or_default());
+                let page = session_of.and_then(|s| sessions.get(s)).map(String::as_str);
+                report(&shared, page, p["payload"].as_str().unwrap_or_default());
             }
             _ => {}
         }
     }
 }
 
-fn report(shared: &Shared, context: Option<&str>, what: &str) {
+fn report(shared: &Shared, page: Option<&str>, what: &str) {
     let (rule, message) = match what {
         "webrtc" => ("webrtc", "WebRTC is blocked: nothing leaves the machine"),
         "popup" => ("popup", "popups are blocked in checks"),
         _ => return,
     };
-    let to = context.and_then(|c| shared.contexts.lock().ok().and_then(|m| m.get(c).cloned()));
+    let to = page.and_then(|c| shared.pages.lock().ok().and_then(|m| m.get(c).cloned()));
     if let Some(to) = to {
         to(rule, message);
     }
