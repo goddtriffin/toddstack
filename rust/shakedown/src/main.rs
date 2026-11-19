@@ -11,6 +11,7 @@ mod guard;
 mod layout;
 mod pixels;
 mod report;
+mod smoke;
 mod steps;
 mod ui;
 mod world;
@@ -89,6 +90,11 @@ fn cli() -> Command {
                 .subcommand(Command::new("install").about("Download and verify the pinned Chrome (once; shared by every project)"))
                 .subcommand(Command::new("path").about("Print the pinned Chrome's executable")),
         )
+        .subcommand(
+            Command::new("smoke")
+                .about("Start the production Docker image through the repo's Makefile targets and check it over HTTP")
+                .arg(Arg::new("json").long("json").action(ArgAction::SetTrue).help("Also write target/shakedown/smoke/summary.json")),
+        )
         .subcommand(Command::new("devices").about("The one device list"))
         .subcommand(Command::new("doctor").about("Check the tools the platforms need, and print the fix for each miss"))
 }
@@ -148,6 +154,10 @@ fn run(m: &ArgMatches) -> Result<(), Error> {
                 .get_many::<String>("only")
                 .map_or_else(Vec::new, |v| v.cloned().collect());
             check(&config, &root, &only, sub.get_flag("json"))
+        }
+        Some(("smoke", sub)) => {
+            let (config, root) = load(explicit)?;
+            smoke::command(&config, &root, sub.get_flag("json"))
         }
         Some(("budgets", _)) => {
             let (config, root) = load(explicit)?;

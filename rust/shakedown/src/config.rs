@@ -36,7 +36,9 @@ pub struct Config {
     /// The screens.
     #[serde(default)]
     pub screen: Vec<Screen>,
-    /// Sections owned by later phases (`sweep`, `smoke`, ...).
+    /// The production-image smoke test.
+    pub smoke: Option<crate::smoke::Smoke>,
+    /// Sections owned by later phases (`sweep`, ...).
     #[serde(flatten)]
     pub unused: BTreeMap<String, toml::Value>,
 }
@@ -416,6 +418,9 @@ impl Config {
             }
         }
         self.validate_ui()?;
+        if let Some(s) = &self.smoke {
+            s.validate()?;
+        }
         for (label, size) in &self.budgets.sizes {
             if size.strip && size.max.is_none() {
                 return Err(Error::Config(format!("budget {label:?}: strip needs max")));
@@ -636,7 +641,7 @@ mod tests {
     use super::*;
 
     const OK: &str = r#"
-shakedown = "0.2.0"
+shakedown = "0.4.0"
 project = "p"
 [check]
 steps = [
@@ -652,7 +657,7 @@ routes = ["/"]
 
     #[test]
     fn parses_and_reports_unused() {
-        let c = Config::parse(OK, "0.2.0").unwrap();
+        let c = Config::parse(OK, "0.4.0").unwrap();
         assert_eq!(c.check.steps.len(), 2);
         assert_eq!(c.unused_sections(), vec!["sweep"]);
     }
@@ -660,21 +665,21 @@ routes = ["/"]
     #[test]
     fn version_mismatch_names_install_command() {
         let e = Config::parse(OK, "0.3.0").unwrap_err().to_string();
-        assert!(e.contains("cargo install shakedown@0.2.0 --locked"), "{e}");
+        assert!(e.contains("cargo install shakedown@0.4.0 --locked"), "{e}");
     }
 
     #[test]
     fn rejects_bad_graphs() {
         let dup = OK.replace(r#"name = "b""#, r#"name = "a""#);
-        assert!(Config::parse(&dup, "0.2.0").is_err());
+        assert!(Config::parse(&dup, "0.4.0").is_err());
         let unknown = OK.replace(r#"["a"]"#, r#"["zzz"]"#);
-        assert!(Config::parse(&unknown, "0.2.0").is_err());
+        assert!(Config::parse(&unknown, "0.4.0").is_err());
         let cycle = OK.replace(
             r#"{ name = "a", run = "true" }"#,
             r#"{ name = "a", run = "true", after = ["b"] }"#,
         );
         assert!(
-            Config::parse(&cycle, "0.2.0")
+            Config::parse(&cycle, "0.4.0")
                 .unwrap_err()
                 .to_string()
                 .contains("cycle")
@@ -688,7 +693,7 @@ routes = ["/"]
             "{ file = \"a.js\", strip = true, raw = 10 }",
         );
         assert!(
-            Config::parse(&bad, "0.2.0")
+            Config::parse(&bad, "0.4.0")
                 .unwrap_err()
                 .to_string()
                 .contains("strip needs max")
@@ -698,11 +703,11 @@ routes = ["/"]
     #[test]
     fn rejects_typos_in_known_sections() {
         let bad = OK.replace("gzip = 10", "gzp = 10");
-        assert!(Config::parse(&bad, "0.2.0").is_err());
+        assert!(Config::parse(&bad, "0.4.0").is_err());
     }
 
     const UI: &str = r#"
-shakedown = "0.2.0"
+shakedown = "0.4.0"
 project = "p"
 [server]
 start = "serve {port}"
@@ -724,7 +729,7 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
 
     #[test]
     fn parses_screens_actions_and_defaults() {
-        let c = Config::parse(UI, "0.2.0").unwrap();
+        let c = Config::parse(UI, "0.4.0").unwrap();
         assert_eq!(c.screen.len(), 2);
         assert_eq!(c.screen[0].player, "guest");
         assert_eq!(c.screen[1].act.len(), 7);
@@ -740,7 +745,7 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
     #[test]
     fn rejects_bad_ui_config() {
         let bad = |from: &str, to: &str| {
-            Config::parse(&UI.replace(from, to), "0.2.0")
+            Config::parse(&UI.replace(from, to), "0.4.0")
                 .unwrap_err()
                 .to_string()
         };
@@ -753,11 +758,33 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
         assert!(bad("{ click = \"button\" }", "{ hover = \"button\" }").contains("hover"));
         let devices = format!("{UI}\n[devices]\nui = [\"nokia\"]\n");
         assert!(
-            Config::parse(&devices, "0.2.0")
+            Config::parse(&devices, "0.4.0")
                 .unwrap_err()
                 .to_string()
                 .contains("unknown device")
         );
+    }
+
+    #[test]
+    fn smoke_section_parses_and_checks_its_paths() {
+        let ok = format!(
+            "{OK}\n[smoke]\nup = \"make smoke_up PORT={{port}}\"\ndown = \"make smoke_down\"\nchecks = [{{ path = \"/\", contains = \"x\" }}]\n"
+        );
+        let c = Config::parse(&ok, "0.4.0").unwrap();
+        let s = c.smoke.unwrap();
+        assert_eq!(
+            (s.timeout, s.ready.as_str(), s.checks[0].status),
+            (30, "/", 200)
+        );
+        let bad = ok.replace("path = \"/\"", "path = \"x\"");
+        assert!(
+            Config::parse(&bad, "0.4.0")
+                .unwrap_err()
+                .to_string()
+                .contains("must start with /")
+        );
+        let typo = ok.replace("down =", "dwon = \"x\"\ndown =");
+        assert!(Config::parse(&typo, "0.4.0").is_err());
     }
 
     #[test]
@@ -775,8 +802,8 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
             "[[screen]]\nname = \"a\"\npath = \"/a\"\n",
         )
         .unwrap();
-        let main = "shakedown = \"0.2.0\"\nproject = \"p\"\ninclude = [\"screens/*.toml\"]\n[server]\nstart = \"x\"\n[[screen]]\nname = \"home\"\npath = \"/\"\n";
-        let c = Config::parse_in(main, "0.2.0", &dir).unwrap();
+        let main = "shakedown = \"0.4.0\"\nproject = \"p\"\ninclude = [\"screens/*.toml\"]\n[server]\nstart = \"x\"\n[[screen]]\nname = \"home\"\npath = \"/\"\n";
+        let c = Config::parse_in(main, "0.4.0", &dir).unwrap();
         let names: Vec<_> = c.screen.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -784,16 +811,16 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
             "own screens first, then each file in name order"
         );
         std::fs::write(dir.join("screens/c.toml"), "project = \"x\"\n").unwrap();
-        let e = Config::parse_in(main, "0.2.0", &dir)
+        let e = Config::parse_in(main, "0.4.0", &dir)
             .unwrap_err()
             .to_string();
         assert!(e.contains("screen"), "{e}");
         let none = main.replace("screens/*.toml", "nowhere/*.toml");
-        assert!(Config::parse_in(&none, "0.2.0", &dir).is_err());
+        assert!(Config::parse_in(&none, "0.4.0", &dir).is_err());
         let dup = format!("{main}[[screen]]\nname = \"a\"\npath = \"/\"\n");
         std::fs::remove_file(dir.join("screens/c.toml")).unwrap();
         assert!(
-            Config::parse_in(&dup, "0.2.0", &dir)
+            Config::parse_in(&dup, "0.4.0", &dir)
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate")
