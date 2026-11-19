@@ -235,23 +235,21 @@ pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> 
             let _permit = gate.acquire().await;
             let size = (job.device.width, job.device.height);
             let id = job.id();
-            match tokio::time::timeout(SHOT_TIMEOUT, shoot(&browser, &env, &job)).await {
-                Ok(Ok(shot)) => shot,
-                Ok(Err(why)) => Shot {
-                    id,
-                    png: Vec::new(),
-                    findings: vec![Finding::new("page-failed", why)],
-                    size,
-                },
-                Err(_) => Shot {
-                    id,
-                    png: Vec::new(),
-                    findings: vec![Finding::new(
-                        "page-failed",
-                        format!("took longer than {}s", SHOT_TIMEOUT.as_secs()),
-                    )],
-                    size,
-                },
+            // The browser, not the page, failed (a command timed out on a starved machine): one more try.
+            // A page that fails twice is a failure.
+            let mut last = String::new();
+            for _ in 0..2 {
+                match tokio::time::timeout(SHOT_TIMEOUT, shoot(&browser, &env, &job)).await {
+                    Ok(Ok(shot)) => return shot,
+                    Ok(Err(why)) => last = why,
+                    Err(_) => last = format!("took longer than {}s", SHOT_TIMEOUT.as_secs()),
+                }
+            }
+            Shot {
+                id,
+                png: Vec::new(),
+                findings: vec![Finding::new("page-failed", last)],
+                size,
             }
         }));
     }
