@@ -20,7 +20,9 @@ pub mod testing;
 pub mod wasm;
 
 pub use app::{ActionSpec, App, Ctx, FieldType, Pending, Pointer};
-pub use effect::{Effect, EffectReq, HttpReply, NavigateOp, NoEffect};
+pub use effect::{
+    BUILT_IN_EFFECT_NAMES, Effect, EffectReq, HttpReply, NavigateOp, NoEffect, builtin_collision,
+};
 pub use policy::{ClockOffset, RetryPolicy};
 pub use runtime::{BRIDGE_PROTOCOL, Bridge, Runtime};
 

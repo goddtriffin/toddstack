@@ -4,6 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use serde_json::{Value, json};
 
 use crate::app::{App, Ctx, Pointer};
+use crate::effect::{Effect, EffectReq, builtin_collision};
 use crate::wire::{Input, Verb};
 
 /// The bridge message format (shell to core): the boot message carries `"v"` and every response
@@ -61,9 +62,20 @@ impl<A: App> Runtime<A> {
                 dirty.push(key);
             }
         }
-        let effects: Value =
-            serde_json::to_value(std::mem::take(&mut self.ctx.effects)).unwrap_or(Value::Null);
-        json!({"dirty": dirty, "effects": effects})
+        let queued: Vec<EffectReq<A::Effect>> = std::mem::take(&mut self.ctx.effects);
+        for req in &queued {
+            if let Effect::App(app_effect) = &req.effect {
+                debug_assert!(
+                    builtin_collision(app_effect).is_none(),
+                    "app effect named like a built-in ({:?}); it would read back as the built-in",
+                    builtin_collision(app_effect),
+                );
+            }
+        }
+        match serde_json::to_value(queued) {
+            Ok(effects) => json!({"dirty": dirty, "effects": effects}),
+            Err(e) => json!({"error": format!("effects not serializable: {e}")}),
+        }
     }
 
     fn handle(&mut self, verb: Verb) -> Value {
@@ -155,5 +167,53 @@ impl<A: App> Bridge for Runtime<A> {
     fn provide_blob(&mut self, name: &str, bytes: &[u8]) -> Vec<u8> {
         self.app.blob(name, bytes, &mut self.ctx);
         serde_json::to_vec(&versioned(self.flush())).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::{Serialize, Serializer};
+
+    use super::*;
+
+    struct Unserializable;
+
+    impl Serialize for Unserializable {
+        fn serialize<S: Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("nope"))
+        }
+    }
+
+    struct Bad;
+
+    impl App for Bad {
+        type Action = String;
+        type Effect = Unserializable;
+
+        fn boot(_: &Value, _: &mut Ctx<Unserializable>) -> Self {
+            Self
+        }
+        fn update(&mut self, _: String, ctx: &mut Ctx<Unserializable>) {
+            ctx.emit_app(Unserializable);
+        }
+        fn resolve(&mut self, _: u64, _: Result<Value, String>, _: &mut Ctx<Unserializable>) {}
+        fn view(&self, _: &str) -> Option<Value> {
+            None
+        }
+        fn screen(&self) -> String {
+            String::new()
+        }
+        fn actions(&self) -> Vec<crate::app::ActionSpec> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn an_unserializable_effect_is_an_error_frame_not_dropped() {
+        let mut rt: Runtime<Bad> = Runtime::new(b"{}");
+        let out: Value = serde_json::from_slice(&rt.dispatch(br#"{"act":"go"}"#)).unwrap();
+        let error: &str = out["error"].as_str().unwrap();
+        assert!(error.contains("effects not serializable"), "{out}");
+        assert!(out.get("effects").is_none());
     }
 }

@@ -32,6 +32,10 @@ Your own go in the app's effect type `X` (`type Effect = MyEffect` on your `App`
 `{"id":4,"Vibrate":{"ms":10}}`. Haptics, sound, share sheets, push registration and review prompts
 are app effects, not built in. An app with none uses `NoEffect`.
 
+Name rule: an app effect must not be named like a built-in (`Http`, `Timer`, ...; see
+`BUILT_IN_EFFECT_NAMES`). It serializes identically and reads back as the built-in. The runtime
+`debug_assert`s this on every flush, so tests and debug builds catch it.
+
 `Pending<T>` remembers, per effect id, what the app was doing when it asked, so `resolve` is a `match`
 over an enum. `RetryPolicy` (exponential backoff, jitter drawn by the caller) and `ClockOffset`
 (server time from the lowest-round-trip sample) are deterministic helpers.
