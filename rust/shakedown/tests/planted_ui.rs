@@ -656,6 +656,10 @@ print(n)
 
 /// Runs `script` on a page that tries a STUN probe to a UDP listener on this machine's network address.
 fn webrtc_probe(tag: &str, script: &str) {
+    webrtc_probe_rule(tag, script, "webrtc");
+}
+
+fn webrtc_probe_rule(tag: &str, script: &str, rule: &str) {
     let Some(ip) = lan_ip() else {
         eprintln!("no network address: skipped");
         return;
@@ -682,7 +686,7 @@ fn webrtc_probe(tag: &str, script: &str) {
     std::io::BufRead::read_line(&mut out, &mut seen).unwrap();
     let _ = listener.wait();
     assert_eq!(seen.trim(), "0", "a packet left the machine over WebRTC");
-    assert!(text(&o).contains("webrtc: "), "{}", text(&o));
+    assert!(text(&o).contains(&format!("{rule}: ")), "{}", text(&o));
     assert_eq!(code(&o), 1, "the screen fails: {}", text(&o));
 }
 
@@ -698,6 +702,32 @@ fn webrtc_from_a_fresh_iframe_is_blocked_too() {
     webrtc_probe(
         "webrtc-iframe",
         "const f=document.createElement('iframe');document.body.appendChild(f);const R=f.contentWindow.RTCPeerConnection;try{const p=new R({iceServers:[{urls:'__STUN__'}]});p.createDataChannel('x');p.createOffer().then(o=>p.setLocalDescription(o))}catch(e){}",
+    );
+}
+
+#[test]
+fn webrtc_from_a_sandboxed_srcdoc_iframe_is_blocked_too() {
+    // A sandboxed frame has an opaque origin and may run in its own process: the page's own scripts never see it.
+    webrtc_probe(
+        "webrtc-sandbox",
+        "const f=document.createElement('iframe');f.setAttribute('sandbox','allow-scripts');f.srcdoc=\"<script>try{const p=new RTCPeerConnection({iceServers:[{urls:'__STUN__'}]});p.createDataChannel('x');p.createOffer().then(o=>p.setLocalDescription(o))}catch(e){}<\\/script>\";document.body.appendChild(f);",
+    );
+}
+
+#[test]
+fn webrtc_from_a_popup_is_blocked_and_the_popup_is_a_finding() {
+    webrtc_probe_rule(
+        "webrtc-popup",
+        "try{const w=window.open('about:blank');const p=new w.RTCPeerConnection({iceServers:[{urls:'__STUN__'}]});p.createDataChannel('x');p.createOffer().then(o=>p.setLocalDescription(o))}catch(e){}",
+        "popup",
+    );
+}
+
+#[test]
+fn a_page_that_hides_console_error_still_gets_the_webrtc_finding() {
+    webrtc_probe(
+        "webrtc-console",
+        "console.error=()=>{};console.warn=()=>{};try{const p=new RTCPeerConnection({iceServers:[{urls:'__STUN__'}]});p.createDataChannel('x');p.createOffer().then(o=>p.setLocalDescription(o))}catch(e){}",
     );
 }
 

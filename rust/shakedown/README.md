@@ -126,14 +126,14 @@ devices = ["phone"]                    # optional: only these
 
 The page is made deterministic: fixed clock and seeded random (`collector.js`, injected before any page script),
 timers of a second or more never fire, no intervals, animations and caret frozen, reduced motion, UTC, en-US,
-density 1, every off-origin request blocked (images get a flat stand-in), a request for `/favicon.ico` ignored. In a
+density 1, WebRTC and popups blocked in every frame (a guard on its own CDP connection attaches to every iframe, popup and worker before it runs and reports through a CDP binding that page code cannot reach), every off-origin request blocked (images get a flat stand-in), a request for `/favicon.ico` ignored. In a
 fake world answers arrive after 150 ms and an unfaked or never-made call fails the screen. A shot is taken when
 two captures in a row are byte-identical. Fixtures may hold `"$now"`, replaced by the fixed clock in ms.
 
 Layout rules (Rust, on the tree the page reports): `sideways-scroll`, `off-screen`, `clipped-text`,
 `text-overlap`, `text-min-size` (under 11 px), `tap-min-size` (under 24 px, inline links exempt) and
 `layout-shift` (shifts of 0.0005 or more, taken before any action). Other findings: `console-error`,
-`page-error`, `network`, `unfaked-call`, `never-called`, `webrtc` (any RTCPeerConnection), `action-failed`, `ignore-without-why`. A shot that never settles (requests or pixels keep changing) is retried once like any
+`page-error`, `network`, `unfaked-call`, `never-called`, `webrtc` (any RTCPeerConnection, in any frame), `popup` (any new window; closed at once, never allow-listable), `action-failed`, `ignore-without-why`. A shot that never settles (requests or pixels keep changing) is retried once like any
 browser failure; a pass on the retry is reported as flaky, a second stall is `page-failed`.
 Opt out per element with `data-shakedown-ignore="rule" data-shakedown-why="reason"` (a horizontal scroller is
 `data-shakedown-scroll-x`), or per selector in `[layout].ignore`.
