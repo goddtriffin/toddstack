@@ -233,7 +233,7 @@ is stored (the config needs its client secret, and the player's `friends` scope 
 (`FriendsAuth::access_token`, forwarded with `Friends`) still works but is deprecated.
 
 ```toml
-toddstack-accounts-server-sdk = { version = "0.9.2", features = ["axum"] }
+toddstack-accounts-server-sdk = { version = "0.9.3", features = ["axum"] }
 ```
 
 ```rust
@@ -415,17 +415,18 @@ it's open succeeds and changes nothing, so always show the same thanks.
 
 ## Retries
 
-Reads from the accounts service (the signing keys, `userinfo`, and every friends `GET`) are retried on an intermittent
-failure: a connection error, a timeout, a 5xx or a 429. Three attempts at most, each with its own 3 s deadline, paced by
-exponential backoff with full jitter (200 ms, doubling, capped at 1 s). A `Retry-After` of up to 2 s is waited out; a
-longer one ends the retries. No retry starts after 6 s. A 4xx is an answer and is never retried.
+This is the canonical retry rule: at most 3 retries (4 attempts), waiting 0.5 s, 1 s and 2 s with +-25% jitter. Reads
+from the accounts service (the signing keys, `userinfo`, and every friends `GET`) are retried on an intermittent
+failure: a connection error, a timeout, a 5xx, a 408 or a 429. Each attempt has its own deadline (3 s for a read). A
+`Retry-After` of up to 5 s is waited out in place of the backoff; a longer one ends the retries. No retry starts after
+25 s. A 4xx other than 408 and 429 is an answer and is never retried. After the last retry you get the plain error.
 
 Server API calls (`accounts.player(sub)`, `report_as_player`) retry writes as well as reads, because every one is
-idempotent (3 attempts, 10 s deadline each for a write, no retry after 15 s; a 429 is retried only on a read).
+idempotent (3 retries, 10 s deadline each for a write, no retry after 55 s).
 
-A notification send is retried too, but only when it carries an `idempotency_key` (two more attempts, each with a 10 s
-deadline, no retry after 15 s): the service replays the recorded send, so a retry cannot notify twice. Without a key it
-is sent once. A 429 is never retried here (nor on `notification_status`): the service's limits are hourly and send no `Retry-After`, so another try would fail too. A malformed status id is a 400 (`Error::Api`).
+A notification send is retried too, but only when it carries an `idempotency_key` (same schedule, each attempt with a
+10 s deadline): the service replays the recorded send, so a retry cannot notify twice. Without a key it is sent once.
+`notification_status` is a read and follows the read rule. A malformed status id is a 400 (`Error::Api`).
 
 Everything else is sent exactly once: the code exchange (a code is single-use), refresh (a refresh that landed but whose
 answer was lost has already rotated the token, so a second try would sign the person out), revocation, and every write
@@ -446,6 +447,11 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 **Issuer match:** the issuer must exactly match the local server's `ACCOUNTS_BASE_URL`. If you run accounts on `http://localhost:8790` (needed for passkeys), use `toddgriffin_at("http://localhost:8790", ..)`, not the `127.0.0.1` default.
 
 ## Added
+
+**0.9.3** (behaviour change, nothing breaks): retries now follow the canonical rule. Was: reads made 3 attempts (2 retries)
+after full-jitter backoff from 200 ms capped at 1 s, `Retry-After` cap 2 s, budget 6 s, 408 final, and 429 final on
+notification calls. Now: 3 retries (4 attempts), 0.5 s, 1 s, 2 s with +-25% jitter, 408 and 429 retried everywhere,
+`Retry-After` cap 5 s, budget 25 s (55 s for keyed sends).
 
 **0.9.2** (additive, nothing breaks): `Accounts::profile_by_sub`, `Accounts::profile_by_username` and `player::PublicProfile`. A blank sub or username is `not_found` locally, with no request.
 

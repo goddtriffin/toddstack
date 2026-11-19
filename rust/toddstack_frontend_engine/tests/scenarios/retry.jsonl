@@ -2,11 +2,11 @@
 {"http":{"GET /api/count":[{"status":503},{"status":503},{"status":200,"body":{"count":42}}]}}
 {"boot":{"v":1,"at":5000}}
 {"send":{"act":"Fetch"}}
-{"expect":{"effects":[{"Http":{"method":"GET","path":"/api/count"}},{"Timer":{"after_ms":250}}],"view":{"counter":{"sync":{"Backoff":{"attempt":1}}}},"actions":["Inc"]}}
-{"advance_ms":249}
+{"expect":{"effects":[{"Http":{"method":"GET","path":"/api/count"}},{"Timer":{"after_ms":375}}],"view":{"counter":{"sync":{"Backoff":{"attempt":1}}}},"actions":["Inc"]}}
+{"advance_ms":374}
 {"expect":{"view":{"counter":{"sync":{"Backoff":{"attempt":1}}}}}}
 {"advance_ms":1}
-{"expect":{"effects":[{"Timer":{"after_ms":500}}],"view":{"counter":{"sync":{"Backoff":{"attempt":2}}}}}}
-{"advance_ms":500}
+{"expect":{"effects":[{"Timer":{"after_ms":750}}],"view":{"counter":{"sync":{"Backoff":{"attempt":2}}}}}}
+{"advance_ms":750}
 {"expect":{"view":{"counter":{"count":42,"sync":"Loaded"}}}}
 {"snapshot":"counter"}

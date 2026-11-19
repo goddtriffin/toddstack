@@ -347,7 +347,7 @@ async fn a_failing_poll_reaches_on_error_keeps_verifying_and_recovers() {
     // The startup poll lands; the next few fail, then it recovers.
     let fake: Fake = Fake::start(|n, _| match n {
         0 => ok_poll("first"),
-        1..=6 => failing(),
+        1..=4 => failing(),
         _ => ok_poll("late"),
     })
     .await;
@@ -366,7 +366,7 @@ async fn a_failing_poll_reaches_on_error_keeps_verifying_and_recovers() {
             .await
             .is_ok()
     );
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
     assert!(!errors.lock().unwrap().is_empty());
     assert!(accounts.revocations().is_revoked("late"));
     drop(poller);
@@ -377,7 +377,7 @@ async fn a_panicking_on_error_does_not_stop_the_poller() {
     let s: Signer = signer();
     let fake: Fake = Fake::start(|n, _| match n {
         0 => ok_poll("first"),
-        1..=3 => failing(),
+        1..=4 => failing(),
         _ => ok_poll("after"),
     })
     .await;
@@ -391,7 +391,7 @@ async fn a_panicking_on_error_does_not_stop_the_poller() {
         }))))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
     assert!(*calls.lock().unwrap() >= 1);
     assert!(
         accounts.revocations().is_revoked("after"),

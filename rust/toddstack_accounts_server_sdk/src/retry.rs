@@ -1,9 +1,11 @@
 //! Retries for reads from the accounts service.
 //!
-//! Only a `GET` is ever retried, and only on an intermittent failure: a
-//! connect error, a timeout, a 5xx or a 429 (not for notification calls: their
-//! limits are hourly). Anything else is an answer, and
-//! asking again would get the same one.
+//! This is the canonical retry rule (infra `docs/canonical-pattern.md` 6d): at
+//! most 3 retries (4 attempts in all), waiting 0.5 s, 1 s and 2 s with +-25%
+//! jitter. Only a `GET` is ever retried, and only on an intermittent failure:
+//! a connect error, a timeout, a 5xx, a 408 or a 429. Anything else is an
+//! answer, and asking again would get the same one. After the last retry the
+//! caller gets the plain last outcome (this crate has no Sentry).
 //!
 //! Everything else is sent exactly once, and must stay that way: the token
 //! exchange (an authorization code is single-use), refresh (rotation: a retried
@@ -25,74 +27,78 @@ use reqwest::{Client, Method, Request, Response};
 /// How hard to try before giving up.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RetryPolicy {
-    /// Attempts in all, the first included.
-    pub(crate) attempts: u32,
+    /// Retries after the first attempt. The rule's ceiling is 3.
+    pub(crate) max_retries: u32,
     /// Each attempt's own deadline, so one hung connection cannot use up the
-    /// whole budget. Fixed per policy: 3 s for reads, 10 s for keyed sends.
+    /// whole budget. Set per policy: 3 s for reads, 10 s for keyed sends.
     pub(crate) attempt_timeout: Duration,
-    /// The backoff ceiling for the first retry; it doubles per retry.
+    /// The nominal wait before the first retry; it doubles per retry.
     pub(crate) base_delay: Duration,
-    pub(crate) max_delay: Duration,
     /// A `Retry-After` longer than this is obeyed by not retrying at all:
     /// waiting it out would stall the caller, and retrying sooner ignores it.
+    /// 5 s: twice the longest backoff, so a short hint is honoured.
     pub(crate) max_retry_after: Duration,
-    /// Whether a 429 is retried. Off where the server's limits are hourly and
-    /// send no `Retry-After`: a retry within seconds cannot succeed.
-    pub(crate) retry_429: bool,
     /// No retry starts once this much time has passed, so the total is at
     /// most this plus one `attempt_timeout`.
     pub(crate) budget: Duration,
 }
 
+/// The rule's ceiling on retries.
+pub(crate) const MAX_RETRIES: u32 = 3;
+
+/// The longest a `Retry-After` is waited out.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(5);
+
 impl RetryPolicy {
     pub(crate) const READ: Self = Self {
-        attempts: 3,
+        max_retries: MAX_RETRIES,
         attempt_timeout: Duration::from_secs(3),
-        base_delay: Duration::from_millis(200),
-        max_delay: Duration::from_secs(1),
-        max_retry_after: Duration::from_secs(2),
-        retry_429: true,
-        budget: Duration::from_secs(6),
+        base_delay: Duration::from_millis(500),
+        max_retry_after: MAX_RETRY_AFTER,
+        budget: Duration::from_secs(25),
     };
 
-    /// A notification status read: like [`Self::READ`], but a 429 is final.
-    pub(crate) const NOTIFICATION_STATUS: Self = Self {
-        retry_429: false,
-        ..Self::READ
-    };
+    /// A notification status read: the same as [`Self::READ`].
+    pub(crate) const NOTIFICATION_STATUS: Self = Self::READ;
 
     /// A notification send that carries an idempotency key. Its deadline is
     /// the client's own, since a send to one player is delivered inline.
     pub(crate) const KEYED_SEND: Self = Self {
-        attempts: 3,
+        max_retries: MAX_RETRIES,
         attempt_timeout: Duration::from_secs(10),
-        base_delay: Duration::from_millis(200),
-        max_delay: Duration::from_secs(1),
-        max_retry_after: Duration::from_secs(2),
-        retry_429: false,
-        budget: Duration::from_secs(15),
+        base_delay: Duration::from_millis(500),
+        max_retry_after: MAX_RETRY_AFTER,
+        budget: Duration::from_secs(55),
     };
 
-    /// Full jitter: uniformly random in `[0, min(max_delay, base_delay * 2^(retry - 1))]`,
-    /// so many servers that failed together do not retry together.
+    /// The wait before retry number `retry` (1 is the first): `base_delay`
+    /// doubled per retry (0.5 s, 1 s, 2 s), scaled by a jitter factor between
+    /// 0.75 and 1.25. `draw` is a random number in `0..=1000` (per mille).
+    fn backoff_for(&self, retry: u32, draw: u64) -> Duration {
+        let nominal_ms: u64 = u64::try_from(
+            self.base_delay
+                .saturating_mul(1_u32 << retry.saturating_sub(1).min(16))
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        // 750..=1250 per mille.
+        let factor: u64 = 750 + draw.min(1000) / 2;
+        Duration::from_millis(nominal_ms.saturating_mul(factor) / 1000)
+    }
+
     fn backoff(&self, retry: u32) -> Duration {
-        let ceiling: Duration = self
-            .base_delay
-            .saturating_mul(1_u32 << retry.saturating_sub(1).min(16))
-            .min(self.max_delay);
-        let ceiling_ms: u64 = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
-        Duration::from_millis(random() % ceiling_ms.saturating_add(1))
+        self.backoff_for(retry, random() % 1001)
     }
 
     /// How long to wait before retrying after `retry` failed attempts, or
     /// `None` when the outcome is final.
     fn delay(&self, retry: u32, outcome: &reqwest::Result<Response>) -> Option<Duration> {
-        if retry >= self.attempts {
+        if retry > self.max_retries.min(MAX_RETRIES) {
             return None;
         }
         match outcome {
             Ok(response) => {
-                if !is_retryable_status(response.status().as_u16(), self.retry_429) {
+                if !is_retryable_status(response.status().as_u16()) {
                     return None;
                 }
                 match retry_after(response) {
@@ -107,8 +113,8 @@ impl RetryPolicy {
     }
 }
 
-const fn is_retryable_status(status: u16, retry_429: bool) -> bool {
-    (status == 429 && retry_429) || (status >= 500 && status < 600)
+const fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
 }
 
 /// `Retry-After` in delta-seconds. The HTTP-date form falls back to backoff:
@@ -194,12 +200,10 @@ pub(crate) mod tests {
     use super::RetryPolicy;
 
     pub(crate) const FAST: RetryPolicy = RetryPolicy {
-        attempts: 3,
+        max_retries: 3,
         attempt_timeout: Duration::from_millis(500),
         base_delay: Duration::from_millis(10),
-        max_delay: Duration::from_millis(20),
         max_retry_after: Duration::from_secs(2),
-        retry_429: true,
         budget: Duration::from_secs(4),
     };
 
@@ -277,26 +281,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_keyed_post_is_not_retried_on_a_429() {
+    async fn a_keyed_post_is_retried_on_a_429() {
         let server: Scripted = Scripted::start(vec![(429, "", NOW), (200, "", NOW)]).await;
-        let client: reqwest::Client = reqwest::Client::new();
-        let request: reqwest::Request = client
-            .post(&server.url)
-            .json(&serde_json::json!({ "idempotency_key": "k1" }))
-            .build()
-            .unwrap();
-        let policy: RetryPolicy = RetryPolicy {
-            retry_429: false,
-            ..FAST
-        };
-        let status: u16 = super::execute_keyed(&client, request, &policy)
-            .await
-            .unwrap()
-            .status()
-            .as_u16();
 
-        assert_eq!(429, status);
-        assert_eq!(1, server.hits());
+        assert_eq!(200, keyed_post_status(&server).await);
+        assert_eq!(2, server.hits());
     }
 
     #[tokio::test]
@@ -320,7 +309,7 @@ pub(crate) mod tests {
         let server: Scripted = Scripted::start(vec![(500, "", NOW)]).await;
 
         assert_eq!(500, status_of(&server, reqwest::Method::GET).await);
-        assert_eq!(3, server.hits());
+        assert_eq!(4, server.hits());
     }
 
     #[tokio::test]
@@ -371,17 +360,86 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn backoff_stays_within_the_doubling_ceiling_and_the_cap() {
-        let policy: RetryPolicy = RetryPolicy {
-            base_delay: Duration::from_millis(100),
-            max_delay: Duration::from_millis(250),
-            ..RetryPolicy::READ
-        };
-        for _ in 0..200 {
-            assert!(policy.backoff(1) <= Duration::from_millis(100));
-            assert!(policy.backoff(2) <= Duration::from_millis(200));
-            assert!(policy.backoff(3) <= Duration::from_millis(250));
-            assert!(policy.backoff(30) <= Duration::from_millis(250));
+    fn backoff_is_half_a_second_then_one_then_two_with_quarter_jitter() {
+        let policy: RetryPolicy = RetryPolicy::READ;
+        for (retry, nominal_ms) in [(1_u32, 500_u64), (2, 1000), (3, 2000)] {
+            assert_eq!(
+                Duration::from_millis(nominal_ms * 3 / 4),
+                policy.backoff_for(retry, 0)
+            );
+            assert_eq!(
+                Duration::from_millis(nominal_ms),
+                policy.backoff_for(retry, 500)
+            );
+            assert_eq!(
+                Duration::from_millis(nominal_ms * 5 / 4),
+                policy.backoff_for(retry, 1000)
+            );
+            for _ in 0..200 {
+                let wait: Duration = policy.backoff(retry);
+                assert!(wait >= Duration::from_millis(nominal_ms * 3 / 4));
+                assert!(wait <= Duration::from_millis(nominal_ms * 5 / 4));
+            }
         }
+    }
+
+    #[test]
+    fn every_policy_makes_at_most_three_retries() {
+        for policy in [
+            RetryPolicy::READ,
+            RetryPolicy::NOTIFICATION_STATUS,
+            RetryPolicy::KEYED_SEND,
+        ] {
+            assert_eq!(3, policy.max_retries);
+            assert_eq!(Duration::from_millis(500), policy.base_delay);
+            assert!(policy.max_retry_after <= Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn only_network_timeout_5xx_408_and_429_statuses_are_retried() {
+        let retried: Vec<u16> = (100_u16..600)
+            .filter(|status| super::is_retryable_status(*status))
+            .collect();
+        let mut expected: Vec<u16> = vec![408, 429];
+        expected.extend(500..600);
+        expected.sort_unstable();
+        assert_eq!(expected, retried);
+    }
+
+    #[tokio::test]
+    async fn a_408_is_retried() {
+        let server: Scripted = Scripted::start(vec![(408, "", NOW), (200, "", NOW)]).await;
+
+        assert_eq!(200, status_of(&server, reqwest::Method::GET).await);
+        assert_eq!(2, server.hits());
+    }
+
+    #[tokio::test]
+    async fn a_connection_error_is_retried_three_times_then_given_up() {
+        let listener: std::net::TcpListener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url: String = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client.get(&url).build().unwrap();
+
+        let outcome = super::execute(&client, request, &FAST).await;
+
+        assert!(outcome.unwrap_err().is_connect());
+    }
+
+    #[tokio::test]
+    async fn a_policy_asking_for_more_than_three_retries_is_held_to_three() {
+        let server: Scripted = Scripted::start(vec![(503, "", NOW)]).await;
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client.get(&server.url).build().unwrap();
+        let greedy: RetryPolicy = RetryPolicy {
+            max_retries: 50,
+            ..FAST
+        };
+
+        super::execute(&client, request, &greedy).await.unwrap();
+
+        assert_eq!(4, server.hits());
     }
 }
