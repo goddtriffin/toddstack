@@ -173,7 +173,10 @@ export class CoreClient {
       this.post({ t: "blob", id: req.id, name: String((req.LoadBlob as { name: string }).name), at: Date.now() });
       return;
     }
+    const gen = this.boots;
     const answer = await this.run(req);
+    // A restart boots a new core whose ids start over: an old in-flight answer must not resolve one.
+    if (gen !== this.boots) return;
     if (answer && !this.gone) this.input({ resolve: { id: req.id, ...answer } });
   }
 

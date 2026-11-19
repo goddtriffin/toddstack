@@ -110,6 +110,38 @@ impl<X> Effect<X> {
     }
 }
 
+/// The variant names of the built-in effects. An app effect serialized under one of these reads
+/// back as the built-in (the untagged [`Effect::App`] is tried last), so app effect names must
+/// avoid them. [`Runtime`](crate::Runtime) checks this in debug builds and tests.
+pub const BUILT_IN_EFFECT_NAMES: [&str; 13] = [
+    "Http",
+    "Timer",
+    "CancelTimer",
+    "Store",
+    "Secure",
+    "Random",
+    "Navigate",
+    "OpenAuthBrowser",
+    "Reload",
+    "LoadBlob",
+    "Span",
+    "Log",
+    "Report",
+];
+
+/// The built-in name an app effect collides with, if any.
+#[must_use]
+pub fn builtin_collision<X: Serialize>(effect: &X) -> Option<String> {
+    let name: String = match serde_json::to_value(effect).ok()? {
+        Value::String(name) => name,
+        Value::Object(map) if map.len() == 1 => map.keys().next()?.clone(),
+        _ => return None,
+    };
+    BUILT_IN_EFFECT_NAMES
+        .contains(&name.as_str())
+        .then_some(name)
+}
+
 /// An effect with its request id, serialized flat: `{"id":3,"Http":{...}}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectReq<X = NoEffect> {
@@ -160,6 +192,22 @@ mod tests {
             json!({"id": 4, "Vibrate": {"ms": 20}}),
             serde_json::to_value(&mine).unwrap()
         );
+    }
+
+    #[test]
+    fn app_effects_named_like_a_built_in_are_detected() {
+        #[derive(Serialize)]
+        enum Clash {
+            Timer { after_ms: u64 },
+            Log,
+        }
+        assert_eq!(
+            Some("Timer".to_owned()),
+            builtin_collision(&Clash::Timer { after_ms: 1 })
+        );
+        assert_eq!(Some("Log".to_owned()), builtin_collision(&Clash::Log));
+        assert_eq!(None, builtin_collision(&Mine::Beep));
+        assert_eq!(None, builtin_collision(&Mine::Vibrate { ms: 1 }));
     }
 
     #[test]
