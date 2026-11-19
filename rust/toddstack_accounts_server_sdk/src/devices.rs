@@ -59,7 +59,7 @@ impl Accounts {
             status: 0,
             message: e.to_string(),
         })?;
-        self.project_call(reqwest::Method::POST, "/devices", Some(body), true)
+        self.project_call(reqwest::Method::POST, "/devices", Some(body), false)
             .await?;
         Ok(())
     }
@@ -71,7 +71,7 @@ impl Accounts {
     /// [`Error::Config`] without a client secret, or the request failed.
     pub async fn unregister_device(&self, platform: Platform, token: &str) -> Result<()> {
         let body: Value = json!({ "platform": platform, "token": token });
-        self.project_call(reqwest::Method::DELETE, "/devices", Some(body), true)
+        self.project_call(reqwest::Method::DELETE, "/devices", Some(body), false)
             .await?;
         Ok(())
     }

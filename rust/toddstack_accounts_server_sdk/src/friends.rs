@@ -181,7 +181,7 @@ fn checked(value: &str) -> Result<&str> {
 }
 
 /// One authenticated JSON call; errors carry the API's message. A `GET` is
-/// retried on an intermittent failure; anything else is sent once (see
+/// retried on an intermittent failure; any other method only after a connect error (see
 /// [`crate::retry`]).
 pub(crate) async fn call(
     accounts: &Accounts,
@@ -190,11 +190,16 @@ pub(crate) async fn call(
     url: &str,
     body: Option<Value>,
 ) -> Result<Value> {
+    let policy: RetryPolicy = if method == reqwest::Method::GET {
+        RetryPolicy::READ
+    } else {
+        RetryPolicy::WRITE
+    };
     let mut request = accounts.http().request(method, url).bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let response = retry::execute(accounts.http(), request.build()?, &RetryPolicy::READ).await?;
+    let response = retry::execute(accounts.http(), request.build()?, &policy).await?;
     let status = response.status();
     let text: String = response.text().await?;
     if !status.is_success() {

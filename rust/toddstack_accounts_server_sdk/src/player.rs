@@ -143,8 +143,11 @@ impl Accounts {
         })
     }
 
-    /// One call to the Server API as your project. Reads and writes are both
-    /// retried: every write is idempotent.
+    /// One call to the Server API as your project. A read is retried on any
+    /// intermittent failure. A write is retried that way only when it carries
+    /// an idempotency key the service honours (`POST /events`); every other
+    /// write (idempotent by target state, but keyless) is retried only after a
+    /// connect error, when it provably never reached the service.
     pub(crate) async fn server_call(
         &self,
         method: reqwest::Method,
@@ -156,10 +159,19 @@ impl Accounts {
                 "the Server API needs the client secret: set Config::client_secret",
             ))
         })?;
+        let keyed: bool = method == reqwest::Method::POST
+            && path.ends_with("/events")
+            && body
+                .as_ref()
+                .and_then(|b| b.get("idempotency_key"))
+                .and_then(Value::as_str)
+                .is_some_and(|k| !k.is_empty());
         let policy: RetryPolicy = if method == reqwest::Method::GET {
             RetryPolicy::READ
-        } else {
+        } else if keyed {
             RetryPolicy::KEYED_SEND
+        } else {
+            RetryPolicy::WRITE
         };
         // RFC 6749 2.3.1, as at the token endpoint: form-encode both parts.
         let encode =
@@ -172,8 +184,12 @@ impl Accounts {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response: reqwest::Response =
-            retry::execute_keyed(self.http(), request.build()?, &policy).await?;
+        let request: reqwest::Request = request.build()?;
+        let response: reqwest::Response = if keyed {
+            retry::execute_keyed(self.http(), request, &policy).await?
+        } else {
+            retry::execute(self.http(), request, &policy).await?
+        };
         let status: reqwest::StatusCode = response.status();
         let text: String = response.text().await?;
         if !status.is_success() {

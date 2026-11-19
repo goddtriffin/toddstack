@@ -158,9 +158,10 @@ username, picture }` (nothing else). Pass the `viewer` (the player asking) so a 
   `suspended`, `scope`, `rate_limited`, `bad_request`, `unprocessable`, ... Match on it. Everything but a 429 and a 5xx is
   final. A player who never signed in to your project, a deleted one and one who removed your app are all `not_found`;
   a suspended player can be read, not written for (`suspended`).
-- **Writes are idempotent and retried.** Each is a no-op success when the state already holds (a repeated block, accept,
-  mute), and an event is deduplicated by its key (`EventResult::replayed`; the same key with another event is
-  `unprocessable`). Three attempts on a 429, a 5xx or a connection failure.
+- **Writes are idempotent, but only an event is retried on a timeout, 5xx or 429.** Each is a no-op success when the
+  state already holds (a repeated block, accept, mute), and an event is deduplicated by its key
+  (`EventResult::replayed`; the same key with another event is `unprocessable`). A write without a key is retried only
+  after a connection failure, when it provably never reached the service (see Retries).
 - Every list shows only people who also use your project. Sending a request may name any account holder; `not_found`
   is the one answer for everyone who can't be asked.
 
@@ -351,7 +352,7 @@ accounts.unregister_device(Platform::Ios, &token_hex).await?; // sign-out; fine 
 ```
 
 - One phone, one person: registering a token that belonged to another player moves it. At most 10 devices are kept per
-  player. Both calls are idempotent, so a transient failure is retried.
+  player. Both calls are idempotent by state, but keyless: they are retried only after a connection failure.
 - `Error::Conflict` (409): the token is registered to another project. `Error::NotFound` (404): the player never
   signed in to your project. A malformed token or app id (400) or an unregistered app id (403) is `Error::Api`; a `sub` that isn't a UUID or an unknown platform is
   422 (`Error::Unprocessable`).
@@ -421,17 +422,22 @@ failure: a connection error, a timeout, a 5xx, a 408 or a 429. Each attempt has 
 `Retry-After` of up to 5 s is waited out in place of the backoff; a longer one ends the retries. A retry starts only
 if it can finish within 15 s of the first attempt. A 4xx other than 408 and 429 is an answer and is never retried. After the last retry you get the plain error.
 
-Server API calls (`accounts.player(sub)`, `report_as_player`) retry writes as well as reads, because every one is
-idempotent (3 retries, 10 s deadline each for a write, all within 15 s). Write limits are hourly, so a write's 429 is
-retried only when it carries a `Retry-After` of at most 5 s.
+Writes are retried far more carefully than reads. A write is retried on a timeout, a 5xx or a 429 only when it carries
+an idempotency key the service honours (3 retries, 10 s deadline each, all within 15 s). Today that is the Server API
+event (`Player::post_event`) and a notification send with an `idempotency_key`. Every other write (friend requests,
+accept, decline, cancel, remove, block, unblock, report, mute, unmute, read, time zone, device register and
+unregister, `cancel_notifications`) is idempotent by state but keyless, so it is retried only after a connection
+failure: that happens before anything is sent, so it cannot have landed. The whole call, attempts and waits together
+(a `Retry-After` included), never takes longer than 15 s; when the budget is spent you get the last error.
 
 A notification send is retried too, but only when it carries an `idempotency_key` (same schedule, each attempt with a
-10 s deadline): the service replays the recorded send, so a retry cannot notify twice. Without a key it is sent once.
+10 s deadline): the service replays the recorded send, so a retry cannot notify twice. Without a key it is sent once
+(after a connection failure it is tried again). `friends_of` is a `POST` that only reads, so it is retried like a read.
 `notification_status` is a read and follows the read rule. A malformed status id is a 400 (`Error::Api`).
 
 Everything else is sent exactly once: the code exchange (a code is single-use), refresh (a refresh that landed but whose
-answer was lost has already rotated the token, so a second try would sign the person out), revocation, and every write
-(a repeated friend request, block, report or event would be a duplicate).
+answer was lost has already rotated the token, so a second try would sign the person out), revocation, and every keyless
+write after anything but a connection failure (a repeated friend request, block, report or event would be a duplicate).
 
 ## Not in this crate
 
