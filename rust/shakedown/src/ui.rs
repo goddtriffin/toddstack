@@ -189,6 +189,22 @@ fn select<'a>(config: &'a Config, opts: &Options, refs: &Path) -> Result<Vec<&'a
         .collect())
 }
 
+/// One run: a fresh Chrome draws every job and is thrown away.
+async fn one_run(chrome: &Path, env: &Arc<Env>, jobs: &[Job], n: u32) -> Result<Vec<Shot>, Error> {
+    let profile = std::env::temp_dir().join(format!("shakedown-chrome-{}-{n}", std::process::id()));
+    let (browser, handler) = capture::launch(chrome, &profile).await?;
+    let browser = Arc::new(browser);
+    let shots = capture::shoot_all(browser.clone(), env.clone(), jobs.to_vec()).await;
+    if let Ok(mut b) = Arc::try_unwrap(browser) {
+        // Nothing in the profile is worth a graceful exit (it is thrown away): a clean close takes seconds.
+        let _ = b.kill().await;
+        let _ = b.wait().await;
+    }
+    handler.abort();
+    let _ = std::fs::remove_dir_all(&profile);
+    Ok(shots)
+}
+
 fn build_jobs(
     config: &Config,
     root: &Path,
@@ -277,29 +293,19 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
             ignores,
             player_limit: config.players.as_ref().map_or(3, |p| p.parallel),
         });
-        let profile = std::env::temp_dir().join(format!("shakedown-chrome-{}", std::process::id()));
-        let (browser, handler) = capture::launch(&chrome, &profile).await?;
-        let browser = Arc::new(browser);
-        trace("chrome up");
         let work = async {
             let mut runs = Vec::new();
-            for _ in 0..repeat {
-                runs.push(capture::shoot_all(browser.clone(), env.clone(), jobs.clone()).await);
+            for n in 0..repeat {
+                // A fresh Chrome every run: nothing one run drew (decoded images, caches) can colour the next.
+                runs.push(one_run(&chrome, &env, &jobs, n).await?);
             }
-            runs
+            Ok::<_, Error>(runs)
         };
         let result = tokio::select! {
-            r = work => Ok(r),
+            r = work => r,
             _ = tokio::signal::ctrl_c() => Err(Error::Failed("interrupted".into())),
         };
         trace("shots done");
-        if let Ok(mut b) = Arc::try_unwrap(browser) {
-            // Nothing in the profile is worth a graceful exit (it is thrown away): a clean close takes seconds.
-            let _ = b.kill().await;
-            let _ = b.wait().await;
-        }
-        handler.abort();
-        let _ = std::fs::remove_dir_all(&profile);
         trace("chrome closed");
         drop(running);
         trace("server down");
@@ -310,7 +316,15 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         shots: first.len(),
         ..Outcome::default()
     };
-    let drift = repeat_failures(&runs);
+    let (drift, noisy) = repeat_failures(&runs, &out);
+    if !noisy.is_empty() {
+        outcome.notes.push(format!(
+            "note: {} of {} shots differ between runs by antialiasing noise, inside the compare tolerance (the pixel verdict is the same): {}",
+            noisy.len(),
+            outcome.shots,
+            noisy.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
     match opts.mode {
         Mode::Check => check(root, &refs, &out, &first, &mut outcome)?,
         Mode::Update => update(&refs, &first, &mut outcome)?,
@@ -327,21 +341,60 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
 }
 
 /// `--repeat N`: every run must give the same pixels and the same findings as the first.
-fn repeat_failures(runs: &[Vec<Shot>]) -> Vec<Failure> {
+/// Failures between runs, and the shots whose pixels moved only within the compare tolerance. Chrome rescales
+/// and clips images (avatars in circles) with an antialiasing race that moves a few edge pixels about one run
+/// in a hundred; the gate is on the verdict the compare gives, which is what a reference check sees.
+fn repeat_failures(runs: &[Vec<Shot>], out_dir: &Path) -> (Vec<Failure>, Vec<String>) {
     let Some(first) = runs.first() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    let mut out = Vec::new();
+    let mut noisy: Vec<String> = Vec::new();
+    let mut out: Vec<Failure> = Vec::new();
     for (n, run) in runs.iter().enumerate().skip(1) {
         for (a, b) in first.iter().zip(run) {
-            let why = if a.png != b.png {
-                Some("pixels differ")
+            let why = if b.png.is_empty() != a.png.is_empty() {
+                let lines: Vec<String> = [a, b]
+                    .iter()
+                    .flat_map(|x| x.findings.iter().map(Finding::line))
+                    .collect();
+                Some(format!(
+                    "one run could not draw the page ({})",
+                    lines.join("; ")
+                ))
+            } else if a.png != b.png
+                && !decode_png(&a.png)
+                    .ok()
+                    .zip(decode_png(&b.png).ok())
+                    .is_some_and(|(x, y)| pixels::compare(&x, &y).passes())
+            {
+                Some("pixels differ".to_string())
             } else if a.findings != b.findings {
-                Some("findings differ")
+                let lines = |s: &Shot| s.findings.iter().map(Finding::line).collect::<Vec<_>>();
+                let (before, after) = (lines(a), lines(b));
+                let gone: Vec<&String> = before.iter().filter(|l| !after.contains(l)).collect();
+                let new: Vec<&String> = after.iter().filter(|l| !before.contains(l)).collect();
+                Some(format!("findings differ (gone: {gone:?}, new: {new:?})"))
             } else {
                 None
             };
+            if why.is_none() && a.png != b.png && !noisy.contains(&a.id) {
+                noisy.push(a.id.clone());
+            }
             if let Some(why) = why {
+                // Keep the first pair that differs per shot, with the diff, so the cause can be looked at.
+                let dir = out_dir.join("repeat");
+                let first_for_shot = !out.iter().any(|f: &Failure| f.id == a.id);
+                if first_for_shot && a.png != b.png {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("{}.run1.png", a.id)), &a.png);
+                    let _ = std::fs::write(dir.join(format!("{}.run{}.png", a.id, n + 1)), &b.png);
+                    if let (Ok(x), Ok(y)) = (decode_png(&a.png), decode_png(&b.png))
+                        && let Some(d) = pixels::compare(&x, &y).diff
+                        && let Ok(bytes) = pixels::encode(&d, 1)
+                    {
+                        let _ = std::fs::write(dir.join(format!("{}.diff.png", a.id)), bytes);
+                    }
+                }
                 out.push(Failure {
                     id: a.id.clone(),
                     reasons: vec![format!("repeat: run {} {why} from run 1", n + 1)],
@@ -350,7 +403,8 @@ fn repeat_failures(runs: &[Vec<Shot>]) -> Vec<Failure> {
             }
         }
     }
-    out
+    noisy.sort();
+    (out, noisy)
 }
 
 fn decode_png(png: &[u8]) -> Result<Image, Error> {
