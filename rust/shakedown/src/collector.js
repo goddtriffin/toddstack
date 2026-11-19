@@ -1,23 +1,25 @@
 // The page collector (design section 2): runs in the page, injected over CDP before any page script. Two jobs:
 // 1. a deterministic page: fixed clock, seeded random, no timer past a second, no interval;
 // 2. record layout shifts from the first frame on, and dump the layout tree for the Rust rules.
-// `__AT__` (epoch ms) and `__SEED__` are replaced by the tool. Nothing here decides pass or fail.
+// `__AT__` (epoch ms), `__SEED__` and `__FIXED__` (false in the interactive viewer: a live clock) are replaced by the tool. Nothing here decides pass or fail.
 (() => {
-  const at = __AT__;
-  const RealDate = Date;
-  const Fixed = function (...a) { return a.length ? new RealDate(...a) : new RealDate(at); };
-  Fixed.prototype = RealDate.prototype; Fixed.now = () => at; Fixed.parse = RealDate.parse; Fixed.UTC = RealDate.UTC;
-  window.Date = Fixed;
-  let s = __SEED__;
-  const rnd = () => { s = (s + 0x6d2b79f5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-  Math.random = rnd;
-  try {
-    crypto.getRandomValues = (a) => { for (let i = 0; i < a.length; i++) a[i] = Math.floor(rnd() * 256); return a; };
-    crypto.randomUUID = () => '00000000-0000-4000-8000-' + Math.floor(rnd() * 0xffffffffffff).toString(16).padStart(12, '0');
-  } catch { /* a frozen crypto: leave it */ }
-  const st = window.setTimeout.bind(window);
-  window.setTimeout = (f, ms, ...r) => (ms >= 1000 ? 0 : st(f, ms, ...r));
-  window.setInterval = () => 0;
+  if (__FIXED__) {
+    const at = __AT__;
+    const RealDate = Date;
+    const Fixed = function (...a) { return a.length ? new RealDate(...a) : new RealDate(at); };
+    Fixed.prototype = RealDate.prototype; Fixed.now = () => at; Fixed.parse = RealDate.parse; Fixed.UTC = RealDate.UTC;
+    window.Date = Fixed;
+    let s = __SEED__;
+    const rnd = () => { s = (s + 0x6d2b79f5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    Math.random = rnd;
+    try {
+      crypto.getRandomValues = (a) => { for (let i = 0; i < a.length; i++) a[i] = Math.floor(rnd() * 256); return a; };
+      crypto.randomUUID = () => '00000000-0000-4000-8000-' + Math.floor(rnd() * 0xffffffffffff).toString(16).padStart(12, '0');
+    } catch { /* a frozen crypto: leave it */ }
+    const st = window.setTimeout.bind(window);
+    window.setTimeout = (f, ms, ...r) => (ms >= 1000 ? 0 : st(f, ms, ...r));
+    window.setInterval = () => 0;
+  }
 
   const S = (window.__shakedown = { shifts: [] });
   const name = (n) => (n ? `${n.nodeName.toLowerCase()}${n.id ? '#' + n.id : ''}${typeof n.className === 'string' && n.className ? '.' + n.className.trim().split(/\s+/).slice(0, 2).join('.') : ''}` : '?');

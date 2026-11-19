@@ -1,18 +1,18 @@
 [package]
 name = "shakedown"
 # Versioned on its own, not with the workspace (webserver-base's version).
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
-description = "One local testing tool for every project: the check step runner, size budgets, pixel compare, and web UI checks in a pinned Chrome (layout rules, screenshots against approved references), driven by a shakedown.toml."
+description = "One local testing tool for every project: the check step runner, size budgets, pixel compare, and web UI checks in a pinned Chrome (layout rules, screenshots against approved references), the device sweep with a review pack, and the interactive device viewer, driven by a shakedown.toml."
 license-file.workspace = true
 keywords = ["testing", "screenshots", "budgets", "toddstack"]
 categories = ["development-tools::testing", "command-line-utilities"]
-include = ["**/*.rs", "**/*.js", "**/*.toml", "LICENSE", "README.md"]
+include = ["**/*.rs", "**/*.js", "**/*.html", "**/*.toml", "LICENSE", "README.md"]
 
 [lints]
 workspace = true

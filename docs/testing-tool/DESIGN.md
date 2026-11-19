@@ -518,13 +518,45 @@ Built as designed, with these differences:
   input-driven, and no person is typing. Screens with actions are judged on the shifts before the first action.
 - The freeze style is a constructable stylesheet, not a `<style>` element: a page's own CSP (`style-src 'self'`)
   blocks the latter. Text covered by a painted element (a dialog, a dropdown) is not "on top"; text over text is.
-- A signed-in player is in at most 3 shots at once (`[players].parallel`): accounts-service caps a person's open
-  event streams at 5.
+- A signed-in player is in at most `[players].parallel` shots at once (default 3; accounts-service sets 4, as it caps
+  a person's open event streams at 5).
 - `/favicon.ico` console errors are ignored (new headless Chrome asks for it by itself); off-origin image and icon
   requests get a flat stand-in, every other off-origin request fails the screen.
 - `loading-indicator` is not implemented yet (it was not in the phase 2 list).
 - Chrome flags for stable pixels: software raster and compositing, no checker imaging, one raster thread. A shot is
-  settled after 3 identical captures 60 ms apart. `--repeat` uses a fresh Chrome per run. Even so, about 7% of
+  settled when every image is decoded and two frames have drawn, then one capture is identical to the one before
+  (event-driven, no fixed sleep). `--repeat` uses a fresh Chrome per run. Even so, about 7% of
   shots differ between runs by up to about 50 edge pixels around images clipped to a circle: the repeat gate is on
   the compare's verdict and the findings, with the noisy shots listed. Strict byte identity needs a different
   renderer and is not met.
+
+`update` rewrites a reference only when the drawn pixels fail the compare against the stored one (raw pixels, not the
+quantized ones, so `update` and `check` agree); a re-run is a no-op in git.
+
+## Phase 3 notes (2026-11-19, shakedown 0.3.0)
+
+Built as designed, with these differences:
+
+- `[sweep].routes` entries are a path (a guest) or a table `{ path, name, player, routes, allow_console }`; a
+  signed-in route names its one account. A group's `players = N` is the number of accounts that take turns: frame
+  `i` (the `i`th device, both themes) is `accounts[i mod N]`, and `N` may not exceed `[players].accounts`. The design's
+  "at least as many players as frames" is not applicable: a group is drawn on 18 devices, not 18 simultaneous frames.
+- `[devices].sweep` is `"all"` (default) or a list of names.
+- The baseline lives in `target/shakedown/sweep/baseline/`, one PNG per shot, written when missing and never
+  replaced by a plain sweep (so a change stays visible until accepted). `--rebase` (an addition to the command line)
+  makes the current run the baseline. A pixel change is the compare's verdict (past the tolerance), a resize counts.
+- `--base URL` skips the `[server]` world and refuses any host that is not loopback or `*.localhost`; `sweep` without
+  `--base` needs `[server]`. A `--base` run takes the world mode and clock from `[server]` when there is one.
+- The review pack is `target/shakedown/review/`: `manifest.json` (routes with their sheets and players, devices,
+  themes, findings, pixel changes, count of new baselines) and `<route>-<theme>.png`. One shared scale per sheet
+  (shelf packing, tallest first, largest scale that fits 1568 x 1568); a tile with findings is outlined red. Sheets
+  are captured from HTML with data URIs in the pinned Chrome (`sheet.rs`).
+- `devices serve` replaces `devices.py` and `devices.html`: one proxy thread per connection on `std::net`, no HTTP
+  dependency. Frames are `p<i+1>.localhost:<port>` (own cookie jar each); the injected collector (`collector.js`
+  with `__FIXED__ = false`, so the clock is live) posts the layout tree to the viewer, which sends it to
+  `/__devices/check` where the Rust rules judge it. The old `sweep()` and the in-page `problems()` are gone: the
+  headless `sweep` is the automation. A target must be loopback; the proxy rejects any Host that is not `localhost`,
+  `127.0.0.1` or `*.localhost`. The theme toggle sets `color-scheme` on the frame (as before); a cross-origin frame
+  cannot be given a different `prefers-color-scheme`, so dark mode is checked exactly only by `sweep`.
+- Not done: the viewer's per-frame "own player" sign-in is a button that loads `[players].signin` (it needs a
+  `shakedown.toml`); `loading-indicator` is still not implemented.

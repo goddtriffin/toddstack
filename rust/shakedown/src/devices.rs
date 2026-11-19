@@ -61,6 +61,20 @@ pub fn pick(names: &[String]) -> Result<Vec<Device>, Error> {
         .collect()
 }
 
+/// `shakedown devices json`: the list as JSON, in file order.
+pub fn json() -> String {
+    let list: Vec<_> = all()
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d.name, "label": d.label, "width": d.width, "height": d.height,
+                "density": d.density, "mobile": d.mobile,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&list).unwrap_or_default()
+}
+
 /// `shakedown devices`: the list as text.
 pub fn table() -> String {
     all()
@@ -108,6 +122,15 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), 18);
+    }
+
+    #[test]
+    fn json_lists_every_device_with_its_size() {
+        let v: serde_json::Value = serde_json::from_str(&json()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 18);
+        assert_eq!(v[0]["name"], "desktop");
+        assert_eq!(v[0]["width"], 1440);
+        assert_eq!(v[0]["mobile"], false);
     }
 
     #[test]

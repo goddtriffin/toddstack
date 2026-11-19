@@ -11,8 +11,11 @@ mod guard;
 mod layout;
 mod pixels;
 mod report;
+mod sheet;
 mod steps;
+mod sweep;
 mod ui;
+mod viewer;
 mod world;
 
 use std::path::{Path, PathBuf};
@@ -89,7 +92,27 @@ fn cli() -> Command {
                 .subcommand(Command::new("install").about("Download and verify the pinned Chrome (once; shared by every project)"))
                 .subcommand(Command::new("path").about("Print the pinned Chrome's executable")),
         )
-        .subcommand(Command::new("devices").about("The one device list"))
+        .subcommand(
+            Command::new("sweep")
+                .about("Every device, theme and sweep route, headless: layout rules and shifts fail; pixels are diffed against a local baseline")
+                .arg(Arg::new("base").long("base").help("Draw against this running local server (http://127.0.0.1:PORT) instead of starting [server]"))
+                .arg(Arg::new("routes").long("routes").value_delimiter(',').help("Only these pages (names from [sweep]); default: all"))
+                .arg(Arg::new("pack").long("pack").action(ArgAction::SetTrue).help("Write the review pack to target/shakedown/review/"))
+                .arg(Arg::new("rebase").long("rebase").action(ArgAction::SetTrue).help("Make this run the pixel baseline")),
+        )
+        .subcommand(
+            Command::new("devices")
+                .about("The one device list: list (default), json, or serve (the side-by-side viewer)")
+                .subcommand(Command::new("list").about("The list as text"))
+                .subcommand(Command::new("json").about("The list as JSON"))
+                .subcommand(
+                    Command::new("serve")
+                        .about("Interactive viewer: every device in iframes, light and dark, layout rules per frame. Binds 127.0.0.1 only")
+                        .arg(Arg::new("target").long("target").default_value("http://127.0.0.1:8790").help("The local app to show"))
+                        .arg(Arg::new("port").long("port").value_parser(value_parser!(u16)).default_value("8799").help("The viewer's port on 127.0.0.1"))
+                        .arg(Arg::new("routes").long("routes").value_parser(value_parser!(PathBuf)).help("A page list for the picker (a path per line, optional label after two spaces, [Group] headers)")),
+                ),
+        )
         .subcommand(Command::new("doctor").about("Check the tools the platforms need, and print the fix for each miss"))
 }
 
@@ -112,9 +135,10 @@ fn run(m: &ArgMatches) -> Result<(), Error> {
     let explicit = m.get_one::<PathBuf>("config").map(PathBuf::as_path);
     match m.subcommand() {
         Some(("doctor", _)) => doctor_cmd(),
-        Some(("devices", _)) => {
-            println!("{}", devices::table());
-            Ok(())
+        Some(("devices", sub)) => devices_cmd(explicit, sub),
+        Some(("sweep", sub)) => {
+            let (config, root) = load(explicit)?;
+            sweep_cmd(&config, &root, sub)
         }
         Some(("browser", sub)) => match sub.subcommand() {
             Some(("install", _)) => {
@@ -154,6 +178,61 @@ fn run(m: &ArgMatches) -> Result<(), Error> {
             sizes_cmd(&config, &root)
         }
         _ => Err(Error::Config("unknown command".into())),
+    }
+}
+
+fn devices_cmd(explicit: Option<&Path>, m: &ArgMatches) -> Result<(), Error> {
+    match m.subcommand() {
+        Some(("json", _)) => {
+            println!("{}", devices::json());
+            Ok(())
+        }
+        Some(("serve", sub)) => {
+            let settings = viewer::Settings {
+                port: sub.get_one::<u16>("port").copied().unwrap_or(8799),
+                target: viewer::target_addr(
+                    sub.get_one::<String>("target").map_or("", String::as_str),
+                )?,
+                routes_file: sub.get_one::<PathBuf>("routes").cloned(),
+                config_routes: Vec::new(),
+                players: None,
+                ignores: "[]".into(),
+            };
+            // A shakedown.toml adds its sweep pages, players and layout ignores; the viewer works without one.
+            let settings = match load(explicit) {
+                Ok((config, _)) => settings.with_config(&config),
+                Err(_) => settings,
+            };
+            viewer::serve(&settings)
+        }
+        _ => {
+            println!("{}", devices::table());
+            Ok(())
+        }
+    }
+}
+
+fn sweep_cmd(config: &Config, root: &Path, m: &ArgMatches) -> Result<(), Error> {
+    let opts = sweep::Options {
+        base: m.get_one::<String>("base").cloned(),
+        routes: m
+            .get_many::<String>("routes")
+            .map_or_else(Vec::new, |v| v.cloned().collect()),
+        pack: m.get_flag("pack"),
+        rebase: m.get_flag("rebase"),
+    };
+    let outcome = sweep::run(config, root, &opts)?;
+    for line in sweep::lines(&outcome) {
+        println!("{line}");
+    }
+    if outcome.failed.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Failed(format!(
+            "{} of {} shots did not pass",
+            outcome.failed.len(),
+            outcome.shots
+        )))
     }
 }
 

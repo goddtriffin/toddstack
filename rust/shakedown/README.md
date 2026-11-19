@@ -6,12 +6,12 @@ local only (macOS). Design record: [`docs/testing-tool/DESIGN.md`](../../docs/te
 
 Shipped: the `check` step runner, `budgets sizes`, `pixels` compare, the report, `doctor` (phase 1); the pinned
 Chrome, `ui web` with layout rules and approved references, `update`, fake and seeded worlds, `include` (phase 2).
-The device sweep, smoke tests and simulators arrive in later phases.
+`sweep` with the review pack and `devices serve`, the interactive viewer (phase 3). Smoke tests and simulators arrive in later phases.
 
 ## Install
 
 ```sh
-cargo install shakedown@0.2.0 --locked          # from crates.io
+cargo install shakedown@0.3.0 --locked          # from crates.io
 cargo install --path rust/shakedown --locked    # from a toddstack checkout
 shakedown doctor                                # what is installed, what is missing, and the fix for each miss
 ```
@@ -29,7 +29,8 @@ Pin the version in each project's `shakedown.toml`; a mismatch stops with the ex
 | `shakedown ui web [--screens a,b] [--repeat N] [--json]` | draws every `[[screen]]` on every `[devices].ui` device and theme in the pinned Chrome; layout rules, console errors and layout shift, then pixels against the references; report on failure |
 | `shakedown update --screens a,b` | rewrites only the named references, and only the files whose pixels changed. `all` only for a first generation |
 | `shakedown browser install` / `path` | the pinned Chrome for Testing 149.0.7827.55 (sha256 checked, unpacked with `ditto` into `~/Library/Caches/shakedown/chrome/`). `ui` installs it on first use |
-| `shakedown devices` | the one device list (18 devices, portrait and landscape) |
+| `shakedown sweep [--base URL] [--routes a,b] [--pack] [--rebase]` | every `[sweep]` page on every sweep device and theme, headless: layout rules and shift fail it; pixels are diffed against a local baseline and only reported. `--pack` writes the review pack |
+| `shakedown devices [list\|json\|serve]` | the one device list (18 devices, portrait and landscape); `serve` is the interactive side-by-side viewer |
 | `shakedown doctor` | checks Rust, a shell, `strip`, Xcode, simulator runtimes, Java, the Android SDK, the pinned Chrome and disk use |
 
 `--config PATH` points at a `shakedown.toml`; without it the nearest one (searching upward) is used, and its
@@ -81,7 +82,7 @@ that ran.
 hold one `*` for hashed names and must then match exactly one file. Ceilings, all in exact bytes: `raw`, `gzip`
 (level 9), `brotli` (quality 11), and `max` (raw size, or the size after `strip -S -x` when `strip = true`).
 
-Sections of later phases (`[sweep]`, `[smoke]`, ...) are accepted and ignored with a note; typos inside the
+Sections of later phases (`[smoke]`, ...) are accepted and ignored with a note; typos inside the
 sections below are errors.
 
 ## UI checks
@@ -148,6 +149,46 @@ note, not failed. A difference beyond the tolerance keeps both images and the di
 list `ui.web` under `[check].builtin`. Exit codes: 0 pass, 1 a check failed, 2 config or usage, 3 environment
 (Chrome, server, seed). `--devices a,b` limits a `ui` run to some devices for a quick look; `SHAKEDOWN_PARALLEL=N` sets the pages drawn at once (default one per core, at most 16; `SHAKEDOWN_BROWSERS=N` sets the Chromes they are spread over, default one per 2 pages).
 
+## Sweep
+
+```toml
+[devices]
+sweep = "all"                # default: every device; or a list of names
+themes = ["light", "dark"]
+
+[sweep]
+routes = [
+  "/sign-in",                                          # a guest
+  { path = "/account", player = "ann" },               # a signed-in player ([players].accounts)
+  { path = "/x?y=1", name = "x-y", allow_console = [{ contains = "status of 404", why = "a 404 by design" }] },
+]
+groups = [{ name = "lobby", path = "/lobby/test", players = 4 }]   # frame i is accounts[i mod 4]
+```
+
+`shakedown sweep` draws every page on every device in both themes, with the same page, rules and settle as `ui web`
+(fake worlds take `routes = { "GET /api/v1/me" = "fixtures/me.json" }` on a page). Layout rules and layout shift fail
+it. Each picture is also compared with the local baseline in `target/shakedown/sweep/baseline/` (never committed):
+the first sweep makes the baseline, later ones report what changed (`pixels: N changed against the baseline`), and
+`--rebase` makes the current run the baseline. `report.html` lists every shot with a finding or a change.
+`--base http://127.0.0.1:PORT` draws against a server you already run; any other host is refused.
+Exit codes as for `ui`.
+
+`--pack` writes `target/shakedown/review/`: `manifest.json` (routes, devices, themes, findings, pixel changes) and one
+contact sheet per route per theme, `<route>-<theme>.png`: every device tiled at one scale with its name burned in, at
+most 1568 px on the long edge, drawn in the pinned Chrome (a tile with findings is outlined red). The Claude skill
+`shakedown-review` (goddtriffin/skills) hands the pack to a fresh Sonnet helper.
+
+## Device viewer
+
+`shakedown devices serve [--target http://127.0.0.1:8790] [--port 8799] [--routes pages.txt]` then open
+`http://localhost:8799/__devices?path=/`. Every device in its own iframe (the browser window is never resized),
+light and dark, the layout rules per frame (the same Rust ones as the sweep), a page picker (`--routes` file,
+`[sweep]` pages), and frames that follow a click made in any frame. It is a proxy bound to 127.0.0.1 only, for local
+apps only: it strips `X-Frame-Options` and `frame-ancestors`, and injects the collector into every page. Frame `i`
+loads from `p<i+1>.localhost:<port>`, so each frame has its own cookies: "Sign frames in as players" signs frame `i`
+in as `[players].accounts[i mod n]` through `[players].signin`. The theme toggle sets the frame's `color-scheme`; the
+sweep is the exact check of `prefers-color-scheme`.
+
 ## Pixel compare
 
 A port of the compare used by Boggledygook, so its references stay valid:
@@ -165,4 +206,5 @@ exit 1, and harmless drift must pass. `tests/planted_ui.rs` plants a break in a 
 console and page errors, a request that leaves the machine, an unfaked and a never-made call, a failed action, a
 layout shift, a 1 px move, a colour change just over the threshold and a missing reference, and requires `ui web`
 to fail naming it; harmless drift, an ignore with a reason and a clean `--repeat 3` must pass. They need the pinned
-Chrome (installed on first use).
+Chrome (installed on first use). `tests/planted_sweep.rs` sweeps a small site: a page that scrolls sideways fails,
+pixel changes are only reported, `--pack` writes a manifest and sheets within 1568 px, and a non-local `--base` is refused.
