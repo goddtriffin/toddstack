@@ -444,7 +444,9 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     for sub in ["current", "diff", "server"] {
         let _ = std::fs::remove_dir_all(dir.join(sub));
     }
-    let _ = std::fs::remove_dir_all(pack_dir(root));
+    if opts.pack {
+        let _ = std::fs::remove_dir_all(pack_dir(root));
+    }
     let runs = ui::draw_all(
         config,
         root,
