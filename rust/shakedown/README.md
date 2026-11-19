@@ -11,7 +11,7 @@ Chrome, `ui web` with layout rules and approved references, `update`, fake and s
 ## Install
 
 ```sh
-cargo install shakedown@0.3.0 --locked          # from crates.io
+cargo install shakedown@0.4.0 --locked          # from crates.io
 cargo install --path rust/shakedown --locked    # from a toddstack checkout
 shakedown doctor                                # what is installed, what is missing, and the fix for each miss
 ```
