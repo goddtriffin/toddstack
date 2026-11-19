@@ -133,7 +133,8 @@ two captures in a row are byte-identical. Fixtures may hold `"$now"`, replaced b
 Layout rules (Rust, on the tree the page reports): `sideways-scroll`, `off-screen`, `clipped-text`,
 `text-overlap`, `text-min-size` (under 11 px), `tap-min-size` (under 24 px, inline links exempt) and
 `layout-shift` (shifts of 0.0005 or more, taken before any action). Other findings: `console-error`,
-`page-error`, `network`, `unfaked-call`, `never-called`, `never-settled`, `action-failed`, `ignore-without-why`.
+`page-error`, `network`, `unfaked-call`, `never-called`, `webrtc` (any RTCPeerConnection), `action-failed`, `ignore-without-why`. A shot that never settles (requests or pixels keep changing) is retried once like any
+browser failure; a pass on the retry is reported as flaky, a second stall is `page-failed`.
 Opt out per element with `data-shakedown-ignore="rule" data-shakedown-why="reason"` (a horizontal scroller is
 `data-shakedown-scroll-x`), or per selector in `[layout].ignore`.
 

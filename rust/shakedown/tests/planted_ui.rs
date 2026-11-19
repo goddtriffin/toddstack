@@ -642,3 +642,94 @@ fn a_signal_stops_the_server_even_before_it_is_ready() {
         assert!(!running(), "{sig}: the server is gone");
     }
 }
+
+/// A UDP listener posing as the outside world: prints its port, then the number of packets seen once stdin closes.
+const UDP_LISTENER: &str = r"
+import select, socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((sys.argv[1], 0))
+print(s.getsockname()[1], flush=True)
+n = 0
+while s in select.select([s, sys.stdin], [], [], 120)[0]:
+    s.recvfrom(2048); n += 1
+print(n)
+";
+
+/// Runs `script` on a page that tries a STUN probe to a UDP listener on this machine's network address.
+fn webrtc_probe(tag: &str, script: &str) {
+    let Some(ip) = lan_ip() else {
+        eprintln!("no network address: skipped");
+        return;
+    };
+    let mut listener = Command::new("python3")
+        .args(["-c", UDP_LISTENER, &ip.to_string()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = std::io::BufReader::new(listener.stdout.take().unwrap());
+    let mut port = String::new();
+    std::io::BufRead::read_line(&mut out, &mut port).unwrap();
+    let port = port.trim().to_string();
+    let site = Site::new(tag);
+    site.screen("");
+    let script = script.replace("__STUN__", &format!("stun:{ip}:{port}"));
+    site.page(&format!("{OK_BODY}<script>{script}</script>"));
+    let o = site.run(&["update", "--screens", "page"]);
+    // Give a stray packet time to arrive before the listener is asked.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    drop(listener.stdin.take());
+    let mut seen = String::new();
+    std::io::BufRead::read_line(&mut out, &mut seen).unwrap();
+    let _ = listener.wait();
+    assert_eq!(seen.trim(), "0", "a packet left the machine over WebRTC");
+    assert!(text(&o).contains("webrtc: "), "{}", text(&o));
+    assert_eq!(code(&o), 1, "the screen fails: {}", text(&o));
+}
+
+const RTC_PROBE: &str = "try{const p=new RTCPeerConnection({iceServers:[{urls:'__STUN__'}]});p.createDataChannel('x');p.createOffer().then(o=>p.setLocalDescription(o))}catch(e){}";
+
+#[test]
+fn webrtc_never_sends_and_fails_the_screen() {
+    webrtc_probe("webrtc", RTC_PROBE);
+}
+
+#[test]
+fn webrtc_from_a_fresh_iframe_is_blocked_too() {
+    webrtc_probe(
+        "webrtc-iframe",
+        "const f=document.createElement('iframe');document.body.appendChild(f);const R=f.contentWindow.RTCPeerConnection;try{const p=new R({iceServers:[{urls:'__STUN__'}]});p.createDataChannel('x');p.createOffer().then(o=>p.setLocalDescription(o))}catch(e){}",
+    );
+}
+
+/// A server that holds the first request for `/slow` open for a long while, then answers every later one at once:
+/// the first try never settles, the retry does.
+const STALL_SERVER: &str = r"
+import functools, http.server, sys, time
+seen = []
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/slow':
+            if not seen:
+                seen.append(1)
+                time.sleep(25)
+            self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'ok')
+            return
+        super().do_GET()
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), functools.partial(H, directory='site')).serve_forever()
+";
+
+#[test]
+fn a_shot_that_never_settles_is_retried_and_reported_as_flaky() {
+    let site = Site::new("stall");
+    site.fixture("stall.py", STALL_SERVER);
+    site.page(&format!("{OK_BODY}<script>fetch('/slow')</script>"));
+    site.file("ok.html", "ok");
+    site.raw(
+        "[server]\nstart = \"python3 stall.py {port}\"\nready = \"/ok.html\"\n[devices]\nui = [\"phone\"]\nthemes = [\"light\"]\n[[screen]]\nname = \"page\"\npath = \"/page.html\"\n",
+    );
+    let o = site.run(&["update", "--screens", "page"]);
+    assert!(o.status.success(), "the retry passes: {}", text(&o));
+    assert!(text(&o).contains("warning: flaky"), "{}", text(&o));
+    assert!(text(&o).contains("never-settled"), "{}", text(&o));
+}
