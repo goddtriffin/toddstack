@@ -353,7 +353,6 @@ fn jobs(
                     plan: plans[i % plans.len()].clone(),
                     device: d.clone(),
                     theme: t.clone(),
-                    shared: true,
                 });
             }
         }
