@@ -402,7 +402,7 @@ fn feed_site(base: &BaseTemplateData, cache_buster: &CacheBuster) -> FeedSite {
     let absolute = |path: &str| format!("{}{path}", base.base_url());
     let year: i32 = i32::from(
         jiff::Timestamp::now()
-            .to_zoned(jiff::tz::TimeZone::UTC)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
             .year(),
     );
 

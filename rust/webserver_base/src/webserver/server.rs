@@ -841,6 +841,12 @@ where
     router
 }
 
+/// A `Last-Modified` value: an HTTP date, always `GMT`.
+#[cfg(feature = "pages")]
+fn http_date(moment: jiff::Timestamp) -> String {
+    moment.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
 /// The feed routes, with the conditional-GET handling the rest of the site has
 /// no use for.
 ///
@@ -861,13 +867,8 @@ where
     // Parsed once, at boot: a header value that cannot be built is a
     // programming error, and discovering it per request would mean either a
     // panic in a handler or a feed served without its validators.
-    let last_modified: HeaderValue = HeaderValue::from_str(
-        &feeds
-            .last_modified()
-            .strftime("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string(),
-    )
-    .unwrap_or_else(|_| HeaderValue::from_static(""));
+    let last_modified: HeaderValue = HeaderValue::from_str(&http_date(feeds.last_modified()))
+        .unwrap_or_else(|_| HeaderValue::from_static(""));
     let cache_control: HeaderValue = HeaderValue::from_str(&format!(
         "public, max-age={}",
         crate::feed::FEED_MAX_AGE_SECONDS
@@ -1197,6 +1198,13 @@ fn strip_api_prefix(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "pages")]
+    #[test]
+    fn the_last_modified_header_is_an_http_date_in_gmt() {
+        let moment: jiff::Timestamp = "2026-01-02T03:04:05Z".parse().expect("a real instant");
+
+        assert_eq!("Fri, 02 Jan 2026 03:04:05 GMT", super::http_date(moment));
+    }
 
     mod static_paths {
         use crate::webserver::server::has_overlong_segment;

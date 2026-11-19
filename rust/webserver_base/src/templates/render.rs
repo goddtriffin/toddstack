@@ -162,7 +162,7 @@ where
             social_image_type: frontend.and_then(|f| f.social_image.mime_type),
             has_svg_icon: frontend.is_some_and(|f| f.has_svg_icon),
             preconnect,
-            copyright_end: i32::from(Timestamp::now().to_zoned(TimeZone::UTC).year()),
+            copyright_end: i32::from(Timestamp::now().to_zoned_datetime(TimeZone::UTC).year()),
 
             color_scheme: base.theme_color().color_scheme(),
             theme_colors: base.theme_color().tags(),

@@ -34,7 +34,7 @@ templates = ["dep:handlebars", "dep:jiff"]
 analytics = ["dep:axum", "dep:reqwest", "dep:tokio"]
 
 # sitemap.xml generation.
-sitemap = ["dep:sitemap-rs", "dep:jiff"]
+sitemap = ["dep:sitemap-rs", "dep:jiff", "dep:jiff_02"]
 
 # RSS 2.0, Atom 1.0 and JSON Feed 1.1 for a site's one content stream.
 # `md5` is for the ETag: a feed is the most-polled document a site serves, so a
@@ -125,6 +125,7 @@ handlebars = { workspace = true, optional = true }
 
 # static assets (cache expiry), templates (copyright year), sitemap (lastmod)
 jiff = { workspace = true, optional = true }
+jiff_02 = { workspace = true, optional = true }
 
 # analytics (proxying), telegram
 reqwest = { workspace = true, optional = true, features = ["multipart"] }
