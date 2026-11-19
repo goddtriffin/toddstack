@@ -197,8 +197,11 @@ fn refused(status: u16, text: &str) -> Error {
 }
 
 impl Accounts {
-    /// One call as your project, with your client credentials. `keyed` lets a
-    /// POST be retried (see [`retry::execute_keyed`]); a GET is always retried.
+    /// One call as your project, with your client credentials. `keyed` is true only
+    /// for a POST that carries an idempotency key the service honours, or that
+    /// only reads (`/friends-of`): it is then retried on any intermittent failure
+    /// (see [`retry::execute_keyed`]). A GET is always retried; any other write
+    /// is retried only after a connect error.
     pub(crate) async fn project_call(
         &self,
         method: reqwest::Method,
@@ -225,7 +228,12 @@ impl Accounts {
         let response: reqwest::Response = if keyed {
             retry::execute_keyed(self.http(), request, &RetryPolicy::KEYED_SEND).await?
         } else {
-            retry::execute(self.http(), request, &RetryPolicy::NOTIFICATION_STATUS).await?
+            let policy: RetryPolicy = if request.method() == reqwest::Method::GET {
+                RetryPolicy::NOTIFICATION_STATUS
+            } else {
+                RetryPolicy::WRITE
+            };
+            retry::execute(self.http(), request, &policy).await?
         };
         let status: reqwest::StatusCode = response.status();
         let text: String = response.text().await?;

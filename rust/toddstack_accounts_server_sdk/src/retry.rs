@@ -5,21 +5,24 @@
 //! jitter. The whole call, attempts and waits together, never takes longer than
 //! 15 s (every policy's `budget`), because it runs inside a caller's HTTP
 //! request handler: a retry starts only if it can finish inside that budget.
-//! Only a `GET` is ever retried, and only on an intermittent failure:
-//! a connect error, a timeout, a 5xx, a 408 or a 429 (see
-//! [`RetryPolicy::retry_429_without_hint`] for the hourly-limited calls). Anything else is an
-//! answer, and asking again would get the same one. After the last retry the
-//! caller gets the plain last outcome (this crate has no Sentry).
+//! A read (a `GET`, or a `POST` that only reads, via [`execute_keyed`]) is
+//! retried on an intermittent failure: a connect error, a timeout, a 5xx, a
+//! 408 or a 429 (see [`RetryPolicy::retry_429_without_hint`] for the
+//! hourly-limited calls). Anything else is an answer, and asking again would
+//! get the same one. After the last retry the caller gets the plain last
+//! outcome (this crate has no Sentry).
 //!
-//! Everything else is sent exactly once, and must stay that way: the token
-//! exchange (an authorization code is single-use), refresh (rotation: a retried
-//! refresh that had in fact landed presents a spent token and signs the person
-//! out), revocation, and every `POST`, `PUT` and `DELETE` (a retried event or
-//! friend request that had landed the first time is a duplicate). [`execute`]
-//! enforces this itself, so a caller cannot opt a write in by mistake. The one
-//! exception is [`execute_keyed`], for a send that carries an idempotency key:
-//! the service replays the recorded answer instead of sending twice, so
-//! retrying it cannot duplicate.
+//! A write is retried only when it cannot have landed twice:
+//! - it carries an idempotency key the service honours ([`execute_keyed`]:
+//!   notification sends and player events), or
+//! - the request provably never reached the service: a connect error, which
+//!   happens before anything is sent ([`execute`] on any non-`GET`).
+//!
+//! A write is never retried on a timeout, a 5xx or a 429 without a key: the
+//! first attempt may have landed (a token exchange code is single-use, a
+//! rotated refresh token is spent, a friend request or event would duplicate).
+//! [`execute`] enforces this itself, so a caller cannot opt a write in by
+//! mistake.
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -34,7 +37,7 @@ pub(crate) struct RetryPolicy {
     /// Retries after the first attempt. The rule's ceiling is 3.
     pub(crate) max_retries: u32,
     /// Each attempt's own deadline, so one hung connection cannot use up the
-    /// whole budget. Set per policy: 3 s for reads, 10 s for keyed sends.
+    /// whole budget. Set per policy: 3 s for reads, 10 s for writes.
     pub(crate) attempt_timeout: Duration,
     /// The nominal wait before the first retry; it doubles per retry.
     pub(crate) base_delay: Duration,
@@ -90,6 +93,13 @@ impl RetryPolicy {
         max_retry_after: MAX_RETRY_AFTER,
         budget: BUDGET,
         retry_429_without_hint: false,
+    };
+
+    /// An unkeyed write: it is retried only after a connect error (see
+    /// [`execute`]), so no status is ever retried and the 429 rule is moot.
+    pub(crate) const WRITE: Self = Self {
+        retry_429_without_hint: false,
+        ..Self::KEYED_SEND
     };
 
     /// The wait before retry number `retry` (1 is the first): `base_delay`
@@ -161,35 +171,53 @@ fn random() -> u64 {
     RandomState::new().hash_one(Instant::now())
 }
 
-/// Sends `request`: once for anything but a `GET`, and under `policy` for a
-/// `GET`. Returns the last outcome: a success, a final answer (any
-/// non-retryable status), or the last failure once attempts or the budget run
-/// out.
+/// How much of a failure may be retried.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Safety {
+    /// A read: any intermittent failure.
+    Read,
+    /// A write with an idempotency key: any intermittent failure.
+    Keyed,
+    /// A write without a key: only a connect error, before anything was sent.
+    Unkeyed,
+}
+
+/// Sends `request` under `policy`. A `GET` is retried on any intermittent
+/// failure; any other method only after a connect error, because that is the
+/// one failure that proves the request never reached the service. Returns the
+/// last outcome: a success, a final answer (any non-retryable status), or the
+/// last failure once attempts or the 15 s budget run out.
 pub(crate) async fn execute(
     client: &Client,
     request: Request,
     policy: &RetryPolicy,
 ) -> reqwest::Result<Response> {
-    run(client, request, policy, false).await
+    let safety: Safety = if request.method() == Method::GET {
+        Safety::Read
+    } else {
+        Safety::Unkeyed
+    };
+    run(client, request, policy, safety).await
 }
 
-/// Like [`execute`], but retries a write too. Only for a request the service
-/// deduplicates by an idempotency key.
+/// Like [`execute`], but retries a write on any intermittent failure. Only for
+/// a request the service deduplicates by an idempotency key, or a `POST` that
+/// only reads.
 pub(crate) async fn execute_keyed(
     client: &Client,
     request: Request,
     policy: &RetryPolicy,
 ) -> reqwest::Result<Response> {
-    run(client, request, policy, true).await
+    run(client, request, policy, Safety::Keyed).await
 }
 
 async fn run(
     client: &Client,
     request: Request,
     policy: &RetryPolicy,
-    retry_writes: bool,
+    safety: Safety,
 ) -> reqwest::Result<Response> {
-    run_counting(client, request, policy, retry_writes, &mut 0).await
+    run_counting(client, request, policy, safety, &mut 0).await
 }
 
 /// [`run`], also reporting how many attempts were made.
@@ -197,12 +225,9 @@ async fn run_counting(
     client: &Client,
     request: Request,
     policy: &RetryPolicy,
-    retry_writes: bool,
+    safety: Safety,
     attempts: &mut u32,
 ) -> reqwest::Result<Response> {
-    if request.method() != Method::GET && !retry_writes {
-        return client.execute(request).await;
-    }
     let started: Instant = Instant::now();
     let mut retry: u32 = 1;
     loop {
@@ -213,6 +238,9 @@ async fn run_counting(
         *attempt.timeout_mut() = Some(policy.attempt_timeout);
         let outcome: reqwest::Result<Response> = client.execute(attempt).await;
         *attempts += 1;
+        if safety == Safety::Unkeyed && !matches!(&outcome, Err(e) if e.is_connect()) {
+            return outcome;
+        }
         let Some(wait) = policy.delay(retry, &outcome) else {
             return outcome;
         };
@@ -474,6 +502,7 @@ pub(crate) mod tests {
             RetryPolicy::READ,
             RetryPolicy::NOTIFICATION_STATUS,
             RetryPolicy::KEYED_SEND,
+            RetryPolicy::WRITE,
         ] {
             assert_eq!(3, policy.max_retries);
             assert_eq!(Duration::from_millis(500), policy.base_delay);
@@ -510,7 +539,8 @@ pub(crate) mod tests {
         let request: reqwest::Request = client.get(&url).build().unwrap();
         let mut attempts: u32 = 0;
 
-        let outcome = super::run_counting(&client, request, &FAST, false, &mut attempts).await;
+        let outcome =
+            super::run_counting(&client, request, &FAST, super::Safety::Read, &mut attempts).await;
 
         assert!(outcome.unwrap_err().is_connect());
         assert_eq!(4, attempts);
@@ -529,5 +559,129 @@ pub(crate) mod tests {
         super::execute(&client, request, &greedy).await.unwrap();
 
         assert_eq!(4, server.hits());
+    }
+
+    async fn unkeyed_post_status(server: &Scripted) -> reqwest::Result<u16> {
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client
+            .post(&server.url)
+            .json(&serde_json::json!({ "sub": "x" }))
+            .build()
+            .unwrap();
+        super::execute(&client, request, &FAST)
+            .await
+            .map(|r| r.status().as_u16())
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_write_is_not_retried_on_a_5xx_or_a_429() {
+        for status in [500_u16, 502, 503, 504, 408, 429] {
+            let server: Scripted = Scripted::start(vec![(status, "", NOW), (200, "", NOW)]).await;
+
+            assert_eq!(status, unkeyed_post_status(&server).await.unwrap());
+            assert_eq!(1, server.hits(), "status {status}");
+        }
+        let server: Scripted =
+            Scripted::start(vec![(429, "retry-after: 1\r\n", NOW), (200, "", NOW)]).await;
+        assert_eq!(429, unkeyed_post_status(&server).await.unwrap());
+        assert_eq!(1, server.hits());
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_write_is_not_retried_on_a_timeout() {
+        let server: Scripted =
+            Scripted::start(vec![(200, "", Duration::from_secs(2)), (200, "", NOW)]).await;
+
+        assert!(unkeyed_post_status(&server).await.unwrap_err().is_timeout());
+        assert_eq!(1, server.hits());
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_delete_and_put_are_not_retried_on_a_503() {
+        for method in [reqwest::Method::DELETE, reqwest::Method::PUT] {
+            let server: Scripted = Scripted::start(vec![(503, "", NOW), (200, "", NOW)]).await;
+
+            assert_eq!(503, status_of(&server, method).await);
+            assert_eq!(1, server.hits());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_write_is_retried_after_a_connect_error() {
+        let listener: std::net::TcpListener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url: String = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client.post(&url).build().unwrap();
+        let mut attempts: u32 = 0;
+
+        let outcome = super::run_counting(
+            &client,
+            request,
+            &FAST,
+            super::Safety::Unkeyed,
+            &mut attempts,
+        )
+        .await;
+
+        assert!(outcome.unwrap_err().is_connect());
+        assert_eq!(4, attempts);
+    }
+
+    #[tokio::test]
+    async fn a_keyed_post_is_retried_on_a_timeout() {
+        let server: Scripted =
+            Scripted::start(vec![(200, "", Duration::from_secs(2)), (200, "", NOW)]).await;
+
+        assert_eq!(200, keyed_post_status(&server).await);
+        assert_eq!(2, server.hits());
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_cannot_push_the_call_past_the_budget() {
+        let server: Scripted = Scripted::start(vec![(503, "retry-after: 1\r\n", NOW)]).await;
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client.get(&server.url).build().unwrap();
+        let tight: RetryPolicy = RetryPolicy {
+            budget: Duration::from_millis(2200),
+            ..FAST
+        };
+        let started: Instant = Instant::now();
+
+        let response = super::execute(&client, request, &tight).await.unwrap();
+
+        assert_eq!(503, response.status().as_u16());
+        assert_eq!(2, server.hits());
+        assert!(started.elapsed() <= Duration::from_millis(2200));
+    }
+
+    #[tokio::test]
+    async fn hung_attempts_and_waits_together_stay_inside_the_budget() {
+        let server: Scripted = Scripted::start(vec![(200, "", Duration::from_secs(10))]).await;
+        let client: reqwest::Client = reqwest::Client::new();
+        let request: reqwest::Request = client.get(&server.url).build().unwrap();
+        let tight: RetryPolicy = RetryPolicy {
+            budget: Duration::from_secs(2),
+            ..FAST
+        };
+        let started: Instant = Instant::now();
+
+        let error = super::execute(&client, request, &tight).await.unwrap_err();
+
+        assert!(error.is_timeout());
+        assert!(server.hits() >= 2);
+        assert!(started.elapsed() <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_real_policies_cap_the_whole_call_at_15_seconds() {
+        for policy in [
+            RetryPolicy::READ,
+            RetryPolicy::NOTIFICATION_STATUS,
+            RetryPolicy::KEYED_SEND,
+            RetryPolicy::WRITE,
+        ] {
+            assert_eq!(Duration::from_secs(15), policy.budget);
+        }
     }
 }
