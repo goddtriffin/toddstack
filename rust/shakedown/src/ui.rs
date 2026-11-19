@@ -559,11 +559,12 @@ fn update(refs: &Path, shots: &[Shot], outcome: &mut Outcome) -> Result<(), Erro
         let new = pixels::encode(&decode_png(&shot.png)?, pixels::REF_STEP)?;
         let path = refs.join(format!("{}.png", shot.id));
         // A reference is rewritten only when it is missing or really fails: antialiasing noise inside the
-        // compare tolerance leaves the file alone, so a re-run changes nothing in git.
+        // compare tolerance leaves the file alone, so a re-run changes nothing in git. The drawn pixels, not the
+        // quantized ones, are compared: that is what `check` compares, so `update` and `check` agree.
         let same = std::fs::read(&path)
             .ok()
             .and_then(|old| decode_png(&old).ok())
-            .zip(decode_png(&new).ok())
+            .zip(decode_png(&shot.png).ok())
             .is_some_and(|(a, b)| a == b || pixels::compare(&a, &b).passes());
         if same {
             outcome.unchanged += 1;

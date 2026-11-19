@@ -763,3 +763,79 @@ fn a_shot_that_never_settles_is_retried_and_reported_as_flaky() {
     assert!(text(&o).contains("warning: flaky"), "{}", text(&o));
     assert!(text(&o).contains("never-settled"), "{}", text(&o));
 }
+
+/// A page the check must let through (hidden on purpose, decoration), after the clean one is approved.
+fn passes(tag: &str, body: &str) {
+    let site = Site::new(tag);
+    site.screen("");
+    site.page(&format!("{OK_BODY}{body}"));
+    site.approve();
+    let o = site.run(&["ui", "web"]);
+    assert_eq!(code(&o), 0, "{tag} must pass: {}", text(&o));
+}
+
+#[test]
+fn visually_hidden_text_is_not_clipped() {
+    passes(
+        "sronly",
+        "<style>.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;white-space:nowrap}</style><span class=\"sr-only\">Skip to the main content</span>",
+    );
+    passes(
+        "cliprect",
+        "<span style=\"position:absolute;width:40px;height:10px;overflow:hidden;white-space:nowrap;clip:rect(0,0,0,0)\">Hidden on purpose text</span>",
+    );
+    passes(
+        "clippath",
+        "<span style=\"position:absolute;width:40px;height:10px;overflow:hidden;white-space:nowrap;clip-path:inset(50%)\">Hidden on purpose text</span>",
+    );
+}
+
+#[test]
+fn a_child_of_visually_hidden_text_is_skipped_too() {
+    passes(
+        "srchild",
+        "<style>.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;white-space:nowrap}</style><span class=\"sr-only\">Score <b>five</b> points</span>",
+    );
+}
+
+#[test]
+fn aria_hidden_layers_do_not_overlap_each_other_or_real_text_above_them() {
+    passes(
+        "decor",
+        "<div aria-hidden=\"true\"><div style=\"position:absolute;top:200px;left:10px\">First line of text</div><div style=\"position:absolute;top:205px;left:20px\">Second line of text</div></div>",
+    );
+    // Real text painted over a decorative layer is fine.
+    passes(
+        "decorunder",
+        "<div aria-hidden=\"true\" style=\"position:absolute;top:200px;left:10px;z-index:0\">Drifting word</div><div style=\"position:absolute;top:203px;left:15px;z-index:1;background:#fff\">Real text above</div>",
+    );
+}
+
+#[test]
+fn an_aria_hidden_icon_painted_over_text_still_fails() {
+    planted(
+        "decorover",
+        &format!(
+            "{OK_BODY}<div style=\"position:absolute;top:200px;left:10px\">Real line of text</div><div aria-hidden=\"true\" style=\"position:absolute;top:203px;left:15px;z-index:2\">Icon label</div>"
+        ),
+        "text-overlap",
+    );
+}
+
+#[test]
+fn a_real_overlap_and_clip_still_fail_beside_hidden_ones() {
+    planted(
+        "realclip",
+        &format!(
+            "{OK_BODY}<span class=\"sr-only\" style=\"position:absolute;width:1px;height:1px;overflow:hidden\">x y z</span><div style=\"width:40px;overflow:hidden;white-space:nowrap\">A long sentence that does not fit</div>"
+        ),
+        "clipped-text",
+    );
+    planted(
+        "realoverlap",
+        &format!(
+            "{OK_BODY}<div aria-hidden=\"true\">decor</div><div style=\"position:absolute;top:200px;left:10px\">First line of text</div><div style=\"position:absolute;top:205px;left:20px\">Second line of text</div>"
+        ),
+        "text-overlap",
+    );
+}

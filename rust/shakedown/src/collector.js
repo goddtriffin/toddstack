@@ -76,7 +76,26 @@
       if (covered(e, r.left + r.width / 2, y) !== false) return false;
       return [r.left + 1, r.right - 1].every((x) => covered(e, x, y) !== true);
     };
-    const walk = (parent, path, inherited, scrollX) => {
+    // Text hidden on purpose (the usual visually-hidden pattern): `.sr-only`, a clip or clip-path down to nothing, or
+    // a 1x1 box with hidden overflow, on the element or any ancestor. Reading it aloud is its job; it is not "cut off".
+    const hiddenBox = (e) => {
+      const cs = getComputedStyle(e);
+      if (e.classList.contains('sr-only')) return true;
+      const zero = (v) => /^(0|1)(px)?$/.test(v);
+      const m = /^rect\(([^)]*)\)$/.exec(cs.clip);
+      if (m && m[1].split(/[\s,]+/).filter(Boolean).every(zero)) return true;
+      if (/^inset\((50|100)%\)$/.test(cs.clipPath) || /^circle\(0(px)?\b/.test(cs.clipPath)) return true;
+      const r = e.getBoundingClientRect();
+      return r.width <= 1 && r.height <= 1 && (clip(cs.overflowX) || clip(cs.overflowY));
+    };
+    const hiddenOnPurpose = (e) => {
+      for (let n = e; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+        if (hiddenBox(n)) return true;
+      }
+      return false;
+    };
+    const decorEls = [];
+    const walk = (parent, path, inherited, scrollX, decor) => {
       const kids = parent.children;
       for (let i = 0; i < kids.length; i++) {
         const e = kids[i];
@@ -84,11 +103,15 @@
         const cs = getComputedStyle(e);
         if (cs.display === 'none') continue;
         const ign = inherited.concat(marks(e));
+        // aria-hidden="true" subtrees are decoration (drifting layers): two of them never overlap each other, and
+        // one counts only where it is painted over real text (see `decorEls` below).
+        const dec = decor || e.getAttribute('aria-hidden') === 'true';
         const sx = scrollX || e.hasAttribute('data-scroll-x') || e.hasAttribute('data-shakedown-scroll-x');
         const tag = e.tagName.toLowerCase();
         const rect = e.getBoundingClientRect();
         if (cs.visibility !== 'hidden' && e.checkVisibility() && (rect.width || rect.height)) {
           const lines = [], topLines = [];
+          const hid = hiddenOnPurpose(e);
           let own = '';
           for (const n of e.childNodes) {
             if (n.nodeType !== 3 || !n.textContent.trim()) continue;
@@ -96,8 +119,9 @@
             const g = document.createRange(); g.selectNodeContents(n);
             for (const r of g.getClientRects()) {
               if (r.width <= 1 || r.height <= 1) continue;
+              if (hid) continue;
               lines.push(rc(r));
-              if (top(e, r)) topLines.push(rc(r));
+              if (!dec && top(e, r)) topLines.push(rc(r));
             }
           }
           own = own.replace(/\s+/g, ' ').trim();
@@ -106,20 +130,36 @@
           else if (e.matches(PROGRESS)) kind = 'progress';
           else if (['img', 'svg', 'canvas', 'video', 'picture'].includes(tag)) kind = 'image';
           else if (lines.length) kind = 'text';
-          const clipped = e.children.length === 0 && own.length > 2
+          const clipped = !hid && e.children.length === 0 && own.length > 2
             && ((clip(cs.overflowX) && e.scrollWidth > e.clientWidth + 1) || (clip(cs.overflowY) && e.scrollHeight > e.clientHeight + 1));
+          if (dec && lines.length) decorEls.push({ e, id });
           nodes.push({
             id, label: label(e), text: own.slice(0, 30), kind, rect: rc(rect), lines, top_lines: topLines,
-            font_size: parseFloat(cs.fontSize) || 0, clipped, scroll_x: sx,
+            font_size: parseFloat(cs.fontSize) || 0, clipped, decor: dec, scroll_x: sx,
             inline: kind === 'tap' && tag === 'a' && cs.display === 'inline',
             ignore: ign,
           });
         }
         // svg and canvas draw their own insides.
-        if (tag !== 'svg' && tag !== 'canvas') walk(e, id, ign, sx);
+        if (tag !== 'svg' && tag !== 'canvas') walk(e, id, ign, sx, dec);
       }
     };
-    walk(document.body, '', [], false);
+    walk(document.body, '', [], false, false);
+    // A decorative line is "on top" only where it is painted over a real (not aria-hidden) text line.
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    for (const { e, id } of decorEls) {
+      const d = byId.get(id);
+      for (const r of d.lines) {
+        const over = nodes.some((n) => !n.decor && n.lines.some((q) => {
+          const x0 = Math.max(r.x, q.x), x1 = Math.min(r.x + r.w, q.x + q.w);
+          const y0 = Math.max(r.y, q.y), y1 = Math.min(r.y + r.h, q.y + q.h);
+          if (x1 - x0 <= 0 || y1 - y0 <= 0) return false;
+          const hit = document.elementFromPoint((x0 + x1) / 2, (y0 + y1) / 2);
+          return !!hit && e.contains(hit);
+        }));
+        if (over) d.top_lines.push(r);
+      }
+    }
     return {
       viewport_w: de.clientWidth, viewport_h: de.clientHeight, content_w: de.scrollWidth,
       nodes, shifts: S.shifts, bad_ignores: bad,
