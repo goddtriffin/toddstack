@@ -1,4 +1,0 @@
--keepattributes *Annotation*, InnerClasses
--keep,includedescriptorclasses class me.toddgriffin.toddstack.accounts.**$$serializer { *; }
--keepclassmembers class me.toddgriffin.toddstack.accounts.** { *** Companion; }
--keepclasseswithmembers class me.toddgriffin.toddstack.accounts.** { kotlinx.serialization.KSerializer serializer(...); }

@@ -26,8 +26,8 @@ Diff against `main` and classify:
 |---|---|
 | `rust/webserver_base/**` (the Rust lib) | Cargo bump, tag, release, crates.io publish — **and** the image steps, because the binary embeds the library |
 | `typescript/webserver-base/**` (the TS lib) | `typescript/deno.jsonc` PATCH bump, JSR publish |
-| `typescript/accounts/**` (TS `toddstack-accounts`) | PATCH bump of `deno.jsonc`, `package.json` and `version.ts` together (a test checks they agree), CI then publishes to JSR and npm on merge. Check the Rust crate has the same features (parity, see `contribution-guide`) |
-| `kotlin/**`, `swift/**` (native SDKs) | no CI publish: set the same `X.Y.Z` in `kotlin/accounts/build.gradle.kts` and `Version.swift`, then Todd tags the merge commit with the bare `X.Y.Z` (SwiftPM and JitPack); see `AGENTS.md` "Releasing the native SDKs" |
+| `rust/toddstack_accounts_server_sdk/**` (Rust `toddstack-accounts-server-sdk`) | Cargo bump in its own `Cargo.toml`, tag, release, crates.io publish by CI on merge |
+| `typescript/accounts/**` (TS `toddstack-accounts`, **frozen**: security fixes only) | PATCH bump of `deno.jsonc`, `package.json` and `version.ts` together (a test checks they agree), CI then publishes to JSR and npm on merge |
 | `rust/template_web_server/**` (the crate, its `html/`, `static/`, `Dockerfile`), `rust/Cargo.lock`, `Makefile` | the image steps: build, smoke test, push |
 | any `README.md`, `AGENTS.md`, `CLAUDE.md`, `.claude/**`, other docs | nothing but the pull request |
 
@@ -182,9 +182,9 @@ No tokens: each registry trusts that workflow file through trusted publishing (s
 crates.io, npm and JSR). Todd has approved every publish in advance. Publishing is **irreversible**:
 crates.io and npm allow yanking or deprecating, never reuse of a version.
 
-Tags name their package (`webserver-base-vX.Y.Z`, `flyball-vX.Y.Z`, `toddstack-accounts-vX.Y.Z`) and follow
-the **Rust** version; `@todd/webserver-base` alone (TS) gets no tag. Tags up to `v0.3.0` predate the rename.
-Bare `X.Y.Z` tags are reserved: Swift Package Manager reads a repo's plain semver tags as its versions.
+Tags name their package (`webserver-base-vX.Y.Z`, `flyball-vX.Y.Z`, `toddstack-accounts-server-sdk-vX.Y.Z`, `toddstack-accounts-vX.Y.Z` for the frozen TS package) and follow
+the package's version; `@todd/webserver-base` alone (TS) gets no tag. Tags up to `v0.3.0` predate the rename.
+Bare `X.Y.Z` tags are unused.
 
 If a publish fails, fix the cause and re-run the workflow (`gh workflow run publish.yml`): it skips what is
 already out. crates.io **requires** trusted publishing for these crates (Todd's setting), so a crate can only
