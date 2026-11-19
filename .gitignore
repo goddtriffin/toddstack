@@ -4,6 +4,8 @@
 target/
 bin/
 docs/
+# ...except the repo's own design records (generated docs land in typescript/docs/)
+!/docs/
 
 # files
 .DS_Store
