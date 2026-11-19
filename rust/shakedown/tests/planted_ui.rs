@@ -499,20 +499,37 @@ fn a_request_or_websocket_to_another_host_never_connects() {
         eprintln!("no network address: skipped");
         return;
     };
-    // A listener posing as the outside world, reachable only through a non-loopback address.
-    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let port = listener.local_addr().unwrap().port();
+    // A listener posing as the outside world, reachable only through a non-loopback address. It runs in python3
+    // (the sites here already need it): it prints its port, then "connected" or "none" once stdin closes.
+    const LISTENER: &str = "import select, socket, sys\n\
+s = socket.socket(); s.bind((sys.argv[1], 0)); s.listen(5)\n\
+print(s.getsockname()[1], flush=True)\n\
+ready = select.select([s, sys.stdin], [], [], 120)[0]\n\
+print('connected' if s in ready else 'none')\n";
+    let mut listener = Command::new("python3")
+        .args(["-c", LISTENER, &ip.to_string()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = std::io::BufReader::new(listener.stdout.take().unwrap());
+    let mut port = String::new();
+    std::io::BufRead::read_line(&mut out, &mut port).unwrap();
+    let port = port.trim().to_string();
     let site = Site::new("no-connect");
     site.screen("");
     site.page(&format!(
-        "{OK_BODY}<script>try{{new WebSocket('ws://{ip}:{port}/live')}}catch(e){{}}fetch('http://{ip}:{port}/x').catch(()=>{{}})</script>"
+        "{OK_BODY}<script>try{{new WebSocket('ws://{ip}:{port}/live')}}catch(e){{}}</script>"
     ));
     let o = site.run(&["update", "--screens", "page"]);
+    drop(listener.stdin.take());
+    let mut verdict = String::new();
+    std::io::BufRead::read_line(&mut out, &mut verdict).unwrap();
+    let _ = listener.wait();
     assert!(text(&o).contains("network: "), "{}", text(&o));
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(
-        matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+    assert_eq!(
+        verdict.trim(),
+        "none",
         "Chrome connected to the outside listener"
     );
 }

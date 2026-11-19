@@ -432,6 +432,7 @@ mod tests {
                 let second = watch_signals();
                 let mut server = Command::new("sleep")
                     .arg("300")
+                    .stdout(Stdio::null())
                     .process_group(0)
                     .spawn()
                     .unwrap();
