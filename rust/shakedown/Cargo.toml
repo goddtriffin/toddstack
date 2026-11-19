@@ -1,0 +1,32 @@
+[package]
+name = "shakedown"
+# Versioned on its own, not with the workspace (webserver-base's version).
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+description = "One local testing tool for every project: the check step runner, size budgets, pixel compare and reports, driven by a shakedown.toml."
+license-file.workspace = true
+keywords = ["testing", "screenshots", "budgets", "toddstack"]
+categories = ["development-tools::testing", "command-line-utilities"]
+include = ["**/*.rs", "Cargo.toml", "LICENSE", "README.md"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "shakedown"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.8", default-features = false, features = ["std", "help", "usage", "error-context", "color"] }
+toml = "1.2.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+png = "0.18.1"
+flate2 = "1.1.11"
+brotli = "9.1.3"
