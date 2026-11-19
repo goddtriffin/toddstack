@@ -173,12 +173,15 @@ fn sigterm_is_forwarded_to_the_process_group() {
 #[test]
 fn ctrl_c_sigint_is_forwarded_and_hup_too() {
     let t = TempDir::new().unwrap();
+    let start = Instant::now();
     let (child, _out) = start_ready(t.path(), &[], "trap 'exit 9' INT; echo ready; sleep 30 & wait");
     kill(&child, "-INT");
     assert_eq!(code(&child.wait_with_output().unwrap()), 9);
     let (child, _out) = start_ready(t.path(), &[], "trap 'exit 11' HUP; echo ready; sleep 30 & wait");
     kill(&child, "-HUP");
     assert_eq!(code(&child.wait_with_output().unwrap()), 11);
+    // The leftover `sleep 30` held the pipes open before; the group is killed after the child exits.
+    assert!(start.elapsed() < Duration::from_secs(10), "leftovers were not killed: {:?}", start.elapsed());
 }
 
 #[test]
@@ -217,6 +220,36 @@ fn timeout_escalates_to_sigkill_after_the_grace_period() {
     let took = start.elapsed();
     assert!(took >= Duration::from_millis(1400) && took < Duration::from_secs(10), "{took:?}");
     assert!(stderr(&o).contains("TIMED OUT"));
+}
+
+#[test]
+fn leftover_background_processes_are_killed_when_the_child_exits() {
+    let t = TempDir::new().unwrap();
+    let start = Instant::now();
+    let o = run(heavy(t.path()).args(["sh", "-c", "sleep 30 & exit 0"]));
+    assert_eq!(code(&o), 0);
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+}
+
+#[test]
+fn full_disk_exits_75_at_once() {
+    let t = TempDir::new().unwrap();
+    let start = Instant::now();
+    let o = run(heavy(t.path()).env("HEAVY_LIVE", "load=0.1,mem_pct=10,disk_free=5G,nonheavy_cpu=0").args(["--disk", "20G", "true"]));
+    assert_eq!(code(&o), 75, "{}", stderr(&o));
+    assert!(stderr(&o).contains("disk is full") && stderr(&o).contains("ask Todd"), "{}", stderr(&o));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(std::fs::read_dir(t.path().join("jobs")).unwrap().next().is_none(), "job file removed");
+}
+
+#[test]
+fn history_records_tree_peaks() {
+    let t = TempDir::new().unwrap();
+    let o = run(heavy(t.path()).args(["sh", "-c", "sleep 1"]));
+    assert_eq!(code(&o), 0);
+    let history = std::fs::read_to_string(t.path().join("history.jsonl")).unwrap();
+    assert!(history.contains("\"peak_tree_rss\":") && !history.contains("\"peak_tree_rss\":0,"), "{history}");
+    assert!(stderr(&o).contains("whole process tree"), "{}", stderr(&o));
 }
 
 #[test]

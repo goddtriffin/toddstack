@@ -26,7 +26,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 jiff = { workspace = true }
 signal-hook = "0.4.6"
-nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "resource", "signal"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "resource", "signal", "term"] }
 sysinfo = { version = "0.40.4", default-features = false, features = ["system", "network"] }
 notify = { version = "8.2.2", default-features = false, features = ["macos_kqueue"] }
 

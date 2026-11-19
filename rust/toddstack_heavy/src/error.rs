@@ -18,6 +18,9 @@ pub enum Error {
     Sysinfo(#[from] sysinfo::Error),
     #[error("{0}")]
     Probe(String),
+    /// The disk cannot hold the request even with nothing else running; the message says what to do.
+    #[error("{0}")]
+    DiskFull(String),
     /// A signal arrived while waiting in the queue; the value is the signal number.
     #[error("interrupted by signal {0}")]
     Interrupted(i32),
