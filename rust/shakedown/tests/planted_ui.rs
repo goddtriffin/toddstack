@@ -457,3 +457,86 @@ fn ui_without_screens_or_server_is_a_config_error() {
     let site = Site::new("empty");
     assert_eq!(code(&site.run(&["ui", "web"])), 2);
 }
+
+#[test]
+fn update_leaves_a_reference_alone_when_the_change_is_within_tolerance() {
+    let site = Site::new("update-tolerance");
+    site.screen("");
+    site.page(&box_page(10, "#808080"));
+    let _ = site.run(&["update", "--screens", "page"]);
+    let reference = site.dir.join("ui/refs/web/page@phone-light.png");
+    let before = std::fs::read(&reference).unwrap();
+    // 8 of 255 on every channel: under the compare threshold, but a different quantized image.
+    site.page(&box_page(10, "#888888"));
+    let o = site.run(&["update", "--screens", "page"]);
+    assert!(text(&o).contains("0 written, 1 unchanged"), "{}", text(&o));
+    assert_eq!(before, std::fs::read(&reference).unwrap(), "byte-identical");
+}
+
+#[test]
+fn a_websocket_that_leaves_the_machine_fails() {
+    planted(
+        "websocket",
+        &format!(
+            "{OK_BODY}<script>try{{new WebSocket('wss://example.com/live')}}catch(e){{}}</script>"
+        ),
+        "network",
+    );
+}
+
+#[test]
+fn a_websocket_to_the_local_server_is_allowed() {
+    let site = Site::new("websocket-local");
+    site.screen("");
+    site.page(&format!(
+        "{OK_BODY}<script>try{{new WebSocket('ws://'+location.host+'/live')}}catch(e){{}}</script>"
+    ));
+    // The static server refuses the handshake (a console error); the wall must not be what complains.
+    let o = site.run(&["update", "--screens", "page"]);
+    assert!(!text(&o).contains("leaves the machine"), "{}", text(&o));
+}
+
+#[test]
+fn a_request_with_another_scheme_fails() {
+    planted(
+        "ftp",
+        &format!("{OK_BODY}<img src=\"ftp://example.com/a.png\" width=1 height=1>"),
+        "network",
+    );
+}
+
+#[test]
+fn a_signal_stops_the_server_even_before_it_is_ready() {
+    for sig in ["-TERM", "-INT"] {
+        let site = Site::new(&format!("signal{sig}"));
+        let marker = format!("shakedown-signal-marker-{}{sig}", std::process::id());
+        site.raw(&format!(
+            "[server]\nstart = \"sleep 300 && echo {marker}\"\nready = \"/\"\ntimeout = 120\n[[screen]]\nname = \"page\"\npath = \"/\"\n"
+        ));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_shakedown"))
+            .args(["ui", "web"])
+            .current_dir(&site.dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let running = || {
+            let out = Command::new("pgrep")
+                .args(["-f", &marker])
+                .output()
+                .unwrap();
+            !out.stdout.is_empty()
+        };
+        let start = std::time::Instant::now();
+        while !running() && start.elapsed().as_secs() < 90 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(running(), "the server started");
+        let _ = Command::new("kill")
+            .args([sig, &child.id().to_string()])
+            .status();
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "an interrupted run fails");
+        assert!(!running(), "{sig}: the server is gone");
+    }
+}

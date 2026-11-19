@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -65,6 +65,8 @@ pub struct Outcome {
     pub unchanged: usize,
     /// Warnings to print before the verdict.
     pub notes: Vec<String>,
+    /// Shots that failed once and passed on the retry: `(shot id, first failure)`. Always reported.
+    pub flaky: Vec<(String, String)>,
     /// Where the failure report is, relative to the repo root.
     pub report: Option<String>,
 }
@@ -276,6 +278,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         .build()
         .map_err(|e| Error::Environment(format!("runtime: {e}")))?;
     let repeat = opts.repeat.max(1);
+    world::watch_signals();
     let runs: Vec<Vec<Shot>> = runtime.block_on(async {
         let trace = |what: &str| {
             if std::env::var_os("SHAKEDOWN_TRACE").is_some() {
@@ -303,7 +306,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         };
         let result = tokio::select! {
             r = work => r,
-            _ = tokio::signal::ctrl_c() => Err(Error::Failed("interrupted".into())),
+            () = async { while !world::interrupted() { tokio::time::sleep(Duration::from_millis(50)).await; } } => Err(Error::Failed("interrupted".into())),
         };
         trace("shots done");
         trace("chrome closed");
@@ -316,6 +319,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         shots: first.len(),
         ..Outcome::default()
     };
+    flaky_note(&runs, &mut outcome);
     let (drift, noisy) = repeat_failures(&runs, &out);
     if !noisy.is_empty() {
         outcome.notes.push(format!(
@@ -338,6 +342,32 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     outcome.failures.sort_by(|a, b| a.id.cmp(&b.id));
     outcome.secs = started.elapsed().as_secs_f64();
     Ok(outcome)
+}
+
+/// Shots that failed once and passed on the retry are reported, never passed silently.
+fn flaky_note(runs: &[Vec<Shot>], outcome: &mut Outcome) {
+    for run in runs {
+        for shot in run {
+            if let Some(why) = &shot.flaky
+                && !outcome.flaky.iter().any(|(id, _)| id == &shot.id)
+            {
+                outcome.flaky.push((shot.id.clone(), why.clone()));
+            }
+        }
+    }
+    outcome.flaky.sort();
+    if !outcome.flaky.is_empty() {
+        outcome.notes.push(format!(
+            "warning: flaky: {} shot(s) failed once and passed on the retry (a page that does not draw the same way every time): {}",
+            outcome.flaky.len(),
+            outcome
+                .flaky
+                .iter()
+                .map(|(id, why)| format!("{id} ({why})"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
 }
 
 /// `--repeat N`: every run must give the same pixels and the same findings as the first.
@@ -528,11 +558,13 @@ fn update(refs: &Path, shots: &[Shot], outcome: &mut Outcome) -> Result<(), Erro
         }
         let new = pixels::encode(&decode_png(&shot.png)?, pixels::REF_STEP)?;
         let path = refs.join(format!("{}.png", shot.id));
+        // A reference is rewritten only when it is missing or really fails: antialiasing noise inside the
+        // compare tolerance leaves the file alone, so a re-run changes nothing in git.
         let same = std::fs::read(&path)
             .ok()
             .and_then(|old| decode_png(&old).ok())
             .zip(decode_png(&new).ok())
-            .is_some_and(|(a, b)| a == b);
+            .is_some_and(|(a, b)| a == b || pixels::compare(&a, &b).passes());
         if same {
             outcome.unchanged += 1;
         } else {
@@ -572,6 +604,7 @@ pub fn summary_json(project: &str, outcome: &Outcome) -> String {
         "platform": "web",
         "shots": outcome.shots,
         "passed": outcome.failures.is_empty(),
+        "flaky": outcome.flaky.iter().map(|(id, why)| json!({"id": id, "first_failure": why})).collect::<Vec<_>>(),
         "failures": failures,
     }))
     .unwrap_or_default();
@@ -660,5 +693,23 @@ pub fn step(config: &Config, root: &Path) -> (crate::steps::Status, String, Stri
             String::new(),
             e.to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod flaky_tests {
+    use super::*;
+
+    #[test]
+    fn flaky_shots_are_in_the_json_summary() {
+        let outcome = Outcome {
+            shots: 2,
+            flaky: vec![("home@phone-light".into(), "took longer than 60s".into())],
+            ..Outcome::default()
+        };
+        let text = summary_json("p", &outcome);
+        assert!(text.contains("\"flaky\""), "{text}");
+        assert!(text.contains("home@phone-light"), "{text}");
+        assert!(text.contains("took longer than 60s"), "{text}");
     }
 }
