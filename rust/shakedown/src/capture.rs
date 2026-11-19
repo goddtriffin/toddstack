@@ -392,7 +392,14 @@ pub async fn shoot_all(
             let mut first_failure: Option<String> = None;
             let mut done = None;
             for _ in 0..2 {
-                let cookies = match pool.cookies(&browser, &guard, &env, &job.plan.player).await {
+                // An `act` shot signs in fresh inside its own context (see `shoot`), so it takes no cached cookies.
+                let own_signin = !job.plan.act.is_empty() && job.plan.player != "guest";
+                let got = if own_signin {
+                    Ok(Arc::default())
+                } else {
+                    pool.cookies(&browser, &guard, &env, &job.plan.player).await
+                };
+                let cookies = match got {
                     Ok(c) => c,
                     Err(why) => {
                         last = why;
@@ -409,8 +416,12 @@ pub async fn shoot_all(
                     Err(why) => last = why,
                 }
                 // A failure that is not a timeout may mean the player's cookies are bad (a sign-in that never
-                // took): the retry signs in again, unless another shot already did (`ptr_eq`).
-                if !last.starts_with("took longer") {
+                // took): the retry signs in again, unless another shot already did (`ptr_eq`). A Chrome command
+                // timeout says nothing about the cookies either.
+                if !own_signin
+                    && !last.starts_with("took longer")
+                    && !last.contains("Request timed out")
+                {
                     pool.reset(&job.plan.player, &cookies);
                 }
                 first_failure.get_or_insert_with(|| last.clone());
@@ -505,7 +516,7 @@ impl Players {
                 .await
                 .unwrap_or_else(|_| Err(format!("took longer than {}s", SHOT_TIMEOUT.as_secs())));
             let _ = browser.dispose_browser_context(ctx).await;
-            got.map(Arc::new)
+            non_empty(got, player).map(Arc::new)
         })
         .await
         .cloned()
@@ -525,6 +536,14 @@ impl Players {
 }
 
 /// Signs in inside `ctx` and returns the context's cookies.
+/// A sign-in that set no cookies did not sign anyone in: that is an error (the cell stays empty, the retry signs in again).
+fn non_empty(got: Result<Vec<Cookie>, String>, player: &str) -> Result<Vec<Cookie>, String> {
+    match got {
+        Ok(c) if c.is_empty() => Err(format!("sign-in as {player} set no cookies")),
+        other => other,
+    }
+}
+
 async fn sign_in(
     browser: &Browser,
     guard: &Guard,
@@ -600,8 +619,26 @@ async fn shoot(
     };
     let slow = || format!("took longer than {}s", SHOT_TIMEOUT.as_secs());
     // A context of its own for every shot, disposed on every way out (that also closes a page a timed-out
-    // `new_page` left behind). A shot that signs out affects only its own context.
+    // `new_page` left behind).
     let ctx = new_context(browser).await?;
+    // An `act` shot signs in fresh in its own context, so a sign-out ends only its own server session. (Every
+    // shot's server session is shared with the player's other shots: act steps must not end every session, delete
+    // the account or rotate sessions server-side. Use a dedicated player for those.)
+    if !job.plan.act.is_empty() && job.plan.player != "guest" {
+        let signed = match &env.signin {
+            Some(t) => {
+                let path = t.replace("{player}", &job.plan.player);
+                tokio::time::timeout(SHOT_TIMEOUT, sign_in(browser, guard, env, &ctx, &path))
+                    .await
+                    .unwrap_or_else(|_| Err(slow()))
+            }
+            None => Err("no [players].signin".to_string()),
+        };
+        if let Err(why) = non_empty(signed, &job.plan.player) {
+            let _ = browser.dispose_browser_context(ctx).await;
+            return Err(why);
+        }
+    }
     let outcome = shoot_in(browser, guard, cookies, env, job, &ctx, &lap, &slow).await;
     let _ = browser.dispose_browser_context(ctx).await;
     outcome
@@ -1433,6 +1470,13 @@ async fn act(page: &Page, action: &Action) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sign_in_without_cookies_is_an_error() {
+        let e = non_empty(Ok(Vec::new()), "ann").unwrap_err();
+        assert_eq!(e, "sign-in as ann set no cookies");
+        assert_eq!(non_empty(Err("x".into()), "ann").unwrap_err(), "x");
+    }
 
     #[test]
     fn a_seed_makes_one_order_and_every_item_stays() {
