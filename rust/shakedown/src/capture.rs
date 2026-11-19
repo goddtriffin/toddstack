@@ -49,6 +49,9 @@ const SHOT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Stops animation, transitions and the caret: references must not depend on when the capture happened.
 const FREEZE: &str = "*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;scroll-behavior:auto!important}";
 /// The seed of the page's random numbers.
+/// Identical captures, this far apart, that make a shot settled.
+const STABLE_MATCHES: u32 = 3;
+const STABLE_GAP_MS: u64 = 60;
 const SEED: u32 = 0x02f6_e2b1;
 
 /// One answer in a fake world.
@@ -178,6 +181,18 @@ pub async fn launch(
             "--force-color-profile=srgb",
             "--hide-scrollbars",
             "--mute-audio",
+            // Same pixels every run: software raster, images decoded before the frame, every compositor stage
+            // finished before it is drawn.
+            "--disable-gpu",
+            "--disable-gpu-compositing",
+            "--disable-features=Vulkan,SkiaGraphite",
+            "--disable-checker-imaging",
+            "--run-all-compositor-stages-before-draw",
+            "--disable-partial-raster",
+            "--num-raster-threads=1",
+            "--disable-oop-rasterization",
+            "--disable-gpu-rasterization",
+            "--disable-skia-runtime-opts",
         ])
         .build()
         .map_err(Error::Environment)?;
@@ -190,7 +205,12 @@ pub async fn launch(
 
 /// Draws every job, `PARALLEL` at a time. Results come back sorted by id.
 pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> Vec<Shot> {
-    let gate = Arc::new(Semaphore::new(PARALLEL));
+    let parallel = std::env::var("SHAKEDOWN_PARALLEL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(PARALLEL);
+    let gate = Arc::new(Semaphore::new(parallel));
     // A signed-in player is in at most `player_limit` shots at once: servers cap a person's open connections.
     let players: HashMap<String, Arc<Semaphore>> = jobs
         .iter()
@@ -455,7 +475,8 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
     idle(page, &collected).await?;
 
     lap("acted");
-    // Settled means two captures in a row are byte-identical (images decoded, layers composited).
+    // Settled means several captures in a row, a moment apart, are byte-identical (images decoded and rescaled at
+    // their final quality, layers composited): Chrome upgrades a scaled image a little after its first draw.
     let grab = || async {
         page.screenshot(ScreenshotParams::builder().build())
             .await
@@ -463,16 +484,23 @@ async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
     };
     let mut png = grab().await?;
     lap("first grab");
-    for i in 0..=20 {
+    let mut same = 0;
+    for i in 0..=30 {
         eval(page, "Promise.all([...document.images].map((im) => im.decode().catch(() => {}))).then(() => true)").await?;
+        tokio::time::sleep(Duration::from_millis(STABLE_GAP_MS)).await;
         let again = grab().await?;
         if again == png {
-            break;
+            same += 1;
+            if same >= STABLE_MATCHES {
+                break;
+            }
+        } else {
+            same = 0;
+            png = again;
         }
-        if i == 20 {
+        if i == 30 {
             collected.note("never-settled", "screenshots keep changing");
         }
-        png = again;
     }
     lap("settled");
     let raw = eval(
@@ -637,7 +665,15 @@ async fn watch_console(page: &Page, c: &Arc<Collected>, allow: &[String]) -> Res
                 .url
                 .as_deref()
                 .is_some_and(|u| strip_origin(u) == "/favicon.ico");
-            if e.entry.level == LogEntryLevel::Error && !favicon && ok3(&e.entry.text) {
+            let whole = format!(
+                "{} {}",
+                e.entry.text,
+                e.entry
+                    .url
+                    .as_deref()
+                    .map_or_else(String::new, strip_origin)
+            );
+            if e.entry.level == LogEntryLevel::Error && !favicon && ok3(&whole) {
                 let url = e
                     .entry
                     .url
@@ -707,7 +743,9 @@ async fn watch_requests(page: &Page, c: &Arc<Collected>) -> Result<(), String> {
                         | ResourceType::CspViolationReport
                 )
             );
-            if !endless {
+            // Only GETs count: a POST (a form, a time-zone ping, a beacon) is something the page does, not
+            // something it is waiting for, and a keepalive one can outlive the page's idea of "done".
+            if !endless && e.request.method == "GET" {
                 c1.started(
                     e.request_id.inner(),
                     format!("{:?} {}", e.r#type, strip_origin(&e.request.url)),

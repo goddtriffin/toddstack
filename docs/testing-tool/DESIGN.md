@@ -523,3 +523,8 @@ Built as designed, with these differences:
 - `/favicon.ico` console errors are ignored (new headless Chrome asks for it by itself); off-origin image and icon
   requests get a flat stand-in, every other off-origin request fails the screen.
 - `loading-indicator` is not implemented yet (it was not in the phase 2 list).
+- Chrome flags for stable pixels: software raster and compositing, no checker imaging, one raster thread. A shot is
+  settled after 3 identical captures 60 ms apart. `--repeat` uses a fresh Chrome per run. Even so, about 7% of
+  shots differ between runs by up to about 50 edge pixels around images clipped to a circle: the repeat gate is on
+  the compare's verdict and the findings, with the noisy shots listed. Strict byte identity needs a different
+  renderer and is not met.

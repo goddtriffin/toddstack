@@ -137,9 +137,12 @@ Layout rules (Rust, on the tree the page reports): `sideways-scroll`, `off-scree
 Opt out per element with `data-shakedown-ignore="rule" data-shakedown-why="reason"` (a horizontal scroller is
 `data-shakedown-scroll-x`), or per selector in `[layout].ignore`.
 
-`ui web --repeat N` runs everything N times and fails if any run differs in pixels or findings. As a check step,
+`ui web --repeat N` runs everything N times, each in a fresh Chrome, and fails if any run differs from the first in
+findings or in the pixel verdict (the compare against run 1). Chrome rescales and clips images (avatars in circles)
+with an antialiasing race that moves a few edge pixels in about one shot in fifteen; those shots are listed in a
+note, not failed. A difference beyond the tolerance keeps both images and the diff in `target/shakedown/web/repeat/`. As a check step,
 list `ui.web` under `[check].builtin`. Exit codes: 0 pass, 1 a check failed, 2 config or usage, 3 environment
-(Chrome, server, seed).
+(Chrome, server, seed). `--devices a,b` limits a `ui` run to some devices for a quick look; `SHAKEDOWN_PARALLEL=N` sets the pages drawn at once (default 8).
 
 ## Pixel compare
 
