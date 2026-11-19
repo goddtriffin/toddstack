@@ -158,13 +158,55 @@ pub fn host_allowed(host: &str) -> bool {
     name == "localhost" || name == "127.0.0.1" || name.ends_with(".localhost")
 }
 
-/// Inserts the script tag right after `<head ...>` (or first thing when there is no head).
+/// Where a tag goes: right after the doctype (leading whitespace and comments allowed before it), so the page stays in standards mode.
+fn after_doctype(lower: &str) -> usize {
+    let mut at = 0;
+    loop {
+        let rest = &lower[at..];
+        let trimmed = rest.trim_start();
+        let skipped = rest.len() - trimmed.len();
+        if trimmed.starts_with("<!--") {
+            match trimmed.find("-->") {
+                Some(end) => at += skipped + end + 3,
+                None => return 0,
+            }
+        } else if trimmed.starts_with("<!doctype") {
+            return match trimmed.find('>') {
+                Some(end) => at + skipped + end + 1,
+                None => 0,
+            };
+        } else {
+            return 0;
+        }
+    }
+}
+
+/// The end of the first `<name ...>` tag at or after `from`, when `name` is the whole tag name.
+fn tag_end(lower: &str, from: usize, name: &str) -> Option<usize> {
+    let open = format!("<{name}");
+    let mut i = from;
+    while let Some(j) = lower[i..].find(&open) {
+        let start = i + j;
+        let next = lower.as_bytes().get(start + open.len()).copied();
+        if matches!(
+            next,
+            Some(b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
+        ) {
+            return lower[start..].find('>').map(|k| start + k + 1);
+        }
+        i = start + open.len();
+    }
+    None
+}
+
+/// Inserts the script tag after the doctype and right after `<head ...>`, else after `<html ...>`, else straight after the doctype
+/// (or first thing). Never before the doctype: that would put the page in quirks mode.
 pub fn inject(html: &str, tag: &str) -> String {
     let lower = html.to_ascii_lowercase();
-    let at = lower
-        .find("<head")
-        .and_then(|i| lower[i..].find('>').map(|j| i + j + 1))
-        .unwrap_or(0);
+    let base = after_doctype(&lower);
+    let at = tag_end(&lower, base, "head")
+        .or_else(|| tag_end(&lower, base, "html"))
+        .unwrap_or(base);
     format!("{}{tag}{}", &html[..at], &html[at..])
 }
 
@@ -585,6 +627,49 @@ mod tests {
         );
         assert_eq!(inject("<p>hi</p>", tag), "<script src=x></script><p>hi</p>");
         assert!(inject("<HTML><HEAD></HEAD>", tag).contains("<HEAD><script"));
+    }
+
+    #[test]
+    fn the_script_never_goes_before_the_doctype() {
+        let t = "<script src=x></script>";
+        let cases = [
+            // (page, expected)
+            (
+                "<!doctype html><meta charset=utf-8><body>x",
+                "<!doctype html><script src=x></script><meta charset=utf-8><body>x",
+            ),
+            (
+                "<!DOCTYPE html>\n<body>x",
+                "<!DOCTYPE html><script src=x></script>\n<body>x",
+            ),
+            (
+                "  \n\t<!doctype html><body>x",
+                "  \n\t<!doctype html><script src=x></script><body>x",
+            ),
+            (
+                "<!-- a > b --><!-- c -->\n<!DocType html><p>x",
+                "<!-- a > b --><!-- c -->\n<!DocType html><script src=x></script><p>x",
+            ),
+            (
+                "<!doctype html><html lang=en class=\"a>b\"><body>x",
+                "<!doctype html><html lang=en class=\"a><script src=x></script>b\"><body>x",
+            ),
+            (
+                "<!doctype html>\n<html lang=en>\n<body>x",
+                "<!doctype html>\n<html lang=en><script src=x></script>\n<body>x",
+            ),
+            (
+                "<!DOCTYPE html><HTML><HEAD lang=en><title>t",
+                "<!DOCTYPE html><HTML><HEAD lang=en><script src=x></script><title>t",
+            ),
+            (
+                "<!doctype html><header>h</header>",
+                "<!doctype html><script src=x></script><header>h</header>",
+            ),
+        ];
+        for (page, want) in cases {
+            assert_eq!(inject(page, t), want, "{page}");
+        }
     }
 
     #[test]
