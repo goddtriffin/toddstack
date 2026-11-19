@@ -712,7 +712,7 @@ fn strip_origin(u: &str) -> String {
 }
 
 /// Is `u` (a `ws`/`wss` URL) on the local server (`base` is `http://127.0.0.1:<port>`) under any loopback name
-/// (localhost, 127.0.0.1, [::1])? Another port, even on loopback, is not the page's world.
+/// (`localhost`, `127.0.0.1`, `[::1]`)? Another port, even on loopback, is not the page's world.
 fn on_the_local_server(u: &url::Url, base: &url::Url) -> bool {
     let loopback = match u.host() {
         Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
