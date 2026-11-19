@@ -24,6 +24,9 @@ use chromiumoxide::cdp::browser_protocol::network::{
     self, ErrorReason, EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
     ResourceType,
 };
+use chromiumoxide::cdp::browser_protocol::page::{
+    CaptureScreenshotFormat, CaptureScreenshotParams,
+};
 use chromiumoxide::cdp::browser_protocol::target::{
     CreateBrowserContextParams, CreateTargetParams,
 };
@@ -43,16 +46,17 @@ use crate::layout::{self, Finding, Tree};
 /// The fake world's answers arrive after this long, as on a phone, so content that lands after the first frame
 /// is seen moving things (a real link is slower, never faster).
 const API_DELAY: Duration = Duration::from_millis(150);
-/// Pages drawn at once.
-const PARALLEL: usize = 8;
+/// Browsers one run starts when `SHAKEDOWN_BROWSERS` is not set: one per this many pages drawn at once.
+const PAGES_PER_BROWSER: usize = 2;
+/// Pages drawn at once when `SHAKEDOWN_PARALLEL` is not set: one per core, at most this many.
+const PARALLEL_MAX: usize = 16;
 /// A shot that takes longer than this is a failure.
 const SHOT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Stops animation, transitions and the caret: references must not depend on when the capture happened.
 const FREEZE: &str = "*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;scroll-behavior:auto!important}";
 /// The seed of the page's random numbers.
 /// Identical captures, this far apart, that make a shot settled.
-const STABLE_MATCHES: u32 = 3;
-const STABLE_GAP_MS: u64 = 60;
+const STABLE_MATCHES: u32 = 1;
 const SEED: u32 = 0x02f6_e2b1;
 
 /// One answer in a fake world.
@@ -221,32 +225,50 @@ pub async fn launch(
     Ok((browser, task))
 }
 
-/// Draws every job, `PARALLEL` at a time. Results come back sorted by id.
-pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> Vec<Shot> {
-    let parallel = std::env::var("SHAKEDOWN_PARALLEL")
+/// Draws every job, one per core (`SHAKEDOWN_PARALLEL` overrides) at a time. Results come back sorted by id.
+pub fn parallel() -> usize {
+    std::env::var("SHAKEDOWN_PARALLEL")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(PARALLEL);
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(8, |n| n.get().clamp(2, PARALLEL_MAX))
+        })
+}
+
+/// How many browsers to start.
+pub fn browsers() -> usize {
+    std::env::var("SHAKEDOWN_BROWSERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| parallel().div_ceil(PAGES_PER_BROWSER))
+}
+
+pub async fn shoot_all(browsers: Vec<Arc<Browser>>, env: Arc<Env>, jobs: Vec<Job>) -> Vec<Shot> {
+    let parallel = parallel();
     let gate = Arc::new(Semaphore::new(parallel));
-    // Its own connection that arms every frame, popup and worker (see `guard`).
-    let guard = match guard::start(browser.websocket_address()).await {
-        Ok(g) => Arc::new(g),
-        Err(why) => {
-            let mut shots: Vec<Shot> = jobs
-                .iter()
-                .map(|j| Shot {
-                    id: j.id(),
-                    png: Vec::new(),
-                    findings: vec![Finding::new("page-failed", why.clone())],
-                    size: (j.device.width, j.device.height),
-                    flaky: None,
-                })
-                .collect();
-            shots.sort_by(|a, b| a.id.cmp(&b.id));
-            return shots;
+    // Each browser has its own connection that arms every frame, popup and worker (see `guard`).
+    let mut guards = Vec::new();
+    for browser in &browsers {
+        match guard::start(browser.websocket_address()).await {
+            Ok(g) => guards.push(Arc::new(g)),
+            Err(why) => {
+                let mut shots: Vec<Shot> = jobs
+                    .iter()
+                    .map(|j| Shot {
+                        id: j.id(),
+                        png: Vec::new(),
+                        findings: vec![Finding::new("page-failed", why.clone())],
+                        size: (j.device.width, j.device.height),
+                        flaky: None,
+                    })
+                    .collect();
+                shots.sort_by(|a, b| a.id.cmp(&b.id));
+                return shots;
+            }
         }
-    };
+    }
     // A signed-in player is in at most `player_limit` shots at once: servers cap a person's open connections.
     let players: HashMap<String, Arc<Semaphore>> = jobs
         .iter()
@@ -259,16 +281,19 @@ pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> 
         })
         .collect();
     let mut tasks = Vec::new();
-    for job in jobs {
-        let (browser, env, gate, guard) =
-            (browser.clone(), env.clone(), gate.clone(), guard.clone());
+    for (n, job) in jobs.into_iter().enumerate() {
+        // Jobs are dealt out to the browsers in turn: one browser's main thread and connection do not carry them all.
+        let at = n % browsers.len();
+        let (browser, env, gate, guard) = (
+            browsers[at].clone(),
+            env.clone(),
+            gate.clone(),
+            guards[at].clone(),
+        );
         let mine = players.get(&job.plan.player).cloned();
         tasks.push(tokio::spawn(async move {
-            // The player's turn first, then a place among the pages drawn at once.
-            let _turn = match &mine {
-                Some(m) => m.acquire().await.ok(),
-                None => None,
-            };
+            // A place among the pages open at once. The player's turn comes later, inside `shoot`, once the page is
+            // ready: only drawing opens the server's connections, so only drawing counts against the player's cap.
             let _permit = gate.acquire().await;
             let size = (job.device.width, job.device.height);
             let id = job.id();
@@ -278,14 +303,12 @@ pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> 
             let mut last = String::new();
             let mut first_failure: Option<String> = None;
             for _ in 0..2 {
-                match tokio::time::timeout(SHOT_TIMEOUT, shoot(&browser, &guard, &env, &job)).await
-                {
-                    Ok(Ok(mut shot)) => {
+                match shoot(&browser, &guard, &env, &job, mine.as_ref()).await {
+                    Ok(mut shot) => {
                         shot.flaky = first_failure;
                         return shot;
                     }
-                    Ok(Err(why)) => last = why,
-                    Err(_) => last = format!("took longer than {}s", SHOT_TIMEOUT.as_secs()),
+                    Err(why) => last = why,
                 }
                 first_failure.get_or_insert_with(|| last.clone());
             }
@@ -328,7 +351,20 @@ async fn eval(page: &Page, expression: &str) -> Result<serde_json::Value, String
     Ok(out.result.result.value.unwrap_or(serde_json::Value::Null))
 }
 
-async fn shoot(browser: &Browser, guard: &Guard, env: &Env, job: &Job) -> Result<Shot, String> {
+async fn shoot(
+    browser: &Browser,
+    guard: &Guard,
+    env: &Env,
+    job: &Job,
+    turn: Option<&Arc<Semaphore>>,
+) -> Result<Shot, String> {
+    let t0 = std::time::Instant::now();
+    let lap = |what: &str| {
+        if std::env::var_os("SHAKEDOWN_TRACE").is_some() {
+            eprintln!("trace {} {what} {}ms", job.id(), t0.elapsed().as_millis());
+        }
+    };
+    let slow = || format!("took longer than {}s", SHOT_TIMEOUT.as_secs());
     let ctx = browser
         .create_browser_context(CreateBrowserContextParams {
             // A context does not take the command-line proxy: it needs its own dead one (see `PROXY`).
@@ -337,25 +373,50 @@ async fn shoot(browser: &Browser, guard: &Guard, env: &Env, job: &Job) -> Result
         })
         .await
         .map_err(err("context"))?;
-    let target = CreateTargetParams::builder()
-        .url("about:blank")
-        .browser_context_id(ctx.clone())
-        .build()
-        .map_err(|e| e.clone())?;
     let collected = Arc::new(Collected::default());
     let to = collected.clone();
     guard.register(
         ctx.as_ref(),
         Arc::new(move |rule: &str, message: &str| to.note(rule, message)),
     );
-    let page = browser.new_page(target).await.map_err(err("new page"))?;
-    // The page is not drawn before the guard is on it (it waits at the debugger until then).
-    let outcome = match guard.armed(page.target_id().as_ref()).await {
-        Ok(()) => draw(&page, env, job, &collected).await,
+    // Starting the page (a new renderer process) is the slow part of a shot; it happens before the player's turn,
+    // so while a player's turns are all taken the next pages are already warm.
+    let prepared = tokio::time::timeout(SHOT_TIMEOUT, async {
+        let target = CreateTargetParams::builder()
+            .url("about:blank")
+            .browser_context_id(ctx.clone())
+            .build()
+            .map_err(|e| e.clone())?;
+        let page = browser.new_page(target).await.map_err(err("new page"))?;
+        // The page is not drawn before the guard is on it (it waits at the debugger until then).
+        match guard.armed(page.target_id().as_ref()).await {
+            Ok(()) => Ok(page),
+            Err(why) => {
+                let _ = page.close().await;
+                Err(why)
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err(slow()));
+    lap("page ready");
+    let outcome = match prepared {
+        Ok(page) => {
+            let _turn = match turn {
+                Some(t) => t.acquire().await.ok(),
+                None => None,
+            };
+            let outcome = tokio::time::timeout(SHOT_TIMEOUT, draw(&page, env, job, &collected))
+                .await
+                .unwrap_or_else(|_| Err(slow()));
+            lap("drawn");
+            let _ = page.close().await;
+            outcome
+        }
         Err(why) => Err(why),
     };
-    let _ = page.close().await;
     let _ = browser.dispose_browser_context(ctx).await;
+    lap("context disposed");
     outcome
 }
 
@@ -538,16 +599,24 @@ async fn draw(
     // Settled means several captures in a row, a moment apart, are byte-identical (images decoded and rescaled at
     // their final quality, layers composited): Chrome upgrades a scaled image a little after its first draw.
     let grab = || async {
-        page.screenshot(ScreenshotParams::builder().build())
-            .await
-            .map_err(err("screenshot"))
+        // `optimize_for_speed`: Chrome spends most of a capture compressing the PNG; the pixels are the same, and
+        // everything downstream decodes the PNG (the reference files are re-encoded by `pixels::encode`).
+        page.screenshot(ScreenshotParams::from(
+            CaptureScreenshotParams::builder()
+                .format(CaptureScreenshotFormat::Png)
+                .optimize_for_speed(true)
+                .build(),
+        ))
+        .await
+        .map_err(err("screenshot"))
     };
     let mut png = grab().await?;
     lap("first grab");
     let mut same = 0;
     for i in 0..=30 {
-        eval(page, "Promise.all([...document.images].map((im) => im.decode().catch(() => {}))).then(() => true)").await?;
-        tokio::time::sleep(Duration::from_millis(STABLE_GAP_MS)).await;
+        // Event-driven: every image decoded, then two frames (the compositor has drawn what the decode finished),
+        // instead of a fixed sleep. Each round starts the moment the last one ends.
+        eval(page, "Promise.all([...document.images].map((im) => im.decode().catch(() => {}))).then(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))))").await?;
         let again = grab().await?;
         if again == png {
             same += 1;

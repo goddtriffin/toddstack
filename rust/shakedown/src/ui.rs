@@ -193,17 +193,32 @@ fn select<'a>(config: &'a Config, opts: &Options, refs: &Path) -> Result<Vec<&'a
 
 /// One run: a fresh Chrome draws every job and is thrown away.
 async fn one_run(chrome: &Path, env: &Arc<Env>, jobs: &[Job], n: u32) -> Result<Vec<Shot>, Error> {
-    let profile = std::env::temp_dir().join(format!("shakedown-chrome-{}-{n}", std::process::id()));
-    let (browser, handler) = capture::launch(chrome, &profile).await?;
-    let browser = Arc::new(browser);
-    let shots = capture::shoot_all(browser.clone(), env.clone(), jobs.to_vec()).await;
-    if let Ok(mut b) = Arc::try_unwrap(browser) {
-        // Nothing in the profile is worth a graceful exit (it is thrown away): a clean close takes seconds.
-        let _ = b.kill().await;
-        let _ = b.wait().await;
+    let count = capture::browsers().min(jobs.len().max(1));
+    let mut browsers = Vec::new();
+    let mut handlers = Vec::new();
+    let mut profiles = Vec::new();
+    for i in 0..count {
+        let profile =
+            std::env::temp_dir().join(format!("shakedown-chrome-{}-{n}-{i}", std::process::id()));
+        let (browser, handler) = capture::launch(chrome, &profile).await?;
+        browsers.push(Arc::new(browser));
+        handlers.push(handler);
+        profiles.push(profile);
     }
-    handler.abort();
-    let _ = std::fs::remove_dir_all(&profile);
+    let shots = capture::shoot_all(browsers.clone(), env.clone(), jobs.to_vec()).await;
+    for browser in browsers {
+        if let Ok(mut b) = Arc::try_unwrap(browser) {
+            // Nothing in the profile is worth a graceful exit (it is thrown away): a clean close takes seconds.
+            let _ = b.kill().await;
+            let _ = b.wait().await;
+        }
+    }
+    for handler in handlers {
+        handler.abort();
+    }
+    for profile in profiles {
+        let _ = std::fs::remove_dir_all(&profile);
+    }
     Ok(shots)
 }
 
