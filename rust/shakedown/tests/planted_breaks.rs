@@ -25,7 +25,10 @@ fn code(o: &Output) -> i32 {
 
 /// 200x200 image of vertical 3 px stripes: stands in for a screen full of text and edges.
 fn stripes(shift: u32, tint: u8) -> Vec<u8> {
-    let (w, h) = (200_u32, 200_u32);
+    sized(200, 200, shift, tint)
+}
+
+fn sized(w: u32, h: u32, shift: u32, tint: u8) -> Vec<u8> {
     let mut rgb = Vec::new();
     for _y in 0..h {
         for x in 0..w {
@@ -56,7 +59,11 @@ fn compare(tag: &str, reference: &[u8], actual: &[u8]) -> i32 {
             d.join("target/shakedown/pixels/report.html").exists(),
             "a failure writes the report"
         );
-        assert!(d.join("target/shakedown/pixels/actual.diff.png").exists());
+        let resized = String::from_utf8_lossy(&o.stderr).contains("size changed");
+        assert!(
+            resized || d.join("target/shakedown/pixels/actual.diff.png").exists(),
+            "a failure writes the diff (a size change has none)"
+        );
     }
     let _ = std::fs::remove_dir_all(&d);
     c
@@ -81,6 +88,15 @@ fn sub_threshold_drift_passes() {
 #[test]
 fn over_threshold_color_change_fails() {
     assert_eq!(compare("color", &stripes(0, 0), &stripes(0, 17)), 1);
+}
+
+#[test]
+fn a_size_change_fails() {
+    // One extra row: same pixels everywhere else, but the page is a different size.
+    assert_eq!(
+        compare("resize", &sized(200, 200, 0, 0), &sized(200, 201, 0, 0)),
+        1
+    );
 }
 
 #[test]
@@ -128,12 +144,35 @@ fn budget_at_the_limit_passes_and_one_byte_over_fails() {
 }
 
 #[test]
-fn unbuilt_artifact_is_skipped_by_budgets_but_fails_check() {
+fn unbuilt_artifact_fails_budgets_and_check() {
     let d = budget_project("unbuilt", 1000, 0, false);
     let o = shakedown(&d, &["budgets", "sizes"]);
-    assert_eq!(code(&o), 0);
+    assert_eq!(code(&o), 1, "a skipped artifact is never a pass");
     assert!(String::from_utf8_lossy(&o.stdout).contains("skipped"));
     assert_eq!(code(&shakedown(&d, &["check"])), 1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn json_only_reports_steps_that_ran() {
+    let d = budget_project("json", 999, 1000, true);
+    let toml = std::fs::read_to_string(d.join("shakedown.toml")).unwrap();
+    std::fs::write(
+        d.join("shakedown.toml"),
+        toml.replacen(
+            "[check]",
+            "[check]\nsteps = [{ name = \"other\", run = \"true\" }]",
+            1,
+        ),
+    )
+    .unwrap();
+    let o = shakedown(&d, &["check", "--only", "other", "--json"]);
+    assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+    let json = std::fs::read_to_string(d.join("target/shakedown/summary.json")).unwrap();
+    assert!(
+        json.contains("\"passed\": true") && !json.contains("over"),
+        "{json}"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 

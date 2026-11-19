@@ -19,7 +19,7 @@ pub fn esc(s: &str) -> String {
 const STYLE: &str = "body{font:14px system-ui,sans-serif;margin:24px;background:#fff;color:#111}\
 @media(prefers-color-scheme:dark){body{background:#111;color:#eee}}\
 pre{background:#8881;padding:12px;overflow:auto;border-radius:6px}.fail{color:#c0152f}.ok{color:#1a7f37}\
-.row{display:flex;gap:12px;flex-wrap:wrap}.row figure{margin:0}.row img{max-width:360px;border:1px solid #8886}";
+.row{display:flex;gap:12px;flex-wrap:wrap}.row figure{margin:0}.row img{max-width:360px;border:1px solid #8886;display:block}.ov{position:relative;display:inline-block}.ov i{position:absolute;outline:2px solid #e11;pointer-events:none}";
 
 fn status_word(s: &Status) -> &'static str {
     match s {
@@ -100,6 +100,12 @@ pub struct PixelFailure {
     pub actual: Option<String>,
     /// Diff image file, if sizes matched.
     pub diff: Option<String>,
+    /// One line per problem (layout findings and the pixel verdict).
+    pub notes: Vec<String>,
+    /// Failing layout nodes as `[x, y, w, h]`, drawn over the actual image.
+    pub boxes: Vec<[f64; 4]>,
+    /// The viewport the boxes are measured in.
+    pub size: Option<(u32, u32)>,
 }
 
 /// The pixel failure report: reference, actual and diff side by side, and a click-to-flip between reference and
@@ -113,15 +119,37 @@ pub fn pixels_html(failures: &[PixelFailure]) -> String {
     for f in failures {
         let _ = write!(
             h,
-            "<h2 class=fail>{}</h2><p>{}</p><div class=row>",
+            "<h2 class=fail>{}</h2><p>{}</p>",
             esc(&f.id),
             esc(&f.reason)
         );
+        if f.notes.len() > 1 {
+            h.push_str("<ul>");
+            for n in &f.notes {
+                let _ = write!(h, "<li>{}</li>", esc(n));
+            }
+            h.push_str("</ul>");
+        }
+        h.push_str("<div class=row>");
+        let mut overlay = String::new();
+        if let Some((w, hh)) = f.size.filter(|(w, hh)| *w > 0 && *hh > 0) {
+            for b in &f.boxes {
+                let _ = write!(
+                    overlay,
+                    "<i style=\"left:{:.3}%;top:{:.3}%;width:{:.3}%;height:{:.3}%\"></i>",
+                    b[0] / f64::from(w) * 100.0,
+                    b[1] / f64::from(hh) * 100.0,
+                    b[2] / f64::from(w) * 100.0,
+                    b[3] / f64::from(hh) * 100.0
+                );
+            }
+        }
         let fig = |label: &str, file: &Option<String>, flip: Option<&str>| match file {
             Some(file) => {
                 let alt = flip.map_or(String::new(), |o| format!(" data-alt=\"{}\" onclick=\"let t=this.src;this.src=this.dataset.alt;this.dataset.alt=t\"", esc(o)));
+                let boxes = if flip.is_some() { overlay.as_str() } else { "" };
                 format!(
-                    "<figure><figcaption>{label}</figcaption><img src=\"{}\"{alt}></figure>",
+                    "<figure><figcaption>{label}</figcaption><div class=ov><img src=\"{}\"{alt}>{boxes}</div></figure>",
                     esc(file)
                 )
             }
@@ -171,7 +199,11 @@ mod tests {
             reference: Some("ref.png".into()),
             actual: Some("a.png".into()),
             diff: Some("d.png".into()),
+            notes: vec!["sideways-scroll: wide".into(), "pixels: 0.5%".into()],
+            boxes: vec![[10.0, 20.0, 30.0, 40.0]],
+            size: Some((100, 200)),
         }]);
+        assert!(h.contains("sideways-scroll: wide") && h.contains("left:10.000%"));
         assert!(
             h.contains("ref.png")
                 && h.contains("a.png")

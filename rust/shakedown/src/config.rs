@@ -1,7 +1,7 @@
 //! `shakedown.toml`: parse and validate. Sections later phases use are accepted and reported as unused.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -20,9 +20,251 @@ pub struct Config {
     /// Budgets.
     #[serde(default)]
     pub budgets: Budgets,
-    /// Sections owned by later phases (`server`, `devices`, `screen`, ...).
+    /// The local server `ui` draws against.
+    pub server: Option<Server>,
+    /// Which devices and themes.
+    #[serde(default)]
+    pub devices: Devices,
+    /// Seeded local accounts.
+    pub players: Option<Players>,
+    /// Where the approved references live.
+    #[serde(default)]
+    pub ui: Ui,
+    /// Layout rule opt-outs.
+    #[serde(default)]
+    pub layout: Layout,
+    /// The screens.
+    #[serde(default)]
+    pub screen: Vec<Screen>,
+    /// Sections owned by later phases (`sweep`, `smoke`, ...).
     #[serde(flatten)]
     pub unused: BTreeMap<String, toml::Value>,
+}
+
+/// `[server]`: the local server that `ui` draws against.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Server {
+    /// Starts the server and stays in the foreground. `{port}` is a free port, `{db}` a per-checkout database name.
+    /// `SHAKEDOWN_PORT`, `SHAKEDOWN_DB`, `SHAKEDOWN_BASE_URL` and `SHAKEDOWN_NOW` are also set.
+    pub start: String,
+    /// A path that answers once the server is up.
+    #[serde(default = "default_ready")]
+    pub ready: String,
+    /// `fake`: every `/api` call is answered from fixtures. `seeded`: the real server and database.
+    #[serde(default)]
+    pub world: World,
+    /// Runs once the server is ready (seeded worlds). Same placeholders as `start`.
+    pub seed: Option<String>,
+    /// The fixed clock, RFC 3339 (given to the server and frozen in the page).
+    #[serde(default = "default_now")]
+    pub now: String,
+    /// Paths starting with this are the API: in a fake world every call must be faked.
+    #[serde(default = "default_api")]
+    pub api: String,
+    /// Seconds to wait for the server to be ready.
+    #[serde(default = "default_timeout")]
+    pub timeout: u64,
+}
+
+fn default_ready() -> String {
+    "/".into()
+}
+fn default_now() -> String {
+    "2026-01-15T12:00:00Z".into()
+}
+fn default_api() -> String {
+    "/api/".into()
+}
+const fn default_timeout() -> u64 {
+    120
+}
+
+/// The two world modes.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum World {
+    /// Every `/api` call answered from fixtures; an unfaked call fails the screen.
+    #[default]
+    Fake,
+    /// The real local server and its database.
+    Seeded,
+}
+
+/// `[devices]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Devices {
+    /// Devices with committed references.
+    #[serde(default = "default_ui_devices")]
+    pub ui: Vec<String>,
+    /// Devices the sweep covers (read by a later phase; accepted now so the file need not change).
+    #[serde(rename = "sweep")]
+    pub _sweep: Option<String>,
+    /// `light` and `dark`.
+    #[serde(default = "default_themes")]
+    pub themes: Vec<String>,
+}
+
+impl Default for Devices {
+    fn default() -> Self {
+        Self {
+            ui: default_ui_devices(),
+            _sweep: None,
+            themes: default_themes(),
+        }
+    }
+}
+
+fn default_ui_devices() -> Vec<String> {
+    vec!["phone".into(), "tablet".into(), "desktop".into()]
+}
+fn default_themes() -> Vec<String> {
+    vec!["light".into(), "dark".into()]
+}
+
+/// `[players]`: seeded local accounts, never production.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Players {
+    /// Account names; `guest` is always available and signs nothing in.
+    pub accounts: Vec<String>,
+    /// A path on the server that signs the browser in; `{player}` is the account.
+    pub signin: String,
+}
+
+/// `[ui]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ui {
+    /// The references directory, from the repo root; web references are in its `web/`.
+    #[serde(default = "default_refs")]
+    pub refs: String,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Self {
+            refs: default_refs(),
+        }
+    }
+}
+
+fn default_refs() -> String {
+    "ui/refs".into()
+}
+
+/// `[layout]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Layout {
+    /// Opt-outs by CSS selector. Every one needs a reason.
+    #[serde(default)]
+    pub ignore: Vec<LayoutIgnore>,
+}
+
+/// One opt-out.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutIgnore {
+    /// The rule to switch off.
+    pub rule: String,
+    /// A CSS selector.
+    #[serde(rename = "match")]
+    pub selector: String,
+    /// Why this is fine.
+    pub why: String,
+}
+
+/// `[[screen]]`: one page state, drawn on every `ui` device and theme.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Screen {
+    /// Unique; lower case letters, digits and `-`.
+    pub name: String,
+    /// The path to open.
+    pub path: String,
+    /// `guest` (default) or one of `[players].accounts`.
+    #[serde(default = "default_player")]
+    pub player: String,
+    /// `"METHOD /path"` (or with `?query`) to the fixture that answers it.
+    #[serde(default)]
+    pub routes: BTreeMap<String, Route>,
+    /// What to do before the shot.
+    #[serde(default)]
+    pub act: Vec<Action>,
+    /// Only these devices (default: `[devices].ui`).
+    pub devices: Option<Vec<String>>,
+    /// Console messages that are expected, with the reason.
+    #[serde(default)]
+    pub allow_console: Vec<AllowConsole>,
+}
+
+fn default_player() -> String {
+    "guest".into()
+}
+
+/// A fixture: a path, or a path with a status.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Route {
+    /// A JSON file, from the repo root.
+    File(String),
+    /// A JSON file answered with a status.
+    Detailed {
+        /// The fixture.
+        file: String,
+        /// HTTP status (default 200).
+        status: Option<u16>,
+    },
+}
+
+/// A console message the screen expects.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowConsole {
+    /// Part of the message.
+    pub contains: String,
+    /// Why it is fine.
+    pub why: String,
+}
+
+/// The small fixed action list (design section 4).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Action {
+    /// Click the first element matching a selector.
+    Click(String),
+    /// Focus a field and type.
+    Type(TypeText),
+    /// Press a key (`Enter`, `Tab`, `Escape`).
+    Press(String),
+    /// Wait until the page's text contains this.
+    WaitText(String),
+    /// Wait until nothing matches this selector.
+    WaitGone(String),
+    /// Scroll a selector into view, or by pixels.
+    Scroll(ScrollTo),
+}
+
+/// `type = { selector, text }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypeText {
+    /// The field.
+    pub selector: String,
+    /// What to type.
+    pub text: String,
+}
+
+/// Where `scroll` goes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ScrollTo {
+    /// Into view.
+    Selector(String),
+    /// Down by pixels.
+    Pixels(i64),
 }
 
 /// `[check]`.
@@ -81,7 +323,7 @@ pub struct SizeBudget {
 }
 
 impl Config {
-    /// Reads and validates the file.
+    /// Reads and validates the file and the files it includes.
     ///
     /// # Errors
     ///
@@ -89,16 +331,36 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-        Self::parse(&text, env!("CARGO_PKG_VERSION"))
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+        Self::parse_in(
+            &text,
+            env!("CARGO_PKG_VERSION"),
+            dir.unwrap_or(Path::new(".")),
+        )
     }
 
-    /// Parses text, with the running tool version passed in so tests can vary it.
+    /// Parses text with no includes, with the running tool version passed in so tests can vary it.
     ///
     /// # Errors
     ///
     /// See [`Config::load`].
+    #[cfg(test)]
     pub fn parse(text: &str, tool_version: &str) -> Result<Self, Error> {
-        let config: Self = toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
+        Self::parse_in(text, tool_version, Path::new("."))
+    }
+
+    /// Like [`Config::parse`], resolving `include` patterns from `dir`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Config::load`].
+    pub fn parse_in(text: &str, tool_version: &str, dir: &Path) -> Result<Self, Error> {
+        let mut table: toml::Table =
+            toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
+        merge_includes(&mut table, dir)?;
+        let config: Self = toml::Value::Table(table)
+            .try_into()
+            .map_err(|e: toml::de::Error| Error::Config(e.to_string()))?;
         if config.shakedown != tool_version {
             return Err(Error::Config(format!(
                 "shakedown.toml expects shakedown {}, this is {tool_version}; run: cargo install shakedown@{} --locked",
@@ -133,14 +395,15 @@ impl Config {
             }
         }
         for b in &self.check.builtin {
-            if b != "budgets.sizes" {
+            if b != "budgets.sizes" && b != "ui.web" {
                 return Err(Error::Config(format!(
-                    "unknown builtin step {b:?} (this version has: budgets.sizes)"
+                    "unknown builtin step {b:?} (this version has: budgets.sizes, ui.web)"
                 )));
             }
         }
+        self.validate_ui()?;
         for (label, size) in &self.budgets.sizes {
-            if size.strip && size.max.is_none() && size.raw.is_none() {
+            if size.strip && size.max.is_none() {
                 return Err(Error::Config(format!("budget {label:?}: strip needs max")));
             }
             if size.raw.is_none()
@@ -155,10 +418,198 @@ impl Config {
         Ok(())
     }
 
+    fn validate_ui(&self) -> Result<(), Error> {
+        let bad = |m: String| Err(Error::Config(m));
+        crate::devices::pick(&self.devices.ui)?;
+        if self.devices.themes.is_empty()
+            || self
+                .devices
+                .themes
+                .iter()
+                .any(|t| t != "light" && t != "dark")
+        {
+            return bad("[devices].themes must be \"light\", \"dark\" or both".into());
+        }
+        let mut names = BTreeSet::new();
+        for s in &self.screen {
+            let ok = !s.name.is_empty()
+                && s.name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !ok {
+                return bad(format!(
+                    "screen name {:?}: use lower case letters, digits and -",
+                    s.name
+                ));
+            }
+            if !names.insert(s.name.as_str()) {
+                return bad(format!("duplicate screen name {:?}", s.name));
+            }
+            if !s.path.starts_with('/') {
+                return bad(format!("screen {:?}: path must start with /", s.name));
+            }
+            if let Some(d) = &s.devices {
+                crate::devices::pick(d)?;
+            }
+            if s.player != "guest" {
+                match &self.players {
+                    Some(p) if p.accounts.contains(&s.player) => {}
+                    _ => {
+                        return bad(format!(
+                            "screen {:?}: player {:?} is not in [players].accounts",
+                            s.name, s.player
+                        ));
+                    }
+                }
+            }
+            for key in s.routes.keys() {
+                if key
+                    .split_once(' ')
+                    .is_none_or(|(m, p)| m.is_empty() || !p.starts_with('/'))
+                {
+                    return bad(format!(
+                        "screen {:?}: route {key:?} must look like \"GET /api/v1/me\"",
+                        s.name
+                    ));
+                }
+            }
+            for c in &s.allow_console {
+                if c.why.trim().is_empty() {
+                    return bad(format!("screen {:?}: allow_console needs a why", s.name));
+                }
+            }
+        }
+        for ig in &self.layout.ignore {
+            if !crate::layout::RULES.contains(&ig.rule.as_str()) {
+                return bad(format!(
+                    "[layout].ignore: unknown rule {:?} (rules: {})",
+                    ig.rule,
+                    crate::layout::RULES.join(", ")
+                ));
+            }
+            if ig.why.trim().is_empty() {
+                return bad(format!(
+                    "[layout].ignore {:?}: every ignore needs a why",
+                    ig.rule
+                ));
+            }
+        }
+        if let Some(p) = &self.players
+            && !p.signin.contains("{player}")
+        {
+            return bad("[players].signin must contain {player}".into());
+        }
+        if self.check.builtin.iter().any(|b| b == "ui.web") {
+            self.require_ui()?;
+        }
+        Ok(())
+    }
+
+    /// `ui` needs a server and at least one screen.
+    ///
+    /// # Errors
+    ///
+    /// Either is missing.
+    pub fn require_ui(&self) -> Result<(), Error> {
+        if self.server.is_none() {
+            return Err(Error::Config(
+                "ui needs a [server] section in shakedown.toml".into(),
+            ));
+        }
+        if self.screen.is_empty() {
+            return Err(Error::Config(
+                "ui needs at least one [[screen]] in shakedown.toml".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Names of top-level sections this version does not read, sorted.
     pub fn unused_sections(&self) -> Vec<String> {
         self.unused.keys().cloned().collect()
     }
+}
+
+/// Appends the `[[screen]]` entries of every included file. Included files hold screens and nothing else.
+fn merge_includes(table: &mut toml::Table, dir: &Path) -> Result<(), Error> {
+    let patterns: Vec<String> = match table.get("include").cloned() {
+        None => return Ok(()),
+        Some(v) => v
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .ok_or_else(|| Error::Config("include must be a list of paths".into()))?,
+    };
+    table.remove("include");
+    let mut screens: Vec<toml::Value> = table
+        .remove("screen")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    for pattern in &patterns {
+        let files = expand(dir, pattern)?;
+        if files.is_empty() {
+            return Err(Error::Config(format!(
+                "include {pattern:?} matches no file"
+            )));
+        }
+        for file in files {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| Error::Config(format!("{}: {e}", file.display())))?;
+            let inc: toml::Table = toml::from_str(&text)
+                .map_err(|e| Error::Config(format!("{}: {e}", file.display())))?;
+            for (key, value) in inc {
+                if key != "screen" {
+                    return Err(Error::Config(format!(
+                        "{}: included files hold [[screen]] entries only, not {key:?}",
+                        file.display()
+                    )));
+                }
+                if let Some(a) = value.as_array() {
+                    screens.extend(a.iter().cloned());
+                }
+            }
+        }
+    }
+    table.insert("screen".into(), toml::Value::Array(screens));
+    Ok(())
+}
+
+/// A path pattern with at most one `*` in its last component, matching files, sorted.
+fn expand(dir: &Path, pattern: &str) -> Result<Vec<PathBuf>, Error> {
+    let full = dir.join(pattern);
+    let name = full
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::Config(format!("include {pattern:?}: not a file pattern")))?
+        .to_string();
+    if full
+        .parent()
+        .is_some_and(|p| p.to_string_lossy().contains('*'))
+    {
+        return Err(Error::Config(format!(
+            "include {pattern:?}: `*` is allowed in the file name only"
+        )));
+    }
+    let Some((pre, post)) = name.split_once('*') else {
+        return Ok(vec![full]);
+    };
+    let parent = full.parent().unwrap_or(dir);
+    let mut found: Vec<PathBuf> = std::fs::read_dir(parent)
+        .map_err(|e| Error::Config(format!("include {pattern:?}: {e}")))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.len() >= pre.len() + post.len() && n.starts_with(pre) && n.ends_with(post)
+                })
+        })
+        .collect();
+    found.sort();
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -166,7 +617,7 @@ mod tests {
     use super::*;
 
     const OK: &str = r#"
-shakedown = "0.1.0"
+shakedown = "0.2.0"
 project = "p"
 [check]
 steps = [
@@ -176,35 +627,35 @@ steps = [
 builtin = ["budgets.sizes"]
 [budgets.sizes]
 "x gzip" = { file = "a.js", gzip = 10 }
-[server]
-start = "x"
+[sweep]
+routes = ["/"]
 "#;
 
     #[test]
     fn parses_and_reports_unused() {
-        let c = Config::parse(OK, "0.1.0").unwrap();
+        let c = Config::parse(OK, "0.2.0").unwrap();
         assert_eq!(c.check.steps.len(), 2);
-        assert_eq!(c.unused_sections(), vec!["server"]);
+        assert_eq!(c.unused_sections(), vec!["sweep"]);
     }
 
     #[test]
     fn version_mismatch_names_install_command() {
-        let e = Config::parse(OK, "0.2.0").unwrap_err().to_string();
-        assert!(e.contains("cargo install shakedown@0.1.0 --locked"), "{e}");
+        let e = Config::parse(OK, "0.3.0").unwrap_err().to_string();
+        assert!(e.contains("cargo install shakedown@0.2.0 --locked"), "{e}");
     }
 
     #[test]
     fn rejects_bad_graphs() {
         let dup = OK.replace(r#"name = "b""#, r#"name = "a""#);
-        assert!(Config::parse(&dup, "0.1.0").is_err());
+        assert!(Config::parse(&dup, "0.2.0").is_err());
         let unknown = OK.replace(r#"["a"]"#, r#"["zzz"]"#);
-        assert!(Config::parse(&unknown, "0.1.0").is_err());
+        assert!(Config::parse(&unknown, "0.2.0").is_err());
         let cycle = OK.replace(
             r#"{ name = "a", run = "true" }"#,
             r#"{ name = "a", run = "true", after = ["b"] }"#,
         );
         assert!(
-            Config::parse(&cycle, "0.1.0")
+            Config::parse(&cycle, "0.2.0")
                 .unwrap_err()
                 .to_string()
                 .contains("cycle")
@@ -212,8 +663,122 @@ start = "x"
     }
 
     #[test]
+    fn strip_needs_max() {
+        let bad = OK.replace(
+            "{ file = \"a.js\", gzip = 10 }",
+            "{ file = \"a.js\", strip = true, raw = 10 }",
+        );
+        assert!(
+            Config::parse(&bad, "0.2.0")
+                .unwrap_err()
+                .to_string()
+                .contains("strip needs max")
+        );
+    }
+
+    #[test]
     fn rejects_typos_in_known_sections() {
         let bad = OK.replace("gzip = 10", "gzp = 10");
-        assert!(Config::parse(&bad, "0.1.0").is_err());
+        assert!(Config::parse(&bad, "0.2.0").is_err());
+    }
+
+    const UI: &str = r#"
+shakedown = "0.2.0"
+project = "p"
+[server]
+start = "serve {port}"
+[players]
+accounts = ["ann"]
+signin = "/dev?as={player}"
+[layout]
+ignore = [{ rule = "clipped-text", match = ".m", why = "scrolls" }]
+[[screen]]
+name = "home"
+path = "/"
+[[screen]]
+name = "menu"
+path = "/"
+player = "ann"
+routes = { "GET /api/me" = "me.json", "GET /api/x" = { file = "x.json", status = 404 } }
+act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { press = "Enter" }, { wait_text = "ok" }, { wait_gone = ".spin" }, { scroll = "footer" }, { scroll = 200 }]
+"#;
+
+    #[test]
+    fn parses_screens_actions_and_defaults() {
+        let c = Config::parse(UI, "0.2.0").unwrap();
+        assert_eq!(c.screen.len(), 2);
+        assert_eq!(c.screen[0].player, "guest");
+        assert_eq!(c.screen[1].act.len(), 7);
+        assert_eq!(c.devices.ui, ["phone", "tablet", "desktop"]);
+        assert_eq!(c.devices.themes, ["light", "dark"]);
+        let s = c.server.unwrap();
+        assert_eq!(
+            (s.world, s.ready.as_str(), s.api.as_str()),
+            (World::Fake, "/", "/api/")
+        );
+    }
+
+    #[test]
+    fn rejects_bad_ui_config() {
+        let bad = |from: &str, to: &str| {
+            Config::parse(&UI.replace(from, to), "0.2.0")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(bad("name = \"menu\"", "name = \"home\"").contains("duplicate"));
+        assert!(bad("name = \"menu\"", "name = \"Menu\"").contains("lower case"));
+        assert!(bad("player = \"ann\"", "player = \"zed\"").contains("not in [players]"));
+        assert!(bad("why = \"scrolls\"", "why = \" \"").contains("needs a why"));
+        assert!(bad("rule = \"clipped-text\"", "rule = \"nope\"").contains("unknown rule"));
+        assert!(bad("\"GET /api/me\"", "\"api/me\"").contains("must look like"));
+        assert!(bad("{ click = \"button\" }", "{ hover = \"button\" }").contains("hover"));
+        let devices = format!("{UI}\n[devices]\nui = [\"nokia\"]\n");
+        assert!(
+            Config::parse(&devices, "0.2.0")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown device")
+        );
+    }
+
+    #[test]
+    fn includes_add_screens_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("shakedown-include-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("screens")).unwrap();
+        std::fs::write(
+            dir.join("screens/b.toml"),
+            "[[screen]]\nname = \"b\"\npath = \"/b\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("screens/a.toml"),
+            "[[screen]]\nname = \"a\"\npath = \"/a\"\n",
+        )
+        .unwrap();
+        let main = "shakedown = \"0.2.0\"\nproject = \"p\"\ninclude = [\"screens/*.toml\"]\n[server]\nstart = \"x\"\n[[screen]]\nname = \"home\"\npath = \"/\"\n";
+        let c = Config::parse_in(main, "0.2.0", &dir).unwrap();
+        let names: Vec<_> = c.screen.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["home", "a", "b"],
+            "own screens first, then each file in name order"
+        );
+        std::fs::write(dir.join("screens/c.toml"), "project = \"x\"\n").unwrap();
+        let e = Config::parse_in(main, "0.2.0", &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("screen"), "{e}");
+        let none = main.replace("screens/*.toml", "nowhere/*.toml");
+        assert!(Config::parse_in(&none, "0.2.0", &dir).is_err());
+        let dup = format!("{main}[[screen]]\nname = \"a\"\npath = \"/\"\n");
+        std::fs::remove_file(dir.join("screens/c.toml")).unwrap();
+        assert!(
+            Config::parse_in(&dup, "0.2.0", &dir)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

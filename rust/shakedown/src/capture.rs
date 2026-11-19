@@ -1,0 +1,859 @@
+//! Drawing screens in the pinned Chrome over CDP: one isolated browser context per shot (own cookies and storage,
+//! so each shot is its own player), a deterministic page, the fake world's `/api` answers, the settled screenshot
+//! and the layout tree. Nothing here decides pass or fail; it returns pixels and findings.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::emulation::{
+    MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams, SetLocaleOverrideParams,
+    SetTimezoneOverrideParams, SetTouchEmulationEnabledParams,
+};
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    self, ContinueRequestParams, EventRequestPaused, FailRequestParams, FulfillRequestParams,
+    HeaderEntry, RequestPattern,
+};
+use chromiumoxide::cdp::browser_protocol::input::{
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    InsertTextParams, MouseButton,
+};
+use chromiumoxide::cdp::browser_protocol::log::{EventEntryAdded, LogEntryLevel};
+use chromiumoxide::cdp::browser_protocol::network::{
+    self, ErrorReason, EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
+    ResourceType,
+};
+use chromiumoxide::cdp::browser_protocol::target::{
+    CreateBrowserContextParams, CreateTargetParams,
+};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    ConsoleApiCalledType, EvaluateParams, EventConsoleApiCalled, EventExceptionThrown,
+};
+use chromiumoxide::page::{Page, ScreenshotParams};
+use futures::StreamExt as _;
+use tokio::sync::Semaphore;
+
+use crate::config::{Action, ScrollTo, World};
+use crate::devices::Device;
+use crate::error::Error;
+use crate::layout::{self, Finding, Tree};
+
+/// The fake world's answers arrive after this long, as on a phone, so content that lands after the first frame
+/// is seen moving things (a real link is slower, never faster).
+const API_DELAY: Duration = Duration::from_millis(150);
+/// Pages drawn at once.
+const PARALLEL: usize = 8;
+/// A shot that takes longer than this is a failure.
+const SHOT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Stops animation, transitions and the caret: references must not depend on when the capture happened.
+const FREEZE: &str = "*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;scroll-behavior:auto!important}";
+/// The seed of the page's random numbers.
+const SEED: u32 = 0x02f6_e2b1;
+
+/// One answer in a fake world.
+#[derive(Debug, Clone)]
+pub struct Fixture {
+    /// HTTP status.
+    pub status: u16,
+    /// Body, JSON, with `"$now"` already replaced.
+    pub body: String,
+}
+
+/// A screen ready to draw.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    /// Screen name.
+    pub name: String,
+    /// Path to open.
+    pub path: String,
+    /// `guest` or an account.
+    pub player: String,
+    /// `"METHOD /path"` to its answer.
+    pub routes: HashMap<String, Fixture>,
+    /// Steps before the shot.
+    pub act: Vec<Action>,
+    /// Console messages that are expected.
+    pub allow: Vec<String>,
+}
+
+/// What every shot shares.
+pub struct Env {
+    /// `http://127.0.0.1:<port>`.
+    pub base: String,
+    /// `[server].api`.
+    pub api: String,
+    /// Fake or seeded.
+    pub world: World,
+    /// The page clock, epoch ms.
+    pub now_ms: i64,
+    /// Sign-in path with `{player}`.
+    pub signin: Option<String>,
+    /// `[layout].ignore` as JSON for the collector.
+    pub ignores: String,
+}
+
+/// One screen on one device in one theme.
+#[derive(Debug, Clone)]
+pub struct Job {
+    /// The screen.
+    pub plan: Arc<Plan>,
+    /// The device.
+    pub device: Device,
+    /// `light` or `dark`.
+    pub theme: String,
+}
+
+impl Job {
+    /// `<screen>@<device>-<theme>`.
+    pub fn id(&self) -> String {
+        format!("{}@{}-{}", self.plan.name, self.device.name, self.theme)
+    }
+}
+
+/// A finished shot.
+#[derive(Debug, Clone)]
+pub struct Shot {
+    /// `<screen>@<device>-<theme>`.
+    pub id: String,
+    /// The settled screenshot (empty if the page could not be drawn).
+    pub png: Vec<u8>,
+    /// Everything wrong with it, sorted.
+    pub findings: Vec<Finding>,
+    /// Viewport size.
+    pub size: (u32, u32),
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// A flat 64x64 gray image: every off-origin image (an avatar on a CDN) is answered with it.
+fn avatar() -> Vec<u8> {
+    let px: Vec<u8> = (0..64 * 64).flat_map(|_| [200_u8, 200, 200, 255]).collect();
+    crate::pixels::encode(&crate::pixels::Image { w: 64, h: 64, px }, 1).unwrap_or_default()
+}
+
+/// Launches the pinned Chrome: new headless mode, one profile directory per run.
+///
+/// # Errors
+///
+/// Chrome is missing or does not start.
+pub async fn launch(
+    chrome: &std::path::Path,
+    profile: &std::path::Path,
+) -> Result<(Browser, tokio::task::JoinHandle<()>), Error> {
+    let _ = std::fs::remove_dir_all(profile);
+    let config = BrowserConfig::builder()
+        .chrome_executable(chrome)
+        .new_headless_mode()
+        .user_data_dir(profile)
+        .viewport(None)
+        .request_timeout(Duration::from_secs(30))
+        .launch_timeout(Duration::from_secs(30))
+        .args([
+            "--font-render-hinting=none",
+            "--disable-lcd-text",
+            "--force-color-profile=srgb",
+            "--hide-scrollbars",
+            "--mute-audio",
+        ])
+        .build()
+        .map_err(Error::Environment)?;
+    let (browser, mut handler) = Browser::launch(config)
+        .await
+        .map_err(|e| Error::Environment(format!("cannot start Chrome: {e}")))?;
+    let task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    Ok((browser, task))
+}
+
+/// Draws every job, `PARALLEL` at a time. Results come back sorted by id.
+pub async fn shoot_all(browser: Arc<Browser>, env: Arc<Env>, jobs: Vec<Job>) -> Vec<Shot> {
+    let gate = Arc::new(Semaphore::new(PARALLEL));
+    let mut tasks = Vec::new();
+    for job in jobs {
+        let (browser, env, gate) = (browser.clone(), env.clone(), gate.clone());
+        tasks.push(tokio::spawn(async move {
+            let _permit = gate.acquire().await;
+            let size = (job.device.width, job.device.height);
+            let id = job.id();
+            match tokio::time::timeout(SHOT_TIMEOUT, shoot(&browser, &env, &job)).await {
+                Ok(Ok(shot)) => shot,
+                Ok(Err(why)) => Shot {
+                    id,
+                    png: Vec::new(),
+                    findings: vec![Finding::new("page-failed", why)],
+                    size,
+                },
+                Err(_) => Shot {
+                    id,
+                    png: Vec::new(),
+                    findings: vec![Finding::new(
+                        "page-failed",
+                        format!("took longer than {}s", SHOT_TIMEOUT.as_secs()),
+                    )],
+                    size,
+                },
+            }
+        }));
+    }
+    let mut shots = Vec::new();
+    for t in tasks {
+        if let Ok(shot) = t.await {
+            shots.push(shot);
+        }
+    }
+    shots.sort_by(|a, b| a.id.cmp(&b.id));
+    shots
+}
+
+fn err<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> String + '_ {
+    move |e| format!("{what}: {e}")
+}
+
+/// Evaluates an expression (promises awaited) and returns its JSON value.
+async fn eval(page: &Page, expression: &str) -> Result<serde_json::Value, String> {
+    let params = EvaluateParams::builder()
+        .expression(expression)
+        .await_promise(true)
+        .return_by_value(true)
+        .build()
+        .map_err(|e| e.clone())?;
+    let out = page.execute(params).await.map_err(err("evaluate"))?;
+    if let Some(ex) = out.result.exception_details {
+        let text = ex.exception.and_then(|e| e.description).unwrap_or(ex.text);
+        return Err(format!("page script: {text}"));
+    }
+    Ok(out.result.result.value.unwrap_or(serde_json::Value::Null))
+}
+
+async fn shoot(browser: &Browser, env: &Env, job: &Job) -> Result<Shot, String> {
+    let ctx = browser
+        .create_browser_context(CreateBrowserContextParams::default())
+        .await
+        .map_err(err("context"))?;
+    let target = CreateTargetParams::builder()
+        .url("about:blank")
+        .browser_context_id(ctx.clone())
+        .build()
+        .map_err(|e| e.clone())?;
+    let page = browser.new_page(target).await.map_err(err("new page"))?;
+    let outcome = draw(&page, env, job).await;
+    let _ = page.close().await;
+    let _ = browser.dispose_browser_context(ctx).await;
+    outcome
+}
+
+/// What the page's event streams collect.
+#[derive(Default)]
+struct Collected {
+    findings: Mutex<Vec<Finding>>,
+    pending: Mutex<HashSet<String>>,
+    served: Mutex<BTreeSet<String>>,
+}
+
+impl Collected {
+    fn note(&self, rule: &str, message: impl Into<String>) {
+        if let Ok(mut f) = self.findings.lock() {
+            let finding = Finding::new(rule, message);
+            if !f.contains(&finding) {
+                f.push(finding);
+            }
+        }
+    }
+    fn pending(&self) -> usize {
+        self.pending.lock().map_or(0, |p| p.len())
+    }
+}
+
+#[expect(clippy::too_many_lines, reason = "one page flow, read top to bottom")]
+async fn draw(page: &Page, env: &Env, job: &Job) -> Result<Shot, String> {
+    let t0 = std::time::Instant::now();
+    let lap = |what: &str| {
+        if std::env::var_os("SHAKEDOWN_TRACE").is_some() {
+            eprintln!("trace {} {what} {}ms", job.id(), t0.elapsed().as_millis());
+        }
+    };
+    let d = &job.device;
+    let collected = Arc::new(Collected::default());
+
+    // The environment: size, density 1, touch, theme, motion, timezone, locale.
+    page.execute(
+        SetDeviceMetricsOverrideParams::builder()
+            .width(i64::from(d.width))
+            .height(i64::from(d.height))
+            .device_scale_factor(1.0)
+            .mobile(d.mobile)
+            .build()
+            .map_err(|e| e.clone())?,
+    )
+    .await
+    .map_err(err("device"))?;
+    page.execute(SetTouchEmulationEnabledParams::new(d.mobile))
+        .await
+        .map_err(err("touch"))?;
+    page.execute(SetEmulatedMediaParams {
+        media: None,
+        features: Some(vec![
+            MediaFeature::new("prefers-color-scheme", job.theme.as_str()),
+            MediaFeature::new("prefers-reduced-motion", "reduce"),
+        ]),
+    })
+    .await
+    .map_err(err("media"))?;
+    page.execute(SetTimezoneOverrideParams::new("UTC"))
+        .await
+        .map_err(err("timezone"))?;
+    page.execute(SetLocaleOverrideParams {
+        locale: Some("en-US".into()),
+    })
+    .await
+    .map_err(err("locale"))?;
+
+    lap("emulation set");
+    // The deterministic page and the collector, before any page script.
+    let prelude = include_str!("collector.js")
+        .replace("__AT__", &env.now_ms.to_string())
+        .replace("__SEED__", &SEED.to_string());
+    page.evaluate_on_new_document(prelude)
+        .await
+        .map_err(err("collector"))?;
+
+    // Listeners first, then switch the domains on.
+    watch_console(page, &collected, &job.plan.allow).await?;
+    watch_requests(page, &collected).await?;
+    intercept(page, env, &job.plan, &collected).await?;
+    page.enable_log().await.map_err(err("log"))?;
+    page.enable_runtime().await.map_err(err("runtime"))?;
+
+    lap("listeners on");
+    if job.plan.player != "guest" {
+        let Some(template) = &env.signin else {
+            return Err("no [players].signin".into());
+        };
+        let path = template.replace("{player}", &job.plan.player);
+        page.goto(format!("{}{path}", env.base))
+            .await
+            .map_err(err("sign-in"))?;
+        wait_loaded(page).await?;
+    }
+    page.goto(format!("{}{}", env.base, job.plan.path))
+        .await
+        .map_err(err("navigation"))?;
+    wait_loaded(page).await?;
+
+    lap("loaded");
+    // Ready: every call the screen's world answers has been made and drawn.
+    let want: Vec<&String> = job.plan.routes.keys().collect();
+    let mut waited = 0;
+    while want
+        .iter()
+        .any(|k| !collected.served.lock().is_ok_and(|s| s.contains(*k)))
+    {
+        if waited > 3000 {
+            let missing: Vec<&str> = want
+                .iter()
+                .filter(|k| !collected.served.lock().is_ok_and(|s| s.contains(**k)))
+                .map(|k| k.as_str())
+                .collect();
+            collected.note("never-called", missing.join(", "));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += 20;
+    }
+    eval(page, "document.fonts.ready.then(() => true)").await?;
+    idle(page, &collected).await?;
+    lap("idle");
+    // Layout shift: nothing may move once it appears. Taken before the actions, which move things on purpose.
+    let shifts = eval(page, "JSON.stringify(window.__shakedown.shifts)").await?;
+    let before_acts: Vec<layout::Shift> =
+        serde_json::from_str(shifts.as_str().unwrap_or("[]")).unwrap_or_default();
+
+    page.execute(EvaluateParams::builder().expression(format!(
+        "(() => {{ const s = document.createElement('style'); s.textContent = {}; document.head.append(s); }})()",
+        serde_json::Value::String(FREEZE.into())
+    )).build().map_err(|e| e.clone())?)
+    .await
+    .map_err(err("freeze"))?;
+
+    for action in &job.plan.act {
+        if let Err(why) = act(page, action).await {
+            collected.note("action-failed", why);
+            break;
+        }
+    }
+    idle(page, &collected).await?;
+
+    lap("acted");
+    // Settled means two captures in a row are byte-identical (images decoded, layers composited).
+    let grab = || async {
+        page.screenshot(ScreenshotParams::builder().build())
+            .await
+            .map_err(err("screenshot"))
+    };
+    let mut png = grab().await?;
+    lap("first grab");
+    for i in 0..=20 {
+        eval(page, "Promise.all([...document.images].map((im) => im.decode().catch(() => {}))).then(() => true)").await?;
+        let again = grab().await?;
+        if again == png {
+            break;
+        }
+        if i == 20 {
+            collected.note("never-settled", "screenshots keep changing");
+        }
+        png = again;
+    }
+    lap("settled");
+    let raw = eval(
+        page,
+        &format!("JSON.stringify(window.__shakedown.tree({}))", env.ignores),
+    )
+    .await?;
+    let mut tree: Tree =
+        serde_json::from_str(raw.as_str().unwrap_or("{}")).map_err(err("layout tree"))?;
+    // Actions move things on purpose, so a screen with actions is judged on the shifts before them; without
+    // actions everything up to the settled shot counts (late content that arrives after the first idle too).
+    if !job.plan.act.is_empty() {
+        tree.shifts = before_acts;
+    }
+    let mut findings = layout::check(&tree);
+    if let Ok(f) = collected.findings.lock() {
+        findings.extend(f.iter().cloned());
+    }
+    findings.sort_by(|a, b| (&a.rule, &a.message).cmp(&(&b.rule, &b.message)));
+    Ok(Shot {
+        id: job.id(),
+        png,
+        findings,
+        size: (d.width, d.height),
+    })
+}
+
+async fn wait_loaded(page: &Page) -> Result<(), String> {
+    for _ in 0..500 {
+        if eval(page, "document.readyState").await?.as_str() == Some("complete") {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err("the page never finished loading".into())
+}
+
+/// No request in flight for 100 ms, then two frames, so late fetches and the renderer's flush have landed.
+async fn idle(page: &Page, c: &Collected) -> Result<(), String> {
+    let mut quiet = 0;
+    for _ in 0..500 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        quiet = if c.pending() == 0 { quiet + 20 } else { 0 };
+        if quiet >= 100 {
+            break;
+        }
+    }
+    if quiet < 100 {
+        c.note("never-settled", "requests keep running");
+    }
+    eval(
+        page,
+        "new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn watch_console(page: &Page, c: &Arc<Collected>, allow: &[String]) -> Result<(), String> {
+    let allowed = |text: &str| allow.iter().any(|a| text.contains(a.as_str()));
+    let allow: Vec<String> = allow.to_vec();
+    let _ = allowed;
+    let mut api = page
+        .event_listener::<EventConsoleApiCalled>()
+        .await
+        .map_err(err("console"))?;
+    let mut exc = page
+        .event_listener::<EventExceptionThrown>()
+        .await
+        .map_err(err("exceptions"))?;
+    let mut log = page
+        .event_listener::<EventEntryAdded>()
+        .await
+        .map_err(err("log"))?;
+    let ok = move |text: &str| !allow.iter().any(|a| text.contains(a.as_str()));
+    let (c1, c2, c3) = (c.clone(), c.clone(), c.clone());
+    let (ok1, ok2, ok3) = (ok.clone(), ok.clone(), ok);
+    tokio::spawn(async move {
+        while let Some(e) = api.next().await {
+            if matches!(
+                e.r#type,
+                ConsoleApiCalledType::Error | ConsoleApiCalledType::Assert
+            ) {
+                let text: Vec<String> = e
+                    .args
+                    .iter()
+                    .map(|a| {
+                        a.value
+                            .as_ref()
+                            .map(|v| v.as_str().map_or_else(|| v.to_string(), String::from))
+                            .or_else(|| a.description.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let text = text.join(" ");
+                if ok1(&text) {
+                    c1.note("console-error", text);
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(e) = exc.next().await {
+            let d = &e.exception_details;
+            let text = d
+                .exception
+                .as_ref()
+                .and_then(|x| x.description.clone())
+                .unwrap_or_else(|| d.text.clone());
+            let first = text.lines().next().unwrap_or_default().to_string();
+            if ok2(&first) {
+                c2.note("page-error", first);
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(e) = log.next().await {
+            // New headless Chrome asks for /favicon.ico by itself (a browser fetch, not the page's); a page that
+            // wants an icon links one, and that request is checked like any other.
+            let favicon = e
+                .entry
+                .url
+                .as_deref()
+                .is_some_and(|u| strip_origin(u) == "/favicon.ico");
+            if e.entry.level == LogEntryLevel::Error && !favicon && ok3(&e.entry.text) {
+                let url = e
+                    .entry
+                    .url
+                    .as_deref()
+                    .map_or_else(String::new, |u| format!(" ({})", strip_origin(u)));
+                c3.note("console-error", format!("{}{url}", e.entry.text));
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Chrome refuses to fulfil a request without a reason phrase for codes it does not know.
+fn phrase(status: u16) -> &'static str {
+    if status < 400 { "OK" } else { "Error" }
+}
+
+fn query_of(u: &url::Url) -> String {
+    u.query().map_or_else(String::new, |q| format!("?{q}"))
+}
+
+/// Messages name URLs; the port changes every run, so it never goes in a message.
+fn strip_origin(u: &str) -> String {
+    url::Url::parse(u).map_or_else(
+        |_| u.to_string(),
+        |p| format!("{}{}", p.path(), query_of(&p)),
+    )
+}
+
+/// Which requests are in flight, so the page is known to be idle. Streams that never end do not count.
+async fn watch_requests(page: &Page, c: &Arc<Collected>) -> Result<(), String> {
+    page.execute(network::EnableParams::default())
+        .await
+        .map_err(err("network"))?;
+    let mut sent = page
+        .event_listener::<EventRequestWillBeSent>()
+        .await
+        .map_err(err("network"))?;
+    let mut done = page
+        .event_listener::<EventLoadingFinished>()
+        .await
+        .map_err(err("network"))?;
+    let mut failed = page
+        .event_listener::<EventLoadingFailed>()
+        .await
+        .map_err(err("network"))?;
+    let (c1, c2, c3) = (c.clone(), c.clone(), c.clone());
+    tokio::spawn(async move {
+        while let Some(e) = sent.next().await {
+            let endless = matches!(
+                e.r#type,
+                Some(
+                    ResourceType::EventSource
+                        | ResourceType::WebSocket
+                        | ResourceType::Ping
+                        | ResourceType::Prefetch
+                        | ResourceType::CspViolationReport
+                )
+            );
+            if !endless && let Ok(mut p) = c1.pending.lock() {
+                p.insert(e.request_id.inner().clone());
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(e) = done.next().await {
+            if let Ok(mut p) = c2.pending.lock() {
+                p.remove(e.request_id.inner());
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(e) = failed.next().await {
+            if let Ok(mut p) = c3.pending.lock() {
+                p.remove(e.request_id.inner());
+            }
+        }
+    });
+    Ok(())
+}
+
+/// The fake world, and the wall around every world: nothing leaves the machine.
+async fn intercept(
+    page: &Page,
+    env: &Env,
+    plan: &Arc<Plan>,
+    c: &Arc<Collected>,
+) -> Result<(), String> {
+    let mut paused = page
+        .event_listener::<EventRequestPaused>()
+        .await
+        .map_err(err("intercept"))?;
+    page.execute(
+        fetch::EnableParams::builder()
+            .pattern(RequestPattern::builder().url_pattern("*").build())
+            .build(),
+    )
+    .await
+    .map_err(err("intercept"))?;
+    let (page, plan, c) = (page.clone(), plan.clone(), c.clone());
+    let (base, api, world) = (env.base.clone(), env.api.clone(), env.world);
+    let image = base64(&avatar());
+    tokio::spawn(async move {
+        while let Some(ev) = paused.next().await {
+            let (page, plan, c, base, api, image) = (
+                page.clone(),
+                plan.clone(),
+                c.clone(),
+                base.clone(),
+                api.clone(),
+                image.clone(),
+            );
+            tokio::spawn(async move {
+                let id = ev.request_id.clone();
+                let Ok(u) = url::Url::parse(&ev.request.url) else {
+                    let _ = page.execute(ContinueRequestParams::new(id)).await;
+                    return;
+                };
+                let origin = u.origin().ascii_serialization();
+                let json_headers = vec![HeaderEntry::new("Content-Type", "application/json")];
+                if !matches!(u.scheme(), "http" | "https") {
+                    let _ = page.execute(ContinueRequestParams::new(id)).await;
+                } else if origin != base {
+                    // An avatar on a CDN: one flat, fixed image stands in. Anything else off-origin is a failure.
+                    if ev.resource_type == ResourceType::Image {
+                        let mut f = FulfillRequestParams::new(id, 200_i64);
+                        f.response_headers =
+                            Some(vec![HeaderEntry::new("Content-Type", "image/png")]);
+                        f.body = Some(image.into());
+                        let _ = page.execute(f).await;
+                    } else {
+                        c.note(
+                            "network",
+                            format!("request leaves the machine: {origin}{}", u.path()),
+                        );
+                        let _ = page
+                            .execute(FailRequestParams::new(id, ErrorReason::BlockedByClient))
+                            .await;
+                    }
+                } else {
+                    let key = format!("{} {}", ev.request.method, u.path());
+                    let with_query = u.query().map(|q| format!("{key}?{q}"));
+                    let hit = with_query
+                        .as_ref()
+                        .and_then(|k| plan.routes.get(k).map(|f| (k.clone(), f)))
+                        .or_else(|| plan.routes.get(&key).map(|f| (key.clone(), f)));
+                    if let Some((matched, fixture)) = hit {
+                        // Answers arrive late, as on a phone.
+                        tokio::time::sleep(API_DELAY).await;
+                        if let Ok(mut s) = c.served.lock() {
+                            s.insert(matched);
+                        }
+                        let mut f = FulfillRequestParams::new(id, i64::from(fixture.status));
+                        f.response_phrase = Some(phrase(fixture.status).into());
+                        f.response_headers = Some(json_headers);
+                        f.body = Some(base64(fixture.body.as_bytes()).into());
+                        let _ = page.execute(f).await;
+                    } else if world == World::Fake && u.path().starts_with(api.as_str()) {
+                        c.note("unfaked-call", format!("{key}{}", query_of(&u)));
+                        let mut f = FulfillRequestParams::new(id, 599_i64);
+                        f.response_phrase = Some("Unfaked".into());
+                        f.response_headers = Some(json_headers);
+                        f.body = Some(base64(br#"{"error":"unfaked"}"#).into());
+                        let _ = page.execute(f).await;
+                    } else {
+                        let _ = page.execute(ContinueRequestParams::new(id)).await;
+                    }
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
+const POLL: Duration = Duration::from_millis(50);
+const WAIT: Duration = Duration::from_secs(8);
+
+async fn poll(page: &Page, expression: &str, what: &str) -> Result<serde_json::Value, String> {
+    let mut waited = Duration::ZERO;
+    loop {
+        let v = eval(page, expression).await?;
+        if !matches!(v, serde_json::Value::Null | serde_json::Value::Bool(false)) {
+            return Ok(v);
+        }
+        if waited > WAIT {
+            return Err(format!("timed out waiting for {what}"));
+        }
+        tokio::time::sleep(POLL).await;
+        waited += POLL;
+    }
+}
+
+fn js(s: &str) -> String {
+    serde_json::Value::String(s.into()).to_string()
+}
+
+/// The centre of the first match, scrolled into view.
+async fn centre(page: &Page, selector: &str) -> Result<(f64, f64), String> {
+    let found = poll(
+        page,
+        &format!(
+            "(() => {{ const e = document.querySelector({sel}); if (!e) return null; e.scrollIntoView({{ block: 'center', inline: 'center' }}); const r = e.getBoundingClientRect(); return r.width || r.height ? [r.left + r.width / 2, r.top + r.height / 2] : null; }})()",
+            sel = js(selector)
+        ),
+        &format!("{selector} to appear"),
+    )
+    .await?;
+    let xy = found.as_array().ok_or("bad position")?;
+    Ok((xy[0].as_f64().unwrap_or(0.0), xy[1].as_f64().unwrap_or(0.0)))
+}
+
+async fn click_at(page: &Page, x: f64, y: f64) -> Result<(), String> {
+    for kind in [
+        DispatchMouseEventType::MouseMoved,
+        DispatchMouseEventType::MousePressed,
+        DispatchMouseEventType::MouseReleased,
+    ] {
+        let mut p = DispatchMouseEventParams::new(kind.clone(), x, y);
+        if kind != DispatchMouseEventType::MouseMoved {
+            p.button = Some(MouseButton::Left);
+            p.click_count = Some(1);
+        }
+        page.execute(p).await.map_err(err("mouse"))?;
+    }
+    Ok(())
+}
+
+async fn act(page: &Page, action: &Action) -> Result<(), String> {
+    match action {
+        Action::Click(sel) => {
+            let (x, y) = centre(page, sel).await?;
+            click_at(page, x, y).await
+        }
+        Action::Type(t) => {
+            let (x, y) = centre(page, &t.selector).await?;
+            click_at(page, x, y).await?;
+            page.execute(InsertTextParams::new(t.text.as_str()))
+                .await
+                .map_err(err("type"))?;
+            Ok(())
+        }
+        Action::Press(key) => {
+            let (code, text) = match key.as_str() {
+                "Enter" => ("Enter", Some("\r")),
+                "Tab" => ("Tab", None),
+                "Escape" => ("Escape", None),
+                other => (other, None),
+            };
+            for kind in [
+                DispatchKeyEventType::RawKeyDown,
+                DispatchKeyEventType::KeyUp,
+            ] {
+                let mut p = DispatchKeyEventParams::new(kind.clone());
+                p.key = Some(key.clone());
+                p.code = Some(code.to_string());
+                if kind == DispatchKeyEventType::RawKeyDown {
+                    p.text = text.map(String::from);
+                }
+                page.execute(p).await.map_err(err("key"))?;
+            }
+            Ok(())
+        }
+        Action::WaitText(text) => {
+            poll(
+                page,
+                &format!("document.body.innerText.includes({})", js(text)),
+                &format!("text {text:?}"),
+            )
+            .await?;
+            Ok(())
+        }
+        Action::WaitGone(sel) => {
+            poll(
+                page,
+                &format!("!document.querySelector({})", js(sel)),
+                &format!("{sel} to go"),
+            )
+            .await?;
+            Ok(())
+        }
+        Action::Scroll(ScrollTo::Selector(sel)) => {
+            centre(page, sel).await?;
+            Ok(())
+        }
+        Action::Scroll(ScrollTo::Pixels(px)) => {
+            eval(page, &format!("window.scrollBy(0, {px}); true")).await?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_the_standard() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+    }
+
+    #[test]
+    fn origins_never_reach_messages() {
+        assert_eq!(strip_origin("http://127.0.0.1:5555/a.js?x=1"), "/a.js?x=1");
+    }
+}

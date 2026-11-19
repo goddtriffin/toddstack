@@ -1,0 +1,148 @@
+# The one device list (design section 6). CSS pixels; `density` is the real device's, used by native harnesses:
+# web renders at density 1 (pinned, so references do not depend on a display). Landscape forms are measured, not
+# swapped, where the browser toolbar moves (iPhone Duo). Carried over from infra scripts/devices.
+# Adding a device means a tool release; projects pick from the list by name.
+
+[[device]]
+name = "desktop"
+label = "Desktop browser"
+width = 1440
+height = 900
+density = 1
+mobile = false
+
+[[device]]
+name = "laptop"
+label = "Small laptop"
+width = 1280
+height = 720
+density = 1
+mobile = false
+
+[[device]]
+name = "tablet"
+label = "Tablet portrait"
+width = 820
+height = 1180
+density = 2
+mobile = true
+
+[[device]]
+name = "tablet-land"
+label = "Tablet landscape"
+width = 1180
+height = 820
+density = 2
+mobile = true
+
+[[device]]
+name = "phone"
+label = "Phone portrait"
+width = 390
+height = 844
+density = 3
+mobile = true
+
+[[device]]
+name = "phone-land"
+label = "Phone landscape"
+width = 844
+height = 390
+density = 3
+mobile = true
+
+[[device]]
+name = "small-phone"
+label = "Small phone portrait (iPhone SE)"
+width = 375
+height = 667
+density = 2
+mobile = true
+
+[[device]]
+name = "small-phone-land"
+label = "Small phone landscape (iPhone SE)"
+width = 667
+height = 375
+density = 2
+mobile = true
+
+[[device]]
+name = "android-small"
+label = "Small Android portrait (Galaxy S8)"
+width = 360
+height = 740
+density = 3
+mobile = true
+
+[[device]]
+name = "android-small-land"
+label = "Small Android landscape (Galaxy S8)"
+width = 740
+height = 360
+density = 3
+mobile = true
+
+[[device]]
+name = "fold-folded"
+label = "Fold folded portrait (Galaxy Z Fold 5 cover)"
+width = 344
+height = 882
+density = 3
+mobile = true
+
+[[device]]
+name = "fold-folded-land"
+label = "Fold folded landscape"
+width = 882
+height = 344
+density = 3
+mobile = true
+
+[[device]]
+name = "fold-open"
+label = "Fold unfolded portrait (Galaxy Z Fold 5 inner)"
+width = 673
+height = 841
+density = 3
+mobile = true
+
+[[device]]
+name = "fold-open-land"
+label = "Fold unfolded landscape"
+width = 841
+height = 673
+density = 3
+mobile = true
+
+[[device]]
+name = "duo-folded"
+label = "iPhone Duo folded portrait"
+width = 382
+height = 580
+density = 3
+mobile = true
+
+[[device]]
+name = "duo-folded-land"
+label = "iPhone Duo folded landscape"
+width = 594
+height = 368
+density = 3
+mobile = true
+
+[[device]]
+name = "duo-open"
+label = "iPhone Duo unfolded portrait"
+width = 669
+height = 867
+density = 3
+mobile = true
+
+[[device]]
+name = "duo-open-land"
+label = "iPhone Duo unfolded landscape"
+width = 951
+height = 585
+density = 3
+mobile = true

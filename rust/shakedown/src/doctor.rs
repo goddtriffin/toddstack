@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// The Chrome for Testing build later phases pin.
-pub const CHROME_VERSION: &str = "149.0.7827.55";
+pub use crate::browser::CHROME_VERSION;
 
 /// One line of the doctor's output.
 #[derive(Debug, PartialEq, Eq)]
@@ -66,10 +66,6 @@ fn tool(
             optional,
         },
     }
-}
-
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// Used and total share of the disk holding `path`, from `df`.
@@ -152,7 +148,7 @@ fn tools() -> Vec<Finding> {
             &["-c", "command -v ditto"],
             "ditto ships with macOS; this is not macOS",
             true,
-            "unpacks the pinned Chrome (phase 2)",
+            "unpacks the pinned Chrome",
         ),
     ]
 }
@@ -178,23 +174,25 @@ fn sdk_and_chrome() -> Vec<Finding> {
             optional: true,
         },
     });
-    let chrome = home().map(|h| {
-        h.join("Library/Caches/shakedown/chrome")
-            .join(CHROME_VERSION)
-    });
-    f.push(match chrome.filter(|p| p.is_dir()) {
-        Some(p) => Finding {
+    f.push(if crate::browser::installed() {
+        Finding {
             name: "chrome",
             missing: None,
-            detail: format!("{CHROME_VERSION} at {}", p.display()),
+            detail: format!(
+                "{CHROME_VERSION} at {}",
+                crate::browser::chrome_dir().display()
+            ),
             optional: true,
-        },
-        None => Finding {
+        }
+    } else {
+        Finding {
             name: "chrome",
-            missing: Some("shakedown browser install (arrives with the browser phase)".into()),
-            detail: format!("pinned Chrome {CHROME_VERSION}, phase 2"),
+            missing: Some("shakedown browser install".into()),
+            detail: format!(
+                "pinned Chrome {CHROME_VERSION} for ui checks (ui installs it on first use)"
+            ),
             optional: true,
-        },
+        }
     });
     f
 }
