@@ -1,7 +1,7 @@
 [package]
 name = "toddstack-accounts"
 # Versioned on its own, not with the workspace (webserver-base's version).
-version = "0.8.1"
+version = "0.9.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -35,8 +35,10 @@ subtle = "2.6.1"
 base64 = "0.23.1"
 getrandom = "0.4.3"
 hex = "0.4.3"
-# `sync`: one JWKS fetch shared by concurrent token checks. `time`: paces retries.
-tokio = { version = "1.54.1", default-features = false, features = ["sync", "time"] }
+# RFC 3339 times from the revoked-tokens poll.
+jiff = { version = "1.0.1", default-features = false, features = ["std"] }
+# `sync`: one JWKS fetch shared by concurrent token checks. `time`: paces retries. `rt`: the revocation poller task.
+tokio = { version = "1.54.1", default-features = false, features = ["sync", "time", "rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

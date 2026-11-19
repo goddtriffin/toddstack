@@ -25,6 +25,12 @@ export type AccountsErrorKind =
   | "unprocessable"
   /** A notification call hit a rate limit (429). Wait before sending again. `status` is set. */
   | "rate_limited"
+  /**
+   * A Server API call (`accounts.player(sub)`, `accounts.reportAsPlayer`) was refused: `status`, `code` (the API's `error`
+   * field: `not_found`, `suspended`, `scope`, `rate_limited`, `bad_request`, `unprocessable`, ...) and the message are set.
+   * Match on `code`. Everything but a 429 and a 5xx is final.
+   */
+  | "server"
   /** The request itself failed (network, timeout). */
   | "http"
   /** Bad configuration. */
@@ -38,14 +44,16 @@ export class AccountsError extends Error {
   readonly error?: string;
   /** The OAuth `error_description`, when the service sent one. */
   readonly description?: string;
-  /** The HTTP status, for `api`, `not_found`, `conflict`, `unprocessable` and `rate_limited`. */
+  /** The HTTP status, for `api`, `server`, `not_found`, `conflict`, `unprocessable` and `rate_limited`. */
   readonly status?: number;
+  /** The API's `error` code, for `server`. */
+  readonly code?: string;
 
   /** Builds an error; `details` carries the OAuth code, description, HTTP status or cause. */
   constructor(
     kind: AccountsErrorKind,
     message: string,
-    details: { error?: string; description?: string; status?: number; cause?: unknown } = {},
+    details: { error?: string; description?: string; status?: number; code?: string; cause?: unknown } = {},
   ) {
     super(message, details.cause === undefined ? undefined : { cause: details.cause });
     this.name = "AccountsError";
@@ -53,5 +61,6 @@ export class AccountsError extends Error {
     this.error = details.error;
     this.description = details.description;
     this.status = details.status;
+    this.code = details.code;
   }
 }

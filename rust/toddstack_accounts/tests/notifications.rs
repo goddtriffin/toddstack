@@ -1,4 +1,5 @@
 //! The notification API, the device API and the time zone hint against a fake accounts API.
+#![expect(deprecated, reason = "covers `Friends`, which stays until 0.10.0")]
 
 use std::sync::{Arc, Mutex};
 

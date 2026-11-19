@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/toddstack-accounts)](https://www.npmjs.com/package/toddstack-accounts)
 
 Client for Todd Griffin's Projects accounts (`accounts.toddgriffin.me`): what a project's backend needs to sign people
-in, check tokens, verify webhooks, use friends, and send notifications. The TypeScript half of `toddstack-accounts`,
+in, check tokens (locally, with instant logout), verify webhooks, act for players, and send notifications. The TypeScript half of `toddstack-accounts`,
 with the same features as the [Rust crate](../../rust/toddstack_accounts/README.md). Part of
 [toddstack](https://github.com/goddtriffin/toddstack).
 
@@ -142,7 +142,66 @@ Verify the raw body before parsing. An empty secret is refused. While you rotate
 both, so the header carries several `v1=` values and the event is accepted when any one matches the secret you hold.
 Signatures older than 5 minutes are refused. Deliveries retry, so ignore repeated `event.id`s.
 
-## Friends and events
+## Acting for a player (the Server API)
+
+Your server calls accounts **as itself** (your client credentials, so the config needs its `clientSecret`), naming the
+player by `sub`. It never sends a player's access or refresh token, so keep none past the sign-in code exchange.
+`accounts.player(sub)` has a method for every route under `/api/v1/players/{sub}`:
+
+```ts
+const player = accounts.player(sub);
+const profile = await player.profile(); // claims for the granted scopes, plus `visibility` and `suspended`
+const list = await player.friends(); // only friends who also use your project
+await player.requestByUsername("alex"); // or request(sub), requestByCode(code)
+await player.postEvent({ kind: "beat_your_score", title: "Alex beat your high score" }, "daily-2026-11-18");
+// the idempotency key is required; needs friends:events
+await player.report(other, "harassment");
+```
+
+Also `relationships(subs)`, `relationship(sub)`, `requests()`, `accept`, `decline`, `cancel`, `remove`, `block`,
+`unblock`, `blocks()`, `inbox(limit)`, `markRead(id)`, `mutes()`, `mute(kind)`, `unmute(kind)` (`ALL_KINDS` is every kind)
+and `setTimeZone(tz)`. `accounts.reportAsPlayer({ reporterSub, sub, reason, note })` is the report with its
+`reporter_sub`.
+
+- **Errors carry the code.** A refusal is an `AccountsError` with `kind: "server"`, `status` and `code`:
+  `not_found`, `suspended`, `scope`, `rate_limited`, `bad_request`, `unprocessable`, ... Match on `code`. Everything but a
+  429 and a 5xx is final. A player who never signed in to your project, a deleted one and one who removed your app are
+  all `not_found`; a suspended player can be read, not written for (`suspended`).
+- **Writes are idempotent and retried.** Each is a no-op success when the state already holds (a repeated block,
+  accept, mute), and an event is deduplicated by its key (`replayed`; the same key with another event is
+  `unprocessable`). Three attempts on a 429, a 5xx or a network failure.
+- Every list shows only people who also use your project. Sending a request may name any account holder; `not_found`
+  is the one answer for everyone who can't be asked.
+
+## Local token checks and instant logout
+
+A native app sends its accounts access token to your server, which checks it with no call to accounts:
+`verifyAccessToken` verifies the ES256 signature against the signing keys (fetched from `/oidc/jwks`, cached,
+refetched on an unknown `kid`), `iss`, `aud` (your client id) and `exp` (30 s of skew), and reads `sub` and `fam` (the
+token family). Local checks can't see a sign-out, so accounts pushes revocations and the client refuses a token whose
+`fam` is revoked. Two feeds fill one in-memory set (`accounts.revocations`), deduplicated by `fam` and kept until each
+entry's `expires_at`:
+
+```ts
+// Starts the poll (once now, awaited, then every 30 s) and gives you the client to share.
+const { accounts, poller } = await Accounts.withRevocationPoller(config, { onError: console.error });
+// at shutdown: poller.stop()
+
+// In your webhook route: verifies the signature, then records `tokens.revoked` families at once.
+const event = await accounts.handleWebhook(secret, request.headers.get(WEBHOOK_HEADER), rawBody);
+```
+
+`accounts.startRevocationPoller({ intervalMs, onError })` runs the poll on an existing client. A failed poll goes to
+`onError` and is retried; verification keeps working meanwhile.
+
+## Friends and events (deprecated)
+
+**Deprecated, removed in 0.10.0.** `accounts.friends(token)` and `Friends` call the bearer API with a player's access
+token, which a project server must not hold. Use `accounts.player(sub)` (above): the same method names, with
+`postEvent` taking an idempotency key. `userinfo` is deprecated the same way: use the ID token's claims from
+`finishLogin`, then `player(sub).profile()`.
+
+### The deprecated token-based API
 
 ```ts
 const friends = accounts.friends(accessToken);
@@ -294,11 +353,12 @@ const visible = playingNow.filter((p) => !hidden.includes(p.sub));
 
 ### Reports
 
-Report a username, picture or behaviour to Todd's review queue. A signed-in person reports with their own token (no
-particular scope); a guest has no token, so your server reports for them with your client secret:
+Report a username, picture or behaviour to Todd's review queue. Your server reports for a signed-in player with
+`player.report(..)` (their `sub` goes as `reporter_sub`; the deprecated `friends.report` uses their own token); a guest
+has no token, so your server reports for them with your client secret:
 
 ```ts
-await friends.report(sub, "harassment", "kept insulting me in chat");
+await player.report(sub, "harassment", "kept insulting me in chat");
 
 await accounts.reportAsGuest({
   sub,
@@ -318,6 +378,9 @@ Reads from the accounts service (the signing keys, `userinfo`, and every friends
 failure: a connection error, a timeout, a 5xx or a 429. Three attempts at most, each with its own 3 s deadline, paced by
 exponential backoff with full jitter (200 ms, doubling, capped at 1 s). A `Retry-After` of up to 2 s is waited out; a
 longer one ends the retries. No retry starts after 6 s. A 4xx is an answer and is never retried.
+
+Server API calls (`accounts.player(sub)`, `reportAsPlayer`) retry writes as well as reads, because every one is
+idempotent (3 attempts, 10 s deadline each for a write, no retry after 15 s; a 429 is retried only on a read).
 
 A notification send is retried too, but only when it carries an `idempotencyKey` (two more attempts, each with a 10 s
 deadline, no retry after 15 s): the service replays the recorded send, so a retry cannot notify twice. Without a key it
@@ -350,6 +413,12 @@ is accepted only for `127.0.0.1`, `localhost` and `::1`; any other `http` base o
 default.
 
 ## Breaking changes
+
+**0.9.0**: added `accounts.player(sub)` (the Server API), `reportAsPlayer`, `Revocations`, `startRevocationPoller`,
+`withRevocationPoller` and `handleWebhook`, and the `tokens.revoked` webhook type. `verifyAccessToken` now also
+refuses a token whose `fam` is revoked (nothing is revoked until you feed the set). `AccountsErrorKind` gained
+`"server"` (with `code`), so a `switch` checked with `never` needs a case for it; `EventResult` gained `replayed`.
+**Deprecated, removed in 0.10.0:** `accounts.friends(token)`, `Friends` and `userinfo`.
 
 **0.8.0**: `IdClaims` has a new required `visibility` field, so code that builds an `IdClaims` by hand (a test double,
 say) must add it. Verified tokens always carry it. Added `Visibility`, `visibilityOf`, `isReview` and

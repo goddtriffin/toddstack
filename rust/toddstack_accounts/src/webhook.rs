@@ -57,6 +57,10 @@ pub enum EventKind {
     /// `friend_request.declined`: `to_sub` turned down `from_sub`'s request.
     /// Sent once per side.
     FriendRequestDeclined,
+    /// `tokens.revoked`: these access-token families are dead (`data.families`,
+    /// see [`Event::families`]). [`crate::revocation::Revocations::apply`]
+    /// records them.
+    TokensRevoked,
     /// A type this version doesn't know.
     Other(String),
 }
@@ -78,6 +82,7 @@ impl EventKind {
             Self::FriendRequestCreated => "friend_request.created",
             Self::FriendRequestCancelled => "friend_request.cancelled",
             Self::FriendRequestDeclined => "friend_request.declined",
+            Self::TokensRevoked => "tokens.revoked",
             Self::Other(kind) => kind,
         }
     }
@@ -98,6 +103,7 @@ impl From<String> for EventKind {
             "friend_request.created" => Self::FriendRequestCreated,
             "friend_request.cancelled" => Self::FriendRequestCancelled,
             "friend_request.declined" => Self::FriendRequestDeclined,
+            "tokens.revoked" => Self::TokensRevoked,
             _ => Self::Other(kind),
         }
     }
@@ -169,6 +175,16 @@ impl Event {
             .get("visibility")
             .and_then(Value::as_str)
             .map(|v| crate::Visibility::from_wire(Some(v)))
+    }
+
+    /// The dead token families, for [`EventKind::TokensRevoked`]
+    /// (`data.families`). Empty when the event carries none.
+    #[must_use]
+    pub fn families(&self) -> Vec<&str> {
+        self.data
+            .get("families")
+            .and_then(Value::as_array)
+            .map_or_default(|list| list.iter().filter_map(Value::as_str).collect())
     }
 
     /// Who the request was sent to, for the `friend_request.*` events.

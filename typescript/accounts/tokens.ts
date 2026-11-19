@@ -4,12 +4,21 @@ import { type Visibility, visibilityOf } from "./visibility.ts";
 import { fromBase64, fromUtf8, utf8 } from "./encoding.ts";
 import { AccountsError } from "./error.ts";
 import { Friends } from "./friends.ts";
+import { checkedId, Player } from "./player.ts";
+import {
+  type RevocationOptions,
+  RevocationPoller,
+  Revocations,
+  unixSeconds,
+  WEBHOOK_REVOCATION_TTL_SECONDS,
+} from "./revocation.ts";
 import { type JwkSet, Keys } from "./jwks.ts";
 import { endSessionUrl, type LogoutOptions, type SignOut } from "./logout.ts";
 import { type LoginOptions, parseCallback, type PendingLogin, type StartedLogin, startLogin } from "./login.ts";
 import { type Device, deviceBody, type Platform } from "./devices.ts";
 import { type Notification, notificationBody, readReceipt, type Receipt } from "./notifications.ts";
-import { type GuestReport, reportBody } from "./report.ts";
+import { type GuestReport, type PlayerReport, playerReportBody, reportBody } from "./report.ts";
+import { verifyWebhook, type WebhookEvent } from "./webhook.ts";
 import { KEYED_SEND, NOTIFICATION_STATUS, READ, type RetryPolicy, send } from "./retry.ts";
 import { VERSION } from "./version.ts";
 
@@ -142,6 +151,11 @@ export interface AccessClaims {
   scope: string;
   /** Expiry, Unix seconds. */
   exp: number;
+  /**
+   * The token family: every token from one sign-in and its refreshes. `verifyAccessToken` refuses a revoked one (see
+   * `Revocations`). Absent on tokens issued before the service added it.
+   */
+  fam?: string;
   /** Any other claim. */
   [claim: string]: unknown;
 }
@@ -186,6 +200,8 @@ export class Accounts {
   readonly config: Config;
   #fetch: typeof fetch;
   #keys: Keys;
+  /** The token families known to be revoked; see `startRevocationPoller` and `handleWebhook`. */
+  readonly revocations: Revocations = new Revocations();
 
   /** A client for `config`. Throws `config` if the client id is empty, or the issuer is plain `http` off loopback. */
   constructor(config: Config, options: AccountsOptions = {}) {
@@ -281,21 +297,128 @@ export class Accounts {
   }
 
   /**
-   * Verifies an access token sent to *your* API (for example by your native app): signature, `typ: at+jwt`,
-   * issuer, audience = your client id, expiry. Tokens issued to other apps are refused.
+   * Verifies an access token sent to *your* API (for example by your native app), locally: ES256 signature against
+   * the cached signing keys (fetched from `/oidc/jwks`, refetched on an unknown `kid`), `typ: at+jwt`, issuer,
+   * audience = your client id, expiry (30 s of clock skew allowed). Tokens issued to other apps are refused, and so
+   * is a token whose `fam` has been revoked: feed `revocations` with `handleWebhook` and `startRevocationPoller`.
+   * Never calls the accounts service per token.
    */
   async verifyAccessToken(token: string): Promise<AccessClaims> {
-    return (await this.#decode(token, "at+jwt")) as AccessClaims;
+    const claims = (await this.#decode(token, "at+jwt")) as AccessClaims;
+    if (typeof claims.fam === "string" && this.revocations.isRevoked(claims.fam)) {
+      throw new AccountsError("invalid_token", "token rejected: token revoked");
+    }
+    return claims;
   }
 
-  /** The person's profile from `/me`. */
+  /**
+   * The person's profile from `/me`, with their access token.
+   *
+   * @deprecated A project server must not hold a player's token. Use the ID token's claims from `finishLogin`, then
+   * `accounts.player(sub).profile()`. Removed in 0.10.0.
+   */
   userinfo(accessToken: string): Promise<Record<string, unknown>> {
     return this.call(accessToken, "GET", `${this.config.issuer}/me`) as Promise<Record<string, unknown>>;
   }
 
-  /** The friends, events and inbox API for one person. */
+  /**
+   * The friends, events and inbox API for one person, with their access token.
+   *
+   * @deprecated A project server must not hold a player's token. Use `accounts.player(sub)`. Removed in 0.10.0.
+   */
   friends(accessToken: string): Friends {
     return new Friends(this, accessToken);
+  }
+
+  /**
+   * The Server API for the player `sub`: everything your server does for a signed-in player (profile, friends,
+   * blocks, events, inbox, mutes, time zone, reports), as your project with your client credentials, never with the
+   * player's token. Throws `config` without a client secret, `server` (`bad_request`) for a `sub` that isn't a
+   * plain id.
+   */
+  player(sub: string): Player {
+    if (this.config.clientSecret === null) {
+      throw new AccountsError("config", "the Server API needs the client secret: set `clientSecret`");
+    }
+    return new Player(this, sub);
+  }
+
+  /**
+   * Reports someone to Todd's review queue on behalf of the signed-in player `reporterSub` (the same as
+   * `player(sub).report`). Idempotent: an open report with the same reporter, person and reason is stored once.
+   */
+  async reportAsPlayer(report: PlayerReport): Promise<void> {
+    checkedId(report.reporterSub);
+    await this.serverCall("POST", "/reports", playerReportBody(report));
+  }
+
+  /**
+   * One Server API call as your project. Reads and writes are both retried: every write is idempotent. Errors are
+   * `server` errors carrying the API's `code`. Used by `Player`.
+   */
+  serverCall(method: string, path: string, body?: unknown): Promise<unknown> {
+    if (this.config.clientSecret === null) {
+      throw new AccountsError("config", "the Server API needs the client secret: set `clientSecret`");
+    }
+    const url = `${this.config.issuer.replace(/\/oidc$/, "")}/api/v1${path}`;
+    return this.#callWith(`Basic ${this.#basic(this.config.clientSecret)}`, method, url, body, {
+      server: true,
+    });
+  }
+
+  /**
+   * Starts the backup poll for revoked tokens: one poll now (awaited, so tokens revoked before this process started
+   * are already refused when it resolves), then one every 30 seconds. Needs the client secret. A failed poll goes to
+   * `onError` and is retried. Call `stop()` on the result at shutdown.
+   */
+  async startRevocationPoller(options: RevocationOptions = {}): Promise<RevocationPoller> {
+    if (this.config.clientSecret === null) {
+      throw new AccountsError("config", "polling revocations needs the client secret: set `clientSecret`");
+    }
+    return await RevocationPoller.start(this, options);
+  }
+
+  /**
+   * One poll of `GET /api/v1/revoked-tokens`: records the families it lists and answers the cursor for the next call
+   * (start with `null`: the service answers the last 15 minutes) and how many families were listed.
+   * `startRevocationPoller` does this for you.
+   */
+  async pollRevocations(since: string | null): Promise<{ next: string | null; listed: number }> {
+    const path = since === null ? "/revoked-tokens" : `/revoked-tokens?since=${encodeURIComponent(since)}`;
+    const answer = await this.#projectCall("GET", path) as
+      | { families?: { fam?: unknown; expires_at?: unknown }[]; now?: unknown }
+      | null;
+    const families = Array.isArray(answer?.families) ? answer.families : [];
+    for (const family of families) {
+      if (typeof family.fam !== "string") continue;
+      // An unreadable expiry still revokes, for the longest a token lives.
+      const until = typeof family.expires_at === "string" ? unixSeconds(family.expires_at) : null;
+      this.revocations.revoke(family.fam, until ?? Math.floor(Date.now() / 1000) + WEBHOOK_REVOCATION_TTL_SECONDS);
+    }
+    return { next: typeof answer?.now === "string" ? answer.now : since, listed: families.length };
+  }
+
+  /**
+   * Verifies a webhook (`verifyWebhook`) and, when it is `tokens.revoked`, records its families so tokens of those
+   * families stop verifying at once. Returns the event for the rest of your handling.
+   */
+  async handleWebhook(
+    secret: string | Uint8Array,
+    signatureHeader: string | null | undefined,
+    body: string | Uint8Array,
+  ): Promise<WebhookEvent> {
+    const event = await verifyWebhook(secret, signatureHeader, body);
+    this.revocations.apply(event);
+    return event;
+  }
+
+  /** A client that checks tokens against revocations from the start: builds it and starts the poller. */
+  static async withRevocationPoller(
+    config: Config,
+    options: AccountsOptions & RevocationOptions = {},
+  ): Promise<{ accounts: Accounts; poller: RevocationPoller }> {
+    const accounts = new Accounts(config, options);
+    return { accounts, poller: await accounts.startRevocationPoller(options) };
   }
 
   /**
@@ -408,7 +531,7 @@ export class Accounts {
     method: string,
     url: string,
     body?: unknown,
-    options: { typedErrors?: boolean; retryWrites?: boolean } = {},
+    options: { typedErrors?: boolean; retryWrites?: boolean; server?: boolean } = {},
   ): Promise<unknown> {
     const headers: Record<string, string> = {
       authorization,
@@ -418,10 +541,29 @@ export class Accounts {
     const response = await this.#send(
       url,
       { method, headers, body: body === undefined ? undefined : JSON.stringify(body) },
-      options.retryWrites ? KEYED_SEND : options.typedErrors ? NOTIFICATION_STATUS : READ,
-      options.retryWrites,
+      options.server
+        ? (method === "GET" ? READ : KEYED_SEND)
+        : options.retryWrites
+        ? KEYED_SEND
+        : options.typedErrors
+        ? NOTIFICATION_STATUS
+        : READ,
+      options.retryWrites || options.server,
     );
     const text = await response.text();
+    if (!response.ok && options.server) {
+      let code = `http_${response.status}`;
+      let message = text;
+      try {
+        const parsed = JSON.parse(text);
+        if (typeof parsed?.error === "string") code = parsed.error;
+        if (typeof parsed?.message === "string") message = parsed.message;
+      } catch { /* not JSON: keep the text */ }
+      throw new AccountsError("server", `accounts API returned ${response.status} ${code}: ${message}`, {
+        status: response.status,
+        code,
+      });
+    }
     if (!response.ok) {
       let message = text;
       try {

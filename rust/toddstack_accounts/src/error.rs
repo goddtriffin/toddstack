@@ -46,8 +46,30 @@ pub enum Error {
     /// A notification call hit a rate limit (429). Wait before sending again.
     #[error("rate limited: {0}")]
     RateLimited(String),
+    /// A Server API call (`Accounts::player`, `Accounts::report_as_player`)
+    /// was refused. `code` is the stable `error` field of the answer
+    /// (`not_found`, `suspended`, `scope`, `rate_limited`, `bad_request`,
+    /// `unprocessable`, ...): match on it, not on `message`. Everything but a
+    /// 429 and a 5xx is final.
+    #[error("accounts API returned {status} {code}: {message}")]
+    Server {
+        status: u16,
+        code: String,
+        message: String,
+    },
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
     #[error("configuration: {0}")]
     Config(String),
+}
+
+impl Error {
+    /// The API's `error` code, for [`Error::Server`].
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Server { code, .. } => Some(code),
+            _ => None,
+        }
+    }
 }

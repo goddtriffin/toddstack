@@ -43,6 +43,7 @@ export const WEBHOOK_EVENT_TYPES = [
   "friend_request.created",
   "friend_request.cancelled",
   "friend_request.declined",
+  "tokens.revoked",
 ] as const;
 
 /** An event type this version knows (see `WEBHOOK_EVENT_TYPES`). */
@@ -73,6 +74,8 @@ export interface WebhookEvent {
     friend_sub?: string;
     from_sub?: string;
     to_sub?: string;
+    /** For `tokens.revoked`: the dead token families (`Revocations.apply` records them). */
+    families?: string[];
     /** `user.updated`: whether the person is a review account (`"review"`) or not (`"normal"`). */
     visibility?: Visibility;
     [field: string]: unknown;

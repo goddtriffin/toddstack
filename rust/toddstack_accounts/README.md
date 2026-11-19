@@ -1,7 +1,7 @@
 # toddstack-accounts
 
 Client for Todd Griffin's Projects accounts (`accounts.toddgriffin.me`): what a project's backend needs to sign
-people in, check tokens, verify webhooks, and use friends. Part of
+people in, check tokens, verify webhooks, and act for players. Part of
 [toddstack](https://github.com/goddtriffin/toddstack).
 
 Web apps use the **backend-for-frontend** pattern: your Rust backend is the OIDC client and keeps the tokens;
@@ -120,7 +120,69 @@ with both, so the header carries several `v1=` values and the event is accepted 
 hold. Signatures older than 5 minutes are refused. Deliveries retry, so ignore
 repeated `event.id`s.
 
-## Friends and events
+## Acting for a player (the Server API)
+
+Your server calls accounts **as itself** (your client credentials, so the config needs its client secret), naming the
+player by `sub`. It never sends a player's access or refresh token, so keep none past the sign-in code exchange.
+`accounts.player(sub)` has a method for every route under `/api/v1/players/{sub}`:
+
+```rust
+use toddstack_accounts::friends::Event;
+
+let player = accounts.player(&sub)?;
+let profile = player.profile().await?;      // claims for the granted scopes, plus `visibility` and `suspended`
+let friends = player.friends().await?;      // only friends who also use your project
+player.request_by_username("alex").await?;  // or request(sub), request_by_code(code)
+player.post_event(&Event {
+    kind: String::from("beat_your_score"),
+    title: String::from("Alex beat your high score"),
+    ..Event::default()
+}, "daily-2026-11-18").await?;              // the idempotency key is required; needs friends:events
+player.report(&other, Reason::Harassment, None).await?;
+```
+
+Also `relationships(&[..])`, `relationship(sub)`, `requests()`, `accept`, `decline`, `cancel`, `remove`, `block`,
+`unblock`, `blocks()`, `inbox(limit)`, `mark_read(id)`, `mutes()`, `mute(kind)`, `unmute(kind)` (`ALL_KINDS` is every kind)
+and `set_time_zone(tz)`. `accounts.report_as_player(&PlayerReport { reporter_sub, .. })` is the report with its
+`reporter_sub`.
+
+- **Errors carry the code.** A refusal is `Error::Server { status, code, message }`; `error.code()` is `not_found`,
+  `suspended`, `scope`, `rate_limited`, `bad_request`, `unprocessable`, ... Match on it. Everything but a 429 and a 5xx is
+  final. A player who never signed in to your project, a deleted one and one who removed your app are all `not_found`;
+  a suspended player can be read, not written for (`suspended`).
+- **Writes are idempotent and retried.** Each is a no-op success when the state already holds (a repeated block, accept,
+  mute), and an event is deduplicated by its key (`EventResult::replayed`; the same key with another event is
+  `unprocessable`). Three attempts on a 429, a 5xx or a connection failure.
+- Every list shows only people who also use your project. Sending a request may name any account holder; `not_found`
+  is the one answer for everyone who can't be asked.
+
+## Local token checks and instant logout
+
+A native app sends its accounts access token to your server, which checks it with no call to accounts:
+`verify_access_token` verifies the ES256 signature against the signing keys (fetched from `/oidc/jwks`, cached, refetched
+on an unknown `kid`), `iss`, `aud` (your client id) and `exp` (30 s of skew), and reads `sub` and `fam` (the token
+family). Local checks can't see a sign-out, so accounts pushes revocations and the client refuses a token whose `fam`
+is revoked. Two feeds fill one in-memory set (`accounts.revocations()`), deduplicated by `fam` and kept until each
+entry's `expires_at`:
+
+```rust
+// Starts the poll (once now, awaited, then every 30 s) and gives you the client to share.
+let (accounts, _poller) = Accounts::with_revocation_poller(config).await?; // keep _poller alive
+
+// In your webhook route: verifies the signature, then records `tokens.revoked` families at once.
+let event = accounts.handle_webhook(secret, signature_header, body)?;
+```
+
+`start_revocation_poller_with(PollerOptions { interval, on_error })` runs the poll on an existing `Arc<Accounts>`;
+`on_error` hears each failed poll (it is retried; verification keeps working meanwhile). Dropping the poller stops it.
+
+## Friends and events (deprecated)
+
+**Deprecated, removed in 0.10.0.** `Friends` calls the bearer API with a player's access token, which a project server
+must not hold. Use `accounts.player(sub)` (above): the same method names, with `post_event` taking an idempotency key.
+`userinfo` is deprecated the same way: use the ID token's claims from `finish_login`, then `player(sub)?.profile()`.
+
+### The deprecated token-based API
 
 ```rust
 use toddstack_accounts::friends::{Event, Friends};
@@ -310,13 +372,14 @@ let visible: Vec<_> = playing_now.into_iter().filter(|p| !blocks.hidden.contains
 
 ## Reports
 
-Report a username, picture or behaviour to Todd's review queue. A signed-in person reports with their own
-token (no particular scope); a guest has no token, so your server reports for them with your client secret:
+Report a username, picture or behaviour to Todd's review queue. Your server reports for a signed-in player with
+`player.report(..)` (their `sub` goes as `reporter_sub`; the deprecated `friends.report` uses their own token); a guest
+has no token, so your server reports for them with your client secret:
 
 ```rust
 use toddstack_accounts::report::{GuestReport, Reason};
 
-friends.report(&sub, Reason::Harassment, Some("kept insulting me in chat")).await?;
+player.report(&sub, Reason::Harassment, Some("kept insulting me in chat")).await?;
 
 accounts.report_as_guest(&GuestReport {
     sub,
@@ -337,6 +400,9 @@ Reads from the accounts service (the signing keys, `userinfo`, and every friends
 failure: a connection error, a timeout, a 5xx or a 429. Three attempts at most, each with its own 3 s deadline, paced by
 exponential backoff with full jitter (200 ms, doubling, capped at 1 s). A `Retry-After` of up to 2 s is waited out; a
 longer one ends the retries. No retry starts after 6 s. A 4xx is an answer and is never retried.
+
+Server API calls (`accounts.player(sub)`, `report_as_player`) retry writes as well as reads, because every one is
+idempotent (3 attempts, 10 s deadline each for a write, no retry after 15 s; a 429 is retried only on a read).
 
 A notification send is retried too, but only when it carries an `idempotency_key` (two more attempts, each with a 10 s
 deadline, no retry after 15 s): the service replays the recorded send, so a retry cannot notify twice. Without a key it
@@ -361,6 +427,14 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 **Issuer match:** the issuer must exactly match the local server's `ACCOUNTS_BASE_URL`. If you run accounts on `http://localhost:8790` (needed for passkeys), use `toddgriffin_at("http://localhost:8790", ..)`, not the `127.0.0.1` default.
 
 ## Breaking changes
+
+**0.9.0**: added `Accounts::player` (the Server API), `report_as_player`, `revocation` (`Revocations`, the poller,
+`Accounts::handle_webhook`) and `EventKind::TokensRevoked`. `verify_access_token` now also refuses a token whose
+`fam` is revoked (nothing is revoked until you feed the set). Source-breaking: `AccessClaims` has a new `fam` field and
+`EventResult` a new `replayed` field, so code that builds either with a struct literal must add it; `Error` has a new
+`Server` variant (`Error` is `non_exhaustive`). New dependency: `jiff` (RFC 3339 times). **Deprecated, removed in
+0.10.0:** `Friends` (every method) and `Accounts::userinfo`. `FriendsAuth` / `friends_router` still use `Friends`
+for now.
 
 **0.8.0**: `IdClaims` has a new `visibility` field and `Notification` a new `sender_sub` field, so code that builds either with a struct literal must add it (`Notification::new` and token verification are unchanged). Added `Visibility`, `IdClaims::is_review` and `Event::visibility`.
 

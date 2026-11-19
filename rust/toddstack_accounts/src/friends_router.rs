@@ -15,6 +15,11 @@
 //! Every route lives under [`BASE`] and answers JSON. Errors are
 //! `{"error": <code>, "message": <text for the person>}`; see [`Failure`].
 
+#![expect(
+    deprecated,
+    reason = "still serves the token-based `FriendsAuth::access_token`; removed in 0.10.0"
+)]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
