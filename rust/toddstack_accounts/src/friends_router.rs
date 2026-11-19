@@ -2,11 +2,16 @@
 //!
 //! Your web and native apps list, send, accept, decline, cancel, remove, block
 //! and unblock friends inside your own UI, through your own server, which
-//! forwards to the accounts service with the signed-in person's access token
-//! ([`Friends`]). The browser and the apps never see that token.
+//! forwards to the accounts service. The browser and the apps never see
+//! accounts credentials.
 //!
 //! You supply the one thing this crate cannot know: who the caller is
-//! ([`FriendsAuth`]). Guests and signed-out callers get `401`.
+//! ([`FriendsAuth`]). Answer [`FriendsAuth::player_sub`] and the router acts
+//! for that player over the Server API with your client credentials
+//! ([`Accounts::player`]), so you store no accounts token. The older
+//! [`FriendsAuth::access_token`] (forwarding the person's own token) still
+//! works but is deprecated and goes in 0.10.0. Guests and signed-out callers
+//! get `401`.
 //!
 //! ```ignore
 //! let app = Router::new().merge(friends_router::router(accounts, Arc::new(my_auth)));
@@ -34,7 +39,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::Error;
-use crate::friends::{Friends, MAX_RELATIONSHIPS_PER_CALL, Sent, is_valid_id};
+use crate::friends::{
+    Blocks, Friends, MAX_RELATIONSHIPS_PER_CALL, Person, Relationship, Requests, Sent, is_valid_id,
+};
+use crate::player::Player;
 use crate::tokens::Accounts;
 
 /// Where [`router`] mounts every route. Chosen to sit beside, not on top of,
@@ -63,9 +71,29 @@ impl Credential {
 pub trait FriendsAuth: Send + Sync + 'static {
     /// The caller's accounts access token (scope `friends`, refreshed if it
     /// expired) and which credential proved it; `None` for a guest or
-    /// signed-out caller. Report [`Credential::Cookie`] whenever a cookie
+    /// signed-out caller (the default). Only asked when `player_sub` has no answer. Report [`Credential::Cookie`] whenever a cookie
     /// authenticated the request, even if a `Bearer` header is also present.
-    fn access_token(&self, headers: &HeaderMap) -> impl Future<Output = Option<Credential>> + Send;
+    #[deprecated(
+        since = "0.9.0",
+        note = "implement `player_sub`: the router then acts for the player with your client credentials"
+    )]
+    fn access_token(&self, headers: &HeaderMap) -> impl Future<Output = Option<Credential>> + Send {
+        let _ = headers;
+        std::future::ready(None)
+    }
+
+    /// The caller's `sub` and which credential proved it; `None` for a guest or signed-out caller, or to fall
+    /// back to [`FriendsAuth::access_token`]. When it answers, the router acts for that player over the Server API
+    /// ([`Accounts::player`]) with your client credentials, so no player token is needed (the client secret is).
+    /// Only the credential's kind matters here (a cookie write gets the same-origin check); its string is ignored,
+    /// so pass an empty one. Report [`Credential::Cookie`] whenever a cookie authenticated the request.
+    fn player_sub(
+        &self,
+        headers: &HeaderMap,
+    ) -> impl Future<Output = Option<(String, Credential)>> + Send {
+        let _ = headers;
+        std::future::ready(None)
+    }
 
     /// Your site's origin (`https://www.example.com`), the only cross-origin
     /// answer a cookie-authenticated write accepts.
@@ -149,6 +177,20 @@ impl Failure {
 }
 
 fn classify(error: &Error) -> (Failure, String) {
+    // The Server API reports `Error::Server`; it means what the same status means from the bearer API.
+    let as_api: Error;
+    let error: &Error = if let Error::Server {
+        status, message, ..
+    } = error
+    {
+        as_api = Error::Api {
+            status: *status,
+            message: message.clone(),
+        };
+        &as_api
+    } else {
+        error
+    };
     match error {
         Error::Api {
             status: 400,
@@ -206,16 +248,113 @@ fn same_origin<A: FriendsAuth>(auth: &A, headers: &HeaderMap) -> bool {
         .is_some_and(|origin| origin == auth.public_origin())
 }
 
-async fn token<A: FriendsAuth>(
-    shared: &Shared<A>,
+/// Who the router acts for on one request: the player over the Server API, or a person's own access token.
+enum Act<'a> {
+    Player(Player<'a>),
+    Token(&'a Accounts, String),
+}
+
+impl Act<'_> {
+    async fn list(&self) -> Result<Vec<Person>, Error> {
+        match self {
+            Self::Player(p) => p.friends().await,
+            Self::Token(a, t) => Friends::new(a, t).list().await,
+        }
+    }
+
+    async fn requests(&self) -> Result<Requests, Error> {
+        match self {
+            Self::Player(p) => p.requests().await,
+            Self::Token(a, t) => Friends::new(a, t).requests().await,
+        }
+    }
+
+    async fn request_by_username(&self, username: &str) -> Result<Sent, Error> {
+        match self {
+            Self::Player(p) => p.request_by_username(username).await,
+            Self::Token(a, t) => Friends::new(a, t).request_by_username(username).await,
+        }
+    }
+
+    async fn request_by_code(&self, code: &str) -> Result<Sent, Error> {
+        match self {
+            Self::Player(p) => p.request_by_code(code).await,
+            Self::Token(a, t) => Friends::new(a, t).request_by_code(code).await,
+        }
+    }
+
+    async fn accept(&self, sub: &str) -> Result<(), Error> {
+        match self {
+            Self::Player(p) => p.accept(sub).await,
+            Self::Token(a, t) => Friends::new(a, t).accept(sub).await,
+        }
+    }
+
+    async fn decline(&self, sub: &str) -> Result<(), Error> {
+        match self {
+            Self::Player(p) => p.decline(sub).await,
+            Self::Token(a, t) => Friends::new(a, t).decline(sub).await,
+        }
+    }
+
+    async fn cancel(&self, sub: &str) -> Result<(), Error> {
+        match self {
+            Self::Player(p) => p.cancel(sub).await,
+            Self::Token(a, t) => Friends::new(a, t).cancel(sub).await,
+        }
+    }
+
+    async fn remove(&self, sub: &str) -> Result<(), Error> {
+        match self {
+            Self::Player(p) => p.remove(sub).await,
+            Self::Token(a, t) => Friends::new(a, t).remove(sub).await,
+        }
+    }
+
+    async fn relationships(&self, subs: &[&str]) -> Result<HashMap<String, Relationship>, Error> {
+        match self {
+            Self::Player(p) => p.relationships(subs).await,
+            Self::Token(a, t) => Friends::new(a, t).relationships(subs).await,
+        }
+    }
+
+    async fn blocks(&self) -> Result<Blocks, Error> {
+        match self {
+            Self::Player(p) => p.blocks().await,
+            Self::Token(a, t) => Friends::new(a, t).blocks().await,
+        }
+    }
+
+    async fn block(&self, sub: &str) -> Result<(), Error> {
+        match self {
+            Self::Player(p) => p.block(sub).await,
+            Self::Token(a, t) => Friends::new(a, t).block(sub).await,
+        }
+    }
+
+    async fn unblock(&self, sub: &str) -> Result<(), Error> {
+        match self {
+            Self::Player(p) => p.unblock(sub).await,
+            Self::Token(a, t) => Friends::new(a, t).unblock(sub).await,
+        }
+    }
+}
+
+async fn actor<'a, A: FriendsAuth>(
+    shared: &'a Shared<A>,
     headers: &HeaderMap,
     write: bool,
-) -> Result<String, Box<Response>> {
-    let credential: Credential = shared
-        .auth
-        .access_token(headers)
-        .await
-        .ok_or_else(|| Box::new(Failure::AccountRequired.respond("Sign in to use friends.")))?;
+) -> Result<Act<'a>, Box<Response>> {
+    let (credential, player): (Credential, Option<String>) =
+        if let Some((sub, credential)) = shared.auth.player_sub(headers).await {
+            (credential, Some(sub))
+        } else {
+            let credential: Credential =
+                shared.auth.access_token(headers).await.ok_or_else(|| {
+                    Box::new(Failure::AccountRequired.respond("Sign in to use friends."))
+                })?;
+            (credential, None)
+        };
     if write
         && matches!(credential, Credential::Cookie(_))
         && !same_origin(shared.auth.as_ref(), headers)
@@ -224,7 +363,14 @@ async fn token<A: FriendsAuth>(
             Failure::CrossSite.respond("That request came from another site."),
         ));
     }
-    Ok(credential.token().to_owned())
+    match player {
+        Some(sub) => shared
+            .accounts
+            .player(&sub)
+            .map(Act::Player)
+            .map_err(|e| Box::new(fail(&e))),
+        None => Ok(Act::Token(&shared.accounts, credential.token().to_owned())),
+    }
 }
 
 /// A `sub` from the URL is percent-decoded by axum: refuse anything that isn't a plain id before it reaches a path.
@@ -248,22 +394,22 @@ fn done(result: Result<(), Error>) -> Response {
 type St<A> = State<Arc<Shared<A>>>;
 
 async fn list<A: FriendsAuth>(State(s): St<A>, headers: HeaderMap) -> Response {
-    let token: String = match token(&s, &headers, false).await {
+    let act: Act<'_> = match actor(&s, &headers, false).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
-    match Friends::new(&s.accounts, &token).list().await {
+    match act.list().await {
         Ok(friends) => Json(json!({ "friends": friends })).into_response(),
         Err(e) => fail(&e),
     }
 }
 
 async fn requests<A: FriendsAuth>(State(s): St<A>, headers: HeaderMap) -> Response {
-    let token: String = match token(&s, &headers, false).await {
+    let act: Act<'_> = match actor(&s, &headers, false).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
-    match Friends::new(&s.accounts, &token).requests().await {
+    match act.requests().await {
         Ok(r) => Json(r).into_response(),
         Err(e) => fail(&e),
     }
@@ -280,14 +426,14 @@ async fn send<A: FriendsAuth>(
     headers: HeaderMap,
     body: Result<Json<SendBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let token: String = match token(&s, &headers, true).await {
+    let act: Act<'_> = match actor(&s, &headers, true).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
     let Ok(Json(body)) = body else {
         return Failure::BadRequest.respond("Send a username or a friend code.");
     };
-    let friends: Friends<'_> = Friends::new(&s.accounts, &token);
+    let friends: &Act<'_> = &act;
     let sent: Result<Sent, Error> = match (body.username, body.friend_code) {
         (Some(username), None) => friends.request_by_username(&username).await,
         (None, Some(code)) => friends.request_by_code(&code).await,
@@ -304,14 +450,14 @@ async fn accept<A: FriendsAuth>(
     headers: HeaderMap,
     Path(sub): Path<String>,
 ) -> Response {
-    let token: String = match token(&s, &headers, true).await {
+    let act: Act<'_> = match actor(&s, &headers, true).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
     if let Err(r) = id(&sub) {
         return *r;
     }
-    done(Friends::new(&s.accounts, &token).accept(&sub).await)
+    done(act.accept(&sub).await)
 }
 
 async fn decline<A: FriendsAuth>(
@@ -319,14 +465,14 @@ async fn decline<A: FriendsAuth>(
     headers: HeaderMap,
     Path(sub): Path<String>,
 ) -> Response {
-    let token: String = match token(&s, &headers, true).await {
+    let act: Act<'_> = match actor(&s, &headers, true).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
     if let Err(r) = id(&sub) {
         return *r;
     }
-    done(Friends::new(&s.accounts, &token).decline(&sub).await)
+    done(act.decline(&sub).await)
 }
 
 async fn cancel<A: FriendsAuth>(
@@ -334,14 +480,14 @@ async fn cancel<A: FriendsAuth>(
     headers: HeaderMap,
     Path(sub): Path<String>,
 ) -> Response {
-    let token: String = match token(&s, &headers, true).await {
+    let act: Act<'_> = match actor(&s, &headers, true).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
     if let Err(r) = id(&sub) {
         return *r;
     }
-    done(Friends::new(&s.accounts, &token).cancel(&sub).await)
+    done(act.cancel(&sub).await)
 }
 
 async fn remove<A: FriendsAuth>(
@@ -349,14 +495,14 @@ async fn remove<A: FriendsAuth>(
     headers: HeaderMap,
     Path(sub): Path<String>,
 ) -> Response {
-    let token: String = match token(&s, &headers, true).await {
+    let act: Act<'_> = match actor(&s, &headers, true).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
     if let Err(r) = id(&sub) {
         return *r;
     }
-    done(Friends::new(&s.accounts, &token).remove(&sub).await)
+    done(act.remove(&sub).await)
 }
 
 #[derive(Deserialize)]
@@ -369,7 +515,7 @@ async fn relationships<A: FriendsAuth>(
     headers: HeaderMap,
     Query(query): Query<RelationshipsQuery>,
 ) -> Response {
-    let token: String = match token(&s, &headers, false).await {
+    let act: Act<'_> = match actor(&s, &headers, false).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -381,7 +527,7 @@ async fn relationships<A: FriendsAuth>(
     {
         return Failure::BadRequest.respond("Send 1 to 100 comma-separated subs.");
     }
-    match Friends::new(&s.accounts, &token).relationships(&subs).await {
+    match act.relationships(&subs).await {
         Ok(found) => {
             let found: HashMap<String, crate::friends::Relationship> = found;
             Json(json!({ "relationships": found })).into_response()
@@ -391,11 +537,11 @@ async fn relationships<A: FriendsAuth>(
 }
 
 async fn blocks<A: FriendsAuth>(State(s): St<A>, headers: HeaderMap) -> Response {
-    let token: String = match token(&s, &headers, false).await {
+    let act: Act<'_> = match actor(&s, &headers, false).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
-    match Friends::new(&s.accounts, &token).blocks().await {
+    match act.blocks().await {
         Ok(b) => Json(b).into_response(),
         Err(e) => fail(&e),
     }
@@ -411,7 +557,7 @@ async fn block<A: FriendsAuth>(
     headers: HeaderMap,
     body: Result<Json<BlockBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let token: String = match token(&s, &headers, true).await {
+    let act: Act<'_> = match actor(&s, &headers, true).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -421,7 +567,7 @@ async fn block<A: FriendsAuth>(
     if let Err(r) = id(&body.sub) {
         return *r;
     }
-    done(Friends::new(&s.accounts, &token).block(&body.sub).await)
+    done(act.block(&body.sub).await)
 }
 
 async fn unblock<A: FriendsAuth>(
@@ -429,14 +575,14 @@ async fn unblock<A: FriendsAuth>(
     headers: HeaderMap,
     Path(sub): Path<String>,
 ) -> Response {
-    let token: String = match token(&s, &headers, true).await {
+    let act: Act<'_> = match actor(&s, &headers, true).await {
         Ok(t) => t,
         Err(r) => return *r,
     };
     if let Err(r) = id(&sub) {
         return *r;
     }
-    done(Friends::new(&s.accounts, &token).unblock(&sub).await)
+    done(act.unblock(&sub).await)
 }
 
 /// The friends routes, ready to merge into your app. Routes:

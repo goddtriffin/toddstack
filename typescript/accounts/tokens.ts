@@ -196,25 +196,30 @@ const LEEWAY_SECONDS = 30;
 
 /** The client. Create one per process and share it; it caches the signing keys. */
 export class Accounts {
-  /** This client's registration. */
-  readonly config: Config;
+  readonly #config: Config;
   #fetch: typeof fetch;
   #keys: Keys;
   /** The token families known to be revoked; see `startRevocationPoller` and `handleWebhook`. */
   readonly revocations: Revocations = new Revocations();
 
+  /** This client's registration, without the client secret (it never appears in logs or inspect output). */
+  get config(): Omit<Config, "clientSecret"> {
+    const { issuer, clientId, redirectUri } = this.#config;
+    return { issuer, clientId, redirectUri };
+  }
+
   /** A client for `config`. Throws `config` if the client id is empty, or the issuer is plain `http` off loopback. */
   constructor(config: Config, options: AccountsOptions = {}) {
     if (!config.clientId) throw new AccountsError("config", "configuration: clientId is required");
     checkUrl(config.issuer);
-    this.config = { ...config, issuer: config.issuer.replace(/\/+$/, "") };
+    this.#config = { ...config, issuer: config.issuer.replace(/\/+$/, "") };
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
-    this.#keys = options.keys ? Keys.pinned(options.keys) : Keys.remote(`${this.config.issuer}/jwks`, this.#fetch);
+    this.#keys = options.keys ? Keys.pinned(options.keys) : Keys.remote(`${this.#config.issuer}/jwks`, this.#fetch);
   }
 
   /** Starts a sign-in: redirect the person to `url` and keep `pending` (see `startLogin`). */
   startLogin(options: LoginOptions = {}): Promise<StartedLogin> {
-    return startLogin(this.config, options);
+    return startLogin(this.#config, options);
   }
 
   /**
@@ -225,7 +230,7 @@ export class Accounts {
     const callback = parseCallback(callbackQuery);
     const mismatch = "the sign-in callback doesn't match this browser's pending sign-in";
     if (callback.state !== pending.state) throw new AccountsError("state_mismatch", mismatch);
-    if (callback.iss !== null && callback.iss !== this.config.issuer) {
+    if (callback.iss !== null && callback.iss !== this.#config.issuer) {
       throw new AccountsError("state_mismatch", mismatch);
     }
     if (callback.error !== null) {
@@ -238,7 +243,7 @@ export class Accounts {
     const tokens = await this.#tokenRequest({
       grant_type: "authorization_code",
       code: callback.code,
-      redirect_uri: this.config.redirectUri,
+      redirect_uri: this.#config.redirectUri,
       code_verifier: pending.verifier,
     });
     const claims = await this.verifyIdToken(tokens.idToken, pending.nonce);
@@ -255,7 +260,7 @@ export class Accounts {
 
   /** Revokes a refresh token (and its whole family), e.g. on sign-out. */
   async revoke(refreshToken: string): Promise<void> {
-    const response = await this.#post(`${this.config.issuer}/token/revocation`, {
+    const response = await this.#post(`${this.#config.issuer}/token/revocation`, {
       token: refreshToken,
       token_type_hint: "refresh_token",
     });
@@ -280,7 +285,7 @@ export class Accounts {
         revokeError = error;
       }
     }
-    return { url: options.localOnly === true ? null : endSessionUrl(this.config, options), revokeError };
+    return { url: options.localOnly === true ? null : endSessionUrl(this.#config, options), revokeError };
   }
 
   /** Verifies an ID token: signature, ES256, issuer, audience (your client id), expiry, and the nonce if given. */
@@ -318,7 +323,7 @@ export class Accounts {
    * `accounts.player(sub).profile()`. Removed in 0.10.0.
    */
   userinfo(accessToken: string): Promise<Record<string, unknown>> {
-    return this.call(accessToken, "GET", `${this.config.issuer}/me`) as Promise<Record<string, unknown>>;
+    return this.call(accessToken, "GET", `${this.#config.issuer}/me`) as Promise<Record<string, unknown>>;
   }
 
   /**
@@ -337,7 +342,7 @@ export class Accounts {
    * plain id.
    */
   player(sub: string): Player {
-    if (this.config.clientSecret === null) {
+    if (this.#config.clientSecret === null) {
       throw new AccountsError("config", "the Server API needs the client secret: set `clientSecret`");
     }
     return new Player(this, sub);
@@ -354,25 +359,29 @@ export class Accounts {
 
   /**
    * One Server API call as your project. Reads and writes are both retried: every write is idempotent. Errors are
-   * `server` errors carrying the API's `code`. Used by `Player`.
+   * `server` errors carrying the API's `code`.
+   *
+   * @internal Used by `Player`; not part of the API.
    */
   serverCall(method: string, path: string, body?: unknown): Promise<unknown> {
-    if (this.config.clientSecret === null) {
+    if (this.#config.clientSecret === null) {
       throw new AccountsError("config", "the Server API needs the client secret: set `clientSecret`");
     }
-    const url = `${this.config.issuer.replace(/\/oidc$/, "")}/api/v1${path}`;
-    return this.#callWith(`Basic ${this.#basic(this.config.clientSecret)}`, method, url, body, {
+    const url = `${this.#config.issuer.replace(/\/oidc$/, "")}/api/v1${path}`;
+    return this.#callWith(`Basic ${this.#basic(this.#config.clientSecret)}`, method, url, body, {
       server: true,
     });
   }
 
   /**
-   * Starts the backup poll for revoked tokens: one poll now (awaited, so tokens revoked before this process started
-   * are already refused when it resolves), then one every 30 seconds. Needs the client secret. A failed poll goes to
-   * `onError` and is retried. Call `stop()` on the result at shutdown.
+   * Starts the backup poll for revoked tokens: one poll now (awaited, retried quickly, about 3 tries over a few
+   * seconds, so tokens revoked before this process started are already refused when it resolves), then one every 30
+   * seconds. Needs the client secret. Rejects with the poll's error if the first poll still fails: until a poll lands,
+   * revoked tokens verify, so you choose whether to run without it. Later failed polls go to `onError` and are
+   * retried. Call `stop()` on the result at shutdown.
    */
   async startRevocationPoller(options: RevocationOptions = {}): Promise<RevocationPoller> {
-    if (this.config.clientSecret === null) {
+    if (this.#config.clientSecret === null) {
       throw new AccountsError("config", "polling revocations needs the client secret: set `clientSecret`");
     }
     return await RevocationPoller.start(this, options);
@@ -389,12 +398,15 @@ export class Accounts {
       | { families?: { fam?: unknown; expires_at?: unknown }[]; now?: unknown }
       | null;
     const families = Array.isArray(answer?.families) ? answer.families : [];
+    // An unreadable expiry still revokes, for the longest a token lives.
+    const fallback = Math.floor(Date.now() / 1000) + WEBHOOK_REVOCATION_TTL_SECONDS;
+    const batch: [string, number][] = [];
     for (const family of families) {
       if (typeof family.fam !== "string") continue;
-      // An unreadable expiry still revokes, for the longest a token lives.
       const until = typeof family.expires_at === "string" ? unixSeconds(family.expires_at) : null;
-      this.revocations.revoke(family.fam, until ?? Math.floor(Date.now() / 1000) + WEBHOOK_REVOCATION_TTL_SECONDS);
+      batch.push([family.fam, until ?? fallback]);
     }
+    this.revocations.revokeMany(batch);
     return { next: typeof answer?.now === "string" ? answer.now : since, listed: families.length };
   }
 
@@ -426,11 +438,11 @@ export class Accounts {
    * secret). Fails with 400 for a bad reason or note, 404 for an unknown account or a guest, 429 for too many.
    */
   async reportAsGuest(report: GuestReport): Promise<void> {
-    if (this.config.clientSecret === null) {
+    if (this.#config.clientSecret === null) {
       throw new AccountsError("config", "reporting for a guest needs the client secret: set `clientSecret`");
     }
-    const url = `${this.config.issuer.replace(/\/oidc$/, "")}/api/v1/reports`;
-    await this.#callWith(`Basic ${this.#basic(this.config.clientSecret)}`, "POST", url, reportBody(report));
+    const url = `${this.#config.issuer.replace(/\/oidc$/, "")}/api/v1/reports`;
+    await this.#callWith(`Basic ${this.#basic(this.#config.clientSecret)}`, "POST", url, reportBody(report));
   }
 
   /**
@@ -511,11 +523,11 @@ export class Accounts {
   }
 
   async #projectCall(method: string, path: string, body?: unknown, retryWrites = false): Promise<unknown> {
-    if (this.config.clientSecret === null) {
+    if (this.#config.clientSecret === null) {
       throw new AccountsError("config", "this call needs the client secret: set `clientSecret`");
     }
-    const url = `${this.config.issuer.replace(/\/oidc$/, "")}/api/v1${path}`;
-    return await this.#callWith(`Basic ${this.#basic(this.config.clientSecret)}`, method, url, body, {
+    const url = `${this.#config.issuer.replace(/\/oidc$/, "")}/api/v1${path}`;
+    return await this.#callWith(`Basic ${this.#basic(this.#config.clientSecret)}`, method, url, body, {
       typedErrors: true,
       retryWrites,
     });
@@ -598,7 +610,7 @@ export class Accounts {
   /** RFC 6749 2.3.1 client credentials: form-encode both parts before Basic. */
   #basic(secret: string): string {
     const enc = (s: string) => new URLSearchParams({ v: s }).toString().slice(2);
-    return btoa(`${enc(this.config.clientId)}:${enc(secret)}`);
+    return btoa(`${enc(this.#config.clientId)}:${enc(secret)}`);
   }
 
   /** A form POST with client authentication (Basic for confidential clients, `client_id` for public ones). */
@@ -608,16 +620,16 @@ export class Accounts {
       "content-type": "application/x-www-form-urlencoded",
       "user-agent": `toddstack-accounts/${VERSION}`,
     };
-    if (this.config.clientSecret !== null) {
-      headers.authorization = `Basic ${this.#basic(this.config.clientSecret)}`;
+    if (this.#config.clientSecret !== null) {
+      headers.authorization = `Basic ${this.#basic(this.#config.clientSecret)}`;
     } else {
-      form.append("client_id", this.config.clientId);
+      form.append("client_id", this.#config.clientId);
     }
     return this.#send(url, { method: "POST", headers, body: form.toString() });
   }
 
   async #tokenRequest(params: Record<string, string>): Promise<TokenSet> {
-    const response = await this.#post(`${this.config.issuer}/token`, params);
+    const response = await this.#post(`${this.#config.issuer}/token`, params);
     if (!response.ok) {
       let error = `http_${response.status}`;
       let description: string | undefined;
@@ -665,9 +677,9 @@ export class Accounts {
       utf8(`${parts[0]}.${parts[1]}`),
     );
     if (!ok) throw reject("InvalidSignature");
-    if (claims.iss !== this.config.issuer) throw reject("InvalidIssuer");
+    if (claims.iss !== this.#config.issuer) throw reject("InvalidIssuer");
     const aud = claims.aud;
-    if (!(aud === this.config.clientId || (Array.isArray(aud) && aud.includes(this.config.clientId)))) {
+    if (!(aud === this.#config.clientId || (Array.isArray(aud) && aud.includes(this.#config.clientId)))) {
       throw reject("InvalidAudience");
     }
     if (typeof claims.exp !== "number") throw reject("Missing required claim: exp");

@@ -27,12 +27,16 @@
 //!
 //! Entries are kept until their `expires_at` (when the family's last access
 //! token has died), so the set stays small. The set is empty until the first
-//! poll lands, so a token revoked before this process started is refused only
-//! after startup's poll: [`Accounts::start_revocation_poller`] awaits it.
-//! If accounts is unreachable, verification keeps working (fail open) and
-//! `on_error` hears about each failed poll.
+//! poll lands, so [`Accounts::start_revocation_poller`] awaits it (retrying
+//! quickly, about 3 tries over a few seconds) and returns an error if it
+//! still fails: you decide whether to start without instant logout or refuse
+//! to boot. After that, if accounts is unreachable, verification keeps
+//! working (fail open), `on_error` hears about each failed poll, and
+//! [`RevocationPoller::last_success`] tells a health check how stale the set is.
 
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +46,9 @@ use serde_json::Value;
 use crate::tokens::Accounts;
 use crate::webhook::{self, EventKind};
 use crate::{Error, Result};
+
+/// Tries at the startup poll before giving up.
+const STARTUP_TRIES: u32 = 3;
 
 /// How often the poller asks for new revocations.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -57,12 +64,21 @@ fn now_unix() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
+/// Expired entries are dropped at most this often, so a burst of inserts never rescans the whole set each time.
+const PRUNE_EVERY_SECONDS: i64 = 10;
+
+#[derive(Debug, Default)]
+struct Held {
+    /// `fam` to the Unix second it stops mattering.
+    families: HashMap<String, i64>,
+    next_prune: i64,
+}
+
 /// The token families known to be revoked, shared between the webhook handler,
 /// the poller and token verification. Cheap to share; deduplicated by `fam`.
 #[derive(Debug, Default)]
 pub struct Revocations {
-    /// `fam` to the Unix second it stops mattering.
-    families: RwLock<HashMap<String, i64>>,
+    held: RwLock<Held>,
 }
 
 impl Revocations {
@@ -72,13 +88,26 @@ impl Revocations {
     }
 
     /// Records a dead family until `expires_at` (Unix seconds). Repeats are
-    /// fine (the service's polls overlap): the later expiry wins.
+    /// fine (the service's polls overlap): the later expiry wins. For many
+    /// families use [`Revocations::revoke_many`]: one lock for the batch.
     pub fn revoke(&self, fam: &str, expires_at: i64) {
+        self.revoke_many([(fam, expires_at)]);
+    }
+
+    /// [`Revocations::revoke`] for a batch, under one write lock, so a mass
+    /// revocation neither stalls token verification nor costs more than one
+    /// pass over the set.
+    pub fn revoke_many<'a>(&self, families: impl IntoIterator<Item = (&'a str, i64)>) {
         let now: i64 = now_unix();
-        if let Ok(mut families) = self.families.write() {
-            families.retain(|_, until| *until > now);
-            let entry: &mut i64 = families.entry(fam.to_owned()).or_insert(expires_at);
-            *entry = (*entry).max(expires_at);
+        if let Ok(mut held) = self.held.write() {
+            for (fam, expires_at) in families {
+                let entry: &mut i64 = held.families.entry(fam.to_owned()).or_insert(expires_at);
+                *entry = (*entry).max(expires_at);
+            }
+            if now >= held.next_prune {
+                held.families.retain(|_, until| *until > now);
+                held.next_prune = now + PRUNE_EVERY_SECONDS;
+            }
         }
     }
 
@@ -86,18 +115,18 @@ impl Revocations {
     #[must_use]
     pub fn is_revoked(&self, fam: &str) -> bool {
         let now: i64 = now_unix();
-        self.families
+        self.held
             .read()
-            .is_ok_and(|families| families.get(fam).is_some_and(|until| *until > now))
+            .is_ok_and(|held| held.families.get(fam).is_some_and(|until| *until > now))
     }
 
     /// How many families are being held.
     #[must_use]
     pub fn len(&self) -> usize {
         let now: i64 = now_unix();
-        self.families
-            .read()
-            .map_or(0, |f| f.values().filter(|until| **until > now).count())
+        self.held.read().map_or(0, |held| {
+            held.families.values().filter(|until| **until > now).count()
+        })
     }
 
     #[must_use]
@@ -113,9 +142,7 @@ impl Revocations {
         }
         let families: Vec<&str> = event.families();
         let until: i64 = now_unix() + WEBHOOK_TTL_SECONDS;
-        for fam in &families {
-            self.revoke(fam, until);
-        }
+        self.revoke_many(families.iter().map(|fam| (*fam, until)));
         families.len()
     }
 }
@@ -145,12 +172,15 @@ fn unix(rfc3339: &str) -> Option<i64> {
 pub type OnError = Arc<dyn Fn(&Error) + Send + Sync>;
 
 /// How the poller runs. [`Default`] is the production setting (every
-/// [`POLL_INTERVAL`], failures ignored).
+/// [`POLL_INTERVAL`], failures ignored, startup retried after 1 s then 2 s).
 #[derive(Clone)]
 pub struct PollerOptions {
     pub interval: Duration,
     /// Called with each failed poll (the poller retries on its own). Log it.
+    /// A panic in it is caught: the poller keeps polling.
     pub on_error: Option<OnError>,
+    /// The wait before the second startup try; the third waits twice as long.
+    pub startup_backoff: Duration,
 }
 
 impl Default for PollerOptions {
@@ -158,6 +188,7 @@ impl Default for PollerOptions {
         Self {
             interval: POLL_INTERVAL,
             on_error: None,
+            startup_backoff: Duration::from_secs(1),
         }
     }
 }
@@ -166,11 +197,24 @@ impl Default for PollerOptions {
 #[derive(Debug)]
 pub struct RevocationPoller {
     task: tokio::task::JoinHandle<()>,
+    /// Unix seconds of the last good poll.
+    last_success: Arc<AtomicI64>,
 }
 
 impl RevocationPoller {
     pub fn stop(self) {
         drop(self);
+    }
+
+    /// When the last poll succeeded (the startup poll counts). For a health
+    /// check: a stale value means revocations may be missed and only webhooks
+    /// are protecting you.
+    #[must_use]
+    pub fn last_success(&self) -> Option<jiff::Timestamp> {
+        match self.last_success.load(Ordering::Relaxed) {
+            0 => None,
+            second => jiff::Timestamp::from_second(second).ok(),
+        }
     }
 }
 
@@ -210,11 +254,14 @@ impl Accounts {
             status: 200,
             message: e.to_string(),
         })?;
-        for family in &polled.families {
-            // An unreadable expiry still revokes, for the longest a token lives.
-            let until: i64 = unix(&family.expires_at).unwrap_or(now_unix() + WEBHOOK_TTL_SECONDS);
-            self.revoked.revoke(&family.fam, until);
-        }
+        // An unreadable expiry still revokes, for the longest a token lives.
+        let fallback: i64 = now_unix() + WEBHOOK_TTL_SECONDS;
+        self.revoked.revoke_many(
+            polled
+                .families
+                .iter()
+                .map(|f| (f.fam.as_str(), unix(&f.expires_at).unwrap_or(fallback))),
+        );
         if polled.now.is_some() {
             *cursor = polled.now;
         }
@@ -227,8 +274,10 @@ impl Accounts {
     /// as the server runs.
     ///
     /// # Errors
-    /// [`Error::Config`] without a client secret. A failed poll is not an
-    /// error here: it goes to `on_error` and is retried.
+    /// [`Error::Config`] without a client secret. If the first poll still
+    /// fails after 3 tries (a few seconds), its error: until a poll lands,
+    /// revoked tokens verify, so you choose whether to run without it. Later
+    /// failed polls are not errors: they go to `on_error` and are retried.
     pub async fn start_revocation_poller(self: &Arc<Self>) -> Result<RevocationPoller> {
         self.start_revocation_poller_with(PollerOptions::default())
             .await
@@ -249,23 +298,35 @@ impl Accounts {
             )));
         }
         let mut cursor: Option<String> = None;
-        if let Err(error) = self.poll_revocations(&mut cursor).await
-            && let Some(on_error) = &options.on_error
-        {
-            on_error(&error);
+        let mut backoff: Duration = options.startup_backoff;
+        for attempt in 1..=STARTUP_TRIES {
+            match self.poll_revocations(&mut cursor).await {
+                Ok(_) => break,
+                Err(error) if attempt == STARTUP_TRIES => return Err(error),
+                Err(_) => {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+            }
         }
+        let last_success: Arc<AtomicI64> = Arc::new(AtomicI64::new(now_unix()));
+        let seen: Arc<AtomicI64> = Arc::clone(&last_success);
         let accounts: Arc<Self> = Arc::clone(self);
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(options.interval).await;
-                if let Err(error) = accounts.poll_revocations(&mut cursor).await
-                    && let Some(on_error) = &options.on_error
-                {
-                    on_error(&error);
+                match accounts.poll_revocations(&mut cursor).await {
+                    Ok(_) => seen.store(now_unix(), Ordering::Relaxed),
+                    Err(error) => {
+                        if let Some(on_error) = &options.on_error {
+                            // User code must not be able to end the poll.
+                            let _ = catch_unwind(AssertUnwindSafe(|| on_error(&error)));
+                        }
+                    }
                 }
             }
         });
-        Ok(RevocationPoller { task })
+        Ok(RevocationPoller { task, last_success })
     }
 
     /// A client that checks tokens against revocations from the start: builds

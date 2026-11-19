@@ -166,15 +166,20 @@ is revoked. Two feeds fill one in-memory set (`accounts.revocations()`), dedupli
 entry's `expires_at`:
 
 ```rust
-// Starts the poll (once now, awaited, then every 30 s) and gives you the client to share.
+// Starts the poll (once now, awaited, then every 30 s) and gives you the client to share. Errors if the first
+// poll still fails after 3 quick tries (a few seconds): until a poll lands, revoked tokens verify, so you decide
+// whether to boot without instant logout.
 let (accounts, _poller) = Accounts::with_revocation_poller(config).await?; // keep _poller alive
 
 // In your webhook route: verifies the signature, then records `tokens.revoked` families at once.
 let event = accounts.handle_webhook(secret, signature_header, body)?;
 ```
 
-`start_revocation_poller_with(PollerOptions { interval, on_error })` runs the poll on an existing `Arc<Accounts>`;
-`on_error` hears each failed poll (it is retried; verification keeps working meanwhile). Dropping the poller stops it.
+`start_revocation_poller_with(PollerOptions { interval, on_error, startup_backoff })` runs the poll on an existing
+`Arc<Accounts>`; after startup, `on_error` hears each failed poll (it is retried; verification keeps working meanwhile;
+a panic in it is caught, so the poll never dies). `poller.last_success()` is the time of the last good poll, for a
+health check. Dropping the poller stops it. A mass revocation is cheap: `Revocations::revoke_many` takes a batch under
+one lock and expired entries are pruned at most every 10 s.
 
 ## Friends and events (deprecated)
 
@@ -214,8 +219,10 @@ and will also go out as push notifications once the native apps exist.
 
 Every project can list, send, accept, decline, cancel, remove, block and unblock friends inside its own web and native
 apps, not only on accounts.toddgriffin.me. Enable the `axum` feature and mount one router; it forwards each call to
-`Friends` with the signed-in person's stored accounts token, so no browser or app ever sees that token. Your login
-needs the `friends` scope.
+the accounts service, so no browser or app ever sees accounts credentials. Implement `FriendsAuth::player_sub` and the
+router acts for that player over the Server API (`accounts.player(sub)`) with your client credentials: no player token
+is stored (the config needs its client secret, and the player's `friends` scope applies as usual). The token path
+(`FriendsAuth::access_token`, forwarded with `Friends`) still works but is deprecated.
 
 ```toml
 toddstack-accounts = { version = "0.8.1", features = ["axum"] }
@@ -226,7 +233,11 @@ use toddstack_accounts::friends_router::{self, Credential, FriendsAuth};
 
 struct MyAuth { /* your sessions */ }
 impl FriendsAuth for MyAuth {
-    // The caller's accounts access token (refresh it if expired) and the credential that proved it:
+    // Preferred: the caller's `sub` and the credential kind that proved it (the string is ignored: pass an empty
+    // one). Cookie writes get the same-origin check. None falls back to `access_token`.
+    async fn player_sub(&self, headers: &axum::http::HeaderMap) -> Option<(String, Credential)> { /* ... */ }
+
+    // Deprecated: the caller's accounts access token (refresh it if expired) and the credential that proved it:
     // Credential::Cookie(token) for your session cookie, Credential::Bearer(token) for the native app's
     // `Authorization: Bearer` app token. None for a guest or signed-out caller (they get 401).
     async fn access_token(&self, headers: &axum::http::HeaderMap) -> Option<Credential> { /* ... */ }
@@ -257,7 +268,7 @@ requests an hour), `accounts_unavailable` (502). A `sub` that isn't 1 to 64 of `
 
 Writes authenticated by a cookie must be provably same-origin: `Sec-Fetch-Site: same-origin`, or, without that header,
 an `Origin` equal to `public_origin`. `same-site`, `cross-site`, `none`, or neither header, is `cross_site` (403). The
-check follows the credential `access_token` reports, not the request's headers, so a `Bearer` header cannot excuse a
+check follows the credential `player_sub` (or `access_token`) reports, not the request's headers, so a `Bearer` header cannot excuse a
 cookie. `Credential::Bearer` (native apps) is exempt, as a forged cross-site request cannot carry it. The
 routes sit beside, not on top of, a project's `/api/v1/app/*` sign-in routes. Your web UI uses the TypeScript
 `FriendsClient`; the Swift and Kotlin SDKs call the same routes (see their READMEs).
@@ -433,8 +444,10 @@ derive from it. `http` is accepted only for `127.0.0.1`, `localhost` and `::1`; 
 `fam` is revoked (nothing is revoked until you feed the set). Source-breaking: `AccessClaims` has a new `fam` field and
 `EventResult` a new `replayed` field, so code that builds either with a struct literal must add it; `Error` has a new
 `Server` variant (`Error` is `non_exhaustive`). New dependency: `jiff` (RFC 3339 times). **Deprecated, removed in
-0.10.0:** `Friends` (every method) and `Accounts::userinfo`. `FriendsAuth` / `friends_router` still use `Friends`
-for now.
+0.10.0:** `Friends` (every method), `Accounts::userinfo` and `FriendsAuth::access_token`, which the router still serves until
+you implement the new `FriendsAuth::player_sub` (both trait methods now default to `None`). `Config` no longer prints
+the client secret in `Debug` (`"[redacted]"`). `start_revocation_poller` now errors if the first poll fails after
+3 quick tries (it used to fail open silently), and `PollerOptions` has a new `startup_backoff` field.
 
 **0.8.0**: `IdClaims` has a new `visibility` field and `Notification` a new `sender_sub` field, so code that builds either with a struct literal must add it (`Notification::new` and token verification are unchanged). Added `Visibility`, `IdClaims::is_review` and `Event::visibility`.
 

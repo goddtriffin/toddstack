@@ -269,6 +269,7 @@ async fn the_poller_polls_at_startup_before_returning_then_keeps_polling_until_d
         .start_revocation_poller_with(PollerOptions {
             interval: Duration::from_millis(30),
             on_error: None,
+            startup_backoff: Duration::from_millis(1),
         })
         .await
         .unwrap();
@@ -287,49 +288,162 @@ async fn the_poller_polls_at_startup_before_returning_then_keeps_polling_until_d
     assert_eq!(before, fake.requests().len());
 }
 
+fn ok_poll(fam: &str) -> (u16, String) {
+    (
+        200,
+        json!({
+            "families": [{ "fam": fam, "expires_at": rfc3339(now() + 600) }],
+            "now": rfc3339(now()),
+        })
+        .to_string(),
+    )
+}
+
+fn failing() -> (u16, String) {
+    (
+        500,
+        json!({ "error": "server_error", "message": "x" }).to_string(),
+    )
+}
+
+fn quick(on_error: Option<toddstack_accounts::revocation::OnError>) -> PollerOptions {
+    PollerOptions {
+        interval: Duration::from_millis(30),
+        on_error,
+        startup_backoff: Duration::from_millis(1),
+    }
+}
+
+#[tokio::test]
+async fn a_failed_startup_poll_is_an_error_after_three_tries_so_the_caller_decides() {
+    let s: Signer = signer();
+    let fake: Fake = Fake::start(|_, _| failing()).await;
+    let accounts: Arc<Accounts> = accounts(&s, &fake.issuer);
+    let started = accounts.start_revocation_poller_with(quick(None)).await;
+    assert!(
+        matches!(started, Err(Error::Api { status: 500, .. })),
+        "{started:?}"
+    );
+    // Three tries, each of which the read retry may itself repeat.
+    assert!(fake.requests().len() >= 3, "{}", fake.requests().len());
+}
+
+#[tokio::test]
+async fn a_startup_poll_that_fails_once_is_retried_and_the_poller_starts() {
+    let s: Signer = signer();
+    let fake: Fake = Fake::start(|n, _| if n < 3 { failing() } else { ok_poll("late") }).await;
+    let accounts: Arc<Accounts> = accounts(&s, &fake.issuer);
+    let poller = accounts
+        .start_revocation_poller_with(quick(None))
+        .await
+        .unwrap();
+    assert!(accounts.revocations().is_revoked("late"));
+    assert!(poller.last_success().is_some());
+}
+
 #[tokio::test]
 async fn a_failing_poll_reaches_on_error_keeps_verifying_and_recovers() {
     let s: Signer = signer();
-    let fake: Fake = Fake::start(|n, _| {
-        if n < 3 {
-            (
-                500,
-                json!({ "error": "server_error", "message": "x" }).to_string(),
-            )
-        } else {
-            (
-                200,
-                json!({
-                    "families": [{ "fam": "late", "expires_at": rfc3339(now() + 600) }],
-                    "now": rfc3339(now()),
-                })
-                .to_string(),
-            )
-        }
+    // The startup poll lands; the next few fail, then it recovers.
+    let fake: Fake = Fake::start(|n, _| match n {
+        0 => ok_poll("first"),
+        1..=6 => failing(),
+        _ => ok_poll("late"),
     })
     .await;
     let accounts: Arc<Accounts> = accounts(&s, &fake.issuer);
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let heard: Arc<Mutex<Vec<String>>> = Arc::clone(&errors);
     let poller = accounts
-        .start_revocation_poller_with(PollerOptions {
-            interval: Duration::from_millis(30),
-            on_error: Some(Arc::new(move |e: &Error| {
-                heard.lock().unwrap().push(e.to_string());
-            })),
-        })
+        .start_revocation_poller_with(quick(Some(Arc::new(move |e: &Error| {
+            heard.lock().unwrap().push(e.to_string());
+        }))))
         .await
         .unwrap();
-    assert_eq!(1, errors.lock().unwrap().len());
     assert!(
         accounts
             .verify_access_token(&token(&s, &fake.issuer, Some("late"), now() + 600))
             .await
             .is_ok()
     );
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!errors.lock().unwrap().is_empty());
     assert!(accounts.revocations().is_revoked("late"));
     drop(poller);
+}
+
+#[tokio::test]
+async fn a_panicking_on_error_does_not_stop_the_poller() {
+    let s: Signer = signer();
+    let fake: Fake = Fake::start(|n, _| match n {
+        0 => ok_poll("first"),
+        1..=3 => failing(),
+        _ => ok_poll("after"),
+    })
+    .await;
+    let accounts: Arc<Accounts> = accounts(&s, &fake.issuer);
+    let calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let counted: Arc<Mutex<u32>> = Arc::clone(&calls);
+    let poller = accounts
+        .start_revocation_poller_with(quick(Some(Arc::new(move |_: &Error| {
+            *counted.lock().unwrap() += 1;
+            panic!("the hook is broken");
+        }))))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(*calls.lock().unwrap() >= 1);
+    assert!(
+        accounts.revocations().is_revoked("after"),
+        "the poll died after on_error panicked"
+    );
+    drop(poller);
+}
+
+#[tokio::test]
+async fn last_success_moves_forward_with_each_good_poll() {
+    let s: Signer = signer();
+    let fake: Fake = Fake::start(|n, _| ok_poll(&format!("f{n}"))).await;
+    let accounts: Arc<Accounts> = accounts(&s, &fake.issuer);
+    let before: i64 = now() - 1;
+    let poller = accounts
+        .start_revocation_poller_with(quick(None))
+        .await
+        .unwrap();
+    let first: i64 = poller.last_success().unwrap().as_second();
+    assert!(first > before);
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    assert!(poller.last_success().unwrap().as_second() > first);
+}
+
+#[test]
+fn a_mass_revocation_of_100k_families_is_one_pass_not_one_per_family() {
+    let set: Revocations = Revocations::new();
+    let until: i64 = now() + 600;
+    let names: Vec<String> = (0..100_000).map(|i| format!("fam-{i}")).collect();
+    let started = std::time::Instant::now();
+    set.revoke_many(names.iter().map(|n| (n.as_str(), until)));
+    // One at a time must be cheap too: the prune is throttled, not per insert.
+    for i in 0..100_000 {
+        set.revoke(&format!("single-{i}"), until);
+    }
+    let took: Duration = started.elapsed();
+    assert_eq!(200_000, set.len());
+    assert!(set.is_revoked("fam-99999"));
+    assert!(took < Duration::from_secs(5), "{took:?}");
+}
+
+#[test]
+fn config_debug_never_prints_the_client_secret() {
+    let config: Config =
+        Config::toddgriffin("app", Some(String::from("s3cret-value")), "https://x/cb");
+    let printed: String = format!("{config:?} {config:#?}");
+    assert!(!printed.contains("s3cret-value"), "{printed}");
+    assert!(
+        printed.contains("client_secret: \"[redacted]\""),
+        "{printed}"
+    );
+    assert!(printed.contains("client_id: \"app\""), "{printed}");
 }
 
 #[tokio::test]
