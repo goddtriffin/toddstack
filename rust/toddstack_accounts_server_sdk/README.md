@@ -423,7 +423,7 @@ failure: a connection error, a timeout, a 5xx, a 408 or a 429. Each attempt has 
 if it can finish within 15 s of the first attempt. A 4xx other than 408 and 429 is an answer and is never retried. After the last retry you get the plain error.
 
 Writes are retried far more carefully than reads. A write is retried on a timeout, a 5xx or a 429 only when it carries
-an idempotency key the service honours (3 retries, 10 s deadline each, all within 15 s). Today that is the Server API
+an idempotency key the service honours (up to 3 retries, 10 s deadline each, all within the 15 s total budget; a retry starts only if it can finish inside that budget, so an attempt that times out after 10 s is not retried, since 10 s + 0.5 s + a new 10 s attempt exceeds 15 s, and you get the timeout error). Today that is the Server API
 event (`Player::post_event`) and a notification send with an `idempotency_key`. Every other write (friend requests,
 accept, decline, cancel, remove, block, unblock, report, mute, unmute, read, time zone, device register and
 unregister, `cancel_notifications`) is idempotent by state but keyless, so it is retried only after a connection

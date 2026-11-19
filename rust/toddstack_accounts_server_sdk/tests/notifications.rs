@@ -432,13 +432,13 @@ async fn device_refusals_become_typed_errors() {
 }
 
 #[tokio::test]
-async fn a_device_call_is_retried_after_a_503_because_it_is_idempotent() {
+async fn a_keyless_device_call_is_not_retried_after_a_503_and_returns_the_error() {
     let (issuer, seen) = service(vec![(503, "{}"), (204, "")]).await;
-    accounts(&issuer, Some("s3cret"))
+    let result = accounts(&issuer, Some("s3cret"))
         .register_device(&device())
-        .await
-        .unwrap();
-    assert_eq!(2, seen.lock().unwrap().len());
+        .await;
+    assert!(result.is_err());
+    assert_eq!(1, seen.lock().unwrap().len());
 }
 
 #[tokio::test]
