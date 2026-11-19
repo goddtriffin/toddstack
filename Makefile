@@ -117,6 +117,7 @@ lint: ## lints the codebase
 	cd $(TS) && deno doc --lint webserver-base/
 	cd $(TS) && deno fmt webserver-base/
 	cd $(TS)/accounts && deno lint && deno doc --lint mod.ts && deno fmt
+	cd $(RUST)/toddstack_frontend_engine/js && deno lint && deno fmt .
 
 	cd $(RUST) && cargo fmt
 
@@ -126,6 +127,7 @@ test: assets ## runs tests; the template's tests serve the bin/ that assets buil
 	# --allow-net: free-port's tests bind real sockets to verify port detection
 	cd $(TS) && deno test --allow-net webserver-base/
 	cd $(TS)/accounts && deno check mod.ts && deno fmt --check && deno test --allow-read
+	cd $(RUST)/toddstack_frontend_engine/js && deno check *.ts && deno fmt --check .
 	# the npm build of toddstack-accounts must compile and load on Node
 	cd $(TS)/accounts && rm -rf dist && npx -y -p typescript@5.9.3 tsc -p tsconfig.npm.json \
 		&& node -e 'import("./dist/mod.js").then((m) => { if (!m.Accounts) process.exit(1) })'
@@ -135,6 +137,8 @@ test: assets ## runs tests; the template's tests serve the bin/ that assets buil
 	cd $(RUST) && cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 	cd $(RUST) && cargo test --all-features
+	# the wasm glue must build for the browser target
+	cd $(RUST) && cargo build --package toddstack-frontend-engine --target wasm32-unknown-unknown --features wasm,example --example wasm_counter
 
 .PHONY: fix
 fix: ## fixes the codebase
@@ -150,6 +154,7 @@ publish_dry_run: ## dry run of publishing libraries to crates.io and JSR
 	echo "\033[1;35m[Packaging Rust]\033[0m"
 	cd $(RUST) && cargo publish --package webserver-base --dry-run
 	cd $(RUST) && cargo package --package webserver-base --list
+	cd $(RUST) && cargo publish --package toddstack-frontend-engine --dry-run
 
 	echo "\033[1;35m[Packaging Typescript]\033[0m"
 	cd $(TS) && deno publish --dry-run --allow-dirty

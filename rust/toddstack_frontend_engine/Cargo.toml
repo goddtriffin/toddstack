@@ -1,0 +1,46 @@
+[package]
+name = "toddstack-frontend-engine"
+# Versioned on its own, not with the workspace (webserver-base's version).
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+description = "App-agnostic Elm-style frontend core: update(model, msg) -> effects, an NDJSON bridge, dirty-key views, introspection, and a headless test harness. Runs as wasm in a worker or through UniFFI."
+license-file.workspace = true
+keywords = ["elm", "wasm", "uniffi", "state-machine", "toddstack"]
+categories = ["gui", "wasm", "development-tools::testing"]
+include = ["**/*.rs", "js/**", "tests/scenarios/**", "tests/snapshots/**", "Cargo.toml", "LICENSE", "README.md"]
+
+[lints]
+workspace = true
+
+[features]
+# Fake world, scenario runner and REPL. Uses std::fs; never enable for a shipped core.
+testing = []
+# `export_wasm_core!`: the wasm-bindgen class a module worker loads.
+wasm = ["dep:wasm-bindgen"]
+# `export_uniffi_core!`: the UniFFI object the Swift and Kotlin shells call.
+ffi = ["dep:uniffi"]
+# The counter example app (an Http effect, a state-machine enum, an app-defined effect).
+example = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Exact: must equal the installed `wasm-bindgen` CLI that builds the bundle.
+wasm-bindgen = { version = "=0.2.130", optional = true }
+# Exact: the generated glue must keep compiling under `unsafe_code = "forbid"`.
+uniffi = { version = "=0.29.5", optional = true }
+
+[[example]]
+name = "wasm_counter"
+crate-type = ["cdylib"]
+required-features = ["wasm", "example"]
+
+[[example]]
+name = "ffi_counter"
+crate-type = ["cdylib"]
+required-features = ["ffi", "example"]

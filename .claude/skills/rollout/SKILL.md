@@ -27,6 +27,7 @@ Diff against `main` and classify:
 | `rust/webserver_base/**` (the Rust lib) | Cargo bump, tag, release, crates.io publish — **and** the image steps, because the binary embeds the library |
 | `typescript/webserver-base/**` (the TS lib) | `typescript/deno.jsonc` PATCH bump, JSR publish |
 | `rust/toddstack_accounts_server_sdk/**` (Rust `toddstack-accounts-server-sdk`) | Cargo bump in its own `Cargo.toml`, tag, release, crates.io publish by CI on merge |
+| `rust/toddstack_frontend_engine/**` (Rust `toddstack-frontend-engine`, including its `js/`) | Cargo bump in its own `Cargo.toml`, tag, release, crates.io publish by CI on merge |
 | `typescript/accounts/**` (TS `toddstack-accounts`, **frozen**: security fixes only) | PATCH bump of `deno.jsonc`, `package.json` and `version.ts` together (a test checks they agree), CI then publishes to JSR and npm on merge |
 | `rust/template_web_server/**` (the crate, its `html/`, `static/`, `Dockerfile`), `rust/Cargo.lock`, `Makefile` | the image steps: build, smoke test, push |
 | any `README.md`, `AGENTS.md`, `CLAUDE.md`, `.claude/**`, other docs | nothing but the pull request |
@@ -182,7 +183,7 @@ No tokens: each registry trusts that workflow file through trusted publishing (s
 crates.io, npm and JSR). Todd has approved every publish in advance. Publishing is **irreversible**:
 crates.io and npm allow yanking or deprecating, never reuse of a version.
 
-Tags name their package (`webserver-base-vX.Y.Z`, `flyball-vX.Y.Z`, `toddstack-accounts-server-sdk-vX.Y.Z`, `toddstack-accounts-vX.Y.Z` for the frozen TS package) and follow
+Tags name their package (`webserver-base-vX.Y.Z`, `flyball-vX.Y.Z`, `toddstack-accounts-server-sdk-vX.Y.Z`, `toddstack-frontend-engine-vX.Y.Z`, `toddstack-accounts-vX.Y.Z` for the frozen TS package) and follow
 the package's version; `@todd/webserver-base` alone (TS) gets no tag. Tags up to `v0.3.0` predate the rename.
 Bare `X.Y.Z` tags are unused.
 

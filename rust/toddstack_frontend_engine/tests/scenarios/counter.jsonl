@@ -1,0 +1,10 @@
+# The boot restore, a built-in effect, an app-defined effect and the pointer fast path.
+{"boot":{"v":1,"at":1000,"app_version":"$APP_VERSION"}}
+{"expect":{"effects":[{"Store":{"key":"example.count"}}],"view":{"counter":{"count":0,"taps":0,"sync":"Idle"}},"screen":"counter","actions":["Inc","Add","Reset","Fetch"]}}
+{"send":{"act":"Inc"}}
+{"expect":{"effects":[{"Vibrate":{"ms":10}},{"Store":{"key":"example.count","value":1}}],"dirty":["counter"],"view":{"counter":{"count":1}}}}
+{"send":{"act":{"Add":{"n":41}}}}
+{"expect":{"effects":[{"Store":{"value":42}}],"view":{"counter":{"count":42}}}}
+{"pointer":[[0,1.0,2.0],[1,1.5,2.0],[2,1.5,2.0]]}
+{"expect":{"view":{"counter":{"taps":1}}}}
+{"snapshot":"counter"}
