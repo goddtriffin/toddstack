@@ -242,6 +242,7 @@ fn build_jobs(
                     plan: p.clone(),
                     device: d.clone(),
                     theme: t.clone(),
+                    shared: false,
                 });
             }
         }

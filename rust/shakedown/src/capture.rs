@@ -29,6 +29,7 @@ use chromiumoxide::cdp::browser_protocol::network::{
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CaptureScreenshotParams,
 };
+use chromiumoxide::cdp::browser_protocol::storage::ClearDataForOriginParams;
 use chromiumoxide::cdp::browser_protocol::target::{
     CreateBrowserContextParams, CreateTargetParams,
 };
@@ -116,6 +117,9 @@ pub struct Job {
     pub device: Device,
     /// `light` or `dark`.
     pub theme: String,
+    /// May share the player's browser context with other shots (the sweep's plain shots); otherwise the shot gets
+    /// a context of its own.
+    pub shared: bool,
 }
 
 impl Job {
@@ -396,6 +400,11 @@ pub async fn shoot_all(
                     }
                     Err(why) => last = why,
                 }
+                // A failure that is not a timeout may have left the player's context in a bad state (a sign-in
+                // that never took, storage half written): the retry starts with a new context and a new sign-in.
+                if !last.starts_with("took longer") {
+                    pool.reset(&job.plan.player);
+                }
                 first_failure.get_or_insert_with(|| last.clone());
             }
             let shot = done.unwrap_or_else(|| Shot {
@@ -471,6 +480,15 @@ impl Players {
     }
 }
 
+impl Players {
+    /// Forgets the player's context and sign-in: the next shot makes new ones.
+    fn reset(&self, player: &str) {
+        if let Ok(mut m) = self.slots.lock() {
+            m.remove(player);
+        }
+    }
+}
+
 /// `items` in an order made by `seed` (the same seed, the same order): `SHAKEDOWN_SHUFFLE=<seed>` draws the shots in
 /// another order, to show that no shot depends on what ran before it.
 fn shuffle<T>(items: &mut [T], seed: u64) {
@@ -481,6 +499,29 @@ fn shuffle<T>(items: &mut [T], seed: u64) {
         x ^= x << 17;
         let j = usize::try_from(x % (i as u64 + 1)).unwrap_or(0);
         items.swap(i, j);
+    }
+}
+
+/// Opens a browser context (it does not take the command-line proxy: it needs its own dead one, see `PROXY`).
+async fn new_context(browser: &Browser) -> Result<BrowserContextId, String> {
+    browser
+        .create_browser_context(CreateBrowserContextParams {
+            proxy_server: Some(PROXY.into()),
+            ..CreateBrowserContextParams::default()
+        })
+        .await
+        .map_err(err("context"))
+}
+
+/// Every kind of origin storage but cookies: sign-in survives, nothing else carries over from the last shot.
+const STORAGE_TYPES: &str = "local_storage,session_storage,indexeddb,websql,cache_storage,service_workers,file_systems,shader_cache,storage_buckets,interest_groups,shared_storage,cache";
+
+/// A command that fails only because the setting already holds (tabs of one renderer share it) has still done its job.
+fn already_in_effect<T>(r: Result<T, impl std::fmt::Display>, what: &str) -> Result<(), String> {
+    match r {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("already in effect") => Ok(()),
+        Err(e) => Err(format!("{what}: {e}")),
     }
 }
 
@@ -498,65 +539,96 @@ async fn shoot(
         }
     };
     let slow = || format!("took longer than {}s", SHOT_TIMEOUT.as_secs());
-    let mine = players.slot(&job.plan.player);
-    let ctx = mine
-        .ctx
-        .get_or_try_init(|| async {
-            browser
-                .create_browser_context(CreateBrowserContextParams {
-                    // A context does not take the command-line proxy: it needs its own dead one (see `PROXY`).
-                    proxy_server: Some(PROXY.into()),
-                    ..CreateBrowserContextParams::default()
-                })
-                .await
-                .map_err(err("context"))
-        })
-        .await?
-        .clone();
-    let collected = Arc::new(Collected::default());
-    let prepared = tokio::time::timeout(SHOT_TIMEOUT, async {
-        let target = CreateTargetParams::builder()
-            .url("about:blank")
-            .browser_context_id(ctx.clone())
-            .build()
-            .map_err(|e| e.clone())?;
-        let page = browser.new_page(target).await.map_err(err("new page"))?;
-        let to = collected.clone();
-        guard.register(
-            page.target_id().as_ref(),
-            Arc::new(move |rule: &str, message: &str| to.note(rule, message)),
-        );
-        // Tabs share a window: a tab behind the others would draw no frames. Every tab is told it is in front.
-        page.execute(SetFocusEmulationEnabledParams::new(true))
-            .await
-            .map_err(err("focus"))?;
-        // The page is not drawn before the guard is on it (it waits at the debugger until then).
-        match guard.armed(page.target_id().as_ref()).await {
-            Ok(()) => Ok(page),
-            Err(why) => {
-                let _ = page.close().await;
-                Err(why)
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| Err(slow()));
-    lap("page ready");
-    match prepared {
-        Ok(page) => {
-            let outcome = tokio::time::timeout(
-                SHOT_TIMEOUT,
-                draw(&page, env, job, &collected, &mine.signed_in),
-            )
-            .await
-            .unwrap_or_else(|_| Err(slow()));
-            lap("drawn");
-            guard.unregister(page.target_id().as_ref());
-            let _ = page.close().await;
-            outcome
-        }
-        Err(why) => Err(why),
+    // A shot that acts (it may sign out, write storage) or is not a plain sweep shot gets a context of its own;
+    // the others share the player's. Either way sign-in happens once per context.
+    let own = !job.shared || !job.plan.act.is_empty();
+    let mine = if own {
+        Arc::default()
+    } else {
+        players.slot(&job.plan.player)
+    };
+    let ctx = if own {
+        new_context(browser).await?
+    } else {
+        mine.ctx
+            .get_or_try_init(|| new_context(browser))
+            .await?
+            .clone()
+    };
+    let outcome = shoot_in(browser, guard, env, job, &mine, &ctx, &lap, &slow).await;
+    if own {
+        let _ = browser.dispose_browser_context(ctx).await;
     }
+    outcome
+}
+
+#[expect(clippy::too_many_arguments, reason = "the pieces of one shot")]
+async fn shoot_in(
+    browser: &Browser,
+    guard: &Guard,
+    env: &Env,
+    job: &Job,
+    mine: &PlayerSlot,
+    ctx: &BrowserContextId,
+    lap: &impl Fn(&str),
+    slow: &impl Fn() -> String,
+) -> Result<Shot, String> {
+    let collected = Arc::new(Collected::default());
+    // Each tab has a window of its own: a background tab in a shared window draws no frames, and the screenshot
+    // then times out.
+    let target = CreateTargetParams::builder()
+        .url("about:blank")
+        .browser_context_id(ctx.clone())
+        .new_window(true)
+        .build()
+        .map_err(|e| e.clone())?;
+    let page = tokio::time::timeout(SHOT_TIMEOUT, browser.new_page(target))
+        .await
+        .map_err(|_| slow())?
+        .map_err(err("new page"))?;
+    let to = collected.clone();
+    guard.register(
+        page.target_id().as_ref(),
+        Arc::new(move |rule: &str, message: &str| to.note(rule, message)),
+    );
+    // The page handle lives out here, so every way out of the setup or the drawing closes the tab and forgets it.
+    let outcome = async {
+        tokio::time::timeout(SHOT_TIMEOUT, async {
+            // The context is shared: a service worker an earlier shot installed must not answer for this one.
+            page.execute(network::SetBypassServiceWorkerParams::new(true))
+                .await
+                .map_err(err("service worker bypass"))?;
+            // Every tab is told it is in front.
+            page.execute(SetFocusEmulationEnabledParams::new(true))
+                .await
+                .map_err(err("focus"))?;
+            let _ = page.bring_to_front().await;
+            // Nothing but the sign-in (cookies) carries over from the shots before.
+            page.execute(ClearDataForOriginParams::new(
+                env.base.clone(),
+                STORAGE_TYPES,
+            ))
+            .await
+            .map_err(err("clear storage"))?;
+            // The page is not drawn before the guard is on it (it waits at the debugger until then).
+            guard.armed(page.target_id().as_ref()).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(slow()))?;
+        lap("page ready");
+        let drawn = tokio::time::timeout(
+            SHOT_TIMEOUT,
+            draw(&page, env, job, &collected, &mine.signed_in),
+        )
+        .await
+        .unwrap_or_else(|_| Err(slow()));
+        lap("drawn");
+        drawn
+    }
+    .await;
+    guard.unregister(page.target_id().as_ref());
+    let _ = page.close().await;
+    outcome
 }
 
 /// What the page's event streams collect.
@@ -648,14 +720,17 @@ async fn draw(
     })
     .await
     .map_err(err("media"))?;
-    page.execute(SetTimezoneOverrideParams::new("UTC"))
-        .await
-        .map_err(err("timezone"))?;
-    page.execute(SetLocaleOverrideParams {
-        locale: Some("en-US".into()),
-    })
-    .await
-    .map_err(err("locale"))?;
+    already_in_effect(
+        page.execute(SetTimezoneOverrideParams::new("UTC")).await,
+        "timezone",
+    )?;
+    already_in_effect(
+        page.execute(SetLocaleOverrideParams {
+            locale: Some("en-US".into()),
+        })
+        .await,
+        "locale",
+    )?;
 
     lap("emulation set");
     // The deterministic page and the collector, before any page script.

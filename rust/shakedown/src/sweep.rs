@@ -353,6 +353,7 @@ fn jobs(
                     plan: plans[i % plans.len()].clone(),
                     device: d.clone(),
                     theme: t.clone(),
+                    shared: true,
                 });
             }
         }
@@ -464,9 +465,9 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     // Each shot is judged on its own thread the moment it is drawn, while the others are still being drawn.
     let judged: Arc<Mutex<Vec<Result<Judged, Error>>>> = Arc::default();
     let sink: capture::Sink = {
-        let (dir, judged, rebase) = (dir.clone(), judged.clone(), opts.rebase);
+        let (dir, judged) = (dir.clone(), judged.clone());
         Arc::new(move |shot: &Shot| {
-            let r = judge_shot(&dir, shot, rebase);
+            let r = judge_shot(&dir, shot);
             if let Ok(mut j) = judged.lock() {
                 j.push(r);
             }
@@ -505,6 +506,9 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
             .map_err(|_| Error::Failed("judge lock".into()))?,
     );
     let (records, pictures) = collect(judged, shots.len())?;
+    // The run finished whole: only now do new pictures (or all of them, on `--rebase`) become the baseline, so a
+    // failed or interrupted run never leaves a half-written one.
+    keep_baseline(&dir, &records, &pictures, opts.rebase)?;
     outcome.new = records.iter().filter(|r| r.change == Change::New).count();
     outcome.changed = records.iter().filter(|r| r.change.line().is_some()).count();
     outcome.failed = records
@@ -537,9 +541,9 @@ struct Judged {
     png: Vec<u8>,
 }
 
-/// Writes `current/`, compares with `baseline/`, and keeps the baseline (new shots, or all of them on `rebase`).
-/// Shots are independent: this runs for each as soon as it is drawn.
-fn judge_shot(dir: &Path, shot: &Shot, rebase: bool) -> Result<Judged, Error> {
+/// Writes `current/` and compares with `baseline/` (which is only read here: `keep_baseline` writes it once the
+/// whole run has finished). Shots are independent: this runs for each as soon as it is drawn.
+fn judge_shot(dir: &Path, shot: &Shot) -> Result<Judged, Error> {
     let (current, baseline, diff) = (dir.join("current"), dir.join("baseline"), dir.join("diff"));
     std::fs::create_dir_all(&current).map_err(|e| io(&e))?;
     let (route, device, theme) =
@@ -550,9 +554,6 @@ fn judge_shot(dir: &Path, shot: &Shot, rebase: bool) -> Result<Judged, Error> {
     let change = judge(old.as_deref(), &png);
     if !png.is_empty() {
         std::fs::write(current.join(format!("{}.png", shot.id)), &png).map_err(|e| io(&e))?;
-        if old.is_none() || rebase {
-            std::fs::write(&old_path, &png).map_err(|e| io(&e))?;
-        }
     }
     if let (Change::Changed { .. }, Some(old)) = (&change, &old)
         && let (Ok(a), Ok(b)) = (pixels::decode(old), pixels::decode(&png))
@@ -578,6 +579,28 @@ fn judge_shot(dir: &Path, shot: &Shot, rebase: bool) -> Result<Judged, Error> {
         id: shot.id.clone(),
         png,
     })
+}
+
+/// Writes `baseline/`: the pictures that have no baseline yet, or every picture on `rebase`.
+fn keep_baseline(
+    dir: &Path,
+    records: &[Record],
+    pictures: &Pictures,
+    rebase: bool,
+) -> Result<(), Error> {
+    let baseline = dir.join("baseline");
+    std::fs::create_dir_all(&baseline).map_err(|e| io(&e))?;
+    for r in records {
+        let id = format!("{}@{}-{}", r.route, r.device, r.theme);
+        let Some(png) = pictures.get(&id).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let path = baseline.join(format!("{id}.png"));
+        if rebase || !path.exists() {
+            std::fs::write(&path, png).map_err(|e| io(&e))?;
+        }
+    }
+    Ok(())
 }
 
 /// The judged shots as sorted records and the pictures by id.

@@ -99,8 +99,8 @@ where
 {
     let (mut sink, mut stream) = ws.split();
     let mut next_id: u64 = 0;
-    // Session id to the top-level page it belongs to (a frame or worker belongs to the page that holds it).
-    let mut sessions: HashMap<String, String> = HashMap::new();
+    // Session id to (top-level page it belongs to, its own target id); a frame or worker belongs to the page that holds it.
+    let mut sessions: HashMap<String, (String, String)> = HashMap::new();
     // Target id to its top-level page.
     let mut roots: HashMap<String, String> = HashMap::new();
     // Command id of a final `runIfWaitingForDebugger` to the target it arms (`BROWSER` for the first command).
@@ -157,14 +157,14 @@ where
                 let opener = info["openerId"].as_str().map(String::from);
                 // A frame or worker is held by the page whose session announced it; a popup by its opener.
                 let root = session_of
-                    .and_then(|s| sessions.get(s).cloned())
+                    .and_then(|s| sessions.get(s).map(|(r, _)| r.clone()))
                     .or_else(|| {
                         opener
                             .as_ref()
                             .map(|o| roots.get(o).cloned().unwrap_or(o.clone()))
                     })
                     .unwrap_or_else(|| target.clone());
-                sessions.insert(sid.to_string(), root.clone());
+                sessions.insert(sid.to_string(), (root.clone(), target.clone()));
                 roots.insert(target.clone(), root.clone());
                 if kind == "page" && info.get("openerId").is_some() {
                     // A popup: never resumed, so it never runs; closed at once.
@@ -196,11 +196,16 @@ where
             }
             Some("Target.detachedFromTarget") => {
                 if let Some(sid) = p["sessionId"].as_str() {
-                    sessions.remove(sid);
+                    // Both maps are pruned when a target detaches, so a long run does not grow them.
+                    if let Some((_, target)) = sessions.remove(sid) {
+                        roots.remove(&target);
+                    }
                 }
             }
             Some("Runtime.bindingCalled") if p["name"] == BINDING => {
-                let page = session_of.and_then(|s| sessions.get(s)).map(String::as_str);
+                let page = session_of
+                    .and_then(|s| sessions.get(s))
+                    .map(|(r, _)| r.as_str());
                 report(&shared, page, p["payload"].as_str().unwrap_or_default());
             }
             _ => {}
