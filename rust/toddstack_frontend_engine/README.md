@@ -37,7 +37,7 @@ Name rule: an app effect must not be named like a built-in (`Http`, `Timer`, ...
 `debug_assert`s this on every flush, so tests and debug builds catch it.
 
 `Pending<T>` remembers, per effect id, what the app was doing when it asked, so `resolve` is a `match`
-over an enum. `RetryPolicy` (exponential backoff, jitter drawn by the caller) and `ClockOffset`
+over an enum. `RetryPolicy` (the canonical rule: 3 retries, 0.5 s, 1 s, 2 s, +-25% jitter drawn by the caller; retry only status 0, 408, 429 and 5xx) and `ClockOffset`
 (server time from the lowest-round-trip sample) are deterministic helpers.
 
 ## A minimal app

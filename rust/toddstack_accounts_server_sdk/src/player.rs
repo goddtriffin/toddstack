@@ -21,8 +21,8 @@
 //! - **Errors carry the code.** A refusal is [`Error::Server`] with the API's
 //!   `error` code (`not_found`, `suspended`, `scope`, `rate_limited`, ...);
 //!   read it with [`Error::code`]. Everything but a 429 and a 5xx is final.
-//! - **Writes are idempotent, so this crate retries them** (3 attempts, on a
-//!   429, a 5xx or a connection failure only): friend requests, accepts,
+//! - **Writes are idempotent, so this crate retries them** (3 retries, on a
+//!   408, 429, a 5xx or a connection failure only): friend requests, accepts,
 //!   blocks, mutes and the rest are no-op successes when the state already
 //!   holds, and an event is deduplicated by its required idempotency key.
 //! - A player who never signed in to your project, a deleted one and one who

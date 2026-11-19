@@ -1,51 +1,60 @@
 //! Deterministic retry and clock helpers: randomness and time come from the caller.
 
-/// Retry with exponential backoff and jitter.
+/// The canonical retry rule (infra `docs/canonical-pattern.md` 6d): at most 3 retries, waiting
+/// 0.5 s, 1 s and 2 s with +-25% jitter. Retry only network errors, timeouts, 5xx, 408 and 429
+/// (see [`RetryPolicy::is_retryable`]). Retry a write only when it is idempotent (keyed). Per-attempt
+/// timeouts belong to the caller, per project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub max_retries: u32,
     pub base_ms: u64,
     pub cap_ms: u64,
-    /// Largest fraction (per mille) a delay may shrink by.
+    /// Largest fraction (per mille) a delay may move by, either way.
     pub jitter_permille: u64,
 }
 
+/// The rule's ceiling on retries.
+pub const MAX_RETRIES: u32 = 3;
+
 impl RetryPolicy {
-    /// Reads retry 3 times, 0.25 s up to 4 s.
+    /// The rule: 3 retries, 0.5 s, 1 s, 2 s, +-25% jitter.
     #[must_use]
-    pub const fn read() -> Self {
+    pub const fn standard() -> Self {
         Self {
-            max_retries: 3,
-            base_ms: 250,
-            cap_ms: 4000,
+            max_retries: MAX_RETRIES,
+            base_ms: 500,
+            cap_ms: 2000,
             jitter_permille: 250,
         }
     }
 
-    /// Writes retry 5 times, 0.5 s up to 8 s.
+    /// Reads follow the rule.
+    #[must_use]
+    pub const fn read() -> Self {
+        Self::standard()
+    }
+
+    /// Writes follow the same rule, but the caller must retry only an idempotent (keyed) write.
     #[must_use]
     pub const fn write() -> Self {
-        Self {
-            max_retries: 5,
-            base_ms: 500,
-            cap_ms: 8000,
-            jitter_permille: 250,
-        }
+        Self::standard()
     }
 
     /// Delay before retry number `failures` (0 after the first failure); `None` when retries are
-    /// spent. `rand_permille` is the caller's random draw in 0..=1000.
+    /// spent (never more than 3, whatever `max_retries` says). `rand_permille` is the caller's
+    /// random draw in 0..=1000: 0 gives the shortest delay (-25%), 1000 the longest (+25%).
     #[must_use]
     pub fn delay_ms(&self, failures: u32, rand_permille: u32) -> Option<u64> {
-        if failures >= self.max_retries {
+        if failures >= self.max_retries.min(MAX_RETRIES) {
             return None;
         }
         let exp: u64 = self
             .base_ms
             .saturating_mul(1u64 << failures.min(32))
             .min(self.cap_ms);
-        let cut: u64 = exp * self.jitter_permille * u64::from(rand_permille.min(1000)) / 1_000_000;
-        Some(exp - cut)
+        // Scale by 1 - j .. 1 + j, where j is the jitter fraction.
+        let span: u64 = 2 * self.jitter_permille * u64::from(rand_permille.min(1000)) / 1000;
+        Some(exp * (1000 - self.jitter_permille + span) / 1000)
     }
 
     /// Network failure (status 0), timeout, rate limit and server errors are worth retrying.
@@ -94,33 +103,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_doubles_to_the_cap_then_stops() {
-        let policy: RetryPolicy = RetryPolicy::write();
-        let actual: Vec<Option<u64>> = (0..6).map(|n| policy.delay_ms(n, 0)).collect();
-        let expected: Vec<Option<u64>> = vec![
-            Some(500),
-            Some(1000),
-            Some(2000),
-            Some(4000),
-            Some(8000),
-            None,
-        ];
-        assert_eq!(expected, actual);
+    fn backoff_is_half_a_second_then_one_then_two_then_stops() {
+        for policy in [RetryPolicy::read(), RetryPolicy::write()] {
+            let actual: Vec<Option<u64>> = (0..5).map(|n| policy.delay_ms(n, 500)).collect();
+            let expected: Vec<Option<u64>> = vec![Some(500), Some(1000), Some(2000), None, None];
+            assert_eq!(expected, actual);
+        }
     }
 
     #[test]
-    fn jitter_only_ever_shortens_a_delay() {
-        assert_eq!(Some(375), RetryPolicy::write().delay_ms(0, 1000));
-        assert_eq!(Some(375), RetryPolicy::write().delay_ms(0, 5000));
+    fn jitter_is_a_quarter_either_way() {
+        let policy: RetryPolicy = RetryPolicy::read();
+        assert_eq!(Some(375), policy.delay_ms(0, 0));
+        assert_eq!(Some(625), policy.delay_ms(0, 1000));
+        assert_eq!(Some(625), policy.delay_ms(0, 5000));
+        assert_eq!(Some(750), policy.delay_ms(1, 0));
+        assert_eq!(Some(2500), policy.delay_ms(2, 1000));
+        for draw in 0..=1000 {
+            for failures in 0..3 {
+                let nominal: u64 = 500 << failures;
+                let got: u64 = policy.delay_ms(failures, draw).unwrap();
+                assert!(got >= nominal * 3 / 4 && got <= nominal * 5 / 4);
+            }
+        }
+    }
+
+    #[test]
+    fn never_more_than_three_retries_even_if_asked() {
+        let greedy: RetryPolicy = RetryPolicy {
+            max_retries: 50,
+            ..RetryPolicy::standard()
+        };
+        let retries: usize = (0..60).filter_map(|n| greedy.delay_ms(n, 500)).count();
+        assert_eq!(3, retries);
+        assert_eq!(3, RetryPolicy::read().max_retries);
+        assert_eq!(500, RetryPolicy::read().base_ms);
+        assert_eq!(250, RetryPolicy::read().jitter_permille);
     }
 
     #[test]
     fn only_transient_statuses_are_retryable() {
-        let retryable: Vec<u16> = [0, 200, 400, 404, 408, 429, 500, 503]
-            .into_iter()
+        let retryable: Vec<u16> = (0..=599)
             .filter(|s| RetryPolicy::is_retryable(*s))
             .collect();
-        assert_eq!(vec![0, 408, 429, 500, 503], retryable);
+        let mut expected: Vec<u16> = vec![0, 408, 429];
+        expected.extend(500..=599);
+        assert_eq!(expected, retryable);
     }
 
     #[test]

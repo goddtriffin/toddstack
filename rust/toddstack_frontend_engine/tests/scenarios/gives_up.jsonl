@@ -2,6 +2,6 @@
 {"http":{"GET /api/count":{"status":500}}}
 {"boot":{"v":1,"at":0}}
 {"send":{"act":"Fetch"}}
-{"advance_ms":1750}
+{"advance_ms":2625}
 {"expect":{"view":{"counter":{"sync":{"Failed":{"reason":"status 500"}}}},"actions":["Fetch"]}}
 {"snapshot":"counter"}

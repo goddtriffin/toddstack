@@ -290,8 +290,8 @@ mod tests {
 
         assert!(matches!(keys.get(&http, "new").await, Err(Error::Http(_))));
         assert!(keys.get(&http, "new").await.is_err());
-        // One fetch of three attempts (a 503 is retried), and no second fetch.
-        assert_eq!(4, server.hits());
+        // One fetch of four attempts (a 503 is retried), and no second fetch.
+        assert_eq!(5, server.hits());
         keys.get(&http, "old").await.unwrap();
     }
 
@@ -356,8 +356,8 @@ mod tests {
         for lookup in lookups {
             assert!(!lookup.await.unwrap());
         }
-        // One fetch of three attempts (a 503 is retried), shared by all eight.
-        assert_eq!(3, server.hits());
+        // One fetch of four attempts (a 503 is retried), shared by all eight.
+        assert_eq!(4, server.hits());
     }
 
     #[tokio::test]
