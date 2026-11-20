@@ -282,7 +282,7 @@ mod tests {
         assert!(d(&["make"]).is_none(), "a bare program is not pooled");
         assert!(d(&["make", "other"]).is_none(), "two words is not pooled");
         assert!(d(&["bash", "-c", "y"]).is_none());
-        assert!(d(&["env", "A=1", "make"]).is_none());
+        assert!(d(&["env", "A=1", "make", "lint"]).is_none());
         assert!(d(&["xcodebuild", "-scheme", "B"]).is_none());
         assert!(d(&["/usr/bin/sudo", "make", "lint"]).is_none());
         assert!(d(&["make", "lint", "X=1"]).is_some());
