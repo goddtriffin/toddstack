@@ -41,7 +41,8 @@ RUN apk add --no-cache musl-dev xz
 # pass BOTH the pinned sha256 and the minisign signature (Zig's published public
 # key, https://ziglang.org/download/) or the build moves on to the next source.
 # If every source fails either check, the build fails. Every request has a
-# connect and a total timeout, so nothing can hang.
+# connect and a total timeout, and a stalled transfer (under 100 KB/s for 15 s)
+# aborts, so nothing can hang.
 RUN apk add --no-cache curl minisign=0.12-r2 \
  && case "$BUILDARCH" in \
       arm64) arch=aarch64; sum="$ZIG_SHA256_ARM64" ;; \
@@ -57,7 +58,7 @@ RUN apk add --no-cache curl minisign=0.12-r2 \
       https://pkg.hexops.org/zig \
       "https://ziglang.org/download/${ZIG_VERSION}"; do \
       echo "zig: trying $base"; \
-      if curl -fsSL --connect-timeout 10 --max-time 180 --retry 2 -o /tmp/zig.tar.xz "$base/$file?source=toddstack" \
+      if curl -fsSL --connect-timeout 10 --max-time 180 --speed-limit 102400 --speed-time 15 --retry 2 -o /tmp/zig.tar.xz "$base/$file?source=toddstack" \
          && curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 -o /tmp/zig.tar.xz.minisig "$base/$file.minisig?source=toddstack" \
          && echo "$sum  /tmp/zig.tar.xz" | sha256sum -c - \
          && minisign -Vm /tmp/zig.tar.xz -x /tmp/zig.tar.xz.minisig -P "$ZIG_MINISIGN_KEY"; then ok=1; break; fi; \
