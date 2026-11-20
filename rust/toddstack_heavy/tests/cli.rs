@@ -144,8 +144,8 @@ fn small_jobs_run_together_with_no_job_cap() {
 #[test]
 fn non_heavy_usage_blocks_a_second_job_but_never_the_first() {
     let t = TempDir::new().unwrap();
-    // Other programs use 6 of 8 cores: a running job plus 2 more cores does not fit under 90% (7.2).
-    let busy = "load=0.1,mem_pct=10,disk_free=90G,nonheavy_cpu=600";
+    // Other programs use 7 of 8 cores and the running job holds its 1 core while it ramps: no core is free.
+    let busy = "load=0.1,mem_pct=10,disk_free=90G,nonheavy_cpu=700";
     let mut a = heavy(t.path()).env("HEAVY_LIVE", busy).args(["--cpu", "1", "sleep", "3"]).stderr(Stdio::null()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::fs::read_dir(t.path().join("jobs")).map_or(true, |mut d| d.next().is_none()) {

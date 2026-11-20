@@ -1,8 +1,9 @@
 //! `heavy history`: how well heavy used the machine, and whether idle time was ever heavy's fault.
 //!
-//! The headline number is "idle while waiting": sample intervals where a job waited although the machine had room
-//! (CPU under 60%, memory under 85%, 1-minute load under 2 x cores). Those minutes are the only ones heavy can be
-//! blamed for; the blocking reasons recorded in them say why it waited anyway.
+//! The headline numbers are the average CPU while jobs waited (it should be near full) and "idle while waiting":
+//! sample intervals where a job waited although the machine had room (CPU under 75%, memory under 85%; load is
+//! ignored, since on macOS it also counts threads blocked in I/O). Those minutes are the ones heavy can be blamed
+//! for; the blocking reasons recorded in them say why it waited anyway.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -11,7 +12,7 @@ use jiff::Timestamp;
 
 use crate::log::Event;
 
-pub const IDLE_CPU_PCT: u64 = 60;
+pub const IDLE_CPU_PCT: u64 = 75;
 pub const IDLE_MEM_PCT: u64 = 85;
 pub const BUCKET_MS: i64 = 300_000;
 
@@ -53,6 +54,8 @@ pub struct Report {
     pub wait_p95_ms: u64,
     /// Wall time during which at least one job waited.
     pub waiting_span_ms: u64,
+    /// Machine CPU % averaged over that wall time (time-weighted); `None` when no job waited.
+    pub wait_cpu_avg: Option<u64>,
     /// Part of that wall time with room on the machine.
     pub idle_ms: u64,
     /// Blocking reasons during the idle part, by time (a reason counts once per interval).
@@ -65,8 +68,6 @@ struct Sample {
     ts: i64,
     cpu_pct: u64,
     mem_pct: u64,
-    load1: f64,
-    ncpu: u32,
     running: u32,
     waiting: u32,
     blocked: BTreeMap<String, u32>,
@@ -102,8 +103,8 @@ pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
                 let row = repos.entry(job.repo.clone().unwrap_or_else(|| "(no repo)".into())).or_insert_with_key(|k| RepoRow { repo: k.clone(), jobs: 0, wait_ms: 0, cpu_ms: 0 });
                 row.cpu_ms += cpu_ms;
             }
-            Event::Sample { cpu_pct, mem_pct, load1, ncpu, running, waiting, blocked, .. } => {
-                samples.push(Sample { ts, cpu_pct: *cpu_pct, mem_pct: *mem_pct, load1: *load1, ncpu: *ncpu, running: *running, waiting: *waiting, blocked: blocked.clone() });
+            Event::Sample { cpu_pct, mem_pct, running, waiting, blocked, .. } => {
+                samples.push(Sample { ts, cpu_pct: *cpu_pct, mem_pct: *mem_pct, running: *running, waiting: *waiting, blocked: blocked.clone() });
             }
             Event::Queued { .. } => {}
         }
@@ -113,7 +114,7 @@ pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
     let wait_total_ms: u64 = waits.iter().sum();
     let jobs = waits.len();
 
-    let (mut waiting_span_ms, mut idle_ms) = (0u64, 0u64);
+    let (mut waiting_span_ms, mut idle_ms, mut cpu_ms) = (0u64, 0u64, 0u64);
     let mut reasons: BTreeMap<String, u64> = BTreeMap::new();
     for pair in samples.windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
@@ -123,7 +124,8 @@ pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
         }
         let dt = u64::try_from(dt).unwrap_or(0);
         waiting_span_ms += dt;
-        if a.cpu_pct < IDLE_CPU_PCT && a.mem_pct < IDLE_MEM_PCT && a.load1 < 2.0 * f64::from(a.ncpu) {
+        cpu_ms += a.cpu_pct.min(100) * dt;
+        if a.cpu_pct < IDLE_CPU_PCT && a.mem_pct < IDLE_MEM_PCT {
             idle_ms += dt;
             if a.blocked.is_empty() {
                 // Nothing blocked: the waiter could have started and had not yet woken up.
@@ -148,6 +150,7 @@ pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
         wait_avg_ms: if jobs == 0 { 0 } else { wait_total_ms / u64::try_from(jobs).unwrap_or(1) },
         wait_p95_ms: p95(&waits),
         waiting_span_ms,
+        wait_cpu_avg: (waiting_span_ms > 0).then(|| cpu_ms / waiting_span_ms),
         idle_ms,
         idle_reasons,
         repos: repo_rows,
@@ -241,9 +244,12 @@ pub fn render_text(r: &Report) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "heavy history, {} to {} UTC", stamp(r.since_ms), stamp(r.until_ms));
     let _ = writeln!(o, "jobs {}, wait total {}, avg {}, p95 {}", r.jobs, fmt_dur(r.wait_total_ms), fmt_dur(r.wait_avg_ms), fmt_dur(r.wait_p95_ms));
+    if let Some(avg) = r.wait_cpu_avg {
+        let _ = writeln!(o, "avg cpu while jobs waited: {avg}%");
+    }
     let _ = writeln!(
         o,
-        "idle while waiting (a job waited, cpu < {IDLE_CPU_PCT}%, mem < {IDLE_MEM_PCT}%, load1 < 2 x cores): {} of {} waiting time ({})",
+        "idle while waiting (a job waited, cpu < {IDLE_CPU_PCT}%, mem < {IDLE_MEM_PCT}%, load ignored): {} of {} waiting time ({})",
         fmt_dur(r.idle_ms),
         fmt_dur(r.waiting_span_ms),
         pct(r.idle_ms, r.waiting_span_ms)
@@ -364,18 +370,19 @@ pub fn render_html(r: &Report) -> String {
     let _ = write!(h, "<h1>heavy history</h1><p class=\"mut\">{} to {} UTC</p>", stamp(r.since_ms), stamp(r.until_ms));
     let _ = write!(
         h,
-        "<div class=\"tiles\"><div class=\"tile\"><b>{}</b>jobs</div><div class=\"tile\"><b>{}</b>wait total</div><div class=\"tile\"><b>{}</b>avg wait</div><div class=\"tile\"><b>{}</b>p95 wait</div><div class=\"tile\"><b>{}</b>idle while waiting ({} of {})</div></div>",
+        "<div class=\"tiles\"><div class=\"tile\"><b>{}</b>jobs</div><div class=\"tile\"><b>{}</b>wait total</div><div class=\"tile\"><b>{}</b>avg wait</div><div class=\"tile\"><b>{}</b>p95 wait</div><div class=\"tile\"><b>{}</b>avg cpu while jobs waited</div><div class=\"tile\"><b>{}</b>idle while waiting ({} of {})</div></div>",
         r.jobs,
         fmt_dur(r.wait_total_ms),
         fmt_dur(r.wait_avg_ms),
         fmt_dur(r.wait_p95_ms),
+        r.wait_cpu_avg.map_or_else(|| "-".to_string(), |c| format!("{c}%")),
         pct(r.idle_ms, r.waiting_span_ms),
         fmt_dur(r.idle_ms),
         fmt_dur(r.waiting_span_ms)
     );
     let _ = write!(
         h,
-        "<p class=\"mut\">Idle while waiting: a job waited although cpu &lt; {IDLE_CPU_PCT}%, memory &lt; {IDLE_MEM_PCT}% and 1-minute load &lt; 2 x cores. Only these minutes can be heavy's fault.</p>"
+        "<p class=\"mut\">Idle while waiting: a job waited although cpu &lt; {IDLE_CPU_PCT}%, memory &lt; {IDLE_MEM_PCT}% (load ignored: on macOS it counts threads waiting on I/O). Only these minutes can be heavy's fault.</p>"
     );
     h.push_str(&chart("CPU used by the whole machine (5-minute buckets)", &[("cpu", "cpu %", path(&cpu, 100.0))], "100%", &first, &last, Some(f(IDLE_CPU_PCT) / 100.0)));
     h.push_str(&chart(
@@ -444,7 +451,8 @@ mod tests {
     #[test]
     fn idle_while_waiting_counts_only_intervals_with_room() {
         // Intervals start at their sample: [0,30s) busy cpu, [30s,60s) idle (ramp), [60s,90s) idle (queue+cpu),
-        // [90s,120s) nobody waiting, [120s,150s) mem high, [150s,180s) load high, gap of 10 min, then one more.
+        // [90s,120s) nobody waiting, [120s,150s) mem high, [150s,180s) load high but cpu idle (still idle: load is
+        // ignored), gap of 10 min, then one more.
         let s = [
             sample(0, 80, 50, 1.0, 1, &[("cpu", 1)]),
             sample(30_000, 30, 50, 1.0, 1, &[("ramp", 1)]),
@@ -458,10 +466,22 @@ mod tests {
         let r = compute(&s, 0, 180_000 + 10 * MIN);
         // Waiting intervals: 0,30,60,120,150 (30 s each) and 180 -> gap of 10 min is skipped.
         assert_eq!(r.waiting_span_ms, 150_000);
-        // Idle: the ones at 30 s and 60 s.
-        assert_eq!(r.idle_ms, 60_000);
-        assert_eq!(r.idle_reasons, vec![("ramp".to_string(), 30_000), ("cpu".to_string(), 30_000), ("queue".to_string(), 30_000)]);
-        assert_eq!(pct(r.idle_ms, r.waiting_span_ms), "40.0%");
+        // Idle: the ones at 30 s, 60 s and 150 s.
+        assert_eq!(r.idle_ms, 90_000);
+        let want = [("ramp", 30_000), ("cpu", 30_000), ("load1", 30_000), ("queue", 30_000)].map(|(k, ms)| (k.to_string(), ms));
+        assert_eq!(r.idle_reasons, want);
+        assert_eq!(pct(r.idle_ms, r.waiting_span_ms), "60.0%");
+        // CPU over the waiting intervals: (80 + 30 + 30 + 10 + 10) / 5.
+        assert_eq!(r.wait_cpu_avg, Some(32));
+        assert!(render_text(&r).contains("avg cpu while jobs waited: 32%"));
+    }
+
+    #[test]
+    fn seventy_percent_cpu_while_waiting_is_underused() {
+        let s = [sample(0, 74, 40, 30.0, 1, &[("cpu", 1)]), sample(30_000, 75, 40, 30.0, 1, &[("cpu", 1)]), sample(60_000, 5, 5, 0.1, 0, &[])];
+        let r = compute(&s, 0, 60_000);
+        assert_eq!((r.idle_ms, r.waiting_span_ms), (30_000, 60_000));
+        assert_eq!(compute(&[sample(0, 5, 5, 0.1, 0, &[])], 0, 1).wait_cpu_avg, None);
     }
 
     #[test]
