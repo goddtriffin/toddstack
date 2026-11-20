@@ -292,3 +292,35 @@ fn runs_under_a_pty_and_passes_the_exit_code() {
     assert!(out.contains("on-a-tty") && out.contains("stdin-is-tty"), "{out}");
     assert_eq!(code(&o), 5, "{out}");
 }
+
+/// A head stopped with Ctrl-Z while waiting must wake the waiter behind it at once (a file event), not after the
+/// 30 s sweep.
+#[test]
+fn stopped_waiting_head_wakes_the_follower_at_once() {
+    let t = TempDir::new().unwrap();
+    // Holder keeps 4G. The head needs 12G (does not fit next to it). The follower needs more cores than the head,
+    // so it waits behind the head although it would fit.
+    let (holder, _out) = start_ready(t.path(), &["--cpu", "1", "--mem", "4G"], "echo ready; sleep 60");
+    let spawn = |extra: &[&str]| heavy(t.path()).args(extra).args(["true"]).stderr(Stdio::piped()).spawn().unwrap();
+    let mut head = spawn(&["--cpu", "1", "--mem", "12G"]);
+    let mut head_err = BufReader::new(head.stderr.take().unwrap());
+    let mut line = String::new();
+    head_err.read_line(&mut line).unwrap();
+    assert!(line.contains("waiting"), "{line}");
+    let mut follower = spawn(&["--cpu", "2", "--mem", "1G"]);
+    let mut follower_err = BufReader::new(follower.stderr.take().unwrap());
+    line.clear();
+    follower_err.read_line(&mut line).unwrap();
+    assert!(line.contains("waiting"), "{line}");
+    let start = Instant::now();
+    kill(&head, "-TSTP");
+    let status = follower.wait().unwrap();
+    assert!(status.success());
+    assert!(start.elapsed() < Duration::from_secs(10), "follower stalled for {:?}", start.elapsed());
+    // The head resumes and is queued again (it still cannot fit), then is torn down.
+    kill(&head, "-CONT");
+    kill(&head, "-TERM");
+    let _ = head.wait();
+    kill(&holder, "-TERM");
+    let _ = holder.wait_with_output();
+}

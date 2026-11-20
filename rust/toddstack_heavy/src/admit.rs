@@ -6,8 +6,9 @@
 //!
 //! cpu headroom = 90% of cores - non-heavy usage - live use of running jobs
 //!
-//! Jobs admitted in the last `RAMP_MS` reserve at least min(their cores, `RAMP_CPU`) while their CPU ramps up. Memory
-//! headroom uses max(reservation, live usage) per running job.
+//! Jobs admitted in the last `RAMP_MS` hold their full peak cores (from history, clamped to the machine) while their
+//! CPU ramps up, so a burst of waiters is staggered about `RAMP_MS` apart instead of all starting at once. After the
+//! ramp only live use counts. Memory headroom uses max(reservation, live usage) per running job.
 //!
 //! Non-heavy usage (Chrome, Discord, other CLIs) is smoothed by the caller (max of recent samples) so a
 //! dip does not over-admit. Live guards (load, memory, disk) can only veto.
@@ -21,8 +22,6 @@ pub const BACKFILL_WINDOW_MS: i64 = 60_000;
 const PCT: u64 = 90;
 /// A job admitted this recently has not ramped its CPU yet.
 pub const RAMP_MS: i64 = 10_000;
-/// CPU (centi-cores) a just-admitted job holds until it ramps, and what a new job needs free to start.
-pub const RAMP_CPU: u64 = 200;
 const CPU_ASK: u64 = 100;
 /// How many recent non-heavy samples the smoother keeps.
 pub const SMOOTH_WINDOW: usize = 4;
@@ -93,7 +92,7 @@ pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> U
     let held = running.iter().fold(Usage::default(), |a, j| {
         let l = live.per_job.iter().find(|(id, _)| *id == j.id).map_or_else(Usage::default, |(_, u)| *u);
         let ramping = j.started_ms.is_some_and(|t| now_ms - t < RAMP_MS);
-        let cpu = if ramping { l.cpu.max(centi(j.weights.cpu).min(RAMP_CPU)) } else { l.cpu };
+        let cpu = if ramping { l.cpu.max(centi(j.weights.cpu).min(centi(cap.cpu))) } else { l.cpu };
         Usage { cpu: a.cpu + cpu, mem: a.mem + l.mem.max(j.weights.mem), vram: a.vram + l.vram.max(j.weights.vram) }
     });
     ceiling(cap).saturating_sub(live.non_heavy).saturating_sub(held)
@@ -156,7 +155,7 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
     if let Some(head) = queued.first().filter(|h| h.id != job.id) {
         if blocker(head.weights, &running, cap, live, now_ms).is_none() {
             // The head could start now: this job may go first only if the head still fits next to it.
-            let me = Job { state: State::Running, ..job.clone() };
+            let me = Job { state: State::Running, started_ms: Some(now_ms), ..job.clone() };
             let mut with_me = running.clone();
             with_me.push(&me);
             if blocker(head.weights, &with_me, cap, live, now_ms).is_some() {
@@ -348,17 +347,51 @@ mod tests {
         let a = job("a", 16, 8, State::Queued, 1);
         let b = job("b", 16, 8, State::Queued, 2);
         assert_eq!(evaluate(&a, &[a.clone(), b.clone()], &c, &live, 10), Decision::Start);
-        // a was admitted just now: b is judged next to a running, ramping a.
+        // a was admitted just now and holds its full 16 cores while ramping: b waits for the ramp, then starts.
         let ra = Job { state: State::Running, started_ms: Some(10), ..a };
-        assert_eq!(evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 11), Decision::Start);
-        // A third one right behind still fits (live 320 + 2 x ramp 200 < 1440).
+        assert!(waits(&evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 11)), "blocked by a's ramp hold");
+        assert_eq!(evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 10 + RAMP_MS), Decision::Start, "second starts within the ramp window");
         let ca = job("c", 16, 8, State::Queued, 3);
-        let rb = Job { state: State::Running, started_ms: Some(11), ..b };
-        assert_eq!(evaluate(&ca, &[ra, rb, ca.clone()], &c, &live, 12), Decision::Start);
         // A genuinely busy CPU still blocks.
         let busy = Live { non_heavy: Usage { cpu: 1400, mem: 8 * G, vram: 0 }, ..calm() };
         let run = Job { state: State::Running, started_ms: Some(0), ..job("r", 16, 8, State::Running, 0) };
         assert!(waits(&evaluate(&ca, &[run, ca.clone()], &c, &busy, 100_000)));
+    }
+
+    #[test]
+    fn burst_is_held_back_by_ramp_holds() {
+        // 16 cores, ceiling 1440; every build peaked at 4 cores but is at 0% live while ramping.
+        let c = Capacity { cpu: 16, ..cap() };
+        let mut jobs: Vec<Job> = (0..8).map(|i| job(&format!("j{i}"), 4, 1, State::Queued, i)).collect();
+        let mut started = 0;
+        // All eight evaluate at the same instant; admit in FIFO order, as the lock serializes them.
+        for i in 0..jobs.len() {
+            let me = jobs[i].clone();
+            if evaluate(&me, &jobs, &c, &calm(), 100) == Decision::Start {
+                jobs[i].state = State::Running;
+                jobs[i].started_ms = Some(100);
+                started += 1;
+            }
+        }
+        assert_eq!(started, 4, "holds of 400 each leave 240 for the 4th and 0 for the 5th: not a burst of 8");
+        // Once the ramp window passes and live CPU is low, the rest follow.
+        let next = jobs.iter().find(|j| j.state == State::Queued).unwrap().clone();
+        assert_eq!(evaluate(&next, &jobs, &c, &calm(), 100 + RAMP_MS), Decision::Start);
+        // Not blocked on peaks long-term: after the ramp the hold is gone entirely.
+        let ramped = Job { state: State::Running, started_ms: Some(0), ..job("r", 16, 1, State::Running, 0) };
+        let room = headroom(&[&ramped], &c, &calm(), RAMP_MS + 1);
+        assert_eq!(room.cpu, 1440);
+    }
+
+    #[test]
+    fn stopped_waiter_file_does_not_block_the_next_waiter() {
+        let run = job("r", 1, 50, State::Running, 0);
+        let head = job("h", 1, 30, State::Queued, 1);
+        let next = job("n", 1, 40, State::Queued, 2);
+        let t = 3 + BACKFILL_WINDOW_MS;
+        assert!(waits(&evaluate(&next, &[run.clone(), head.clone(), next.clone()], &cap(), &calm(), t)));
+        let stopped = Job { state: State::Stopped, ..head };
+        assert_eq!(evaluate(&next, &[run, stopped, next.clone()], &cap(), &calm(), t), Decision::Start);
     }
 
     #[test]

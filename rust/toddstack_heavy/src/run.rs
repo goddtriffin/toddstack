@@ -3,7 +3,7 @@
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGTSTP};
 use signal_hook::iterator::Signals;
 
 use crate::admit::{Decision, Smoother, evaluate};
@@ -42,6 +42,8 @@ const TREE_SAMPLE: Duration = Duration::from_millis(500);
 enum Event {
     Fs,
     Signal(i32),
+    /// Ctrl-Z while waiting in the queue.
+    Stop,
 }
 
 /// Shared with the signal thread so a signal reaches the child's group at any moment.
@@ -49,6 +51,8 @@ enum Event {
 struct Sig {
     pgid: AtomicI32,
     last: AtomicI32,
+    /// True while this heavy waits in the queue: Ctrl-Z is then handled here (see `park`), not by the default stop.
+    waiting: AtomicBool,
 }
 
 /// Sends `sig` to the group, then SIGCONT so a stopped group can act on it.
@@ -65,10 +69,18 @@ fn forward(pgid: i32, sig: i32) {
 /// forwards INT, TERM and HUP to that group.
 fn spawn_signal_thread(tx: Sender<Event>) -> Result<Arc<Sig>, Error> {
     let sig = Arc::new(Sig::default());
-    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGTSTP])?;
     let shared = sig.clone();
     std::thread::spawn(move || {
         for s in signals.forever() {
+            if s == SIGTSTP {
+                if shared.waiting.load(Ordering::SeqCst) {
+                    let _ = tx.send(Event::Stop);
+                } else if let Err(e) = signal_hook::low_level::emulate_default_handler(s) {
+                    eprintln!("heavy: cannot stop: {e}");
+                }
+                continue;
+            }
             shared.last.store(s, Ordering::SeqCst);
             let pg = shared.pgid.load(Ordering::SeqCst);
             if pg > 0 {
@@ -151,7 +163,10 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         let _lock = state.lock()?;
         state.write_job(&job)?;
     }
-    match acquire(state, &cwd, &cap, &mut job, &rx) {
+    sig.waiting.store(true, Ordering::SeqCst);
+    let acquired = acquire(state, &cwd, &cap, &mut job, &rx);
+    sig.waiting.store(false, Ordering::SeqCst);
+    match acquired {
         Ok(()) => {}
         Err(Error::Interrupted(s)) => return Ok(u8::try_from(128 + s).unwrap_or(130)),
         Err(Error::DiskFull(why)) => {
@@ -216,11 +231,26 @@ fn acquire(state: &StateDir, cwd: &Path, cap: &Capacity, job: &mut Job, rx: &Rec
         }
         match rx.recv_timeout(if live_blocked { LIVE_RESAMPLE } else { SWEEP }) {
             Ok(Event::Signal(s)) => return Err(Error::Interrupted(s)),
+            Ok(Event::Stop) => park(state, job)?,
             Ok(Event::Fs) => while rx.try_recv().is_ok_and(|e| matches!(e, Event::Fs)) {},
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Err(Error::Probe("event channel closed".into())),
         }
     }
+}
+
+/// Ctrl-Z while waiting. The job file says `stopped` first (that file change is the event that wakes the waiters
+/// behind this one), then the process stops itself. After SIGCONT it is `queued` again, keeping its place.
+fn park(state: &StateDir, job: &mut Job) -> Result<(), Error> {
+    set_state(state, job, State::Stopped)?;
+    kill(Pid::this(), Signal::SIGSTOP)?;
+    set_state(state, job, State::Queued)
+}
+
+fn set_state(state: &StateDir, job: &mut Job, to: State) -> Result<(), Error> {
+    let _lock = state.lock()?;
+    job.state = to;
+    state.write_job(job)
 }
 
 fn exit_code(status: ExitStatus) -> i32 {

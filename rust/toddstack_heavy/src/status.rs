@@ -36,7 +36,11 @@ pub fn print(state: &StateDir) -> Result<(), Error> {
     println!("{:<8} {:>7} {:>5} {:>8} {:>8} {:>8}  command (live use)", "state", "pid", "cpu", "mem", "vram", "disk");
     for j in &jobs {
         let u = live.per_job.iter().find(|(id, _)| *id == j.id).map(|(_, u)| *u);
-        let state = if j.state == State::Running { "running" } else { "queued" };
+        let state = match j.state {
+            State::Running => "running",
+            State::Stopped => "stopped",
+            State::Queued => "queued",
+        };
         let used = u.map_or(String::new(), |u| format!(" ({}.{:02} cores, {})", u.cpu / 100, u.cpu % 100, fmt_size(u.mem)));
         println!(
             "{:<8} {:>7} {:>5} {:>8} {:>8} {:>8}  {}{used}",
