@@ -11,7 +11,7 @@ Chrome, `ui web` with layout rules and approved references, `update`, fake and s
 ## Install
 
 ```sh
-cargo install shakedown@0.4.0 --locked          # from crates.io
+cargo install shakedown@0.4.1 --locked          # from crates.io
 cargo install --path rust/shakedown --locked    # from a toddstack checkout
 shakedown doctor                                # what is installed, what is missing, and the fix for each miss
 ```
@@ -28,7 +28,7 @@ Pin the version in each project's `shakedown.toml`; a mismatch stops with the ex
 | `shakedown pixels encode <in.png> <out.png> [--step 8]` | stores a PNG the way references are stored |
 | `shakedown ui web [--screens a,b] [--repeat N] [--json]` | draws every `[[screen]]` on every `[devices].ui` device and theme in the pinned Chrome; layout rules, console errors and layout shift, then pixels against the references; report on failure |
 | `shakedown update --screens a,b` | rewrites only the named references, and only the files whose pixels changed. `all` only for a first generation |
-| `shakedown browser install` / `path` | the pinned Chrome for Testing 149.0.7827.55 (sha256 checked, unpacked with `ditto` into `~/Library/Caches/shakedown/chrome/`). `ui` installs it on first use |
+| `shakedown browser install` / `path` | the pinned Chrome for Testing 149.0.7827.55 (macOS arm64 or Linux x86_64; sha256 checked, unpacked with `ditto` or, on Linux, `unzip` into `~/Library/Caches/shakedown/chrome/` or `~/.cache/shakedown/chrome/`; Linux Chrome needs `sudo apt install libnss3 libnspr4 libasound2t64`). `ui` installs it on first use |
 | `shakedown sweep [--base URL] [--routes a,b] [--pack] [--rebase]` | every `[sweep]` page on every sweep device and theme, headless: layout rules and shift fail it; pixels are diffed against a local baseline and only reported. `--pack` writes the review pack |
 | `shakedown devices [list\|json\|serve]` | the one device list (18 devices, portrait and landscape); `serve` is the interactive side-by-side viewer |
 | `shakedown doctor` | checks Rust, a shell, `strip`, Xcode, simulator runtimes, Java, the Android SDK, the pinned Chrome and disk use |
