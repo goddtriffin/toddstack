@@ -15,6 +15,7 @@ LIBS=(
   "crate toddstack-accounts-server-sdk rust/toddstack_accounts_server_sdk rust/toddstack_accounts_server_sdk/Cargo.toml toddstack-accounts-server-sdk-v"
   "crate toddstack-frontend-engine rust/toddstack_frontend_engine rust/toddstack_frontend_engine/Cargo.toml toddstack-frontend-engine-v"
   "crate shakedown rust/shakedown rust/shakedown/Cargo.toml shakedown-v"
+  "crate stokehold rust/stokehold rust/stokehold/Cargo.toml stokehold-v"
   "jsr   @todd/webserver-base typescript/webserver-base typescript/deno.jsonc        -"
   "jsr   @todd/toddstack-accounts typescript/accounts  typescript/accounts/deno.jsonc toddstack-accounts-v"
   "npm   toddstack-accounts typescript/accounts       typescript/accounts/package.json toddstack-accounts-v"
