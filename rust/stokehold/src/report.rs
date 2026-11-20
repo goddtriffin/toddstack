@@ -1,4 +1,4 @@
-//! `heavy history`: how well heavy used the machine, and whether idle time was ever heavy's fault.
+//! `stokehold history`: how well heavy used the machine, and whether idle time was ever heavy's fault.
 //!
 //! The headline numbers are the average CPU while jobs waited (it should be near full) and "idle while waiting":
 //! sample intervals where a job waited although the machine had room (CPU under 75%, memory under 85%; load is
@@ -242,7 +242,7 @@ pub fn spark(values: &[Option<f64>], max: f64) -> String {
 #[must_use]
 pub fn render_text(r: &Report) -> String {
     let mut o = String::new();
-    let _ = writeln!(o, "heavy history, {} to {} UTC", stamp(r.since_ms), stamp(r.until_ms));
+    let _ = writeln!(o, "stokehold history, {} to {} UTC", stamp(r.since_ms), stamp(r.until_ms));
     let _ = writeln!(o, "jobs {}, wait total {}, avg {}, p95 {}", r.jobs, fmt_dur(r.wait_total_ms), fmt_dur(r.wait_avg_ms), fmt_dur(r.wait_p95_ms));
     if let Some(avg) = r.wait_cpu_avg {
         let _ = writeln!(o, "avg cpu while jobs waited: {avg}%");
@@ -354,7 +354,7 @@ pub fn render_html(r: &Report) -> String {
     let max_n = r.buckets.iter().flat_map(|b| [b.running, b.waiting]).flatten().max().unwrap_or(1).max(1);
     let (first, last) = (r.buckets.first().map_or_default(|b| stamp(b.start_ms)), r.buckets.last().map_or_default(|b| stamp(b.start_ms + BUCKET_MS)));
     let mut h = String::from(concat!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>heavy history</title><style>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>stokehold history</title><style>",
         ":root{--bg:#fff;--fg:#1b1f24;--mut:#667;--line:#d7dbe0;--cpu:#2563eb;--run:#16a34a;--wait:#d97706;--bad:#dc2626}",
         "@media(prefers-color-scheme:dark){:root{--bg:#14171a;--fg:#e6e8ea;--mut:#9aa3ad;--line:#2d333a;--cpu:#60a5fa;--run:#4ade80;--wait:#fbbf24;--bad:#f87171}}",
         "body{margin:0 auto;max-width:960px;padding:16px;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}",
@@ -367,7 +367,7 @@ pub fn render_html(r: &Report) -> String {
         ".bar{fill:var(--bad)}.barbg{fill:var(--line)}",
         "</style></head><body>"
     ));
-    let _ = write!(h, "<h1>heavy history</h1><p class=\"mut\">{} to {} UTC</p>", stamp(r.since_ms), stamp(r.until_ms));
+    let _ = write!(h, "<h1>stokehold history</h1><p class=\"mut\">{} to {} UTC</p>", stamp(r.since_ms), stamp(r.until_ms));
     let _ = write!(
         h,
         "<div class=\"tiles\"><div class=\"tile\"><b>{}</b>jobs</div><div class=\"tile\"><b>{}</b>wait total</div><div class=\"tile\"><b>{}</b>avg wait</div><div class=\"tile\"><b>{}</b>p95 wait</div><div class=\"tile\"><b>{}</b>avg cpu while jobs waited</div><div class=\"tile\"><b>{}</b>idle while waiting ({} of {})</div></div>",
@@ -395,7 +395,7 @@ pub fn render_html(r: &Report) -> String {
     ));
     h.push_str("<section><h2>Blockers while idle</h2>");
     if r.idle_reasons.is_empty() {
-        h.push_str("<p class=\"mut\">None: heavy never waited with room on the machine in this window.</p>");
+        h.push_str("<p class=\"mut\">None: stokehold never waited with room on the machine in this window.</p>");
     } else {
         let top = r.idle_reasons.first().map_or(1, |(_, ms)| *ms).max(1);
         let _ = write!(h, "<svg viewBox=\"0 0 {W} {}\" role=\"img\" aria-label=\"blocking reasons during idle minutes\">", r.idle_reasons.len() * 24 + 4);

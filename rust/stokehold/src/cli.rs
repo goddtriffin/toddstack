@@ -1,4 +1,4 @@
-//! Argument parsing: `heavy [flags] [--] cmd args...` and `heavy status`.
+//! Argument parsing: `stokehold [flags] [--] cmd args...` and `stokehold status`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::sizes::parse_size;
 
-pub const USAGE: &str = "usage: heavy [--cpu N] [--mem SIZE] [--vram SIZE] [--disk SIZE] [--timeout DURATION] [--] cmd [args...]\n       heavy status\n       heavy history [--since 2h|1d|7d] [--html PATH]";
+pub const USAGE: &str = "usage: stokehold [--cpu N] [--mem SIZE] [--vram SIZE] [--disk SIZE] [--timeout DURATION] [--] cmd [args...]\n       stokehold status\n       stokehold history [--since 2h|1d|7d] [--html PATH]";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Flags {
@@ -20,7 +20,7 @@ pub struct Flags {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Status,
-    /// `heavy history`: how well heavy used the machine.
+    /// `stokehold history`: how well heavy used the machine.
     History {
         since: Duration,
         html: Option<PathBuf>,
@@ -33,10 +33,10 @@ pub enum Command {
     },
 }
 
-/// The default maximum run time (from config: `HEAVY_TIMEOUT`, else this).
+/// The default maximum run time (from config: `STOKEHOLD_TIMEOUT`, else this).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_hours(1);
 
-/// The default window of `heavy history`.
+/// The default window of `stokehold history`.
 pub const DEFAULT_SINCE: Duration = Duration::from_hours(24);
 
 /// `90s`, `10m`, `2h`, `1d`, `1500ms`; a bare number is seconds.
@@ -59,10 +59,10 @@ pub fn parse_duration(text: &str) -> Result<Duration, Error> {
 }
 
 impl Flags {
-    /// `--timeout`, else `HEAVY_TIMEOUT`, else 60 minutes.
+    /// `--timeout`, else `STOKEHOLD_TIMEOUT`, else 60 minutes.
     #[must_use]
     pub fn timeout(&self) -> Duration {
-        self.timeout.or_else(|| parse_duration(&std::env::var("HEAVY_TIMEOUT").ok()?).ok()).unwrap_or(DEFAULT_TIMEOUT)
+        self.timeout.or_else(|| parse_duration(&crate::state::env_var("STOKEHOLD_TIMEOUT")?.into_string().ok()?).ok()).unwrap_or(DEFAULT_TIMEOUT)
     }
 }
 
@@ -76,7 +76,7 @@ fn parse_history(args: &[String]) -> Result<Command, Error> {
             "--since" => since = parse_duration(&value()?)?,
             "--html" => html = Some(PathBuf::from(value()?)),
             _ => {
-                return Err(Error::Usage(format!("heavy history: unknown argument {arg:?}\n{USAGE}")));
+                return Err(Error::Usage(format!("stokehold history: unknown argument {arg:?}\n{USAGE}")));
             }
         }
     }

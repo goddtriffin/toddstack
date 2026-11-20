@@ -101,7 +101,7 @@ fn secs(ms: u64) -> String {
 pub fn format_stats(s: &Stats) -> String {
     let timing = if s.queued_ms >= SIGNIFICANT_QUEUE_MS { format!("queued {}, ran {}", secs(s.queued_ms), secs(s.run_ms)) } else { format!("ran {}", secs(s.run_ms)) };
     let mut out = format!(
-        "heavy: {timing}\nheavy: cpu {} user + {} sys, avg {}.{:02} cores, peak {}.{:02} cores\nheavy: peak rss {} (whole process tree) / {} (largest process), disk blocks read {} written {}\nheavy: network (machine-wide) in {} out {}",
+        "stokehold: {timing}\nstokehold: cpu {} user + {} sys, avg {}.{:02} cores, peak {}.{:02} cores\nstokehold: peak rss {} (whole process tree) / {} (largest process), disk blocks read {} written {}\nstokehold: network (machine-wide) in {} out {}",
         secs(s.cpu_user_ms),
         secs(s.cpu_sys_ms),
         s.centi_cores / 100,
@@ -116,15 +116,15 @@ pub fn format_stats(s: &Stats) -> String {
         fmt_size(s.net_out),
     );
     if let Some(v) = s.peak_vram {
-        let _ = write!(out, "\nheavy: peak vram (machine-wide) {}", fmt_size(v));
+        let _ = write!(out, "\nstokehold: peak vram (machine-wide) {}", fmt_size(v));
     }
     if let Some(v) = s.steal_ms {
-        let _ = write!(out, "\nheavy: cpu steal (machine-wide) {}", secs(v));
+        let _ = write!(out, "\nstokehold: cpu steal (machine-wide) {}", secs(v));
     }
     if s.timed_out {
-        let _ = write!(out, "\nheavy: TIMED OUT after {} (SIGTERM to the process group, SIGKILL after the grace period)", secs(s.run_ms));
+        let _ = write!(out, "\nstokehold: TIMED OUT after {} (SIGTERM to the process group, SIGKILL after the grace period)", secs(s.run_ms));
     }
-    out.push_str("\nheavy: ");
+    out.push_str("\nstokehold: ");
     out.push_str(REVIEW_PROMPT);
     out
 }
@@ -156,6 +156,6 @@ mod tests {
         assert!(text.contains("TIMED OUT"), "{text}");
         assert!(text.ends_with(REVIEW_PROMPT), "{text}");
         let quick = format_stats(&Stats { queued_ms: 200, run_ms: 1000, ..Stats::default() });
-        assert!(quick.contains("heavy: ran 1.0s") && !quick.contains("queued"), "{quick}");
+        assert!(quick.contains("stokehold: ran 1.0s") && !quick.contains("queued"), "{quick}");
     }
 }

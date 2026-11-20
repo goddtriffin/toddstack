@@ -1,6 +1,6 @@
 //! Probing the machine: capacity, live samples, process liveness, network and VRAM counters.
 //!
-//! `HEAVY_CAPACITY` (`cpu=8,mem=16G,vram=0,disk=100G`) and `HEAVY_LIVE` (`load=0.5,load5=0.5,mem_pct=10,disk_free=50G,nonheavy_cpu=200,nonheavy_mem=8G,nonheavy_vram=0`)
+//! `STOKEHOLD_CAPACITY` (`cpu=8,mem=16G,vram=0,disk=100G`) and `STOKEHOLD_LIVE` (`load=0.5,load5=0.5,mem_pct=10,disk_free=50G,nonheavy_cpu=200,nonheavy_mem=8G,nonheavy_vram=0`)
 //! override probed numbers; the tests use them (`mem_pressure=2` fakes memory pressure; with any override set, the real
 //! pressure is not read).
 
@@ -22,7 +22,7 @@ pub fn to_u64<T: TryInto<u64>>(x: T) -> u64 {
 }
 
 fn overrides(var: &str) -> Result<Vec<(String, String)>, Error> {
-    let Ok(text) = std::env::var(var) else { return Ok(Vec::new()) };
+    let Some(text) = crate::state::env_var(var).and_then(|v| v.into_string().ok()) else { return Ok(Vec::new()) };
     text.split(',')
         .filter(|s| !s.trim().is_empty())
         .map(|kv| {
@@ -64,14 +64,14 @@ pub fn vram() -> Option<(u64, u64)> {
 /// # Errors
 /// Fails when the cwd's filesystem cannot be read or an override is malformed.
 pub fn capacity(cwd: &Path) -> Result<Capacity, Error> {
-    let o = overrides("HEAVY_CAPACITY")?;
+    let o = overrides("STOKEHOLD_CAPACITY")?;
     let mut sys = System::new()?;
     sys.refresh_memory();
     let (disk_total, _) = disk(cwd)?;
     let on_mac = cfg!(target_os = "macos");
     let probed_cpu = std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX));
     let cpu = match get(&o, "cpu") {
-        Some(v) => v.parse().map_err(|_| Error::Usage(format!("HEAVY_CAPACITY cpu: {v:?}")))?,
+        Some(v) => v.parse().map_err(|_| Error::Usage(format!("STOKEHOLD_CAPACITY cpu: {v:?}")))?,
         None => probed_cpu,
     };
     let mem = get(&o, "mem").map(parse_size).transpose()?.unwrap_or_else(|| sys.total_memory());
@@ -297,8 +297,8 @@ fn measure(jobs: &[Job], cpu_count: u32, want_vram: bool) -> Result<(Usage, Vec<
 /// # Errors
 /// Fails when the filesystem cannot be read or an override is malformed.
 pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> {
-    let o = overrides("HEAVY_LIVE")?;
-    let bad = |k: &str, v: &str| Error::Usage(format!("HEAVY_LIVE {k}: {v:?}"));
+    let o = overrides("STOKEHOLD_LIVE")?;
+    let bad = |k: &str, v: &str| Error::Usage(format!("STOKEHOLD_LIVE {k}: {v:?}"));
     let load1 = match get(&o, "load") {
         Some(v) => v.parse().map_err(|_| bad("load", v))?,
         None => System::load_average()?.one,

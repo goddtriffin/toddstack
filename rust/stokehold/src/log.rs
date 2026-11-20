@@ -1,5 +1,5 @@
 //! The event log: `history-YYYY-MM.jsonl` (UTC) in the state dir. One JSON line per job event (queued, started,
-//! finished) and per machine sample, read back by `heavy history`. Five monthly files are kept.
+//! finished) and per machine sample, read back by `stokehold history`. Five monthly files are kept.
 //!
 //! (`history.jsonl`, see `history.rs`, is separate: it holds the finished runs that set the default weights.)
 
@@ -134,7 +134,7 @@ pub fn append(dir: &Path, event: &Event) -> Result<(), Error> {
 /// Records an event; a failure only warns (history must never fail a job).
 pub fn record(dir: &Path, event: &Event) {
     if let Err(e) = append(dir, event) {
-        eprintln!("heavy: could not write history: {e}");
+        eprintln!("stokehold: could not write history: {e}");
     }
 }
 

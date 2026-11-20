@@ -1,4 +1,4 @@
-//! Machine samples for `heavy history`. While any heavy job waits or runs, each heavy process checks every 10 s
+//! Machine samples for `stokehold history`. While any heavy job waits or runs, each heavy process checks every 10 s
 //! whether a sample is due; the one that finds it due and takes the lock writes it. So samples are at most 30 s apart
 //! in the log, whoever writes them, and none are written when no job exists. This is monitoring (exempt from the
 //! no-polling rule). The same check keeps the shared CPU readings (`admit::sustained_pct`) at most 10 s old while any
