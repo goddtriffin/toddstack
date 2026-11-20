@@ -9,11 +9,12 @@
 //! A job asks for one free core, so on 16 cores jobs start until the CPU is about 94% busy.
 //!
 //! A job admitted in the last `RAMP_MS` holds its peak cores (from history, clamped to the machine) while its CPU ramps
-//! up, so a burst of waiters cannot all start at once. The hold is full for the first `RAMP_FULL_MS` (the stagger floor:
-//! two jobs whose holds fill the machine, such as cold or Docker jobs, never start within 3 s of each other). After
-//! that the measured machine decides: under `RAMP_IDLE_CPU_PCT` busy the job has shown its real use and the hold is
-//! released; otherwise it shrinks linearly to nothing at `RAMP_MS`. After the ramp only live use counts. Memory
-//! headroom uses max(reservation, live usage) per running job.
+//! up, so a burst of waiters cannot all start at once. A hold of the whole machine (cold and Docker jobs) stays full for
+//! all of `RAMP_MS`, so those start at least 10 s apart: their real use is unknown and may show up late. A learned peak
+//! below the machine is full for the first `RAMP_FULL_MS` (the stagger floor); after that the measured machine decides:
+//! under `RAMP_IDLE_CPU_PCT` busy the job has shown its real use and the hold is released, otherwise it shrinks linearly
+//! to nothing at `RAMP_MS`. After the ramp only live use counts. Memory headroom uses max(reservation, live usage) per
+//! running job.
 //!
 //! Non-heavy usage (Chrome, Discord, other CLIs) is smoothed by the caller: max(latest sample, mean of the last 3), so
 //! a rise blocks at once and a fall is released slowly. Live guards (load, memory, disk) can only veto.
@@ -164,14 +165,16 @@ pub fn fits_reservations(req: Weights, running: &[&Job], cap: &Capacity) -> bool
     fits(Usage { cpu: 0, ..request(req) }, room)
 }
 
-/// The CPU a job `elapsed_ms` into its ramp still holds beyond its live use: its full peak for `RAMP_FULL_MS`, then
-/// nothing if the machine is measured under `RAMP_IDLE_CPU_PCT` busy, else the peak shrinking linearly to 0 at `RAMP_MS`.
+/// The CPU a job `elapsed_ms` into its ramp still holds beyond its live use (`peak` already clamped to `machine`). A
+/// whole-machine hold (cold or Docker) is full for all of `RAMP_MS`. A learned peak below the machine is full for
+/// `RAMP_FULL_MS`, then nothing if the machine is measured under `RAMP_IDLE_CPU_PCT` busy, else it shrinks linearly to 0
+/// at `RAMP_MS`.
 #[must_use]
-pub fn ramp_hold(peak: u64, elapsed_ms: i64, cpu_pct: u64) -> u64 {
+pub fn ramp_hold(peak: u64, machine: u64, elapsed_ms: i64, cpu_pct: u64) -> u64 {
     if elapsed_ms >= RAMP_MS {
         return 0;
     }
-    if elapsed_ms < RAMP_FULL_MS {
+    if elapsed_ms < RAMP_FULL_MS || peak >= machine {
         return peak;
     }
     if cpu_pct < RAMP_IDLE_CPU_PCT {
@@ -187,7 +190,7 @@ pub fn ramp_hold(peak: u64, elapsed_ms: i64, cpu_pct: u64) -> u64 {
 pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> Usage {
     let held = running.iter().fold(Usage::default(), |a, j| {
         let l = live.per_job.iter().find(|(id, _)| *id == j.id).map_or_else(Usage::default, |(_, u)| *u);
-        let hold = j.started_ms.map_or(0, |t| ramp_hold(centi(j.weights.cpu).min(centi(cap.cpu)), now_ms.saturating_sub(t).max(0), live.cpu_pct));
+        let hold = j.started_ms.map_or(0, |t| ramp_hold(centi(j.weights.cpu).min(centi(cap.cpu)), centi(cap.cpu), now_ms.saturating_sub(t).max(0), live.cpu_pct));
         let cpu = l.cpu.max(hold);
         Usage { cpu: a.cpu + cpu, mem: a.mem + l.mem.max(j.weights.mem), vram: a.vram + l.vram.max(j.weights.vram) }
     });
@@ -500,9 +503,9 @@ mod tests {
             t += 100;
         }
         assert_eq!(starts.len(), 8);
-        // The machine reads idle here (the fake builds never use CPU), so each hold is released after the stagger floor.
-        assert!(starts.windows(2).all(|w| w[1] - w[0] >= RAMP_FULL_MS), "never two cold builds within the floor: {starts:?}");
-        // With the CPU measured 60% busy, the holds only shrink, so cold builds stay further apart.
+        // Even on a machine that reads idle, whole-machine holds are never released early: one cold build per ramp.
+        assert!(starts.windows(2).all(|w| w[1] - w[0] >= RAMP_MS), "one cold build per ramp: {starts:?}");
+        // Same with the CPU measured 60% busy.
         let busy = Live { cpu_pct: 60, non_heavy: Usage { cpu: 960, mem: 0, vram: 0 }, ..calm() };
         let mut jobs: Vec<Job> = (0..3).map(|i| job(&format!("k{i}"), 16, 1, State::Queued, i)).collect();
         let mut starts = Vec::new();
@@ -518,7 +521,7 @@ mod tests {
             t += 100;
         }
         assert_eq!(starts.len(), 3);
-        assert!(starts.windows(2).all(|w| w[1] - w[0] >= 7_500), "busy: a hold of 1600 x (10 s - e) / 7 s must drop to 540: {starts:?}");
+        assert!(starts.windows(2).all(|w| w[1] - w[0] >= RAMP_MS), "busy: one cold build per ramp: {starts:?}");
         // At one instant only the first is admitted.
         let mut now = jobs.clone();
         for j in &mut now {
@@ -587,14 +590,20 @@ mod tests {
         let live = Live { non_heavy: Usage { cpu: 320, mem: 8 * G, vram: 0 }, ..calm() };
         let ra = Job { state: State::Running, started_ms: Some(10), ..job("a", 16, 8, State::Running, 0) };
         let b = job("b", 16, 8, State::Queued, 2);
-        // The machine reads idle: the hold is released when the stagger floor ends.
+        // A whole-machine hold (cold) lasts the full ramp, idle or not.
         let d = evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 500);
-        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), live: true, .. } if e == 10 + RAMP_FULL_MS), "{d:?}");
-        // At 60% busy the hold shrinks linearly: 1600 x (10 s - e) / 7 s <= 1180 free from e = 4.84 s, next 250 ms step.
+        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), live: true, .. } if e == 10 + RAMP_MS), "{d:?}");
         let warm = Live { cpu_pct: 60, ..live.clone() };
-        let d = evaluate(&b, &[ra.clone(), b.clone()], &c, &warm, 500);
-        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(5000), .. }), "{d:?}");
-        assert_eq!(evaluate(&b, &[ra, b.clone()], &c, &warm, 5000), Decision::Start);
+        let d = evaluate(&b, &[ra, b.clone()], &c, &warm, 500);
+        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), .. } if e == 10 + RAMP_MS), "{d:?}");
+        // A learned 15-core peak on a machine that reads idle: released when the stagger floor ends.
+        let rl = Job { state: State::Running, started_ms: Some(10), ..job("l", 15, 8, State::Running, 0) };
+        let d = evaluate(&b, &[rl.clone(), b.clone()], &c, &live, 500);
+        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), .. } if e == 10 + RAMP_FULL_MS), "{d:?}");
+        // At 60% busy it shrinks linearly: 1500 x (10 s - e) / 7 s, rounded down, is 1180 (the room left) at e = 4.49 s.
+        let d = evaluate(&b, &[rl.clone(), b.clone()], &c, &warm, 500);
+        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(4500), .. }), "{d:?}");
+        assert_eq!(evaluate(&b, &[rl, b.clone()], &c, &warm, 4500), Decision::Start);
         // A genuinely busy CPU is a cpu block, with no ramp time.
         let busy = Live { non_heavy: Usage { cpu: 1550, mem: 8 * G, vram: 0 }, ..calm() };
         let run = Job { state: State::Running, started_ms: Some(0), ..job("r", 1, 8, State::Running, 0) };
@@ -613,7 +622,7 @@ mod tests {
         // a was admitted just now and holds its full 16 cores while ramping: b waits for the ramp, then starts.
         let ra = Job { state: State::Running, started_ms: Some(10), ..a };
         assert!(waits(&evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 11)), "blocked by a's ramp hold");
-        assert_eq!(evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 10 + RAMP_FULL_MS), Decision::Start, "the machine reads idle once the floor ends");
+        assert!(waits(&evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 10 + RAMP_FULL_MS)), "a whole-machine hold is not released early");
         assert_eq!(evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 10 + RAMP_MS), Decision::Start, "the second starts once the first one's ramp has ended");
         let ca = job("c", 16, 8, State::Queued, 3);
         // A genuinely busy CPU still blocks.
@@ -706,9 +715,10 @@ mod tests {
 
     #[test]
     fn ramp_hold_is_released_while_measured_cpu_is_low() {
-        // 2026-11-20 07:01:33: cpu 20%, one job running (cold, ramping), one waiting, blocked by ramp.
-        // 0.3.0 held the running job's 16 cores for the whole 10 s ramp, so the waiter sat with 80% of the CPU idle.
-        let run = Job { started_ms: Some(0), ..job("r", 16, 4, State::Running, 0) };
+        // 2026-11-20 07:01:33: cpu 20%, one job running (ramping), one waiting, blocked by ramp.
+        // 0.3.0 held the running job's peak for the whole 10 s ramp, so the waiter sat with 80% of the CPU idle.
+        // Here the running job has a learned 15-core peak (below the machine).
+        let run = Job { started_ms: Some(0), ..job("r", 15, 4, State::Running, 0) };
         let me = job("a", 16, 4, State::Queued, 1);
         let all = [run.clone(), me.clone()];
         let live = Live {
@@ -720,12 +730,19 @@ mod tests {
             non_heavy: Usage { cpu: 170, mem: 22 * G, vram: 0 },
             ..calm()
         };
-        // Inside the stagger floor the hold is full: no simultaneous cold starts.
+        // Inside the stagger floor the hold is full: no simultaneous starts.
         let d = evaluate(&me, &all, &mac(), &live, 1_000);
         assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(RAMP_FULL_MS), .. }), "{d:?}");
         // After it, the idle machine shows the ramping job's real use: admitted (0.3.0 waited until 10 s).
         assert_eq!(evaluate(&me, &all, &mac(), &live, 4_000), Decision::Start);
         assert_eq!(evaluate(&me, &all, &mac(), &live, RAMP_FULL_MS), Decision::Start);
+        // The same moment with a cold running job (whole-machine hold): held for the full 10 s, as in 0.3.0.
+        let cold = Job { started_ms: Some(0), ..job("r", 16, 4, State::Running, 0) };
+        let all_cold = [cold, me.clone()];
+        let d = evaluate(&me, &all_cold, &mac(), &live, 4_000);
+        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(RAMP_MS), .. }), "{d:?}");
+        assert!(waits(&evaluate(&me, &all_cold, &mac(), &live, RAMP_MS - 1)));
+        assert_eq!(evaluate(&me, &all_cold, &mac(), &live, RAMP_MS), Decision::Start);
 
         // 06:22:23: cpu 24%, four running (three ramped, one admitted 5 s ago with a learned 8-core peak), one waiting.
         let mut all: Vec<Job> = (0..3).map(|i| Job { started_ms: Some(0), ..job(&format!("d{i}"), 4, 2, State::Running, 0) }).collect();
@@ -754,13 +771,17 @@ mod tests {
 
     #[test]
     fn ramp_hold_schedule() {
-        let peak = 1600;
-        assert_eq!(ramp_hold(peak, 0, 0), peak, "full at admission");
-        assert_eq!(ramp_hold(peak, RAMP_FULL_MS - 1, 0), peak, "full through the floor, however idle");
-        assert_eq!(ramp_hold(peak, RAMP_FULL_MS, 49), 0, "released on an idle machine");
-        assert_eq!(ramp_hold(peak, RAMP_FULL_MS, 50), peak, "shrinks from the full peak on a busy one");
-        assert_eq!(ramp_hold(peak, 6_500, 80), 800, "halfway down at the middle of the shrink");
-        assert_eq!(ramp_hold(peak, RAMP_MS, 100), 0, "gone when the ramp ends");
+        let (peak, machine) = (800, 1600);
+        assert_eq!(ramp_hold(peak, machine, 0, 0), peak, "full at admission");
+        assert_eq!(ramp_hold(peak, machine, RAMP_FULL_MS - 1, 0), peak, "full through the floor, however idle");
+        assert_eq!(ramp_hold(peak, machine, RAMP_FULL_MS, 49), 0, "released on an idle machine");
+        assert_eq!(ramp_hold(peak, machine, RAMP_FULL_MS, 50), peak, "shrinks from the full peak on a busy one");
+        assert_eq!(ramp_hold(peak, machine, 6_500, 80), 400, "halfway down at the middle of the shrink");
+        assert_eq!(ramp_hold(peak, machine, RAMP_MS, 100), 0, "gone when the ramp ends");
+        // A whole-machine hold (cold or Docker) is full for the whole ramp, however idle the machine reads.
+        assert_eq!(ramp_hold(machine, machine, RAMP_FULL_MS, 0), machine);
+        assert_eq!(ramp_hold(machine, machine, RAMP_MS - 1, 0), machine);
+        assert_eq!(ramp_hold(machine, machine, RAMP_MS, 0), 0);
     }
 
     #[test]
