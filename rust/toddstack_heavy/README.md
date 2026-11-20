@@ -22,7 +22,7 @@ runs (for prompts and pagers) and `heavy` takes it back afterwards. If the child
 
 Cores, RAM, GPU memory and free disk the job needs. Without flags: the median measured peak (whole process tree,
 sampled every 0.5 s while the job runs: peak cores at once and peak RSS) from
-`~/.local/state/heavy/history.jsonl` for the same command and cwd, else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 3 s apart; after one run, history gives the real peak). A request larger than
+`~/.local/state/heavy/history.jsonl` for the same command and cwd, else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 10 s apart; after one run, history gives the real peak). A request larger than
 the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
 
 ## Admission
@@ -32,9 +32,10 @@ All of these must hold:
 - Reservations: running RAM and VRAM reservations plus this request are at most 90% of capacity.
 - CPU headroom: `all cores - non-heavy usage - live CPU of running jobs` leaves one free core (on 16 cores, jobs
   start until the CPU is about 94% busy). A job admitted in the last 10 s holds its peak cores (from history) while it
-  ramps up, so a burst of waiters is staggered: the hold is full for 3 s (cold and Docker jobs, which hold every core,
-  never start within 3 s of each other); after that, if the machine reads under 50% CPU the job has shown its real
-  use and the hold is released, otherwise the hold shrinks linearly to nothing at 10 s. A waiter held back by a ramp
+  ramps up, so a burst of waiters is staggered. A whole-machine hold (cold and Docker jobs) stays full for all 10 s, so
+  those start at least 10 s apart. A learned peak below the machine is full for 3 s; after that, if the machine reads
+  under 50% CPU the job has shown its real use and the hold is released, otherwise it shrinks linearly to nothing at
+  10 s. A waiter held back by a ramp
   sleeps until the first moment the shrinking holds leave room. A job's recorded peak is the larger of its process tree's peak and the
   machine-wide CPU rise of other programs over the pre-start baseline, so work hosted in Docker's VM (outside the
   tree) also teaches a real peak.
