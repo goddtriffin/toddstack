@@ -196,6 +196,7 @@ fn acquire(state: &StateDir, cwd: &Path, cap: &Capacity, job: &mut Job, rx: &Rec
         let decision = {
             let _lock = state.lock()?;
             let jobs = state.live_jobs();
+            live.stopped = machine::stopped_ids(&jobs);
             let d = evaluate(job, &jobs, cap, &live, now_ms());
             if d == Decision::Start {
                 job.state = State::Running;

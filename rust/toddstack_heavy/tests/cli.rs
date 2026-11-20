@@ -114,14 +114,14 @@ fn second_big_job_waits_for_the_first_fifo() {
     let t = TempDir::new().unwrap();
     let log = t.path().join("order.log");
     let script = |name: &str, sleep: &str| format!("echo start-{name} >> {p}; sleep {sleep}; echo end-{name} >> {p}", p = log.display());
-    let a = heavy(t.path()).args(["--cpu", "8", "sh", "-c", &script("a", "1")]).stderr(Stdio::null()).spawn().unwrap();
+    let a = heavy(t.path()).args(["--mem", "10G", "sh", "-c", &script("a", "1")]).stderr(Stdio::null()).spawn().unwrap();
     // Wait until A is running (its job file says so), so B really queues behind it.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !log.exists() {
         assert!(Instant::now() < deadline, "a never started");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let b = run(heavy(t.path()).args(["--cpu", "8", "sh", "-c", &script("b", "0")]));
+    let b = run(heavy(t.path()).args(["--mem", "10G", "sh", "-c", &script("b", "0")]));
     assert_eq!(code(&b), 0);
     assert!(stderr(&b).contains("waiting"), "b queued: {}", stderr(&b));
     let _ = a.wait_with_output().unwrap();
@@ -187,8 +187,8 @@ fn ctrl_c_sigint_is_forwarded_and_hup_too() {
 #[test]
 fn signal_while_queued_removes_the_job_file() {
     let t = TempDir::new().unwrap();
-    let (holder, _out) = start_ready(t.path(), &["--cpu", "8"], "echo ready; sleep 30");
-    let mut waiter = heavy(t.path()).args(["--cpu", "8", "true"]).stderr(Stdio::null()).spawn().unwrap();
+    let (holder, _out) = start_ready(t.path(), &["--mem", "10G"], "echo ready; sleep 30");
+    let mut waiter = heavy(t.path()).args(["--mem", "10G", "true"]).stderr(Stdio::null()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::fs::read_dir(t.path().join("jobs")).unwrap().count() < 2 {
         assert!(Instant::now() < deadline);
@@ -262,4 +262,33 @@ fn status_lists_running_jobs() {
     assert!(text.contains("running") && text.contains("sleep 30") && text.contains("capacity"), "{text}");
     kill(&holder, "-TERM");
     let _ = holder.wait_with_output();
+}
+
+/// Runs heavy under a real pty (via `script`) so the terminal-foreground handoff path is exercised.
+#[test]
+fn runs_under_a_pty_and_passes_the_exit_code() {
+    if Command::new("script").arg("--help").output().is_err() {
+        return;
+    }
+    let t = TempDir::new().unwrap();
+    let heavy_bin = env!("CARGO_BIN_EXE_heavy");
+    let inner = "echo on-a-tty; test -t 0 && echo stdin-is-tty; exit 5";
+    let mut c = if cfg!(target_os = "macos") {
+        let mut c = Command::new("script");
+        c.args(["-q", "/dev/null", heavy_bin, "sh", "-c", inner]);
+        c
+    } else {
+        let mut c = Command::new("script");
+        c.args(["-qec", &format!("{heavy_bin} sh -c '{inner}'"), "/dev/null"]);
+        c
+    };
+    c.env("HEAVY_STATE_DIR", t.path())
+        .env("HEAVY_CAPACITY", "cpu=8,mem=16G,vram=0,disk=100G")
+        .env("HEAVY_LIVE", "load=0.1,mem_pct=10,disk_free=90G,nonheavy_cpu=0,nonheavy_mem=0,nonheavy_vram=0")
+        .env_remove("HEAVY_JOB")
+        .stdin(Stdio::null());
+    let o = c.output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("on-a-tty") && out.contains("stdin-is-tty"), "{out}");
+    assert_eq!(code(&o), 5, "{out}");
 }
