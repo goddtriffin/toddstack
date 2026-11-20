@@ -14,6 +14,13 @@ use crate::log::Event;
 pub const IDLE_CPU_PCT: u64 = 60;
 pub const IDLE_MEM_PCT: u64 = 85;
 pub const BUCKET_MS: i64 = 300_000;
+
+/// Tie-break for equal idle time: a specific check outranks `queue` (a consequence of another waiter's block), which
+/// outranks `startable` (nothing blocked).
+fn reason_rank(name: &str) -> usize {
+    ["ramp", "cpu", "mem", "load1", "load5", "vram", "queue", "startable"].iter().position(|r| *r == name).unwrap_or(7)
+}
+
 /// Samples are 30 s apart while jobs exist; a longer gap means no job existed, so it counts for nothing.
 pub const MAX_GAP_MS: i64 = 120_000;
 /// The text timeline shows at most this many buckets (24 h); `--html` shows them all.
@@ -128,7 +135,7 @@ pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
         }
     }
     let mut idle_reasons: Vec<(String, u64)> = reasons.into_iter().collect();
-    idle_reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    idle_reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| reason_rank(&a.0).cmp(&reason_rank(&b.0))).then_with(|| a.0.cmp(&b.0)));
 
     let mut repo_rows: Vec<RepoRow> = repos.into_values().collect();
     repo_rows.sort_by(|a, b| b.cpu_ms.cmp(&a.cpu_ms).then_with(|| b.wait_ms.cmp(&a.wait_ms)).then_with(|| a.repo.cmp(&b.repo)));
@@ -453,8 +460,15 @@ mod tests {
         assert_eq!(r.waiting_span_ms, 150_000);
         // Idle: the ones at 30 s and 60 s.
         assert_eq!(r.idle_ms, 60_000);
-        assert_eq!(r.idle_reasons, vec![("cpu".to_string(), 30_000), ("queue".to_string(), 30_000), ("ramp".to_string(), 30_000)]);
+        assert_eq!(r.idle_reasons, vec![("ramp".to_string(), 30_000), ("cpu".to_string(), 30_000), ("queue".to_string(), 30_000)]);
         assert_eq!(pct(r.idle_ms, r.waiting_span_ms), "40.0%");
+    }
+
+    #[test]
+    fn a_tie_ranks_a_specific_reason_before_queue() {
+        let s = [sample(0, 5, 5, 0.1, 2, &[("queue", 1), ("ramp", 1)]), sample(30_000, 5, 5, 0.1, 0, &[])];
+        let r = compute(&s, 0, 60_000);
+        assert_eq!(r.idle_reasons, vec![("ramp".to_string(), 30_000), ("queue".to_string(), 30_000)]);
     }
 
     #[test]

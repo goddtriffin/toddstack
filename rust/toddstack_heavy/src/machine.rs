@@ -11,8 +11,8 @@ use std::time::Duration;
 use nix::sys::statvfs::statvfs;
 use sysinfo::{Networks, Pid, ProcessesToUpdate, System};
 
-use crate::admit::non_heavy;
 use crate::error::Error;
+use crate::admit::non_heavy;
 use crate::job::{Capacity, Job, Live, Usage};
 use crate::sizes::parse_size;
 
@@ -21,12 +21,14 @@ pub fn to_u64<T: TryInto<u64>>(x: T) -> u64 {
 }
 
 fn overrides(var: &str) -> Result<Vec<(String, String)>, Error> {
-    let Ok(text) = std::env::var(var) else {
-        return Ok(Vec::new());
-    };
+    let Ok(text) = std::env::var(var) else { return Ok(Vec::new()) };
     text.split(',')
         .filter(|s| !s.trim().is_empty())
-        .map(|kv| kv.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).ok_or_else(|| Error::Usage(format!("{var}: expected key=value, got {kv:?}"))))
+        .map(|kv| {
+            kv.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .ok_or_else(|| Error::Usage(format!("{var}: expected key=value, got {kv:?}")))
+        })
         .collect()
 }
 
@@ -260,9 +262,7 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
 #[must_use]
 pub fn stopped_ids(jobs: &[Job]) -> Vec<String> {
     let pids: Vec<Pid> = jobs.iter().map(|j| Pid::from_u32(j.pid)).collect();
-    let Ok(mut sys) = System::new() else {
-        return Vec::new();
-    };
+    let Ok(mut sys) = System::new() else { return Vec::new() };
     sys.refresh_processes(ProcessesToUpdate::Some(&pids), true);
     jobs.iter().filter(|j| sys.process(Pid::from_u32(j.pid)).is_some_and(|p| matches!(p.status(), sysinfo::ProcessStatus::Stop))).map(|j| j.id.clone()).collect()
 }
@@ -279,9 +279,7 @@ pub fn process_start(pid: u32) -> Option<u64> {
 /// Machine-wide network bytes (in, out), loopback excluded.
 #[must_use]
 pub fn net_bytes() -> (u64, u64) {
-    let Ok(nets) = Networks::new_with_refreshed_list() else {
-        return (0, 0);
-    };
+    let Ok(nets) = Networks::new_with_refreshed_list() else { return (0, 0) };
     nets.iter().filter(|(name, _)| !name.to_string_lossy().starts_with("lo")).fold((0, 0), |(i, o), (_, d)| (i + d.total_received(), o + d.total_transmitted()))
 }
 

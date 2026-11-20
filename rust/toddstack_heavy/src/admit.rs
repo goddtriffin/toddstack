@@ -263,6 +263,7 @@ mod tests {
             state,
             enqueued_ms: enq,
             started_ms: None,
+            blocked_by: None,
         }
     }
     fn waits(d: &Decision) -> bool {
@@ -291,7 +292,11 @@ mod tests {
         // 10 cores, 100G. Ceiling 900 centi-cores, 90G. Non-heavy: 2 cores, 30G.
         // Running job reserves 10G but really uses 3 cores / 20G: CPU is live, memory max(reservation, live).
         let run = job("r", 2, 10, State::Running, 0);
-        let live = Live { non_heavy: Usage { cpu: 200, mem: 30 * G, vram: 0 }, per_job: vec![("r".into(), Usage { cpu: 300, mem: 20 * G, vram: 0 })], ..calm() };
+        let live = Live {
+            non_heavy: Usage { cpu: 200, mem: 30 * G, vram: 0 },
+            per_job: vec![("r".into(), Usage { cpu: 300, mem: 20 * G, vram: 0 })],
+            ..calm()
+        };
         let room = headroom(&[&run], &cap(), &live, 100_000);
         assert_eq!(room, Usage { cpu: 900 - 200 - 300, mem: 90 * G - 30 * G - 20 * G, vram: 0 });
         // Memory fits at exactly the edge, blocked one GiB over; both pass the reservation-only check.
