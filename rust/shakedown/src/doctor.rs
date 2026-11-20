@@ -143,10 +143,25 @@ fn tools() -> Vec<Finding> {
             "Android checks (phase 5)",
         ),
         tool(
-            "ditto",
+            if cfg!(target_os = "macos") {
+                "ditto"
+            } else {
+                "unzip"
+            },
             "sh",
-            &["-c", "command -v ditto"],
-            "ditto ships with macOS; this is not macOS",
+            &[
+                "-c",
+                if cfg!(target_os = "macos") {
+                    "command -v ditto"
+                } else {
+                    "command -v unzip"
+                },
+            ],
+            if cfg!(target_os = "macos") {
+                "ditto ships with macOS; this is not macOS"
+            } else {
+                "sudo apt install unzip"
+            },
             true,
             "unpacks the pinned Chrome",
         ),

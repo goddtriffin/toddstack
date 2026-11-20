@@ -281,7 +281,14 @@ pub async fn launch(
         .map_err(Error::Environment)?;
     let (browser, mut handler) = Browser::launch(config)
         .await
-        .map_err(|e| Error::Environment(format!("cannot start Chrome: {e}")))?;
+        .map_err(|e| {
+            let hint = if cfg!(target_os = "linux") {
+                " (on Linux Chrome needs libnss3, libnspr4 and libasound2t64: sudo apt install libnss3 libnspr4 libasound2t64)"
+            } else {
+                ""
+            };
+            Error::Environment(format!("cannot start Chrome: {e}{hint}"))
+        })?;
     let task = tokio::spawn(async move { while handler.next().await.is_some() {} });
     Ok((browser, task))
 }
