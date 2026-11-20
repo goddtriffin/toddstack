@@ -254,7 +254,16 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         let trees = per_job.iter().fold(Usage::default(), |a, (_, u)| Usage { cpu: a.cpu + u.cpu, mem: a.mem + u.mem, vram: a.vram + u.vram });
         (non_heavy(machine, trees), per_job)
     };
-    Ok(Live { load1, load5, mem_used_pct, disk_free, non_heavy, per_job })
+    Ok(Live { load1, load5, mem_used_pct, disk_free, non_heavy, per_job, stopped: Vec::new() })
+}
+
+/// Ids of the jobs whose process is stopped (state T).
+#[must_use]
+pub fn stopped_ids(jobs: &[Job]) -> Vec<String> {
+    let pids: Vec<Pid> = jobs.iter().map(|j| Pid::from_u32(j.pid)).collect();
+    let Ok(mut sys) = System::new() else { return Vec::new() };
+    sys.refresh_processes(ProcessesToUpdate::Some(&pids), true);
+    jobs.iter().filter(|j| sys.process(Pid::from_u32(j.pid)).is_some_and(|p| matches!(p.status(), sysinfo::ProcessStatus::Stop))).map(|j| j.id.clone()).collect()
 }
 
 /// The start time of a live process (seconds since the epoch), or `None` when it does not exist.

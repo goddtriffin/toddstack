@@ -1,9 +1,13 @@
 //! Admission: pure decisions.
 //!
-//! Reservations come first (sum of running reservations plus the request within 90% of capacity). On top
-//! of that, headroom accounts for everything else on the machine:
+//! Memory and VRAM are reservation-based (real safety): running reservations plus the request must fit
+//! within 90% of capacity. CPU is judged by live headroom only, never by peak-core reservations (a build
+//! that peaks near all cores would otherwise block everything on an idle machine):
 //!
-//! headroom = 90% of capacity - non-heavy usage - sum over running jobs of max(reservation, live usage)
+//! cpu headroom = 90% of cores - non-heavy usage - live use of running jobs
+//!
+//! Jobs admitted in the last `RAMP_MS` reserve at least min(their cores, `RAMP_CPU`) while their CPU ramps up. Memory
+//! headroom uses max(reservation, live usage) per running job.
 //!
 //! Non-heavy usage (Chrome, Discord, other CLIs) is smoothed by the caller (max of recent samples) so a
 //! dip does not over-admit. Live guards (load, memory, disk) can only veto.
@@ -15,6 +19,11 @@ use crate::job::{Capacity, Job, Live, State, Usage, Weights};
 /// A backfilling job may pass the head only while the head has waited less than this.
 pub const BACKFILL_WINDOW_MS: i64 = 60_000;
 const PCT: u64 = 90;
+/// A job admitted this recently has not ramped its CPU yet.
+pub const RAMP_MS: i64 = 10_000;
+/// CPU (centi-cores) a just-admitted job holds until it ramps, and what a new job needs free to start.
+pub const RAMP_CPU: u64 = 200;
+const CPU_ASK: u64 = 100;
 /// How many recent non-heavy samples the smoother keeps.
 pub const SMOOTH_WINDOW: usize = 4;
 
@@ -63,32 +72,29 @@ fn ceiling(cap: &Capacity) -> Usage {
 }
 
 fn request(w: Weights) -> Usage {
-    Usage { cpu: centi(w.cpu), mem: w.mem, vram: w.vram }
+    Usage { cpu: if w.cpu > 0 { CPU_ASK } else { 0 }, mem: w.mem, vram: w.vram }
 }
 
 fn fits(ask: Usage, room: Usage) -> bool {
     ask.cpu <= room.cpu && ask.mem <= room.mem && ask.vram <= room.vram
 }
 
-/// Reservations only: running sums plus the request within 90% of capacity.
+/// Memory and VRAM reservations only: running sums plus the request within 90% of capacity. CPU is live.
 #[must_use]
 pub fn fits_reservations(req: Weights, running: &[&Job], cap: &Capacity) -> bool {
-    let used = running.iter().fold(Usage::default(), |a, j| {
-        let r = request(j.weights);
-        Usage { cpu: a.cpu + r.cpu, mem: a.mem + r.mem, vram: a.vram + r.vram }
-    });
+    let used = running.iter().fold(Usage::default(), |a, j| Usage { cpu: 0, mem: a.mem + j.weights.mem, vram: a.vram + j.weights.vram });
     let room = ceiling(cap).saturating_sub(used);
-    fits(request(req), room)
+    fits(Usage { cpu: 0, ..request(req) }, room)
 }
 
 /// What is left for a new job once the other programs and the running jobs' real use are counted.
 #[must_use]
-pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live) -> Usage {
+pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> Usage {
     let held = running.iter().fold(Usage::default(), |a, j| {
-        let r = request(j.weights);
         let l = live.per_job.iter().find(|(id, _)| *id == j.id).map_or_else(Usage::default, |(_, u)| *u);
-        let m = r.max(l);
-        Usage { cpu: a.cpu + m.cpu, mem: a.mem + m.mem, vram: a.vram + m.vram }
+        let ramping = j.started_ms.is_some_and(|t| now_ms - t < RAMP_MS);
+        let cpu = if ramping { l.cpu.max(centi(j.weights.cpu).min(RAMP_CPU)) } else { l.cpu };
+        Usage { cpu: a.cpu + cpu, mem: a.mem + l.mem.max(j.weights.mem), vram: a.vram + l.vram.max(j.weights.vram) }
     });
     ceiling(cap).saturating_sub(live.non_heavy).saturating_sub(held)
 }
@@ -124,12 +130,12 @@ pub fn guard_block(cap: &Capacity, live: &Live) -> Option<String> {
 
 /// Why a request cannot start now, or `None`. Alone (nothing running) a clamped request always passes
 /// the resource checks, so a busy desktop cannot starve it forever; guards still apply.
-fn blocker(w: Weights, running: &[&Job], cap: &Capacity, live: &Live) -> Option<(String, bool)> {
+fn blocker(w: Weights, running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> Option<(String, bool)> {
     if !running.is_empty() {
         if !fits_reservations(w, running, cap) {
-            return Some(("reservations full".to_string(), false));
+            return Some(("memory reservations full".to_string(), false));
         }
-        if !fits(request(w), headroom(running, cap, live)) {
+        if !fits(request(w), headroom(running, cap, live, now_ms)) {
             return Some(("no headroom (other programs and running jobs use the machine)".to_string(), true));
         }
     }
@@ -140,19 +146,20 @@ fn blocker(w: Weights, running: &[&Job], cap: &Capacity, live: &Live) -> Option<
 #[must_use]
 pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i64) -> Decision {
     let running: Vec<&Job> = jobs.iter().filter(|j| j.state == State::Running).collect();
-    let mut queued: Vec<&Job> = jobs.iter().filter(|j| j.state == State::Queued).collect();
+    // A waiter that is stopped (Ctrl-Z) cannot start, so it never blocks the queue behind it.
+    let mut queued: Vec<&Job> = jobs.iter().filter(|j| j.state == State::Queued && (j.id == job.id || !live.stopped.contains(&j.id))).collect();
     queued.sort_by(|a, b| (a.enqueued_ms, &a.id).cmp(&(b.enqueued_ms, &b.id)));
 
     if let Some(why) = disk_full(job.weights, cap, live) {
         return Decision::Fail(why);
     }
     if let Some(head) = queued.first().filter(|h| h.id != job.id) {
-        if blocker(head.weights, &running, cap, live).is_none() {
+        if blocker(head.weights, &running, cap, live, now_ms).is_none() {
             // The head could start now: this job may go first only if the head still fits next to it.
             let me = Job { state: State::Running, ..job.clone() };
             let mut with_me = running.clone();
             with_me.push(&me);
-            if blocker(head.weights, &with_me, cap, live).is_some() {
+            if blocker(head.weights, &with_me, cap, live, now_ms).is_some() {
                 return wait("queued behind a job that fits now", false);
             }
         } else {
@@ -165,7 +172,7 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
             }
         }
     }
-    match blocker(job.weights, &running, cap, live) {
+    match blocker(job.weights, &running, cap, live, now_ms) {
         Some((why, is_live)) => wait(why, is_live),
         None => Decision::Start,
     }
@@ -209,9 +216,9 @@ mod tests {
 
     #[test]
     fn ninety_percent_reservation_ceiling() {
-        let run = job("r", 5, 10, State::Running, 0);
-        let fits = job("a", 4, 10, State::Queued, 1);
-        let over = job("b", 5, 10, State::Queued, 1);
+        let run = job("r", 5, 50, State::Running, 0);
+        let fits = job("a", 4, 40, State::Queued, 1);
+        let over = job("b", 5, 41, State::Queued, 1);
         assert_eq!(evaluate(&fits, &[run.clone(), fits.clone()], &cap(), &calm(), 2), Decision::Start);
         let d = evaluate(&over, &[run, over.clone()], &cap(), &calm(), 2);
         assert!(matches!(d, Decision::Wait { live: false, .. }), "{d:?}");
@@ -220,24 +227,25 @@ mod tests {
     #[test]
     fn headroom_math_with_fake_non_heavy_usage() {
         // 10 cores, 100G. Ceiling 900 centi-cores, 90G. Non-heavy: 2 cores, 30G.
-        // Running job reserves 2 cores / 10G but really uses 3 cores / 20G: max(reservation, live) counts.
+        // Running job reserves 10G but really uses 3 cores / 20G: CPU is live, memory max(reservation, live).
         let run = job("r", 2, 10, State::Running, 0);
         let live = Live {
             non_heavy: Usage { cpu: 200, mem: 30 * G, vram: 0 },
             per_job: vec![("r".into(), Usage { cpu: 300, mem: 20 * G, vram: 0 })],
             ..calm()
         };
-        let room = headroom(&[&run], &cap(), &live);
+        let room = headroom(&[&run], &cap(), &live, 100_000);
         assert_eq!(room, Usage { cpu: 900 - 200 - 300, mem: 90 * G - 30 * G - 20 * G, vram: 0 });
-        // Fits at exactly the edge, blocked one core over; both pass the reservation-only check.
+        // Memory fits at exactly the edge, blocked one GiB over; both pass the reservation-only check.
         let edge = job("e", 4, 40, State::Queued, 1);
         assert_eq!(evaluate(&edge, &[run.clone(), edge.clone()], &cap(), &live, 2), Decision::Start);
-        let over = job("o", 5, 40, State::Queued, 1);
+        let over = job("o", 5, 41, State::Queued, 1);
         let d = evaluate(&over, &[run.clone(), over.clone()], &cap(), &live, 2);
         assert!(matches!(d, Decision::Wait { live: true, .. }), "{d:?}");
-        // The reservation is the floor when live usage is lower.
+        // The memory reservation is the floor when live usage is lower; CPU is just live.
         let idle = Live { per_job: vec![("r".into(), Usage::default())], non_heavy: Usage::default(), ..calm() };
-        assert_eq!(headroom(&[&run], &cap(), &idle).cpu, 700);
+        let room = headroom(&[&run], &cap(), &idle, 100_000);
+        assert_eq!((room.cpu, room.mem), (900, 80 * G));
     }
 
     #[test]
@@ -292,16 +300,16 @@ mod tests {
 
     #[test]
     fn fifo_head_blocks_non_fitting_follower() {
-        let run = job("r", 8, 10, State::Running, 0);
-        let head = job("h", 5, 10, State::Queued, 1);
-        let big = job("z", 6, 10, State::Queued, 2);
+        let run = job("r", 8, 50, State::Running, 0);
+        let head = job("h", 5, 30, State::Queued, 1);
+        let big = job("z", 6, 40, State::Queued, 2);
         assert!(waits(&evaluate(&big, &[run, head, big.clone()], &cap(), &calm(), 3)));
     }
 
     #[test]
     fn backfill_only_while_head_is_young_and_follower_smaller() {
-        let run = job("r", 8, 10, State::Running, 0);
-        let head = job("h", 5, 10, State::Queued, 1);
+        let run = job("r", 8, 70, State::Running, 0);
+        let head = job("h", 5, 30, State::Queued, 1);
         let small = job("s", 1, 5, State::Queued, 2);
         let all = [run, head, small.clone()];
         assert_eq!(evaluate(&small, &all, &cap(), &calm(), 1000), Decision::Start);
@@ -319,17 +327,49 @@ mod tests {
 
     #[test]
     fn follower_waits_when_it_would_stop_the_head_fitting() {
-        // The ceiling is 9 cores: head 5 fits alone, but 5 + 5 does not.
-        let head = job("h", 5, 10, State::Queued, 1);
-        let other = job("o", 5, 10, State::Queued, 2);
+        // The memory ceiling is 90G: head 50 fits alone, but 50 + 50 does not.
+        let head = job("h", 5, 50, State::Queued, 1);
+        let other = job("o", 5, 50, State::Queued, 2);
         let all = [head.clone(), other.clone()];
         assert!(waits(&evaluate(&other, &all, &cap(), &calm(), 3)));
         assert_eq!(evaluate(&head, &all, &cap(), &calm(), 3), Decision::Start);
-        // Same with a running job: head fits (5 + 3), a follower of 2 would push it over 9.
-        let run = job("r", 3, 10, State::Running, 0);
-        let follow = job("f", 2, 1, State::Queued, 3);
+        // Same with a running job: head fits (50 + 30), a follower of 20 would push it over 90.
+        let run = job("r", 3, 30, State::Running, 0);
+        let follow = job("f", 2, 20, State::Queued, 3);
         let all = [run, head.clone(), follow.clone()];
         assert!(waits(&evaluate(&follow, &all, &cap(), &calm(), 4)));
+    }
+
+    #[test]
+    fn peak_core_waiters_start_on_a_mostly_idle_machine() {
+        // Both builds peaked near all cores in history (weights.cpu = ncpu); live CPU is 20%.
+        let c = Capacity { cpu: 16, ..cap() };
+        let live = Live { non_heavy: Usage { cpu: 320, mem: 8 * G, vram: 0 }, ..calm() };
+        let a = job("a", 16, 8, State::Queued, 1);
+        let b = job("b", 16, 8, State::Queued, 2);
+        assert_eq!(evaluate(&a, &[a.clone(), b.clone()], &c, &live, 10), Decision::Start);
+        // a was admitted just now: b is judged next to a running, ramping a.
+        let ra = Job { state: State::Running, started_ms: Some(10), ..a };
+        assert_eq!(evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 11), Decision::Start);
+        // A third one right behind still fits (live 320 + 2 x ramp 200 < 1440).
+        let ca = job("c", 16, 8, State::Queued, 3);
+        let rb = Job { state: State::Running, started_ms: Some(11), ..b };
+        assert_eq!(evaluate(&ca, &[ra, rb, ca.clone()], &c, &live, 12), Decision::Start);
+        // A genuinely busy CPU still blocks.
+        let busy = Live { non_heavy: Usage { cpu: 1400, mem: 8 * G, vram: 0 }, ..calm() };
+        let run = Job { state: State::Running, started_ms: Some(0), ..job("r", 16, 8, State::Running, 0) };
+        assert!(waits(&evaluate(&ca, &[run, ca.clone()], &c, &busy, 100_000)));
+    }
+
+    #[test]
+    fn stopped_head_does_not_block_the_next_waiter() {
+        let run = job("r", 1, 50, State::Running, 0);
+        let head = job("h", 1, 30, State::Queued, 1);
+        let next = job("n", 1, 40, State::Queued, 2);
+        let all = [run, head, next.clone()];
+        assert!(waits(&evaluate(&next, &all, &cap(), &calm(), 3 + BACKFILL_WINDOW_MS)), "a live head blocks the bigger follower");
+        let live = Live { stopped: vec!["h".into()], ..calm() };
+        assert_eq!(evaluate(&next, &all, &cap(), &live, 3 + BACKFILL_WINDOW_MS), Decision::Start);
     }
 
     #[test]

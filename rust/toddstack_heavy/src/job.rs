@@ -66,6 +66,8 @@ pub struct Live {
     pub non_heavy: Usage,
     /// Live usage of each running job's process tree, by job id.
     pub per_job: Vec<(String, Usage)>,
+    /// Ids of jobs whose process is stopped (Ctrl-Z): they cannot start, so they never block the queue.
+    pub stopped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
