@@ -15,21 +15,118 @@ use crate::error::Error;
 use crate::job::{Job, START_UNKNOWN};
 use crate::machine::process_start;
 
-/// Reads `STOKEHOLD_<X>`, falling back to the legacy `HEAVY_<X>` (pass the `STOKEHOLD_` name).
+/// Reads `STOKEHOLD_<X>`, falling back to the legacy `HEAVY_<X>` (pass the `STOKEHOLD_` name). Empty counts as unset.
 #[must_use]
 pub fn env_var(name: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(name).or_else(|| std::env::var_os(name.replacen("STOKEHOLD_", "HEAVY_", 1)))
+    prefer(std::env::var_os(name), || std::env::var_os(name.replacen("STOKEHOLD_", "HEAVY_", 1)))
 }
 
-/// Moves a real `old` directory to `new` and leaves a symlink `old -> new`. Does nothing when `new` exists or
-/// `old` is missing or already a symlink. Losing a race to another process is harmless (the rename just fails).
-fn migrate_legacy(old: &Path, new: &Path) {
-    let is_real_dir = fs::symlink_metadata(old).is_ok_and(|m| m.is_dir());
-    if !is_real_dir || fs::symlink_metadata(new).is_ok() {
-        return;
+fn prefer(new: Option<std::ffi::OsString>, legacy: impl FnOnce() -> Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    new.filter(|v| !v.is_empty()).or_else(|| legacy().filter(|v| !v.is_empty()))
+}
+
+/// What `migrate_legacy` found and did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Migration {
+    /// `old` was already a symlink to `new`.
+    Linked,
+    /// `old` was missing; a symlink to `new` was created.
+    LinkCreated,
+    /// `old` was a real directory and `new` missing; it was renamed and a symlink left behind.
+    Migrated,
+    /// Two queues exist (both real dirs, or `old` points elsewhere). Nothing deleted; `new` keeps being used.
+    Split,
+}
+
+fn warn_split(old: &Path, new: &Path, why: &str) {
+    eprintln!(
+        "stokehold: WARNING: {} {why}; using {} only. Jobs of a still-running old `heavy` are NOT seen by this queue. \
+         After they finish, fix with: mv {} {}.bak && ln -s {} {}",
+        old.display(),
+        new.display(),
+        old.display(),
+        old.display(),
+        new.display(),
+        old.display()
+    );
+}
+
+/// Makes `old` (the legacy `heavy` dir) a symlink to `new`, on every run, idempotently. Never deletes data.
+///
+/// Race safety: all new binaries serialize on a flock on `<parent>/.stokehold-migrate.lock`. An old binary cannot
+/// take that lock, so the order is chosen so its window is minimal and detected: the symlink is built under a
+/// temp name first and renamed over `old` (atomic) right after `old` is renamed away. If an old binary slips in
+/// and recreates a real `old` in that gap, the final rename fails (cannot replace a directory), and we take the
+/// `Split` path: its job files are moved (never overwritten) into `new/jobs`, and a loud warning with the exact
+/// fix command is printed. Either way both queues are never silently split.
+pub fn migrate_legacy(old: &Path, new: &Path) -> Migration {
+    use std::os::unix::fs::symlink;
+    let parent = old.parent().unwrap_or_else(|| Path::new("."));
+    let _ = fs::create_dir_all(parent);
+    // Held until return; if the lock file cannot be opened we proceed unlocked (best effort).
+    let _lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(parent.join(".stokehold-migrate.lock"))
+        .ok()
+        .and_then(|f| Flock::lock(f, FlockArg::LockExclusive).ok());
+    let points_at_new = |old: &Path| match fs::read_link(old) {
+        Ok(t) => t == new || (t.is_relative() && old.parent().map(|p| p.join(&t)).as_deref() == Some(new)),
+        Err(_) => false,
+    };
+    let link_over_old = |old: &Path| -> bool {
+        let tmp = old.with_extension(format!("link-{}", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        symlink(new, &tmp).is_ok() && fs::rename(&tmp, old).map_err(|_| { let _ = fs::remove_file(&tmp); }).is_ok()
+    };
+    match fs::symlink_metadata(old) {
+        Err(_) => {
+            let _ = fs::create_dir_all(new);
+            if link_over_old(old) { Migration::LinkCreated } else { Migration::Split }
+        }
+        Ok(m) if m.file_type().is_symlink() => {
+            if points_at_new(old) {
+                Migration::Linked
+            } else {
+                warn_split(old, new, "is a symlink pointing elsewhere");
+                Migration::Split
+            }
+        }
+        Ok(m) if m.is_dir() && fs::symlink_metadata(new).is_err() => {
+            if fs::rename(old, new).is_err() {
+                return Migration::Split;
+            }
+            if link_over_old(old) {
+                return Migration::Migrated;
+            }
+            // An old binary recreated `old` in the gap: fold its jobs in and warn.
+            merge_jobs(old, new);
+            warn_split(old, new, "was recreated by an old binary during migration");
+            Migration::Split
+        }
+        Ok(m) if m.is_dir() => {
+            merge_jobs(old, new);
+            warn_split(old, new, "and the new dir are both real directories");
+            Migration::Split
+        }
+        Ok(_) => {
+            warn_split(old, new, "is not a directory or symlink");
+            Migration::Split
+        }
     }
-    if fs::rename(old, new).is_ok() {
-        let _ = std::os::unix::fs::symlink(new, old);
+}
+
+/// Moves job files from `old/jobs` into `new/jobs`, never overwriting. Leaves anything that collides behind.
+fn merge_jobs(old: &Path, new: &Path) {
+    let dest = new.join("jobs");
+    let _ = fs::create_dir_all(&dest);
+    let Ok(entries) = fs::read_dir(old.join("jobs")) else { return };
+    for e in entries.flatten() {
+        let to = dest.join(e.file_name());
+        if fs::symlink_metadata(&to).is_err() {
+            let _ = fs::rename(e.path(), to);
+        }
     }
 }
 
@@ -41,10 +138,10 @@ pub struct StateDir {
 impl StateDir {
     /// `STOKEHOLD_STATE_DIR` (or the legacy `HEAVY_STATE_DIR`), else `~/.local/state/stokehold`.
     ///
-    /// The tool was called `heavy` until 0.3.x and kept its state in `~/.local/state/heavy`. On the first run
-    /// the old directory is renamed to the new one and a symlink is left at the old path, so history carries
-    /// over and a still-running old `heavy` binary follows the link to the same `jobs/` and lock files (flock
-    /// is per inode, so both binaries admit against one queue).
+    /// The tool was called `heavy` until 0.3.x and kept its state in `~/.local/state/heavy`. On every run
+    /// `migrate_legacy` makes sure that path is a symlink to the new dir (migrating, creating or warning), so
+    /// history carries over and a still-running old `heavy` binary follows the link to the same `jobs/` and
+    /// lock files (flock is per inode, so both binaries admit against one queue).
     ///
     /// # Errors
     /// Fails when there is neither the variable nor `HOME`.
@@ -221,6 +318,96 @@ mod tests {
         let s = StateDir::at(t.path().to_path_buf());
         s.ensure().unwrap();
         (t, s)
+    }
+
+    fn mk(p: &Path) {
+        fs::create_dir_all(p.join("jobs")).unwrap();
+    }
+
+    fn paths() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let (old, new) = (t.path().join("heavy"), t.path().join("stokehold"));
+        (t, old, new)
+    }
+
+    #[test]
+    fn migrate_missing_old_creates_symlink() {
+        let (_t, old, new) = paths();
+        mk(&new);
+        assert_eq!(migrate_legacy(&old, &new), Migration::LinkCreated);
+        assert_eq!(fs::read_link(&old).unwrap(), new);
+    }
+
+    #[test]
+    fn migrate_missing_both_creates_new_and_symlink() {
+        let (_t, old, new) = paths();
+        assert_eq!(migrate_legacy(&old, &new), Migration::LinkCreated);
+        assert!(new.is_dir() && fs::read_link(&old).unwrap() == new);
+    }
+
+    #[test]
+    fn migrate_existing_symlink_is_noop_and_idempotent() {
+        let (_t, old, new) = paths();
+        mk(&new);
+        migrate_legacy(&old, &new);
+        assert_eq!(migrate_legacy(&old, &new), Migration::Linked);
+        assert_eq!(migrate_legacy(&old, &new), Migration::Linked);
+    }
+
+    #[test]
+    fn migrate_real_old_moves_data() {
+        let (_t, old, new) = paths();
+        mk(&old);
+        fs::write(old.join("jobs/a.json"), "a").unwrap();
+        assert_eq!(migrate_legacy(&old, &new), Migration::Migrated);
+        assert_eq!(fs::read_to_string(new.join("jobs/a.json")).unwrap(), "a");
+        assert_eq!(fs::read_link(&old).unwrap(), new);
+        assert_eq!(migrate_legacy(&old, &new), Migration::Linked);
+    }
+
+    #[test]
+    fn migrate_both_real_merges_jobs_without_deleting() {
+        let (_t, old, new) = paths();
+        mk(&old);
+        mk(&new);
+        fs::write(old.join("jobs/a.json"), "old-a").unwrap();
+        fs::write(old.join("jobs/b.json"), "old-b").unwrap();
+        fs::write(new.join("jobs/b.json"), "new-b").unwrap();
+        assert_eq!(migrate_legacy(&old, &new), Migration::Split);
+        assert_eq!(fs::read_to_string(new.join("jobs/a.json")).unwrap(), "old-a");
+        assert_eq!(fs::read_to_string(new.join("jobs/b.json")).unwrap(), "new-b", "no overwrite");
+        assert_eq!(fs::read_to_string(old.join("jobs/b.json")).unwrap(), "old-b", "collision left behind");
+        assert!(old.is_dir() && !fs::symlink_metadata(&old).unwrap().file_type().is_symlink(), "old dir untouched");
+    }
+
+    #[test]
+    fn migrate_symlink_elsewhere_warns_and_changes_nothing() {
+        let (t, old, new) = paths();
+        mk(&new);
+        let other = t.path().join("other");
+        mk(&other);
+        std::os::unix::fs::symlink(&other, &old).unwrap();
+        assert_eq!(migrate_legacy(&old, &new), Migration::Split);
+        assert_eq!(fs::read_link(&old).unwrap(), other);
+    }
+
+    #[test]
+    fn migrate_recreated_old_during_gap_is_merged_not_lost() {
+        // Simulates the gap: the symlink cannot replace a real dir, so we land in Split with data kept.
+        let (_t, old, new) = paths();
+        mk(&new);
+        mk(&old);
+        fs::write(old.join("jobs/x.json"), "x").unwrap();
+        assert_eq!(migrate_legacy(&old, &new), Migration::Split);
+        assert!(new.join("jobs/x.json").exists());
+    }
+
+    #[test]
+    fn empty_stokehold_env_does_not_hide_heavy() {
+        let os = |v: &str| Some(std::ffi::OsString::from(v));
+        assert_eq!(prefer(os(""), || os("legacy")), os("legacy"));
+        assert_eq!(prefer(os("new"), || os("legacy")), os("new"));
+        assert_eq!(prefer(None, || os("")), None);
     }
 
     #[test]

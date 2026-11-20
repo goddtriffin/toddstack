@@ -13,7 +13,13 @@ fn stokehold(state: &Path) -> Command {
         .env("STOKEHOLD_CAPACITY", "cpu=8,mem=16G,vram=0,disk=100G")
         .env("STOKEHOLD_LIVE", "load=0.1,mem_pct=10,disk_free=90G,nonheavy_cpu=0,nonheavy_mem=0,nonheavy_vram=0")
         .env_remove("STOKEHOLD_JOB")
-        .env_remove("STOKEHOLD_TIMEOUT");
+        .env_remove("STOKEHOLD_TIMEOUT")
+        .env_remove("HEAVY_JOB")
+        .env_remove("HEAVY_TIMEOUT")
+        .env_remove("HEAVY_STATE_DIR")
+        .env_remove("HEAVY_KILL_GRACE_MS")
+        .env_remove("HEAVY_CAPACITY")
+        .env_remove("HEAVY_LIVE");
     c
 }
 
@@ -286,6 +292,10 @@ fn runs_under_a_pty_and_passes_the_exit_code() {
         .env("STOKEHOLD_CAPACITY", "cpu=8,mem=16G,vram=0,disk=100G")
         .env("STOKEHOLD_LIVE", "load=0.1,mem_pct=10,disk_free=90G,nonheavy_cpu=0,nonheavy_mem=0,nonheavy_vram=0")
         .env_remove("STOKEHOLD_JOB")
+        .env_remove("HEAVY_JOB")
+        .env_remove("HEAVY_STATE_DIR")
+        .env_remove("HEAVY_CAPACITY")
+        .env_remove("HEAVY_LIVE")
         .stdin(Stdio::null());
     let o = c.output().unwrap();
     let out = String::from_utf8_lossy(&o.stdout);
