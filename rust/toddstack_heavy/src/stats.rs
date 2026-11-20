@@ -59,11 +59,7 @@ pub fn children_usage() -> Result<ChildUsage, Error> {
     let u = getrusage(UsageWho::RUSAGE_CHILDREN)?;
     let rss = to_u64(u.max_rss());
     // macOS reports bytes, Linux kilobytes.
-    let max_rss = if cfg!(target_os = "macos") {
-        rss
-    } else {
-        rss * 1024
-    };
+    let max_rss = if cfg!(target_os = "macos") { rss } else { rss * 1024 };
     Ok(ChildUsage {
         user_us: to_u64(u.user_time().num_microseconds()),
         sys_us: to_u64(u.system_time().num_microseconds()),
@@ -99,11 +95,7 @@ fn secs(ms: u64) -> String {
 /// The stderr report.
 #[must_use]
 pub fn format_stats(s: &Stats) -> String {
-    let timing = if s.queued_ms >= SIGNIFICANT_QUEUE_MS {
-        format!("queued {}, ran {}", secs(s.queued_ms), secs(s.run_ms))
-    } else {
-        format!("ran {}", secs(s.run_ms))
-    };
+    let timing = if s.queued_ms >= SIGNIFICANT_QUEUE_MS { format!("queued {}, ran {}", secs(s.queued_ms), secs(s.run_ms)) } else { format!("ran {}", secs(s.run_ms)) };
     let mut out = format!(
         "heavy: {timing}\nheavy: cpu {} user + {} sys, avg {}.{:02} cores, peak {}.{:02} cores\nheavy: peak rss {} (whole process tree) / {} (largest process), disk blocks read {} written {}\nheavy: network (machine-wide) in {} out {}",
         secs(s.cpu_user_ms),
@@ -126,11 +118,7 @@ pub fn format_stats(s: &Stats) -> String {
         let _ = write!(out, "\nheavy: cpu steal (machine-wide) {}", secs(v));
     }
     if s.timed_out {
-        let _ = write!(
-            out,
-            "\nheavy: TIMED OUT after {} (SIGTERM to the process group, SIGKILL after the grace period)",
-            secs(s.run_ms)
-        );
+        let _ = write!(out, "\nheavy: TIMED OUT after {} (SIGTERM to the process group, SIGKILL after the grace period)", secs(s.run_ms));
     }
     out.push_str("\nheavy: ");
     out.push_str(REVIEW_PROMPT);
@@ -144,13 +132,7 @@ mod tests {
     #[test]
     fn computes_averages() {
         let before = ChildUsage::default();
-        let after = ChildUsage {
-            user_us: 6_000_000,
-            sys_us: 2_000_000,
-            max_rss: 1 << 30,
-            blocks_in: 5,
-            blocks_out: 7,
-        };
+        let after = ChildUsage { user_us: 6_000_000, sys_us: 2_000_000, max_rss: 1 << 30, blocks_in: 5, blocks_out: 7 };
         let s = compute(1500, 4000, before, after);
         assert_eq!(s.centi_cores, 200);
         assert_eq!((s.cpu_user_ms, s.cpu_sys_ms, s.blocks_out), (6000, 2000, 7));
@@ -158,47 +140,18 @@ mod tests {
 
     #[test]
     fn formats_report() {
-        let s = Stats {
-            queued_ms: 1500,
-            run_ms: 4000,
-            cpu_user_ms: 6000,
-            cpu_sys_ms: 2000,
-            centi_cores: 250,
-            peak_rss: 1 << 30,
-            peak_tree_rss: 3 << 30,
-            peak_centi_cores: 450,
-            blocks_in: 5,
-            blocks_out: 7,
-            net_in: 2048,
-            net_out: 0,
-            peak_vram: Some(1 << 30),
-            steal_ms: Some(300),
-            timed_out: true,
-        };
+        let s = Stats { queued_ms: 1500, run_ms: 4000, cpu_user_ms: 6000, cpu_sys_ms: 2000, centi_cores: 250, peak_rss: 1 << 30, peak_tree_rss: 3 << 30, peak_centi_cores: 450, blocks_in: 5, blocks_out: 7, net_in: 2048, net_out: 0, peak_vram: Some(1 << 30), steal_ms: Some(300), timed_out: true };
         let text = format_stats(&s);
         assert!(text.contains("queued 1.5s, ran 4.0s"), "{text}");
         assert!(text.contains("avg 2.50 cores"), "{text}");
         assert!(text.contains("peak 4.50 cores"), "{text}");
-        assert!(
-            text.contains("peak rss 3.0G (whole process tree) / 1.0G (largest process)"),
-            "{text}"
-        );
-        assert!(
-            text.contains("network (machine-wide) in 2.0K out 0B"),
-            "{text}"
-        );
+        assert!(text.contains("peak rss 3.0G (whole process tree) / 1.0G (largest process)"), "{text}");
+        assert!(text.contains("network (machine-wide) in 2.0K out 0B"), "{text}");
         assert!(text.contains("peak vram (machine-wide) 1.0G"), "{text}");
         assert!(text.contains("steal (machine-wide) 0.3s"), "{text}");
         assert!(text.contains("TIMED OUT"), "{text}");
         assert!(text.ends_with(REVIEW_PROMPT), "{text}");
-        let quick = format_stats(&Stats {
-            queued_ms: 200,
-            run_ms: 1000,
-            ..Stats::default()
-        });
-        assert!(
-            quick.contains("heavy: ran 1.0s") && !quick.contains("queued"),
-            "{quick}"
-        );
+        let quick = format_stats(&Stats { queued_ms: 200, run_ms: 1000, ..Stats::default() });
+        assert!(quick.contains("heavy: ran 1.0s") && !quick.contains("queued"), "{quick}");
     }
 }

@@ -42,15 +42,9 @@ fn real_main() -> Result<u8, Error> {
     }
 }
 
-fn history(
-    state: &StateDir,
-    since: std::time::Duration,
-    html: Option<&std::path::Path>,
-) -> Result<u8, Error> {
+fn history(state: &StateDir, since: std::time::Duration, html: Option<&std::path::Path>) -> Result<u8, Error> {
     let now = jiff::Timestamp::now();
-    let from = now
-        .checked_sub(since)
-        .map_err(|e| Error::Usage(format!("--since: {e}")))?;
+    let from = now.checked_sub(since).map_err(|e| Error::Usage(format!("--since: {e}")))?;
     let events = log::read_since(state.base(), from);
     let report = report::compute(&events, from.as_millisecond(), now.as_millisecond());
     if let Some(path) = html {
