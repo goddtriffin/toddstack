@@ -65,17 +65,17 @@ pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> R
     Ok(true)
 }
 
-/// Counts the waiters and what blocks them. Only queued jobs wait: a stopped one (Ctrl-Z) cannot start, so it is
+/// Counts the waiters and what blocks them. Only queued jobs that have evaluated (have a reason) wait: a stopped one (Ctrl-Z) cannot start, so it is
 /// neither waiting nor blocked. The reasons are the ones the waiters wrote into their own job files (they decide with
 /// smoothed data; the sampler never re-evaluates).
 fn tally(jobs: &[Job], stopped: &[String]) -> (u32, BTreeMap<String, u32>) {
     let mut blocked: BTreeMap<String, u32> = BTreeMap::new();
     let mut waiting = 0;
     for j in jobs.iter().filter(|j| j.state == State::Queued && !stopped.contains(&j.id)) {
+        // No reason yet: the waiter has not evaluated, so it is not known to wait.
+        let Some(b) = &j.blocked_by else { continue };
         waiting += 1;
-        if let Some(b) = &j.blocked_by {
-            *blocked.entry(b.clone()).or_default() += 1;
-        }
+        *blocked.entry(b.clone()).or_default() += 1;
     }
     (waiting, blocked)
 }
@@ -117,6 +117,14 @@ mod tests {
         let (waiting, blocked) = tally(&jobs, &[]);
         assert_eq!(waiting, 3);
         assert_eq!(blocked, BTreeMap::from([("cpu".to_string(), 2), ("ramp".to_string(), 1)]));
+    }
+
+    #[test]
+    fn unevaluated_waiters_are_not_counted() {
+        let jobs = [job("a", State::Queued, None), job("b", State::Queued, Some("cpu"))];
+        let (waiting, blocked) = tally(&jobs, &[]);
+        assert_eq!(waiting, 1);
+        assert_eq!(blocked, BTreeMap::from([("cpu".to_string(), 1)]));
     }
 
     #[test]
