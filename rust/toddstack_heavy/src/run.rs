@@ -112,13 +112,7 @@ fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
 
-fn resolve_weights(
-    state: &StateDir,
-    flags: &Flags,
-    cmd: &[String],
-    cwd: &str,
-    cap: &Capacity,
-) -> Weights {
+fn resolve_weights(state: &StateDir, flags: &Flags, cmd: &[String], cwd: &str, cap: &Capacity) -> Weights {
     let hist = history::defaults_for(&state.history_path(), cmd, cwd);
     cap.clamp(Weights {
         cpu: flags.cpu.or(hist.map(|d| d.cpu)).unwrap_or(DEFAULT_CPU),
@@ -142,10 +136,7 @@ fn exec_nested(state: &StateDir, cmd: &[String]) -> Option<Error> {
 /// Fails on state-dir, probe or watcher errors. A child that cannot start exits 127.
 pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error> {
     if let Some(e) = exec_nested(state, cmd) {
-        eprintln!(
-            "heavy: cannot run {}: {e}",
-            cmd.first().map_or("", String::as_str)
-        );
+        eprintln!("heavy: cannot run {}: {e}", cmd.first().map_or("", String::as_str));
         return Ok(127);
     }
     state.ensure()?;
@@ -171,23 +162,14 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         enqueued_ms,
         started_ms: None,
     };
-    let _guard = JobGuard {
-        state,
-        id: job.id.clone(),
-    };
+    let _guard = JobGuard { state, id: job.id.clone() };
     {
         let _lock = state.lock()?;
         state.write_job(&job)?;
     }
     let info = JobInfo::new(&job.id, pid, &job.cwd, cmd, weights);
     log::prune(state.base());
-    log::record(
-        state.base(),
-        &Event::Queued {
-            ts: Timestamp::now(),
-            job: info.clone(),
-        },
-    );
+    log::record(state.base(), &Event::Queued { ts: Timestamp::now(), job: info.clone() });
     sample::spawn(state, cwd.clone(), cap);
     sig.waiting.store(true, Ordering::SeqCst);
     let mut tally = WaitTally::default();
@@ -203,15 +185,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         Err(e) => return Err(e),
     }
     let queued_ms = u64::try_from(now_ms() - enqueued_ms).unwrap_or(0);
-    log::record(
-        state.base(),
-        &Event::Started {
-            ts: Timestamp::now(),
-            job: info.clone(),
-            wait_ms: queued_ms,
-            reasons: tally.reasons(),
-        },
-    );
+    log::record(state.base(), &Event::Started { ts: Timestamp::now(), job: info.clone(), wait_ms: queued_ms, reasons: tally.reasons() });
     execute(state, &cap, &job, &info, &sig, flags.timeout(), queued_ms)
 }
 
@@ -248,22 +222,11 @@ fn wait_timeout(live_blocked: bool, ramp_end_ms: Option<i64>, now_ms: i64) -> Du
 }
 
 /// Waits in the queue. Wakes on job-file changes; re-samples on a timer only when live data blocks.
-fn acquire(
-    state: &StateDir,
-    cwd: &Path,
-    cap: &Capacity,
-    job: &mut Job,
-    rx: &Receiver<WaitEvent>,
-    tally: &mut WaitTally,
-) -> Result<(), Error> {
+fn acquire(state: &StateDir, cwd: &Path, cap: &Capacity, job: &mut Job, rx: &Receiver<WaitEvent>, tally: &mut WaitTally) -> Result<(), Error> {
     let mut smoother = Smoother::default();
     let mut said = String::new();
     loop {
-        let running: Vec<Job> = state
-            .read_jobs()
-            .into_iter()
-            .filter(|j| j.state == State::Running)
-            .collect();
+        let running: Vec<Job> = state.read_jobs().into_iter().filter(|j| j.state == State::Running).collect();
         let mut live = machine::live(cwd, cap, &running)?;
         live.non_heavy = smoother.push(live.non_heavy);
         let decision = {
@@ -284,12 +247,7 @@ fn acquire(
                 return Ok(());
             }
             Decision::Fail(why) => return Err(Error::DiskFull(why)),
-            Decision::Wait {
-                reason,
-                live,
-                block,
-                ramp_end_ms,
-            } => (reason, live, block, ramp_end_ms),
+            Decision::Wait { reason, live, block, ramp_end_ms } => (reason, live, block, ramp_end_ms),
         };
         tally.note(now_ms(), Some(block));
         if said != reason {
@@ -323,9 +281,7 @@ fn set_state(state: &StateDir, job: &mut Job, to: State) -> Result<(), Error> {
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
-    status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 /// Samples machine-wide GPU memory every 2 s while the job runs (monitoring); returns the peak.
@@ -338,10 +294,7 @@ fn vram_sampler(cap: &Capacity) -> Option<(Sender<()>, std::thread::JoinHandle<u
         let mut peak = 0;
         loop {
             peak = peak.max(vram().map_or(0, |(_, used)| used));
-            if !matches!(
-                stop_rx.recv_timeout(Duration::from_secs(2)),
-                Err(RecvTimeoutError::Timeout)
-            ) {
+            if !matches!(stop_rx.recv_timeout(Duration::from_secs(2)), Err(RecvTimeoutError::Timeout)) {
                 return peak;
             }
         }
@@ -358,10 +311,7 @@ fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<Usage>
         let mut peak = Usage::default();
         loop {
             peak = peak.max(sampler.sample());
-            if !matches!(
-                stop_rx.recv_timeout(TREE_SAMPLE),
-                Err(RecvTimeoutError::Timeout)
-            ) {
+            if !matches!(stop_rx.recv_timeout(TREE_SAMPLE), Err(RecvTimeoutError::Timeout)) {
                 return peak;
             }
         }
@@ -393,24 +343,10 @@ fn wait_child(pid: Pid, term: Option<Terminal>) -> Result<ExitStatus, nix::Error
     }
 }
 
-fn execute(
-    dir: &StateDir,
-    cap: &Capacity,
-    job: &Job,
-    info: &JobInfo,
-    sig: &Sig,
-    timeout: Duration,
-    queued_ms: u64,
-) -> Result<u8, Error> {
-    let (first, rest) = job
-        .cmd
-        .split_first()
-        .ok_or_else(|| Error::Usage("no command".into()))?;
+fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig, timeout: Duration, queued_ms: u64) -> Result<u8, Error> {
+    let (first, rest) = job.cmd.split_first().ok_or_else(|| Error::Usage("no command".into()))?;
     let mut command = Command::new(first);
-    command
-        .args(rest)
-        .process_group(0)
-        .env("HEAVY_JOB", &job.id);
+    command.args(rest).process_group(0).env("HEAVY_JOB", &job.id);
 
     let usage_before = children_usage()?;
     let net_before = net_bytes();
@@ -438,12 +374,7 @@ fn execute(
     std::thread::spawn(move || {
         let _ = wtx.send(wait_child(Pid::from_raw(pgid), term));
     });
-    let grace = Duration::from_millis(
-        std::env::var("HEAVY_KILL_GRACE_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_GRACE_MS),
-    );
+    let grace = Duration::from_millis(std::env::var("HEAVY_KILL_GRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_GRACE_MS));
     let (result, timed_out) = if let Ok(r) = wrx.recv_timeout(timeout) {
         (r, false)
     } else {
@@ -465,9 +396,7 @@ fn execute(
     let net_after = net_bytes();
     stats.net_in = net_after.0.saturating_sub(net_before.0);
     stats.net_out = net_after.1.saturating_sub(net_before.1);
-    stats.steal_ms = steal_before
-        .zip(cpu_times())
-        .map(|(a, b)| b.steal.saturating_sub(a) * 10);
+    stats.steal_ms = steal_before.zip(cpu_times()).map(|(a, b)| b.steal.saturating_sub(a) * 10);
     stats.peak_vram = sampler.and_then(|(stop, h)| {
         drop(stop);
         h.join().ok().filter(|v| *v > 0)
@@ -482,19 +411,8 @@ fn execute(
     stats.timed_out = timed_out;
     eprintln!("{}", format_stats(&stats));
 
-    let code = if timed_out {
-        i32::from(TIMEOUT_EXIT)
-    } else {
-        exit_code(exit)
-    };
-    let entry = Entry {
-        ts: Timestamp::now(),
-        cmd: job.cmd.clone(),
-        cwd: job.cwd.clone(),
-        requested: job.weights,
-        measured: stats,
-        exit_code: code,
-    };
+    let code = if timed_out { i32::from(TIMEOUT_EXIT) } else { exit_code(exit) };
+    let entry = Entry { ts: Timestamp::now(), cmd: job.cmd.clone(), cwd: job.cwd.clone(), requested: job.weights, measured: stats, exit_code: code };
     if let Err(e) = history::append(&dir.history_path(), &entry) {
         eprintln!("heavy: could not write history: {e}");
     }
@@ -524,14 +442,8 @@ mod tests {
         // Ramp ends in a minute: capped at the live re-sample.
         assert_eq!(wait_timeout(true, Some(70_000), 10_000), LIVE_RESAMPLE);
         // Already over (or about to be): a short sleep, never a spin.
-        assert_eq!(
-            wait_timeout(true, Some(10_000), 10_000),
-            ms(RAMP_MIN_SLEEP_MS)
-        );
-        assert_eq!(
-            wait_timeout(true, Some(9_000), 10_000),
-            ms(RAMP_MIN_SLEEP_MS)
-        );
+        assert_eq!(wait_timeout(true, Some(10_000), 10_000), ms(RAMP_MIN_SLEEP_MS));
+        assert_eq!(wait_timeout(true, Some(9_000), 10_000), ms(RAMP_MIN_SLEEP_MS));
         // No ramp: live blockers re-sample every 10 s, the rest wait for events.
         assert_eq!(wait_timeout(true, None, 0), LIVE_RESAMPLE);
         assert_eq!(wait_timeout(false, None, 0), SWEEP);

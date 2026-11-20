@@ -29,17 +29,8 @@ impl Capacity {
     /// Folds VRAM into RAM where they are the same memory, then clamps every number to the machine.
     #[must_use]
     pub fn clamp(&self, w: Weights) -> Weights {
-        let (mem, vram) = if self.vram_is_ram {
-            (w.mem.saturating_add(w.vram), 0)
-        } else {
-            (w.mem, w.vram)
-        };
-        Weights {
-            cpu: w.cpu.min(self.cpu),
-            mem: mem.min(self.mem),
-            vram: vram.min(self.vram),
-            disk: w.disk.min(self.disk_total),
-        }
+        let (mem, vram) = if self.vram_is_ram { (w.mem.saturating_add(w.vram), 0) } else { (w.mem, w.vram) };
+        Weights { cpu: w.cpu.min(self.cpu), mem: mem.min(self.mem), vram: vram.min(self.vram), disk: w.disk.min(self.disk_total) }
     }
 }
 
@@ -55,20 +46,12 @@ impl Usage {
     /// Per-dimension maximum.
     #[must_use]
     pub fn max(self, o: Self) -> Self {
-        Self {
-            cpu: self.cpu.max(o.cpu),
-            mem: self.mem.max(o.mem),
-            vram: self.vram.max(o.vram),
-        }
+        Self { cpu: self.cpu.max(o.cpu), mem: self.mem.max(o.mem), vram: self.vram.max(o.vram) }
     }
 
     #[must_use]
     pub fn saturating_sub(self, o: Self) -> Self {
-        Self {
-            cpu: self.cpu.saturating_sub(o.cpu),
-            mem: self.mem.saturating_sub(o.mem),
-            vram: self.vram.saturating_sub(o.vram),
-        }
+        Self { cpu: self.cpu.saturating_sub(o.cpu), mem: self.mem.saturating_sub(o.mem), vram: self.vram.saturating_sub(o.vram) }
     }
 }
 

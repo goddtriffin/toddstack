@@ -40,15 +40,7 @@ pub struct JobInfo {
 impl JobInfo {
     #[must_use]
     pub fn new(id: &str, pid: u32, cwd: &str, cmd: &[String], w: Weights) -> Self {
-        Self {
-            id: id.into(),
-            pid,
-            cwd: cwd.chars().take(MAX_CWD).collect(),
-            repo: repo_of(Path::new(cwd)),
-            command: short_command(cmd),
-            cpu: w.cpu,
-            mem: w.mem,
-        }
+        Self { id: id.into(), pid, cwd: cwd.chars().take(MAX_CWD).collect(), repo: repo_of(Path::new(cwd)), command: short_command(cmd), cpu: w.cpu, mem: w.mem }
     }
 }
 
@@ -101,10 +93,7 @@ impl Event {
     #[must_use]
     pub const fn ts(&self) -> Timestamp {
         match self {
-            Self::Queued { ts, .. }
-            | Self::Started { ts, .. }
-            | Self::Finished { ts, .. }
-            | Self::Sample { ts, .. } => *ts,
+            Self::Queued { ts, .. } | Self::Started { ts, .. } | Self::Finished { ts, .. } | Self::Sample { ts, .. } => *ts,
         }
     }
 }
@@ -112,23 +101,13 @@ impl Event {
 /// `argv[0..2]` joined with a space, cut to 80 characters.
 #[must_use]
 pub fn short_command(cmd: &[String]) -> String {
-    cmd.iter()
-        .take(2)
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(MAX_COMMAND)
-        .collect()
+    cmd.iter().take(2).map(String::as_str).collect::<Vec<_>>().join(" ").chars().take(MAX_COMMAND).collect()
 }
 
 /// The basename of the nearest ancestor that holds a `.git` (a directory, or a file in a worktree).
 #[must_use]
 pub fn repo_of(cwd: &Path) -> Option<String> {
-    cwd.ancestors()
-        .find(|d| d.join(".git").exists())
-        .and_then(|d| d.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
+    cwd.ancestors().find(|d| d.join(".git").exists()).and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned())
 }
 
 /// `history-2026-11.jsonl`: the month in UTC.
@@ -148,11 +127,7 @@ pub fn append(dir: &Path, event: &Event) -> Result<(), Error> {
         return Err(Error::Probe("history line too long".into()));
     }
     line.push(b'\n');
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(file_name(event.ts())))?
-        .write_all(&line)?;
+    OpenOptions::new().create(true).append(true).open(dir.join(file_name(event.ts())))?.write_all(&line)?;
     Ok(())
 }
 
@@ -170,11 +145,7 @@ fn monthly_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = rd
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                n.starts_with("history-") && Path::new(n).extension().is_some_and(|x| x == "jsonl")
-            })
-        })
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("history-") && Path::new(n).extension().is_some_and(|x| x == "jsonl")))
         .collect();
     files.sort();
     files
@@ -194,11 +165,7 @@ pub fn read_since(dir: &Path, since: Timestamp) -> Vec<Event> {
     let mut events: Vec<Event> = monthly_files(dir)
         .iter()
         .filter_map(|p| fs::read_to_string(p).ok())
-        .flat_map(|t| {
-            t.lines()
-                .filter_map(|l| serde_json::from_str::<Event>(l).ok())
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|t| t.lines().filter_map(|l| serde_json::from_str::<Event>(l).ok()).collect::<Vec<_>>())
         .filter(|e| e.ts() >= since)
         .collect();
     events.sort_by_key(Event::ts);
@@ -224,13 +191,7 @@ impl WaitTally {
 
     #[must_use]
     pub fn reasons(&self) -> Vec<ReasonTime> {
-        self.totals
-            .iter()
-            .map(|(reason, ms)| ReasonTime {
-                reason: *reason,
-                ms: *ms,
-            })
-            .collect()
+        self.totals.iter().map(|(reason, ms)| ReasonTime { reason: *reason, ms: *ms }).collect()
     }
 }
 
@@ -239,15 +200,7 @@ mod tests {
     use super::*;
 
     fn info(id: &str) -> JobInfo {
-        JobInfo {
-            id: id.into(),
-            pid: 7,
-            cwd: "/w".into(),
-            repo: Some("r".into()),
-            command: "cargo test".into(),
-            cpu: 4,
-            mem: 1 << 30,
-        }
+        JobInfo { id: id.into(), pid: 7, cwd: "/w".into(), repo: Some("r".into()), command: "cargo test".into(), cpu: 4, mem: 1 << 30 }
     }
 
     fn ts(s: &str) -> Timestamp {
@@ -259,38 +212,10 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let when = ts("2026-11-19T10:00:00Z");
         let events = vec![
-            Event::Queued {
-                ts: when,
-                job: info("a"),
-            },
-            Event::Started {
-                ts: when,
-                job: info("a"),
-                wait_ms: 1500,
-                reasons: vec![ReasonTime {
-                    reason: Block::Ramp,
-                    ms: 1500,
-                }],
-            },
-            Event::Finished {
-                ts: when,
-                job: info("a"),
-                exit: 0,
-                wall_ms: 9000,
-                cpu_ms: 30_000,
-                peak_rss: 1 << 20,
-            },
-            Event::Sample {
-                ts: when,
-                cpu_pct: 42,
-                mem_pct: 50,
-                load1: 3.5,
-                load5: 2.0,
-                ncpu: 16,
-                running: 1,
-                waiting: 2,
-                blocked: BTreeMap::from([("cpu".to_string(), 2)]),
-            },
+            Event::Queued { ts: when, job: info("a") },
+            Event::Started { ts: when, job: info("a"), wait_ms: 1500, reasons: vec![ReasonTime { reason: Block::Ramp, ms: 1500 }] },
+            Event::Finished { ts: when, job: info("a"), exit: 0, wall_ms: 9000, cpu_ms: 30_000, peak_rss: 1 << 20 },
+            Event::Sample { ts: when, cpu_pct: 42, mem_pct: 50, load1: 3.5, load5: 2.0, ncpu: 16, running: 1, waiting: 2, blocked: BTreeMap::from([("cpu".to_string(), 2)]) },
         ];
         for e in &events {
             append(t.path(), e).unwrap();
@@ -313,46 +238,23 @@ mod tests {
         assert_eq!(c.chars().count(), 80);
         assert!(c.starts_with("cargo xx"));
         let j = JobInfo::new("id", 1, &"/y".repeat(1000), &cmd, Weights::default());
-        let line = serde_json::to_string(&Event::Queued {
-            ts: Timestamp::UNIX_EPOCH,
-            job: j,
-        })
-        .unwrap();
+        let line = serde_json::to_string(&Event::Queued { ts: Timestamp::UNIX_EPOCH, job: j }).unwrap();
         assert!(line.len() < 1000, "{}", line.len());
     }
 
     #[test]
     fn months_split_by_utc_and_only_five_are_kept() {
         let t = tempfile::tempdir().unwrap();
-        assert_eq!(
-            file_name(ts("2026-11-30T23:59:59Z")),
-            "history-2026-11.jsonl"
-        );
-        assert_eq!(
-            file_name(ts("2026-12-01T00:00:00Z")),
-            "history-2026-12.jsonl"
-        );
+        assert_eq!(file_name(ts("2026-11-30T23:59:59Z")), "history-2026-11.jsonl");
+        assert_eq!(file_name(ts("2026-12-01T00:00:00Z")), "history-2026-12.jsonl");
         for m in 1..=7 {
             fs::write(t.path().join(format!("history-2026-{m:02}.jsonl")), "").unwrap();
         }
         fs::write(t.path().join("history.jsonl"), "").unwrap();
         prune(t.path());
-        let mut names: Vec<String> = fs::read_dir(t.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut names: Vec<String> = fs::read_dir(t.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         names.sort();
-        assert_eq!(
-            names,
-            [
-                "history-2026-03.jsonl",
-                "history-2026-04.jsonl",
-                "history-2026-05.jsonl",
-                "history-2026-06.jsonl",
-                "history-2026-07.jsonl",
-                "history.jsonl"
-            ]
-        );
+        assert_eq!(names, ["history-2026-03.jsonl", "history-2026-04.jsonl", "history-2026-05.jsonl", "history-2026-06.jsonl", "history-2026-07.jsonl", "history.jsonl"]);
     }
 
     #[test]
@@ -371,18 +273,6 @@ mod tests {
         w.note(1400, Some(Block::Ramp));
         w.note(1500, Some(Block::Queue));
         w.note(2500, None);
-        assert_eq!(
-            w.reasons(),
-            vec![
-                ReasonTime {
-                    reason: Block::Queue,
-                    ms: 1400
-                },
-                ReasonTime {
-                    reason: Block::Ramp,
-                    ms: 100
-                }
-            ]
-        );
+        assert_eq!(w.reasons(), vec![ReasonTime { reason: Block::Queue, ms: 1400 }, ReasonTime { reason: Block::Ramp, ms: 100 }]);
     }
 }

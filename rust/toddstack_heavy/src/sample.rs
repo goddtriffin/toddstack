@@ -34,11 +34,7 @@ pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> R
         return Ok(false);
     }
     // Measure before taking the lock (it takes a quarter of a second); recheck under it.
-    let running: Vec<_> = state
-        .read_jobs()
-        .into_iter()
-        .filter(|j| j.state == State::Running)
-        .collect();
+    let running: Vec<_> = state.read_jobs().into_iter().filter(|j| j.state == State::Running).collect();
     let mut live = machine::live(cwd, cap, &running)?;
     let _lock = state.lock()?;
     let now = now_ms();
@@ -61,8 +57,7 @@ pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> R
             *blocked.entry(block.name().to_string()).or_default() += 1;
         }
     }
-    let running = u32::try_from(jobs.iter().filter(|j| j.state == State::Running).count())
-        .unwrap_or(u32::MAX);
+    let running = u32::try_from(jobs.iter().filter(|j| j.state == State::Running).count()).unwrap_or(u32::MAX);
     log::record(
         state.base(),
         &Event::Sample {

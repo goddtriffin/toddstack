@@ -32,11 +32,7 @@ pub fn append(path: &Path, entry: &Entry) -> Result<(), Error> {
     let mut line = serde_json::to_vec(entry)?;
     line.push(b'\n');
     // One write call on an O_APPEND file: concurrent writers do not interleave.
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?
-        .write_all(&line)?;
+    OpenOptions::new().create(true).append(true).open(path)?.write_all(&line)?;
     Ok(())
 }
 
@@ -58,45 +54,21 @@ fn median(mut v: Vec<u64>) -> Option<u64> {
 
 #[must_use]
 pub fn defaults_from(entries: &[Entry], cmd: &[String], cwd: &str) -> Option<Defaults> {
-    let mine: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| e.exit_code == 0 && e.cwd == cwd && e.cmd == cmd)
-        .collect();
+    let mine: Vec<&Entry> = entries.iter().filter(|e| e.exit_code == 0 && e.cwd == cwd && e.cmd == cmd).collect();
     let mine = &mine[mine.len().saturating_sub(KEEP)..];
     // Peaks of the whole process tree; runs too short to sample (or old entries) fall back to the average
     // cores and the largest single process.
-    let cores = median(
-        mine.iter()
-            .map(|e| {
-                if e.measured.peak_centi_cores > 0 {
-                    e.measured.peak_centi_cores
-                } else {
-                    e.measured.centi_cores
-                }
-            })
-            .collect(),
-    )?;
-    let mem = median(
-        mine.iter()
-            .map(|e| e.measured.peak_tree_rss.max(e.measured.peak_rss))
-            .collect(),
-    )?;
+    let cores = median(mine.iter().map(|e| if e.measured.peak_centi_cores > 0 { e.measured.peak_centi_cores } else { e.measured.centi_cores }).collect())?;
+    let mem = median(mine.iter().map(|e| e.measured.peak_tree_rss.max(e.measured.peak_rss)).collect())?;
     let vram = median(mine.iter().filter_map(|e| e.measured.peak_vram).collect());
-    Some(Defaults {
-        cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX),
-        mem,
-        vram,
-    })
+    Some(Defaults { cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX), mem, vram })
 }
 
 /// Reads the history file (a missing or damaged one just means no defaults).
 #[must_use]
 pub fn defaults_for(path: &Path, cmd: &[String], cwd: &str) -> Option<Defaults> {
     let text = fs::read_to_string(path).ok()?;
-    let entries: Vec<Entry> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
+    let entries: Vec<Entry> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     defaults_from(&entries, cmd, cwd)
 }
 
@@ -110,33 +82,16 @@ mod tests {
             cmd: vec![cmd.into()],
             cwd: cwd.into(),
             requested: Weights::default(),
-            measured: Stats {
-                centi_cores: centi,
-                peak_rss: rss,
-                ..Stats::default()
-            },
+            measured: Stats { centi_cores: centi, peak_rss: rss, ..Stats::default() },
             exit_code: code,
         }
     }
 
     #[test]
     fn median_defaults_for_same_cmd_and_cwd() {
-        let all = vec![
-            entry("t", "/a", 150, 100, 0),
-            entry("t", "/a", 350, 300, 0),
-            entry("t", "/a", 250, 200, 0),
-            entry("t", "/b", 900, 900, 0),
-            entry("t", "/a", 900, 900, 1),
-        ];
+        let all = vec![entry("t", "/a", 150, 100, 0), entry("t", "/a", 350, 300, 0), entry("t", "/a", 250, 200, 0), entry("t", "/b", 900, 900, 0), entry("t", "/a", 900, 900, 1)];
         let d = defaults_from(&all, &["t".to_string()], "/a").unwrap();
-        assert_eq!(
-            d,
-            Defaults {
-                cpu: 3,
-                mem: 200,
-                vram: None
-            }
-        );
+        assert_eq!(d, Defaults { cpu: 3, mem: 200, vram: None });
         assert!(defaults_from(&all, &["other".to_string()], "/a").is_none());
     }
 
@@ -146,14 +101,7 @@ mod tests {
         e.measured.peak_centi_cores = 650;
         e.measured.peak_tree_rss = 900;
         let d = defaults_from(&[e], &["t".to_string()], "/a").unwrap();
-        assert_eq!(
-            d,
-            Defaults {
-                cpu: 7,
-                mem: 900,
-                vram: None
-            }
-        );
+        assert_eq!(d, Defaults { cpu: 7, mem: 900, vram: None });
     }
 
     #[test]
