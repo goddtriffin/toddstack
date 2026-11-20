@@ -75,6 +75,8 @@ pub struct Live {
 pub enum State {
     Queued,
     Running,
+    /// A waiter stopped with Ctrl-Z: it cannot start, so it never blocks the queue. Written before it stops.
+    Stopped,
 }
 
 /// One JSON file per job in the state dir.
