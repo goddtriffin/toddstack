@@ -29,21 +29,44 @@ ARG BUILDARCH
 ARG ZIG_VERSION=0.17.1
 ARG ZIG_SHA256_ARM64=a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795
 ARG ZIG_SHA256_AMD64=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
+ARG ZIG_MINISIGN_KEY=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 ARG CARGO_CHEF_VERSION=0.1.78
 
 RUN apk add --no-cache musl-dev xz
 
-# zig, from the official tarball, checked against its published sha256
-RUN case "$BUILDARCH" in \
+# zig, from the community mirrors (https://ziglang.org/download/community-mirrors.txt)
+# in a fixed order, then ziglang.org last: ziglang.org asks CI to use mirrors,
+# and it is slow and has hung builds. The list is pinned here, never fetched at
+# build time. Mirrors are untrusted: every source, ziglang.org included, must
+# pass BOTH the pinned sha256 and the minisign signature (Zig's published public
+# key, https://ziglang.org/download/) or the build moves on to the next source.
+# If every source fails either check, the build fails. Every request has a
+# connect and a total timeout, so nothing can hang.
+RUN apk add --no-cache curl minisign=0.12-r2 \
+ && case "$BUILDARCH" in \
       arm64) arch=aarch64; sum="$ZIG_SHA256_ARM64" ;; \
       amd64) arch=x86_64; sum="$ZIG_SHA256_AMD64" ;; \
       *) echo "unsupported build arch: $BUILDARCH" >&2; exit 1 ;; \
     esac \
- && wget -q -O /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" \
- && echo "$sum  /tmp/zig.tar.xz" | sha256sum -c - \
+ && file="zig-${arch}-linux-${ZIG_VERSION}.tar.xz" \
+ && ok= \
+ && for base in \
+      https://zig.linus.dev/zig \
+      https://zig.savalione.com \
+      https://pkg.earth/zig \
+      https://pkg.hexops.org/zig \
+      "https://ziglang.org/download/${ZIG_VERSION}"; do \
+      echo "zig: trying $base"; \
+      if curl -fsSL --connect-timeout 10 --max-time 180 --retry 2 -o /tmp/zig.tar.xz "$base/$file?source=toddstack" \
+         && curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 -o /tmp/zig.tar.xz.minisig "$base/$file.minisig?source=toddstack" \
+         && echo "$sum  /tmp/zig.tar.xz" | sha256sum -c - \
+         && minisign -Vm /tmp/zig.tar.xz -x /tmp/zig.tar.xz.minisig -P "$ZIG_MINISIGN_KEY"; then ok=1; break; fi; \
+      echo "zig: $base failed a download or check, trying the next source" >&2; \
+    done \
+ && if [ -z "$ok" ]; then echo "zig: every source failed the download, sha256 or signature check" >&2; exit 1; fi \
  && mkdir /opt/zig \
  && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
- && rm /tmp/zig.tar.xz
+ && rm /tmp/zig.tar.xz /tmp/zig.tar.xz.minisig
 ENV PATH="/opt/zig:${PATH}"
 
 RUN cargo install --locked cargo-chef@${CARGO_CHEF_VERSION} \
