@@ -32,8 +32,8 @@ All of these must hold:
 - Reservations: running RAM and VRAM reservations plus this request are at most 90% of capacity.
 - CPU headroom: `all cores - non-heavy usage - live CPU of running jobs` leaves one free core (on 16 cores, jobs
   start until the CPU is about 94% busy). A job admitted in the last 10 s holds its peak cores (from history) while it
-  ramps up, so a burst of waiters is staggered. A whole-machine hold (cold and Docker jobs) stays full for all 10 s, so
-  those start at least 10 s apart. A learned peak below the machine is full for 3 s; after that, if the machine reads
+  ramps up, so a burst of waiters is staggered. The full 10 s hold covers cold jobs, Docker/VM jobs and learned peaks of 75% of
+  the machine or more, so those start at least 10 s apart. Any smaller learned peak is full for 3 s; after that, if the machine reads
   under 50% CPU the job has shown its real use and the hold is released, otherwise it shrinks linearly to nothing at
   10 s. A waiter held back by a ramp
   sleeps until the first moment the shrinking holds leave room. A job's recorded peak is the larger of its process tree's peak and the
@@ -63,7 +63,7 @@ head has waited under 60 s.
 `~/.local/state/heavy/jobs/` holds one JSON file per job (pid, process start time, reservation, cmd, cwd, state).
 Decisions are made under a `flock`, which the kernel releases if a process dies. Files of dead jobs are dropped.
 Waiters watch the directory (kqueue/inotify) and re-evaluate when a job file changes or disappears. Only while live
-data blocks a job is there a 10 s re-sample (monitoring; a waiter held back by a ramp sleeps until the ramp ends instead); a 30 s safety sweep catches jobs killed with SIGKILL.
+data blocks a job is there a 10 s re-sample (monitoring; a waiter held back by a ramp sleeps until the first moment it fits instead, not until the ramp ends); a 30 s safety sweep catches jobs killed with SIGKILL.
 
 A job's file is never deleted while its pid exists: if the process start time cannot be read, a marker is stored and
 liveness checks the pid only. Leftover `.tmp` files are swept with the dead jobs.
