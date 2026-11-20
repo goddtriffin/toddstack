@@ -357,11 +357,11 @@ fn other_sampler(dir: &StateDir, own_pid: u32, cores: u32) -> Option<OtherHandle
     let (stop_tx, stop_rx) = channel::<()>();
     let dir = dir.clone();
     let handle = std::thread::spawn(move || {
-        let mut samples = vec![];
+        let mut rises = vec![];
         loop {
-            samples.push(sampler.sample(&roots(&dir)).saturating_sub(baseline));
+            rises.push(sampler.sample(&roots(&dir)).saturating_sub(baseline));
             if !matches!(stop_rx.recv_timeout(OTHER_SAMPLE), Err(RecvTimeoutError::Timeout)) {
-                return p90(&mut samples);
+                return p90(&mut rises);
             }
         }
     });
