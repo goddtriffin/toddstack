@@ -145,6 +145,7 @@ then later stages first (finish work before starting work), then oldest. Budget 
 | option | verdict |
 |---|---|
 | **Relay on the droplet: GitHub webhooks in, SSE out** | **Recommended.** Event-driven end to end, one ingress for all repos, gives us the lease authority and metrics store in the same place, reconnect replays by `Last-Event-ID` (events kept 7 days). |
+| `gh event listen` (gh 2.105.0, preview) | Push stream, but pull requests only (no issues, so no labels or new items), no replay of missed events, subscriptions expire after 24 h and are capped per account. Fine for one-off waits on a PR; cannot carry the queue. |
 | `gh webhook forward` (gh extension) | Dev tool: one forwarder per repo, needs repo admin, documented for testing, no replay after a laptop sleeps. |
 | GitHub REST Events API / `gh api` loops | Polling (it even returns `X-Poll-Interval`). Banned. |
 | smee.io or other third-party relays | Third party sees every payload; no replay guarantee; no lease store. |
