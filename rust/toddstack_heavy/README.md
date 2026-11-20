@@ -29,13 +29,18 @@ the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
 
 All of these must hold:
 
-- Reservations: running reservations plus this request are at most 90% of capacity (cores, RAM, VRAM).
-- Headroom: `90% of capacity - non-heavy usage - sum over running jobs of max(reservation, live usage)` fits the
+- Reservations: running RAM and VRAM reservations plus this request are at most 90% of capacity.
+- CPU headroom: `all cores - non-heavy usage - live CPU of running jobs` leaves one free core (on 16 cores, jobs
+  start until the CPU is about 94% busy). A job admitted in the last 10 s holds its peak cores (from history) while it
+  ramps up, so a burst of waiters is staggered.
+- Memory headroom: `90% of RAM - non-heavy usage - sum over running jobs of max(reservation, live usage)` fits the
   request. Non-heavy usage is machine-wide use minus the process trees of heavy's own jobs (Chrome, Discord, other
-  CLIs), smoothed as the max of the last 4 samples. On Linux CPU includes steal time (`/proc/stat` field 8), which
-  WSL2 and VMs otherwise hide.
-- Guards (veto only): 1-minute and 5-minute load each below 2 x the core count (macOS load reads high), memory used
-  below 90%.
+  CLIs), smoothed as the mean of the last 3 samples (10 s apart): a single spike or dip does not decide alone. On
+  Linux CPU includes steal time (`/proc/stat` field 8), which WSL2 and VMs otherwise hide.
+- Guards (veto only): 1-minute load at or over 2 x cores blocks only while the CPU is also at least 90% busy (on
+  macOS load also counts threads blocked in I/O, so it can read 20-30 on an idle CPU); at or over 4 x cores it
+  blocks whatever the CPU says (runaway load: 120 on 16 cores killed Docker on 2026-11-19). The 5-minute load is
+  not used: it lags, and blocked a nearly idle machine for minutes after a burst. Memory used below 90%.
 - Disk: free space on the cwd's filesystem must be at least `--disk` plus 10% of the disk. If it is not, waiting
   cannot help, so `heavy` exits 75 at once and says the disk is full (clean up, or ask Todd).
 - A job running alone always passes the resource checks. There is no cap on the number of jobs.
@@ -69,15 +74,16 @@ months, newest 5 kept) in the state dir. One JSON line per event, one `write()` 
 
 - `queued`, `started`, `finished`: ts, job id, pid, cwd, repo (git toplevel basename), command (`argv[0..2]`, 80
   chars), requested cpu and mem. `started` adds `wait_ms` and `reasons` (time blocked by each of
-  cpu/mem/vram/load1/load5/queue/ramp). `finished` adds exit code, wall time, cpu time, peak RSS.
+  cpu/mem/vram/load1/queue/ramp; older lines may say load5). `finished` adds exit code, wall time, cpu time, peak RSS.
 - `sample`: ts, cpu %, mem %, load1, load5, cores, jobs running, jobs waiting, and `blocked` (what each waiting job is
   blocked by right now). While any job waits or runs, every heavy process checks every 10 s whether a sample is due,
   and the one that takes the lock writes it, so samples are at most 30 s apart. With no jobs nothing is written
   (monitoring, exempt from the no-polling rule).
 
-`heavy history` prints totals (jobs, total, average and p95 wait), **idle while waiting**, a per-repo table (jobs,
-wait, cpu-hours) and a 5-minute timeline of cpu, running and waiting. Idle while waiting is the time a job waited
-although cpu < 60%, memory < 85% and 1-minute load < 2 x cores: the only time that can be heavy's fault. It prints
+`heavy history` prints totals (jobs, total, average and p95 wait), **avg cpu while jobs waited** (time-weighted;
+it should be near full), **idle while waiting**, a per-repo table (jobs, wait, cpu-hours) and a 5-minute timeline of
+cpu, running and waiting. Idle while waiting is the time a job waited although cpu < 75% and memory < 85% (load is
+ignored): the time that can be heavy's fault. It prints
 its share of all waiting time and the blockers recorded in those minutes (`startable` means nothing blocked and the
 waiter had not yet woken). `--html PATH` writes one self-contained page (inline SVG, no scripts) and prints its path.
 
