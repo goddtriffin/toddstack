@@ -1,8 +1,14 @@
 //! `history.jsonl`: one line per finished job; the median of past peaks (whole process tree) is the default weight.
+//!
+//! Lookup goes from the most to the least specific match: the same command in the same cwd; else the same command in
+//! the same place of the same repository (any worktree or clone of it: `repo`); else the same program and first
+//! argument there (`make ui-check`, `cargo test`). Agents run each task in a fresh worktree, so keyed on the cwd alone
+//! 75% of the Mac's jobs on 2026-11-20 were cold and held the whole machine for 10 s each, though their median peak
+//! was 2 cores.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -25,6 +31,32 @@ pub struct Entry {
     /// processes (about 17x inflated), so learned defaults ignore them there.
     #[serde(default)]
     pub v: u32,
+    /// Where in which repository the job ran (`repo_key`): shared by every worktree of a repository. Absent before
+    /// 0.4.1 and outside git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+/// Identifies a place in a repository across its worktrees: the repository's common git dir, then the cwd relative
+/// to the worktree root (`<common git dir>:<relative path>`). `None` outside git.
+#[must_use]
+pub fn repo_key(cwd: &Path) -> Option<String> {
+    let root = cwd.ancestors().find(|d| d.join(".git").exists())?;
+    let git = root.join(".git");
+    let common = if git.is_dir() {
+        git
+    } else {
+        // A worktree (or submodule): `.git` is a file naming its own git dir, whose `commondir` names the shared one.
+        let text = fs::read_to_string(&git).ok()?;
+        let own = root.join(text.trim().strip_prefix("gitdir:")?.trim());
+        match fs::read_to_string(own.join("commondir")) {
+            Ok(c) => own.join(c.trim()),
+            Err(_) => own,
+        }
+    };
+    let common = common.canonicalize().unwrap_or(common);
+    let rel = cwd.strip_prefix(root).map_or_else(|_| PathBuf::new(), Path::to_path_buf);
+    Some(format!("{}:{}", common.display(), rel.display()))
 }
 
 /// The version written into new entries.
@@ -60,15 +92,30 @@ fn median(mut v: Vec<u64>) -> Option<u64> {
 }
 
 #[must_use]
-pub fn defaults_from(entries: &[Entry], cmd: &[String], cwd: &str) -> Option<Defaults> {
+pub fn defaults_from(entries: &[Entry], cmd: &[String], cwd: &str, repo: Option<&str>) -> Option<Defaults> {
     // macOS never counted threads as children (sysinfo reports no thread kind there), so old entries stay valid.
-    defaults_with(entries, cmd, cwd, if cfg!(target_os = "linux") { VERSION } else { 0 })
+    defaults_with(entries, cmd, cwd, repo, if cfg!(target_os = "linux") { VERSION } else { 0 })
 }
 
-/// Like `defaults_from`, using only entries whose version is at least `min_v`.
+/// How many leading words of the command the last lookup tier compares (`make ui-check`, `cargo test`).
+const PROGRAM_WORDS: usize = 2;
+
+/// Like `defaults_from`, using only entries whose version is at least `min_v`. Tries the same command in the same
+/// cwd, then the same command in the same repository place, then the same program and first argument there.
 #[must_use]
-pub fn defaults_with(entries: &[Entry], cmd: &[String], cwd: &str, min_v: u32) -> Option<Defaults> {
-    let mine: Vec<&Entry> = entries.iter().filter(|e| e.v >= min_v && e.exit_code == 0 && e.cwd == cwd && e.cmd == cmd).collect();
+pub fn defaults_with(entries: &[Entry], cmd: &[String], cwd: &str, repo: Option<&str>, min_v: u32) -> Option<Defaults> {
+    let ok: Vec<&Entry> = entries.iter().filter(|e| e.v >= min_v && e.exit_code == 0).collect();
+    let same_repo = |e: &Entry| repo.is_some() && e.repo.as_deref() == repo;
+    let program = cmd.get(..PROGRAM_WORDS).unwrap_or(cmd);
+    let tiers: [&dyn Fn(&Entry) -> bool; 3] = [
+        &|e| e.cwd == cwd && e.cmd == cmd,
+        &|e| same_repo(e) && e.cmd == cmd,
+        &|e| same_repo(e) && e.cmd.starts_with(program),
+    ];
+    tiers.iter().find_map(|tier| median_of(&ok.iter().copied().filter(|e| tier(e)).collect::<Vec<_>>()))
+}
+
+fn median_of(mine: &[&Entry]) -> Option<Defaults> {
     let mine = &mine[mine.len().saturating_sub(KEEP)..];
     // Peaks of the whole process tree; runs too short to sample (or old entries) fall back to the average
     // cores and the largest single process.
@@ -80,10 +127,10 @@ pub fn defaults_with(entries: &[Entry], cmd: &[String], cwd: &str, min_v: u32) -
 
 /// Reads the history file (a missing or damaged one just means no defaults).
 #[must_use]
-pub fn defaults_for(path: &Path, cmd: &[String], cwd: &str) -> Option<Defaults> {
+pub fn defaults_for(path: &Path, cmd: &[String], cwd: &str, repo: Option<&str>) -> Option<Defaults> {
     let text = fs::read_to_string(path).ok()?;
     let entries: Vec<Entry> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-    defaults_from(&entries, cmd, cwd)
+    defaults_from(&entries, cmd, cwd, repo)
 }
 
 #[cfg(test)]
@@ -99,15 +146,16 @@ mod tests {
             measured: Stats { centi_cores: centi, peak_rss: rss, ..Stats::default() },
             exit_code: code,
             v: VERSION,
+            repo: None,
         }
     }
 
     #[test]
     fn median_defaults_for_same_cmd_and_cwd() {
         let all = vec![entry("t", "/a", 150, 100, 0), entry("t", "/a", 350, 300, 0), entry("t", "/a", 250, 200, 0), entry("t", "/b", 900, 900, 0), entry("t", "/a", 900, 900, 1)];
-        let d = defaults_from(&all, &["t".to_string()], "/a").unwrap();
+        let d = defaults_from(&all, &["t".to_string()], "/a", None).unwrap();
         assert_eq!(d, Defaults { cpu: 3, mem: 200, vram: None });
-        assert!(defaults_from(&all, &["other".to_string()], "/a").is_none());
+        assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
     }
 
     #[test]
@@ -115,7 +163,7 @@ mod tests {
         let mut e = entry("t", "/a", 100, 50, 0);
         e.measured.peak_centi_cores = 650;
         e.measured.peak_tree_rss = 900;
-        let d = defaults_from(&[e], &["t".to_string()], "/a").unwrap();
+        let d = defaults_from(&[e], &["t".to_string()], "/a", None).unwrap();
         assert_eq!(d, Defaults { cpu: 7, mem: 900, vram: None });
     }
 
@@ -125,15 +173,15 @@ mod tests {
         old.v = 0;
         let new = entry("t", "/a", 100, 2_600, 0);
         let c = ["t".to_string()];
-        assert_eq!(defaults_with(&[old.clone()], &c, "/a", 1), None);
-        assert_eq!(defaults_with(&[old, new], &c, "/a", 1).unwrap().mem, 2_600);
+        assert_eq!(defaults_with(&[old.clone()], &c, "/a", None, 1), None);
+        assert_eq!(defaults_with(&[old, new], &c, "/a", None, 1).unwrap().mem, 2_600);
     }
 
     #[test]
     fn v0_entries_are_used_when_min_version_is_zero() {
         let mut old = entry("t", "/a", 100, 700, 0);
         old.v = 0;
-        assert_eq!(defaults_with(&[old], &["t".to_string()], "/a", 0).unwrap().mem, 700);
+        assert_eq!(defaults_with(&[old], &["t".to_string()], "/a", None, 0).unwrap().mem, 700);
     }
 
     #[test]
@@ -152,6 +200,61 @@ mod tests {
         append(&p, &entry("t", "/a", 100, 1, 0)).unwrap();
         append(&p, &entry("t", "/a", 100, 1, 0)).unwrap();
         assert_eq!(fs::read_to_string(&p).unwrap().lines().count(), 2);
-        assert_eq!(defaults_for(&p, &["t".to_string()], "/a").unwrap().cpu, 1);
+        assert_eq!(defaults_for(&p, &["t".to_string()], "/a", None).unwrap().cpu, 1);
+    }
+
+    fn in_repo(cmd: &[&str], cwd: &str, repo: &str, peak: u64) -> Entry {
+        let mut e = entry("x", cwd, peak, 1 << 30, 0);
+        e.cmd = cmd.iter().map(|s| (*s).to_string()).collect();
+        e.measured.peak_centi_cores = peak;
+        e.repo = Some(repo.into());
+        e
+    }
+
+    #[test]
+    fn a_fresh_worktree_learns_from_the_other_worktrees_of_its_repo() {
+        // 2026-11-20 on the Mac: every agent task runs in a new worktree (wt216, wt225, ...), so keyed on the cwd 75% of
+        // jobs were cold and held all 16 cores for 10 s, though their median peak was 2 cores.
+        let s = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let bdg = "/code/bdg/.git:apple";
+        let all = vec![
+            in_repo(&["make", "ui-check"], "/s/wt216/apple", bdg, 200),
+            in_repo(&["make", "ui-check"], "/s/wt218/apple", bdg, 300),
+            in_repo(&["make", "ui-check"], "/s/wt219/apple", bdg, 250),
+            in_repo(&["make", "lint"], "/s/wt216/apple", bdg, 900),
+            in_repo(&["make", "ui-check"], "/s/wt9/web", "/code/other/.git:web", 1600),
+        ];
+        // Same cwd first.
+        assert_eq!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt218/apple", Some(bdg)).unwrap().cpu, 3);
+        // A new worktree of the same repo: the median of the same command there.
+        assert_eq!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", Some(bdg)).unwrap().cpu, 3);
+        // A command never run in this repo place, but the same program and first argument: `make ui-check SCREENS=a`.
+        assert_eq!(defaults_from(&all, &s(&["make", "ui-check", "SCREENS=a"]), "/s/wt225/apple", Some(bdg)).unwrap().cpu, 3);
+        // Another repo, another directory or no repo at all stays cold.
+        assert!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", Some("/code/bdg/.git:web")).is_none());
+        assert!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", None).is_none());
+        assert!(defaults_from(&all, &s(&["make", "test"]), "/s/wt225/apple", Some(bdg)).is_none());
+    }
+
+    #[test]
+    fn repo_key_is_shared_by_worktrees_and_absent_outside_git() {
+        let t = tempfile::tempdir().unwrap();
+        let main = t.path().join("repo");
+        fs::create_dir_all(main.join(".git/worktrees/wt1")).unwrap();
+        fs::create_dir_all(main.join("apple")).unwrap();
+        fs::write(main.join(".git/worktrees/wt1/commondir"), "../..\n").unwrap();
+        let wt = t.path().join("scratch/wt1");
+        fs::create_dir_all(wt.join("apple")).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", main.join(".git/worktrees/wt1").display())).unwrap();
+        let a = repo_key(&main.join("apple")).unwrap();
+        assert_eq!(repo_key(&wt.join("apple")).unwrap(), a, "a worktree shares the main checkout's key");
+        assert!(a.ends_with(":apple"), "{a}");
+        assert_ne!(repo_key(&wt).unwrap(), a, "the worktree root is another place in the repo");
+        assert_eq!(repo_key(t.path()), None);
+        // Entries without the field (before 0.4.1) still parse.
+        let mut value = serde_json::to_value(entry("t", "/a", 1, 1, 0)).unwrap();
+        assert!(value.get("repo").is_none(), "absent repo is not written");
+        value.as_object_mut().unwrap().insert("repo".into(), a.clone().into());
+        assert_eq!(serde_json::from_value::<Entry>(value).unwrap().repo, Some(a));
     }
 }

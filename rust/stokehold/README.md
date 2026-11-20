@@ -22,7 +22,9 @@ runs (for prompts and pagers) and `stokehold` takes it back afterwards. If the c
 
 Cores, RAM, GPU memory and free disk the job needs. Without flags: the median measured peak (whole process tree,
 sampled every 0.5 s while the job runs: peak cores at once and peak RSS) from
-`~/.local/state/stokehold/history.jsonl` for the same command and cwd, else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 10 s apart; after one run, history gives the real peak). A request larger than
+`~/.local/state/stokehold/history.jsonl` for the same command and cwd; else for the same command in the same place of
+the same repository (any worktree or clone sharing its git dir, so a fresh agent worktree is not cold); else for the
+same program and first argument there (`make ui-check`, `cargo test`); else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 10 s apart; after one run, history gives the real peak). A request larger than
 the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
 History entries carry a version (`v`); on Linux, entries from before 0.3.2 (no `v`) are ignored for defaults because they counted threads as processes.
 

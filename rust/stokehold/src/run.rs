@@ -121,7 +121,7 @@ fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
 }
 
 fn resolve_weights(state: &StateDir, flags: &Flags, cmd: &[String], cwd: &str, cap: &Capacity) -> Weights {
-    let hist = history::defaults_for(&state.history_path(), cmd, cwd);
+    let hist = history::defaults_for(&state.history_path(), cmd, cwd, history::repo_key(Path::new(cwd)).as_deref());
     cap.clamp(Weights {
         cpu: flags.cpu.or(hist.map(|d| d.cpu)).unwrap_or_else(|| default_cpu(cmd, cap)),
         mem: flags.mem.or(hist.map(|d| d.mem)).unwrap_or(DEFAULT_MEM),
@@ -495,7 +495,7 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
     eprintln!("{}", format_stats(&stats));
 
     let code = if timed_out { i32::from(TIMEOUT_EXIT) } else { exit_code(exit) };
-    let entry = Entry { ts: Timestamp::now(), cmd: job.cmd.clone(), cwd: job.cwd.clone(), requested: job.weights, measured: stats, exit_code: code, v: crate::history::VERSION };
+    let entry = Entry { ts: Timestamp::now(), cmd: job.cmd.clone(), cwd: job.cwd.clone(), requested: job.weights, measured: stats, exit_code: code, v: crate::history::VERSION, repo: history::repo_key(Path::new(&job.cwd)) };
     if let Err(e) = history::append(&dir.history_path(), &entry) {
         eprintln!("stokehold: could not write history: {e}");
     }
