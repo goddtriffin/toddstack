@@ -11,9 +11,15 @@ const KIB: u128 = 1024;
 pub fn parse_size(text: &str) -> Result<u64, Error> {
     let bad = || Error::Usage(format!("not a size: {text:?} (try 512M or 4G)"));
     let t = text.trim();
-    let split = t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len());
+    let split = t
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(t.len());
     let (num, suffix) = t.split_at(split);
-    let unit: u128 = match suffix.to_ascii_lowercase().trim_end_matches('b').trim_end_matches('i') {
+    let unit: u128 = match suffix
+        .to_ascii_lowercase()
+        .trim_end_matches('b')
+        .trim_end_matches('i')
+    {
         "" => 1,
         "k" => KIB,
         "m" => KIB.pow(2),
@@ -25,7 +31,11 @@ pub fn parse_size(text: &str) -> Result<u64, Error> {
     if whole.is_empty() && frac.is_empty() {
         return Err(bad());
     }
-    let whole: u128 = if whole.is_empty() { 0 } else { whole.parse().map_err(|_| bad())? };
+    let whole: u128 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| bad())?
+    };
     let mut total = whole.checked_mul(unit).ok_or_else(bad)?;
     if !frac.is_empty() {
         let digits = frac.get(..frac.len().min(9)).ok_or_else(bad)?;

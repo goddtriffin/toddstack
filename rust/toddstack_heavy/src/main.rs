@@ -5,8 +5,11 @@ mod cli;
 mod error;
 mod history;
 mod job;
+mod log;
 mod machine;
+mod report;
 mod run;
+mod sample;
 mod sizes;
 mod state;
 mod stats;
@@ -34,8 +37,29 @@ fn real_main() -> Result<u8, Error> {
             status::print(&StateDir::from_env()?)?;
             Ok(0)
         }
+        Command::History { since, html } => history(&StateDir::from_env()?, since, html.as_deref()),
         Command::Run { flags, cmd } => run::run(&StateDir::from_env()?, &flags, &cmd),
     }
+}
+
+fn history(
+    state: &StateDir,
+    since: std::time::Duration,
+    html: Option<&std::path::Path>,
+) -> Result<u8, Error> {
+    let now = jiff::Timestamp::now();
+    let from = now
+        .checked_sub(since)
+        .map_err(|e| Error::Usage(format!("--since: {e}")))?;
+    let events = log::read_since(state.base(), from);
+    let report = report::compute(&events, from.as_millisecond(), now.as_millisecond());
+    if let Some(path) = html {
+        std::fs::write(path, report::render_html(&report))?;
+        println!("{}", std::fs::canonicalize(path)?.display());
+    } else {
+        print!("{}", report::render_text(&report));
+    }
+    Ok(0)
 }
 
 fn main() -> ExitCode {
