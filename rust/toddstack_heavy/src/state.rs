@@ -29,8 +29,11 @@ impl StateDir {
         if let Some(dir) = std::env::var_os("HEAVY_STATE_DIR") {
             return Ok(Self { base: dir.into() });
         }
-        let home = std::env::var_os("HOME").ok_or_else(|| Error::Usage("HOME is not set".into()))?;
-        Ok(Self { base: PathBuf::from(home).join(".local/state/heavy") })
+        let home =
+            std::env::var_os("HOME").ok_or_else(|| Error::Usage("HOME is not set".into()))?;
+        Ok(Self {
+            base: PathBuf::from(home).join(".local/state/heavy"),
+        })
     }
 
     #[cfg(test)]
@@ -42,6 +45,26 @@ impl StateDir {
     #[must_use]
     pub fn jobs_dir(&self) -> PathBuf {
         self.base.join("jobs")
+    }
+
+    /// Where the monthly event logs live.
+    #[must_use]
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
+    /// When the last machine sample was written (ms since the epoch; 0 for never). Shared by every heavy process.
+    #[must_use]
+    pub fn last_sample_ms(&self) -> i64 {
+        fs::read_to_string(self.base.join("last_sample"))
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Call with the lock held.
+    pub fn set_last_sample_ms(&self, ms: i64) {
+        let _ = fs::write(self.base.join("last_sample"), ms.to_string());
     }
 
     #[must_use]
@@ -61,7 +84,11 @@ impl StateDir {
     /// # Errors
     /// Fails when the lock file cannot be opened or locked.
     pub fn lock(&self) -> Result<Flock<File>, Error> {
-        let file = OpenOptions::new().create(true).truncate(false).write(true).open(self.base.join("lock"))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.base.join("lock"))?;
         Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| Error::Sys(e))
     }
 
@@ -90,10 +117,16 @@ impl StateDir {
     /// Every readable job file, oldest first.
     #[must_use]
     pub fn read_jobs(&self) -> Vec<Job> {
-        let Ok(rd) = fs::read_dir(self.jobs_dir()) else { return Vec::new() };
+        let Ok(rd) = fs::read_dir(self.jobs_dir()) else {
+            return Vec::new();
+        };
         let mut jobs: Vec<Job> = rd
             .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_str().is_some_and(|n| !n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "json")))
+            .filter(|e| {
+                e.file_name().to_str().is_some_and(|n| {
+                    !n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "json")
+                })
+            })
             .filter_map(|e| serde_json::from_slice(&fs::read(e.path()).ok()?).ok())
             .collect();
         jobs.sort_by(|a: &Job, b: &Job| (a.enqueued_ms, &a.id).cmp(&(b.enqueued_ms, &b.id)));
@@ -103,9 +136,13 @@ impl StateDir {
     /// Removes leftover `.tmp` files of writers that died mid-write. Writers hold the lock, so with the lock
     /// held every `.tmp` file is stale.
     fn sweep_tmp(&self) {
-        let Ok(rd) = fs::read_dir(self.jobs_dir()) else { return };
+        let Ok(rd) = fs::read_dir(self.jobs_dir()) else {
+            return;
+        };
         for e in rd.filter_map(Result::ok) {
-            if e.file_name().to_str().is_some_and(|n| n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "tmp")) {
+            if e.file_name().to_str().is_some_and(|n| {
+                n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "tmp")
+            }) {
                 let _ = fs::remove_file(e.path());
             }
         }
@@ -127,7 +164,9 @@ impl StateDir {
 /// the process start (here or when the file was written) never makes a live job look dead.
 #[must_use]
 pub fn is_alive(job: &Job) -> bool {
-    let Ok(pid) = i32::try_from(job.pid) else { return false };
+    let Ok(pid) = i32::try_from(job.pid) else {
+        return false;
+    };
     match kill(Pid::from_raw(pid), None) {
         Ok(()) | Err(nix::errno::Errno::EPERM) => {}
         Err(_) => return false,
@@ -144,7 +183,17 @@ mod tests {
     use crate::job::{State, Weights};
 
     pub fn job(id: &str, pid: u32, start: u64, state: State) -> Job {
-        Job { id: id.into(), pid, start_time: start, weights: Weights::default(), cmd: vec!["x".into()], cwd: "/".into(), state, enqueued_ms: 1, started_ms: None }
+        Job {
+            id: id.into(),
+            pid,
+            start_time: start,
+            weights: Weights::default(),
+            cmd: vec!["x".into()],
+            cwd: "/".into(),
+            state,
+            enqueued_ms: 1,
+            started_ms: None,
+        }
     }
 
     fn dir() -> (tempfile::TempDir, StateDir) {
@@ -159,8 +208,10 @@ mod tests {
         let (_t, s) = dir();
         let me = std::process::id();
         let start = process_start(me).unwrap();
-        s.write_job(&job("alive", me, start, State::Running)).unwrap();
-        s.write_job(&job("reused-pid", me, start + 10_000, State::Running)).unwrap();
+        s.write_job(&job("alive", me, start, State::Running))
+            .unwrap();
+        s.write_job(&job("reused-pid", me, start + 10_000, State::Running))
+            .unwrap();
         let mut gone = std::process::Command::new("true").spawn().unwrap();
         let dead = gone.id();
         gone.wait().unwrap();
@@ -173,7 +224,13 @@ mod tests {
     #[test]
     fn unknown_start_time_is_alive_while_the_pid_exists_and_tmp_files_are_swept() {
         let (_t, s) = dir();
-        s.write_job(&job("unknown", std::process::id(), START_UNKNOWN, State::Running)).unwrap();
+        s.write_job(&job(
+            "unknown",
+            std::process::id(),
+            START_UNKNOWN,
+            State::Running,
+        ))
+        .unwrap();
         std::fs::write(s.jobs_dir().join(".stale.tmp"), "{").unwrap();
         let ids: Vec<String> = s.live_jobs().into_iter().map(|j| j.id).collect();
         assert_eq!(ids, vec!["unknown".to_string()]);
