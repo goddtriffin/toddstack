@@ -8,18 +8,22 @@
 //!
 //! A job asks for one free core, so on 16 cores jobs start until the CPU is about 94% busy.
 //!
-//! Jobs admitted in the last `RAMP_MS` hold their full peak cores (from history, clamped to the machine) while their
-//! CPU ramps up, so a burst of waiters is staggered about `RAMP_MS` apart instead of all starting at once. After the
-//! ramp only live use counts. Memory headroom uses max(reservation, live usage) per running job.
+//! A job admitted in the last `RAMP_MS` holds its peak cores (from history, clamped to the machine) while its CPU ramps
+//! up, so a burst of waiters cannot all start at once. The hold is full for the first `RAMP_FULL_MS` (the stagger floor:
+//! two jobs whose holds fill the machine, such as cold or Docker jobs, never start within 3 s of each other). After
+//! that the measured machine decides: under `RAMP_IDLE_CPU_PCT` busy the job has shown its real use and the hold is
+//! released; otherwise it shrinks linearly to nothing at `RAMP_MS`. After the ramp only live use counts. Memory
+//! headroom uses max(reservation, live usage) per running job.
 //!
 //! Non-heavy usage (Chrome, Discord, other CLIs) is smoothed by the caller: max(latest sample, mean of the last 3), so
 //! a rise blocks at once and a fall is released slowly. Live guards (load, memory, disk) can only veto.
 //!
 //! Load: a 1-minute load of 4 x cores blocks whatever the CPU says (an I/O storm; on 2026-11-19 load 120 on 16 cores
-//! killed Docker). From 2 x cores up, a load that is still rising (load1 > 1.1 x load5) blocks, because builds could
-//! otherwise pile up during low-CPU phases until the lagging load1 reaches the hard limit. A load at 2 x cores or more
-//! that is flat or falling blocks only while the CPU is also busy: on macOS load also counts threads blocked in I/O,
-//! so it can read 20-30 with the CPU nearly idle. Memory pressure (macOS level, Linux PSI) also blocks.
+//! killed Docker). From 2 x cores up, a load that is still rising (load1 > 1.1 x load5) blocks while the CPU is at
+//! least 60% busy, and any load there blocks while the CPU is at least 90% busy. Load without CPU is not CPU overload:
+//! on macOS load also counts threads blocked in I/O (network, disk), so it can read 20-60 with the CPU nearly idle
+//! (a power or network outage on 2026-11-20 read load1 58 at 26% CPU with nothing heavy running). Memory pressure
+//! (macOS level, Linux PSI) also blocks.
 
 use std::collections::VecDeque;
 
@@ -33,10 +37,19 @@ const CPU_PCT: u64 = 100;
 /// Load at or over this many times the core count blocks only while the CPU is also this busy.
 const LOAD_SOFT: f64 = 2.0;
 const LOAD_BUSY_CPU_PCT: u64 = 90;
+/// A rising load at or over `LOAD_SOFT` x cores blocks only while the CPU is at least this busy; below it the load is
+/// threads waiting on I/O, not CPU work.
+const LOAD_RISING_CPU_PCT: u64 = 60;
 /// Load at or over this many times the core count blocks whatever the CPU says.
 const LOAD_HARD: f64 = 4.0;
 /// A job admitted this recently has not ramped its CPU yet.
 pub const RAMP_MS: i64 = 10_000;
+/// For this long after admission a ramping job holds its full peak, whatever the machine reads: the stagger floor.
+pub const RAMP_FULL_MS: i64 = 3_000;
+/// After `RAMP_FULL_MS`, a machine measured under this CPU % has room the ramping job is not using: its hold is released.
+const RAMP_IDLE_CPU_PCT: u64 = 50;
+/// Granularity of the search for the moment a ramp-blocked waiter will fit.
+const RAMP_STEP_MS: i64 = 250;
 const CPU_ASK: u64 = 100;
 /// How many recent non-heavy samples the smoother averages (waiters re-sample every 10 s).
 pub const SMOOTH_WINDOW: usize = 3;
@@ -151,13 +164,31 @@ pub fn fits_reservations(req: Weights, running: &[&Job], cap: &Capacity) -> bool
     fits(Usage { cpu: 0, ..request(req) }, room)
 }
 
+/// The CPU a job `elapsed_ms` into its ramp still holds beyond its live use: its full peak for `RAMP_FULL_MS`, then
+/// nothing if the machine is measured under `RAMP_IDLE_CPU_PCT` busy, else the peak shrinking linearly to 0 at `RAMP_MS`.
+#[must_use]
+pub fn ramp_hold(peak: u64, elapsed_ms: i64, cpu_pct: u64) -> u64 {
+    if elapsed_ms >= RAMP_MS {
+        return 0;
+    }
+    if elapsed_ms < RAMP_FULL_MS {
+        return peak;
+    }
+    if cpu_pct < RAMP_IDLE_CPU_PCT {
+        return 0;
+    }
+    let left = u64::try_from(RAMP_MS - elapsed_ms).unwrap_or(0);
+    let span = u64::try_from(RAMP_MS - RAMP_FULL_MS).unwrap_or(1);
+    peak * left / span
+}
+
 /// What is left for a new job once the other programs and the running jobs' real use are counted.
 #[must_use]
 pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> Usage {
     let held = running.iter().fold(Usage::default(), |a, j| {
         let l = live.per_job.iter().find(|(id, _)| *id == j.id).map_or_else(Usage::default, |(_, u)| *u);
-        let ramping = j.started_ms.is_some_and(|t| now_ms - t < RAMP_MS);
-        let cpu = if ramping { l.cpu.max(centi(j.weights.cpu).min(centi(cap.cpu))) } else { l.cpu };
+        let hold = j.started_ms.map_or(0, |t| ramp_hold(centi(j.weights.cpu).min(centi(cap.cpu)), now_ms.saturating_sub(t).max(0), live.cpu_pct));
+        let cpu = l.cpu.max(hold);
         Usage { cpu: a.cpu + cpu, mem: a.mem + l.mem.max(j.weights.mem), vram: a.vram + l.vram.max(j.weights.vram) }
     });
     ceiling(cap).saturating_sub(live.non_heavy).saturating_sub(held)
@@ -180,8 +211,9 @@ pub fn disk_full(req: Weights, cap: &Capacity, live: &Live) -> Option<String> {
 const RISING_MARGIN: f64 = 1.1;
 
 /// Live guards, a veto only. The 1-minute load blocks at 4 x cores always (runaway load). From 2 x cores up it blocks
-/// while it is still rising (load1 > 1.1 x load5), and while the CPU is at least 90% busy; a flat or falling load with a
-/// calmer CPU is I/O wait (macOS counts blocked threads), so it admits. Memory used at 90% or memory pressure blocks.
+/// while it is still rising (load1 > 1.1 x load5) with the CPU at least 60% busy, and while the CPU is at least 90%
+/// busy; a high load with a calm CPU is I/O wait (macOS counts blocked threads), so it admits. Memory used at 90% or
+/// memory pressure blocks.
 #[must_use]
 pub fn guard_block(cap: &Capacity, live: &Live) -> Option<(String, Block)> {
     let cores = f64::from(cap.cpu);
@@ -190,8 +222,11 @@ pub fn guard_block(cap: &Capacity, live: &Live) -> Option<(String, Block)> {
         return Some((format!("1-minute load {:.1} >= {hard:.0} (4 x {} cores)", live.load1, cap.cpu), Block::Load1));
     }
     if live.load1 >= soft {
-        if live.load1 > live.load5 * RISING_MARGIN {
-            return Some((format!("1-minute load {:.1} >= {soft:.0} (2 x {} cores) and still rising (5-minute {:.1})", live.load1, cap.cpu, live.load5), Block::Load1));
+        if live.load1 > live.load5 * RISING_MARGIN && live.cpu_pct >= LOAD_RISING_CPU_PCT {
+            return Some((
+                format!("1-minute load {:.1} >= {soft:.0} (2 x {} cores) and still rising (5-minute {:.1}), cpu {}% busy", live.load1, cap.cpu, live.load5, live.cpu_pct),
+                Block::Load1,
+            ));
         }
         if live.cpu_pct >= LOAD_BUSY_CPU_PCT {
             return Some((format!("1-minute load {:.1} >= {soft:.0} (2 x {} cores) and cpu {}% busy", live.load1, cap.cpu, live.cpu_pct), Block::Load1));
@@ -218,9 +253,17 @@ fn blocker(w: Weights, running: &[&Job], cap: &Capacity, live: &Live, now_ms: i6
         }
         let ask = request(w);
         if !fits(ask, headroom(running, cap, live, now_ms)) {
-            // Would it fit without the ramp holds? Then the ramp is the blocker, and it ends at a known time.
+            // Would it fit without the ramp holds? Then the ramp is the blocker, and the holds shrink on a known schedule:
+            // name the first moment it fits with the machine as measured now (at the latest, when the last ramp ends).
             if fits(ask, headroom(running, cap, live, i64::MAX)) {
-                let end = running.iter().filter_map(|j| j.started_ms).map(|t| t + RAMP_MS).filter(|e| *e > now_ms).min();
+                let last = running.iter().filter_map(|j| j.started_ms).map(|t| t + RAMP_MS).filter(|e| *e > now_ms).max();
+                let end = last.map(|last| {
+                    // Every step, plus the exact moments the stagger floors end (where an idle machine releases a hold).
+                    let floors = running.iter().filter_map(|j| j.started_ms).map(|t| t + RAMP_FULL_MS);
+                    let mut at: Vec<i64> = (1..=(last - now_ms) / RAMP_STEP_MS).map(|k| now_ms + k * RAMP_STEP_MS).chain(floors).filter(|t| *t > now_ms && *t < last).collect();
+                    at.sort_unstable();
+                    at.into_iter().find(|t| fits(ask, headroom(running, cap, live, *t))).unwrap_or(last)
+                });
                 return Some(Blocked { reason: "no headroom (jobs admitted a moment ago are still ramping up)".into(), live: true, block: Block::Ramp, ramp_end_ms: end });
             }
             let room = headroom(running, cap, live, now_ms);
@@ -406,10 +449,13 @@ mod tests {
     fn rising_load_blocks_at_two_times_cores_but_falling_load_admits() {
         let me = job("a", 1, 1, State::Queued, 0);
         let one = std::slice::from_ref(&me);
-        // 10 cores, soft limit 20. Low CPU: the load is I/O wait or a build that is about to burn CPU.
-        let rising = Live { load1: 30.0, load5: 22.0, cpu_pct: 30, ..calm() };
+        // 10 cores, soft limit 20. A rising load with a CPU at least 60% busy is builds piling up: blocked.
+        let rising = Live { load1: 30.0, load5: 22.0, cpu_pct: 65, ..calm() };
         let d = evaluate(&me, one, &cap(), &rising, 0);
         assert!(matches!(&d, Decision::Wait { block: Block::Load1, live: true, reason, .. } if reason.contains("rising")), "{d:?}");
+        // The same rising load with a calm CPU is threads waiting on I/O, not CPU overload: admitted.
+        let rising_io = Live { cpu_pct: 30, ..rising.clone() };
+        assert_eq!(evaluate(&me, one, &cap(), &rising_io, 0), Decision::Start);
         let falling = Live { load1: 30.0, load5: 38.0, cpu_pct: 30, ..calm() };
         assert_eq!(evaluate(&me, one, &cap(), &falling, 0), Decision::Start, "falling and CPU under 90%");
         let level = Live { load1: 30.0, load5: 30.0, cpu_pct: 30, ..calm() };
@@ -454,7 +500,25 @@ mod tests {
             t += 100;
         }
         assert_eq!(starts.len(), 8);
-        assert!(starts.windows(2).all(|w| w[1] - w[0] >= RAMP_MS), "one cold build per ramp: {starts:?}");
+        // The machine reads idle here (the fake builds never use CPU), so each hold is released after the stagger floor.
+        assert!(starts.windows(2).all(|w| w[1] - w[0] >= RAMP_FULL_MS), "never two cold builds within the floor: {starts:?}");
+        // With the CPU measured 60% busy, the holds only shrink, so cold builds stay further apart.
+        let busy = Live { cpu_pct: 60, non_heavy: Usage { cpu: 960, mem: 0, vram: 0 }, ..calm() };
+        let mut jobs: Vec<Job> = (0..3).map(|i| job(&format!("k{i}"), 16, 1, State::Queued, i)).collect();
+        let mut starts = Vec::new();
+        let mut t = 100;
+        while t < 100 + 4 * RAMP_MS && starts.len() < 3 {
+            for i in 0..jobs.len() {
+                if jobs[i].state == State::Queued && evaluate(&jobs[i].clone(), &jobs, &c, &busy, t) == Decision::Start {
+                    jobs[i].state = State::Running;
+                    jobs[i].started_ms = Some(t);
+                    starts.push(t);
+                }
+            }
+            t += 100;
+        }
+        assert_eq!(starts.len(), 3);
+        assert!(starts.windows(2).all(|w| w[1] - w[0] >= 7_500), "busy: a hold of 1600 x (10 s - e) / 7 s must drop to 540: {starts:?}");
         // At one instant only the first is admitted.
         let mut now = jobs.clone();
         for j in &mut now {
@@ -523,8 +587,14 @@ mod tests {
         let live = Live { non_heavy: Usage { cpu: 320, mem: 8 * G, vram: 0 }, ..calm() };
         let ra = Job { state: State::Running, started_ms: Some(10), ..job("a", 16, 8, State::Running, 0) };
         let b = job("b", 16, 8, State::Queued, 2);
-        let d = evaluate(&b, &[ra, b.clone()], &c, &live, 500);
-        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), live: true, .. } if e == 10 + RAMP_MS), "{d:?}");
+        // The machine reads idle: the hold is released when the stagger floor ends.
+        let d = evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 500);
+        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), live: true, .. } if e == 10 + RAMP_FULL_MS), "{d:?}");
+        // At 60% busy the hold shrinks linearly: 1600 x (10 s - e) / 7 s <= 1180 free from e = 4.84 s, next 250 ms step.
+        let warm = Live { cpu_pct: 60, ..live.clone() };
+        let d = evaluate(&b, &[ra.clone(), b.clone()], &c, &warm, 500);
+        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(5000), .. }), "{d:?}");
+        assert_eq!(evaluate(&b, &[ra, b.clone()], &c, &warm, 5000), Decision::Start);
         // A genuinely busy CPU is a cpu block, with no ramp time.
         let busy = Live { non_heavy: Usage { cpu: 1550, mem: 8 * G, vram: 0 }, ..calm() };
         let run = Job { state: State::Running, started_ms: Some(0), ..job("r", 1, 8, State::Running, 0) };
@@ -543,6 +613,7 @@ mod tests {
         // a was admitted just now and holds its full 16 cores while ramping: b waits for the ramp, then starts.
         let ra = Job { state: State::Running, started_ms: Some(10), ..a };
         assert!(waits(&evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 11)), "blocked by a's ramp hold");
+        assert_eq!(evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 10 + RAMP_FULL_MS), Decision::Start, "the machine reads idle once the floor ends");
         assert_eq!(evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 10 + RAMP_MS), Decision::Start, "the second starts once the first one's ramp has ended");
         let ca = job("c", 16, 8, State::Queued, 3);
         // A genuinely busy CPU still blocks.
@@ -631,6 +702,85 @@ mod tests {
         // Jobs keep starting until about one core is left (15 of 16 busy), then wait on cpu.
         let full = Live { per_job: vec![("r".into(), Usage { cpu: 1100, mem: 4 * G, vram: 0 })], non_heavy: Usage { cpu: 420, mem: 22 * G, vram: 0 }, cpu_pct: 95, ..live };
         assert!(matches!(evaluate(&me, &[run, me.clone()], &mac(), &full, 100_000), Decision::Wait { block: Block::Cpu, .. }));
+    }
+
+    #[test]
+    fn ramp_hold_is_released_while_measured_cpu_is_low() {
+        // 2026-11-20 07:01:33: cpu 20%, one job running (cold, ramping), one waiting, blocked by ramp.
+        // 0.3.0 held the running job's 16 cores for the whole 10 s ramp, so the waiter sat with 80% of the CPU idle.
+        let run = Job { started_ms: Some(0), ..job("r", 16, 4, State::Running, 0) };
+        let me = job("a", 16, 4, State::Queued, 1);
+        let all = [run.clone(), me.clone()];
+        let live = Live {
+            load1: 29.4,
+            load5: 23.7,
+            cpu_pct: 20,
+            mem_used_pct: 38,
+            per_job: vec![("r".into(), Usage { cpu: 150, mem: 2 * G, vram: 0 })],
+            non_heavy: Usage { cpu: 170, mem: 22 * G, vram: 0 },
+            ..calm()
+        };
+        // Inside the stagger floor the hold is full: no simultaneous cold starts.
+        let d = evaluate(&me, &all, &mac(), &live, 1_000);
+        assert!(matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(RAMP_FULL_MS), .. }), "{d:?}");
+        // After it, the idle machine shows the ramping job's real use: admitted (0.3.0 waited until 10 s).
+        assert_eq!(evaluate(&me, &all, &mac(), &live, 4_000), Decision::Start);
+        assert_eq!(evaluate(&me, &all, &mac(), &live, RAMP_FULL_MS), Decision::Start);
+
+        // 06:22:23: cpu 24%, four running (three ramped, one admitted 5 s ago with a learned 8-core peak), one waiting.
+        let mut all: Vec<Job> = (0..3).map(|i| Job { started_ms: Some(0), ..job(&format!("d{i}"), 4, 2, State::Running, 0) }).collect();
+        all.push(Job { started_ms: Some(95_000), ..job("new", 8, 2, State::Running, 1) });
+        all.push(me.clone());
+        let live = Live {
+            load1: 15.5,
+            load5: 14.3,
+            cpu_pct: 24,
+            mem_used_pct: 46,
+            per_job: vec![
+                ("d0".into(), Usage { cpu: 80, mem: G, vram: 0 }),
+                ("d1".into(), Usage { cpu: 60, mem: G, vram: 0 }),
+                ("d2".into(), Usage { cpu: 40, mem: G, vram: 0 }),
+                ("new".into(), Usage { cpu: 50, mem: G, vram: 0 }),
+            ],
+            non_heavy: Usage { cpu: 150, mem: 25 * G, vram: 0 },
+            ..calm()
+        };
+        assert_eq!(evaluate(&me, &all, &mac(), &live, 100_000), Decision::Start);
+        // The same moment with the CPU busy keeps a shrinking hold: 1180 busy plus the new job's 571 held (800 x 5/7) is
+        // over the 1500 that leaves a core free.
+        let busy = Live { cpu_pct: 70, non_heavy: Usage { cpu: 1180 - 230, mem: 25 * G, vram: 0 }, ..live };
+        assert!(matches!(evaluate(&me, &all, &mac(), &busy, 100_000), Decision::Wait { block: Block::Ramp, .. }));
+    }
+
+    #[test]
+    fn ramp_hold_schedule() {
+        let peak = 1600;
+        assert_eq!(ramp_hold(peak, 0, 0), peak, "full at admission");
+        assert_eq!(ramp_hold(peak, RAMP_FULL_MS - 1, 0), peak, "full through the floor, however idle");
+        assert_eq!(ramp_hold(peak, RAMP_FULL_MS, 49), 0, "released on an idle machine");
+        assert_eq!(ramp_hold(peak, RAMP_FULL_MS, 50), peak, "shrinks from the full peak on a busy one");
+        assert_eq!(ramp_hold(peak, 6_500, 80), 800, "halfway down at the middle of the shrink");
+        assert_eq!(ramp_hold(peak, RAMP_MS, 100), 0, "gone when the ramp ends");
+    }
+
+    #[test]
+    fn rising_load_with_idle_cpu_is_io_wait_not_overload() {
+        // 2026-11-20 06:59-07:01, a power and network outage: load1 46-58 against load5 24-26 (rising), cpu 16-28%,
+        // nothing heavy running. 0.3.0 blocked on the rising load; it is threads stuck in I/O, not CPU work.
+        let me = job("a", 4, 4, State::Queued, 0);
+        let one = std::slice::from_ref(&me);
+        for (load1, load5, cpu_pct) in [(57.85, 24.18, 26), (53.44, 24.32, 28), (46.16, 25.83, 16)] {
+            let live = Live { load1, load5, cpu_pct, mem_used_pct: 36, non_heavy: Usage { cpu: cpu_pct * 16, mem: 23 * G, vram: 0 }, ..calm() };
+            assert_eq!(evaluate(&me, one, &mac(), &live, 0), Decision::Start, "load1 {load1} cpu {cpu_pct}%");
+            // The same load with a CPU 60% busy is builds piling up: still blocked.
+            let busy = Live { cpu_pct: 60, ..live.clone() };
+            assert!(matches!(evaluate(&me, one, &mac(), &busy, 0), Decision::Wait { block: Block::Load1, .. }), "load1 {load1} busy");
+        }
+        // 4 x cores (64 on 16) still blocks whatever the CPU says, and memory pressure still blocks.
+        let hard = Live { load1: 64.0, load5: 24.0, cpu_pct: 16, ..calm() };
+        assert!(matches!(evaluate(&me, one, &mac(), &hard, 0), Decision::Wait { block: Block::Load1, .. }));
+        let pressured = Live { load1: 50.0, load5: 24.0, cpu_pct: 16, mem_pressure: true, ..calm() };
+        assert!(matches!(evaluate(&me, one, &mac(), &pressured, 0), Decision::Wait { block: Block::Mem, .. }));
     }
 
     #[test]
