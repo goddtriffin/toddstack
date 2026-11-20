@@ -1,0 +1,31 @@
+{
+  "name": "shiftboss-goddtriffin",
+  "url": "https://github.com/goddtriffin/toddstack/tree/main/rust/shiftboss",
+  "description": "Todd's software factory: moves factory-labeled issues to merged PRs. Installed only on onboarded repos.",
+  "public": false,
+  "hook_attributes": {
+    "url": "https://shiftboss.toddgriffin.me/github/webhook",
+    "active": true
+  },
+  "redirect_url": "http://127.0.0.1:8787/callback",
+  "request_oauth_on_install": false,
+  "setup_on_update": false,
+  "default_permissions": {
+    "metadata": "read",
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "checks": "read",
+    "statuses": "read"
+  },
+  "default_events": [
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "check_run",
+    "check_suite",
+    "status",
+    "push"
+  ]
+}
