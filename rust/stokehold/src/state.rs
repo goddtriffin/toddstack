@@ -15,22 +15,48 @@ use crate::error::Error;
 use crate::job::{Job, START_UNKNOWN};
 use crate::machine::process_start;
 
+/// Reads `STOKEHOLD_<X>`, falling back to the legacy `HEAVY_<X>` (pass the `STOKEHOLD_` name).
+#[must_use]
+pub fn env_var(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).or_else(|| std::env::var_os(name.replacen("STOKEHOLD_", "HEAVY_", 1)))
+}
+
+/// Moves a real `old` directory to `new` and leaves a symlink `old -> new`. Does nothing when `new` exists or
+/// `old` is missing or already a symlink. Losing a race to another process is harmless (the rename just fails).
+fn migrate_legacy(old: &Path, new: &Path) {
+    let is_real_dir = fs::symlink_metadata(old).is_ok_and(|m| m.is_dir());
+    if !is_real_dir || fs::symlink_metadata(new).is_ok() {
+        return;
+    }
+    if fs::rename(old, new).is_ok() {
+        let _ = std::os::unix::fs::symlink(new, old);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StateDir {
     base: PathBuf,
 }
 
 impl StateDir {
-    /// `HEAVY_STATE_DIR`, else `~/.local/state/heavy`.
+    /// `STOKEHOLD_STATE_DIR` (or the legacy `HEAVY_STATE_DIR`), else `~/.local/state/stokehold`.
+    ///
+    /// The tool was called `heavy` until 0.3.x and kept its state in `~/.local/state/heavy`. On the first run
+    /// the old directory is renamed to the new one and a symlink is left at the old path, so history carries
+    /// over and a still-running old `heavy` binary follows the link to the same `jobs/` and lock files (flock
+    /// is per inode, so both binaries admit against one queue).
     ///
     /// # Errors
     /// Fails when there is neither the variable nor `HOME`.
     pub fn from_env() -> Result<Self, Error> {
-        if let Some(dir) = std::env::var_os("HEAVY_STATE_DIR") {
+        if let Some(dir) = env_var("STOKEHOLD_STATE_DIR") {
             return Ok(Self { base: dir.into() });
         }
         let home = std::env::var_os("HOME").ok_or_else(|| Error::Usage("HOME is not set".into()))?;
-        Ok(Self { base: PathBuf::from(home).join(".local/state/heavy") })
+        let base = PathBuf::from(home).join(".local/state");
+        let (new, old) = (base.join("stokehold"), base.join("heavy"));
+        migrate_legacy(&old, &new);
+        Ok(Self { base: new })
     }
 
     #[cfg(test)]
@@ -243,5 +269,24 @@ mod tests {
         assert!(!h.is_finished());
         drop(a);
         h.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod migrate_tests {
+    use super::*;
+
+    #[test]
+    fn old_dir_moves_and_leaves_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let (old, new) = (t.path().join("heavy"), t.path().join("stokehold"));
+        fs::create_dir_all(old.join("jobs")).unwrap();
+        fs::write(old.join("history.jsonl"), "x").unwrap();
+        migrate_legacy(&old, &new);
+        assert_eq!(fs::read_to_string(new.join("history.jsonl")).unwrap(), "x");
+        assert!(fs::symlink_metadata(&old).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(old.join("history.jsonl")).unwrap(), "x");
+        migrate_legacy(&old, &new); // second run changes nothing
+        assert!(new.join("jobs").is_dir());
     }
 }

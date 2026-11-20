@@ -3746,6 +3746,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "stokehold"
+version = "0.4.0"
+dependencies = [
+ "jiff 1.0.1",
+ "nix",
+ "notify",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "sysinfo",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3998,21 +4013,6 @@ dependencies = [
  "serde_json",
  "uniffi",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "toddstack-heavy"
-version = "0.3.2"
-dependencies = [
- "jiff 1.0.1",
- "nix",
- "notify",
- "serde",
- "serde_json",
- "signal-hook",
- "sysinfo",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]

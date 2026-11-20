@@ -1,4 +1,4 @@
-//! `heavy status`: for humans only. Agents never need it; `heavy` decides by itself.
+//! `stokehold status`: for humans only. Agents never need it; `heavy` decides by itself.
 
 use crate::error::Error;
 use crate::job::State;

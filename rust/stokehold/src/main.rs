@@ -1,4 +1,4 @@
-//! heavy: a machine-wide admission queue for heavy jobs. See the README.
+//! stokehold: a machine-wide admission queue for heavy jobs. See the README.
 
 mod admit;
 mod cli;
@@ -30,7 +30,7 @@ fn real_main() -> Result<u8, Error> {
             Ok(0)
         }
         Command::Version => {
-            println!("heavy {}", env!("CARGO_PKG_VERSION"));
+            println!("stokehold {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
         Command::Status => {
@@ -60,11 +60,11 @@ fn main() -> ExitCode {
     match real_main() {
         Ok(code) => ExitCode::from(code),
         Err(Error::Usage(msg)) => {
-            eprintln!("heavy: {msg}");
+            eprintln!("stokehold: {msg}");
             ExitCode::from(2)
         }
         Err(e) => {
-            eprintln!("heavy: {e}");
+            eprintln!("stokehold: {e}");
             ExitCode::from(125)
         }
     }
