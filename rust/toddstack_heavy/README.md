@@ -22,7 +22,7 @@ runs (for prompts and pagers) and `heavy` takes it back afterwards. If the child
 
 Cores, RAM, GPU memory and free disk the job needs. Without flags: the median measured peak (whole process tree,
 sampled every 0.5 s while the job runs: peak cores at once and peak RSS) from
-`~/.local/state/heavy/history.jsonl` for the same command and cwd, else `--cpu 4 --mem 4G`. A request larger than
+`~/.local/state/heavy/history.jsonl` for the same command and cwd, else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start one ramp apart; after one run, history gives the real peak). A request larger than
 the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
 
 ## Admission
@@ -32,15 +32,19 @@ All of these must hold:
 - Reservations: running RAM and VRAM reservations plus this request are at most 90% of capacity.
 - CPU headroom: `all cores - non-heavy usage - live CPU of running jobs` leaves one free core (on 16 cores, jobs
   start until the CPU is about 94% busy). A job admitted in the last 10 s holds its peak cores (from history) while it
-  ramps up, so a burst of waiters is staggered.
+  ramps up, so a burst of waiters is staggered. A job's recorded peak is the larger of its process tree's peak and the
+  machine-wide CPU rise of other programs over the pre-start baseline, so work hosted in Docker's VM (outside the
+  tree) also teaches a real peak.
 - Memory headroom: `90% of RAM - non-heavy usage - sum over running jobs of max(reservation, live usage)` fits the
   request. Non-heavy usage is machine-wide use minus the process trees of heavy's own jobs (Chrome, Discord, other
-  CLIs), smoothed as the mean of the last 3 samples (10 s apart): a single spike or dip does not decide alone. On
+  CLIs), smoothed as max(latest sample, mean of the last 3, 10 s apart): a rise blocks at once, a fall is released slowly. On
   Linux CPU includes steal time (`/proc/stat` field 8), which WSL2 and VMs otherwise hide.
-- Guards (veto only): 1-minute load at or over 2 x cores blocks only while the CPU is also at least 90% busy (on
-  macOS load also counts threads blocked in I/O, so it can read 20-30 on an idle CPU); at or over 4 x cores it
-  blocks whatever the CPU says (runaway load: 120 on 16 cores killed Docker on 2026-11-19). The 5-minute load is
-  not used: it lags, and blocked a nearly idle machine for minutes after a burst. Memory used below 90%.
+- Guards (veto only): 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16
+  cores killed Docker on 2026-11-19). From 2 x cores up, load blocks while it is still rising (load1 > load5) or the
+  CPU is at least 90% busy; a flat or falling load (load1 <= load5) with the CPU under 90% admits (on macOS load also
+  counts threads blocked in I/O, so it can read 20-30 on an idle CPU). Memory used below 90%, and no memory
+  pressure: macOS `kern.memorystatus_vm_pressure_level` of 2 or more, Linux `/proc/pressure/memory` (`some avg10`
+  25 or more, or `full avg10` 5 or more; the Windows rig's WSL Ubuntu). An unreadable pressure source never blocks.
 - Disk: free space on the cwd's filesystem must be at least `--disk` plus 10% of the disk. If it is not, waiting
   cannot help, so `heavy` exits 75 at once and says the disk is full (clean up, or ask Todd).
 - A job running alone always passes the resource checks. There is no cap on the number of jobs.
@@ -90,5 +94,5 @@ waiter had not yet woken). `--html PATH` writes one self-contained page (inline 
 ## Configuration
 
 `HEAVY_STATE_DIR`, `HEAVY_TIMEOUT` (default 60m). Test overrides: `HEAVY_CAPACITY`
-(`cpu=8,mem=16G,vram=0,disk=100G`), `HEAVY_LIVE` (`load=,load5=,mem_pct=,disk_free=,nonheavy_cpu=,nonheavy_mem=,nonheavy_vram=`),
+(`cpu=8,mem=16G,vram=0,disk=100G`), `HEAVY_LIVE` (`load=,load5=,mem_pct=,mem_pressure=,disk_free=,nonheavy_cpu=,nonheavy_mem=,nonheavy_vram=`),
 `HEAVY_KILL_GRACE_MS`.

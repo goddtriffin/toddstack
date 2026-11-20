@@ -1,7 +1,8 @@
 //! Probing the machine: capacity, live samples, process liveness, network and VRAM counters.
 //!
 //! `HEAVY_CAPACITY` (`cpu=8,mem=16G,vram=0,disk=100G`) and `HEAVY_LIVE` (`load=0.5,load5=0.5,mem_pct=10,disk_free=50G,nonheavy_cpu=200,nonheavy_mem=8G,nonheavy_vram=0`)
-//! override probed numbers; the tests use them.
+//! override probed numbers; the tests use them (`mem_pressure=2` fakes memory pressure; with any override set, the real
+//! pressure is not read).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -189,6 +190,64 @@ impl TreeSampler {
     }
 }
 
+/// macOS: `kern.memorystatus_vm_pressure_level` is 1 normal, 2 warn, 4 critical; pressure is level 2 or more.
+#[must_use]
+pub fn mac_pressure(sysctl_out: &str) -> bool {
+    sysctl_out.trim().parse::<u32>().is_ok_and(|l| l >= 2)
+}
+
+/// Linux PSI (`/proc/pressure/memory`): tasks stalled on memory. Pressure is `some avg10` of 25 or more, or
+/// `full avg10` of 5 or more.
+#[must_use]
+pub fn psi_pressure(text: &str) -> bool {
+    let avg10 = |line: &str| line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    text.lines().any(|l| (l.starts_with("some ") && avg10(l) >= 25.0) || (l.starts_with("full ") && avg10(l) >= 5.0))
+}
+
+/// Whether the system is under memory pressure. Cheap, and fails open (false) when it cannot be read.
+fn memory_pressure() -> bool {
+    if cfg!(target_os = "macos") {
+        return Command::new("sysctl")
+            .args(["-n", "kern.memorystatus_vm_pressure_level"])
+            .output()
+            .is_ok_and(|o| o.status.success() && mac_pressure(&String::from_utf8_lossy(&o.stdout)));
+    }
+    std::fs::read_to_string("/proc/pressure/memory").is_ok_and(|t| psi_pressure(&t))
+}
+
+/// Samples what the other programs (not heavy's own job trees) use: machine CPU minus every heavy job's tree. Work
+/// hosted outside the process tree (Docker's VM) shows up here, so a job's peak can be learned from the machine's
+/// CPU rise over a baseline.
+pub struct OtherSampler {
+    sys: System,
+    cores: u64,
+}
+
+impl OtherSampler {
+    /// # Errors
+    /// Fails when the system cannot be probed.
+    pub fn new(cores: u32) -> Result<Self, Error> {
+        Ok(Self { sys: System::new()?, cores: u64::from(cores) })
+    }
+
+    /// CPU (centi-cores) of the machine minus the process trees rooted at `roots`.
+    pub fn sample(&mut self, roots: &[u32]) -> u64 {
+        self.sys.refresh_cpu_usage();
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        let machine = whole(self.sys.global_cpu_usage()) * self.cores;
+        let children = child_map(&self.sys);
+        let trees: u64 = roots.iter().map(|r| tree_usage(&self.sys, &children, *r, &[]).cpu).sum();
+        machine.saturating_sub(trees)
+    }
+}
+
+/// A job's peak for the history: the process tree's peak, or the machine-wide rise over the baseline when that is
+/// larger (work in a VM, such as Docker builds, is outside the tree), capped at the whole machine.
+#[must_use]
+pub fn effective_peak(tree_peak: u64, other_peak: u64, baseline: u64, cores: u32) -> u64 {
+    tree_peak.max(other_peak.saturating_sub(baseline)).min(u64::from(cores) * 100)
+}
+
 /// Machine-wide usage and the live usage of each running job's process tree, over a short window.
 fn measure(jobs: &[Job], cpu_count: u32, want_vram: bool) -> Result<(Usage, Vec<(String, Usage)>), Error> {
     let mut sys = System::new()?;
@@ -246,6 +305,10 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
     };
     // Tests fake the other programs' usage: nonheavy_cpu (centi-cores), nonheavy_mem, nonheavy_vram.
     let fake = ["nonheavy_cpu", "nonheavy_mem", "nonheavy_vram"].iter().any(|k| get(&o, k).is_some());
+    let mem_pressure = match get(&o, "mem_pressure") {
+        Some(v) => v.parse::<u32>().map_err(|_| bad("mem_pressure", v))? >= 2,
+        None => o.is_empty() && memory_pressure(),
+    };
     let (non_heavy, per_job, cpu_pct) = if fake {
         let num = |k: &str| -> Result<u64, Error> { get(&o, k).map_or(Ok(0), |v| if k == "nonheavy_cpu" { v.parse().map_err(|_| bad(k, v)) } else { parse_size(v) }) };
         let nh = Usage { cpu: num("nonheavy_cpu")?, mem: num("nonheavy_mem")?, vram: num("nonheavy_vram")? };
@@ -255,7 +318,7 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         let trees = per_job.iter().fold(Usage::default(), |a, (_, u)| Usage { cpu: a.cpu + u.cpu, mem: a.mem + u.mem, vram: a.vram + u.vram });
         (non_heavy(machine, trees), per_job, (machine.cpu / u64::from(cap.cpu.max(1))).min(100))
     };
-    Ok(Live { load1, load5, mem_used_pct, cpu_pct, disk_free, non_heavy, per_job, stopped: Vec::new() })
+    Ok(Live { load1, load5, mem_used_pct, cpu_pct, mem_pressure, disk_free, non_heavy, per_job, stopped: Vec::new() })
 }
 
 /// Ids of the jobs whose process is stopped (state T).
@@ -286,6 +349,29 @@ pub fn net_bytes() -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_pressure_levels() {
+        assert!(!mac_pressure("1\n"));
+        assert!(mac_pressure("2\n"));
+        assert!(mac_pressure("4"));
+        assert!(!mac_pressure("garbage"), "fails open");
+        assert!(!psi_pressure("some avg10=3.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=0.50 avg60=0.0 avg300=0.0 total=0\n"));
+        assert!(psi_pressure("some avg10=30.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=0.50 avg60=0.0 avg300=0.0 total=0\n"));
+        assert!(psi_pressure("some avg10=3.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=6.00 avg60=0.0 avg300=0.0 total=0\n"));
+        assert!(!psi_pressure(""));
+    }
+
+    #[test]
+    fn a_vm_hosted_job_learns_the_machine_rise() {
+        // The tree (docker client) peaked at 1 core, the machine rose 9 cores over the baseline: the peak is 9.
+        assert_eq!(effective_peak(100, 1100, 200, 16), 900);
+        // A native job: the tree peak wins.
+        assert_eq!(effective_peak(800, 300, 200, 16), 800);
+        // Never below the tree, never above the machine, and a lower-than-baseline machine is no rise.
+        assert_eq!(effective_peak(100, 50, 200, 16), 100);
+        assert_eq!(effective_peak(100, 5000, 0, 16), 1600);
+    }
 
     #[test]
     fn steal_counts_as_busy() {

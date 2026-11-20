@@ -22,13 +22,12 @@ use crate::error::Error;
 use crate::history::{self, Entry};
 use crate::job::{Capacity, Job, START_UNKNOWN, State, Usage, Weights};
 use crate::log::{self, Event, JobInfo, WaitTally};
-use crate::machine::{self, TreeSampler, cpu_times, net_bytes, process_start, vram};
+use crate::machine::{self, OtherSampler, TreeSampler, effective_peak, cpu_times, net_bytes, process_start, vram};
 use crate::sample;
 use crate::state::{StateDir, is_alive};
 use crate::stats::{children_usage, compute, format_stats};
 use crate::tty::{Terminal, TerminalGuard};
 
-const DEFAULT_CPU: u32 = 4;
 const DEFAULT_MEM: u64 = 4 << 30;
 /// Re-sample live data this often while live data is what blocks a job (monitoring).
 const LIVE_RESAMPLE: Duration = Duration::from_secs(10);
@@ -42,6 +41,8 @@ const TIMEOUT_EXIT: u8 = 124;
 const DISK_FULL_EXIT: u8 = 75;
 /// How often the process tree's peak CPU and RSS are sampled while a job runs (monitoring).
 const TREE_SAMPLE: Duration = Duration::from_millis(500);
+/// How often the machine-wide CPU of other programs is sampled while a job runs (monitoring).
+const OTHER_SAMPLE: Duration = Duration::from_secs(1);
 
 enum WaitEvent {
     Fs,
@@ -112,10 +113,17 @@ fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
 
+/// The CPU ask of a job with no history: the whole machine. Its ramp hold then lets one cold job in per ramp, so a burst
+/// of cold builds is staggered 10 s apart; after one run, history gives the real peak. Docker commands (the work runs
+/// in Docker's VM, outside the process tree) get the same default.
+fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
+    cap.cpu
+}
+
 fn resolve_weights(state: &StateDir, flags: &Flags, cmd: &[String], cwd: &str, cap: &Capacity) -> Weights {
     let hist = history::defaults_for(&state.history_path(), cmd, cwd);
     cap.clamp(Weights {
-        cpu: flags.cpu.or(hist.map(|d| d.cpu)).unwrap_or(DEFAULT_CPU),
+        cpu: flags.cpu.or(hist.map(|d| d.cpu)).unwrap_or_else(|| default_cpu(cmd, cap)),
         mem: flags.mem.or(hist.map(|d| d.mem)).unwrap_or(DEFAULT_MEM),
         vram: flags.vram.or(hist.and_then(|d| d.vram)).unwrap_or(0),
         disk: flags.disk.unwrap_or(0),
@@ -327,6 +335,40 @@ fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<Usage>
     Some((stop_tx, handle))
 }
 
+/// Samples the other programs' CPU (machine minus every heavy tree) while the job runs. The baseline is taken before
+/// the job starts; returns (baseline, peak) in centi-cores.
+fn other_sampler(dir: &StateDir, own_pid: u32, cores: u32) -> Option<OtherHandle> {
+    let mut sampler = OtherSampler::new(cores).ok()?;
+    let roots = move |d: &StateDir| {
+        let mut r: Vec<u32> = d.read_jobs().iter().filter(|j| j.state == State::Running).map(|j| j.pid).collect();
+        if !r.contains(&own_pid) {
+            r.push(own_pid);
+        }
+        r
+    };
+    sampler.sample(&roots(dir));
+    std::thread::sleep(Duration::from_millis(250));
+    let baseline = sampler.sample(&roots(dir));
+    let (stop_tx, stop_rx) = channel::<()>();
+    let dir = dir.clone();
+    let handle = std::thread::spawn(move || {
+        let mut peak = baseline;
+        loop {
+            peak = peak.max(sampler.sample(&roots(&dir)));
+            if !matches!(stop_rx.recv_timeout(OTHER_SAMPLE), Err(RecvTimeoutError::Timeout)) {
+                return peak;
+            }
+        }
+    });
+    Some(OtherHandle { stop: stop_tx, handle, baseline })
+}
+
+struct OtherHandle {
+    stop: Sender<()>,
+    handle: std::thread::JoinHandle<u64>,
+    baseline: u64,
+}
+
 /// Waits for the child, also noticing when it stops (Ctrl-Z, SIGTTIN, SIGSTOP). A stopped child stops
 /// heavy too (the shell then sees one stopped job and gets the terminal back); when heavy is continued
 /// (`fg`), it hands the terminal to the child again and sends it SIGCONT.
@@ -361,6 +403,7 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
     let steal_before = cpu_times().map(|t| t.steal);
     let sampler = vram_sampler(cap);
     let tree = tree_sampler(job.pid);
+    let other = other_sampler(dir, job.pid, cap.cpu);
     let started = Instant::now();
     let child = match command.spawn() {
         Ok(c) => c,
@@ -409,12 +452,21 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
         drop(stop);
         h.join().ok().filter(|v| *v > 0)
     });
-    if let Some(peak) = tree.and_then(|(stop, h)| {
+    let tree_peak = tree.and_then(|(stop, h)| {
         drop(stop);
         h.join().ok()
-    }) {
+    });
+    let other_peak = other.and_then(|o| {
+        drop(o.stop);
+        o.handle.join().ok().map(|p| (p, o.baseline))
+    });
+    if let Some(peak) = tree_peak {
         stats.peak_tree_rss = peak.mem;
         stats.peak_centi_cores = peak.cpu;
+    }
+    if let Some((peak, baseline)) = other_peak {
+        stats.peak_other_centi_cores = peak.saturating_sub(baseline);
+        stats.peak_centi_cores = effective_peak(stats.peak_centi_cores, peak, baseline, cap.cpu);
     }
     stats.timed_out = timed_out;
     eprintln!("{}", format_stats(&stats));
@@ -441,6 +493,16 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_and_docker_jobs_ask_for_the_whole_machine() {
+        let cap = Capacity { cpu: 16, mem: 64 << 30, vram: 0, disk_total: 1 << 40, vram_is_ram: true };
+        let cold = |c: &[&str]| default_cpu(&c.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(), &cap);
+        assert_eq!(cold(&["cargo", "build"]), 16);
+        assert_eq!(cold(&["docker", "build", "."]), 16);
+        assert_eq!(cold(&["docker", "compose", "up"]), 16);
+        assert_eq!(cold(&["make", "docker-build"]), 16);
+    }
 
     #[test]
     fn a_ramp_sleeps_until_its_end_not_a_fixed_ten_seconds() {

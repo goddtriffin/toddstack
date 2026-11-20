@@ -31,6 +31,10 @@ pub struct Stats {
     /// Peak cores (times 100) the whole process tree used at once, sampled while the job ran.
     #[serde(default)]
     pub peak_centi_cores: u64,
+    /// Peak machine-wide CPU (times 100) of other programs above the pre-start baseline: work hosted outside the
+    /// process tree (Docker's VM). `peak_centi_cores` is the larger of this and the tree's peak.
+    #[serde(default)]
+    pub peak_other_centi_cores: u64,
     pub blocks_in: u64,
     pub blocks_out: u64,
     /// Machine-wide, not just this job.
@@ -140,7 +144,7 @@ mod tests {
 
     #[test]
     fn formats_report() {
-        let s = Stats { queued_ms: 1500, run_ms: 4000, cpu_user_ms: 6000, cpu_sys_ms: 2000, centi_cores: 250, peak_rss: 1 << 30, peak_tree_rss: 3 << 30, peak_centi_cores: 450, blocks_in: 5, blocks_out: 7, net_in: 2048, net_out: 0, peak_vram: Some(1 << 30), steal_ms: Some(300), timed_out: true };
+        let s = Stats { queued_ms: 1500, run_ms: 4000, cpu_user_ms: 6000, cpu_sys_ms: 2000, centi_cores: 250, peak_rss: 1 << 30, peak_other_centi_cores: 0, peak_tree_rss: 3 << 30, peak_centi_cores: 450, blocks_in: 5, blocks_out: 7, net_in: 2048, net_out: 0, peak_vram: Some(1 << 30), steal_ms: Some(300), timed_out: true };
         let text = format_stats(&s);
         assert!(text.contains("queued 1.5s, ran 4.0s"), "{text}");
         assert!(text.contains("avg 2.50 cores"), "{text}");
