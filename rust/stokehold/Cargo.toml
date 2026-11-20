@@ -1,13 +1,13 @@
 [package]
-name = "toddstack-heavy"
-version = "0.3.2"
+name = "stokehold"
+version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
-description = "heavy: a machine-wide admission queue for heavy jobs (builds, tests, GPU work). Reserves cores, RAM, VRAM and disk, runs jobs when they fit, and prints what each one used."
+description = "stokehold (formerly heavy): a machine-wide admission queue for heavy jobs (builds, tests, GPU work). Reserves cores, RAM, VRAM and disk, runs jobs when they fit, and prints what each one used."
 license-file.workspace = true
 keywords = ["queue", "scheduler", "build", "resources", "toddstack"]
 categories = ["development-tools", "command-line-utilities"]
@@ -17,7 +17,7 @@ include = ["**/*.rs", "Cargo.toml", "LICENSE", "README.md"]
 workspace = true
 
 [[bin]]
-name = "heavy"
+name = "stokehold"
 path = "src/main.rs"
 
 [dependencies]

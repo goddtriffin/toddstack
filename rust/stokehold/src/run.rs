@@ -82,7 +82,7 @@ fn spawn_signal_thread(tx: Sender<WaitEvent>) -> Result<Arc<Sig>, Error> {
                 if shared.waiting.load(Ordering::SeqCst) {
                     let _ = tx.send(WaitEvent::Stop);
                 } else if let Err(e) = signal_hook::low_level::emulate_default_handler(s) {
-                    eprintln!("heavy: cannot stop: {e}");
+                    eprintln!("stokehold: cannot stop: {e}");
                 }
                 continue;
             }
@@ -121,7 +121,7 @@ fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
 }
 
 fn resolve_weights(state: &StateDir, flags: &Flags, cmd: &[String], cwd: &str, cap: &Capacity) -> Weights {
-    let hist = history::defaults_for(&state.history_path(), cmd, cwd);
+    let hist = history::defaults_for(&state.history_path(), cmd, cwd, history::repo_key(Path::new(cwd)).as_deref());
     cap.clamp(Weights {
         cpu: flags.cpu.or(hist.map(|d| d.cpu)).unwrap_or_else(|| default_cpu(cmd, cap)),
         mem: flags.mem.or(hist.map(|d| d.mem)).unwrap_or(DEFAULT_MEM),
@@ -131,7 +131,7 @@ fn resolve_weights(state: &StateDir, flags: &Flags, cmd: &[String], cwd: &str, c
 }
 
 fn exec_nested(state: &StateDir, cmd: &[String]) -> Option<Error> {
-    let id = std::env::var("HEAVY_JOB").ok()?;
+    let id = crate::state::env_var("STOKEHOLD_JOB")?.into_string().ok()?;
     let job = state.read_job(&id)?;
     if job.state != State::Running || !is_alive(&job) {
         return None;
@@ -144,7 +144,7 @@ fn exec_nested(state: &StateDir, cmd: &[String]) -> Option<Error> {
 /// Fails on state-dir, probe or watcher errors. A child that cannot start exits 127.
 pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error> {
     if let Some(e) = exec_nested(state, cmd) {
-        eprintln!("heavy: cannot run {}: {e}", cmd.first().map_or("", String::as_str));
+        eprintln!("stokehold: cannot run {}: {e}", cmd.first().map_or("", String::as_str));
         return Ok(127);
     }
     state.ensure()?;
@@ -188,7 +188,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         Ok(()) => {}
         Err(Error::Interrupted(s)) => return Ok(u8::try_from(128 + s).unwrap_or(130)),
         Err(Error::DiskFull(why)) => {
-            eprintln!("heavy: {why}");
+            eprintln!("stokehold: {why}");
             return Ok(DISK_FULL_EXIT);
         }
         Err(e) => return Err(e),
@@ -273,7 +273,7 @@ fn acquire(state: &StateDir, cwd: &Path, cap: &Capacity, job: &mut Job, rx: &Rec
         };
         tally.note(now_ms(), Some(block));
         if said != reason {
-            eprintln!("heavy: waiting ({reason})");
+            eprintln!("stokehold: waiting ({reason})");
             said = reason;
         }
         match rx.recv_timeout(wait_timeout(live_blocked, ramp_end_ms, now_ms())) {
@@ -419,7 +419,7 @@ fn wait_child(pid: Pid, term: Option<Terminal>) -> Result<ExitStatus, nix::Error
 fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig, timeout: Duration, queued_ms: u64) -> Result<u8, Error> {
     let (first, rest) = job.cmd.split_first().ok_or_else(|| Error::Usage("no command".into()))?;
     let mut command = Command::new(first);
-    command.args(rest).process_group(0).env("HEAVY_JOB", &job.id);
+    command.args(rest).process_group(0).env("STOKEHOLD_JOB", &job.id).env("HEAVY_JOB", &job.id);
 
     let usage_before = children_usage()?;
     let net_before = net_bytes();
@@ -431,7 +431,7 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
     let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("heavy: cannot run {first}: {e}");
+            eprintln!("stokehold: cannot run {first}: {e}");
             return Ok(127);
         }
     };
@@ -448,7 +448,7 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
     std::thread::spawn(move || {
         let _ = wtx.send(wait_child(Pid::from_raw(pgid), term));
     });
-    let grace = Duration::from_millis(std::env::var("HEAVY_KILL_GRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_GRACE_MS));
+    let grace = Duration::from_millis(crate::state::env_var("STOKEHOLD_KILL_GRACE_MS").and_then(|v| v.into_string().ok()).and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_GRACE_MS));
     let (result, timed_out) = if let Ok(r) = wrx.recv_timeout(timeout) {
         (r, false)
     } else {
@@ -495,9 +495,9 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
     eprintln!("{}", format_stats(&stats));
 
     let code = if timed_out { i32::from(TIMEOUT_EXIT) } else { exit_code(exit) };
-    let entry = Entry { ts: Timestamp::now(), cmd: job.cmd.clone(), cwd: job.cwd.clone(), requested: job.weights, measured: stats, exit_code: code, v: crate::history::VERSION };
+    let entry = Entry { ts: Timestamp::now(), cmd: job.cmd.clone(), cwd: job.cwd.clone(), requested: job.weights, measured: stats, exit_code: code, v: crate::history::VERSION, repo: history::repo_key(Path::new(&job.cwd)) };
     if let Err(e) = history::append(&dir.history_path(), &entry) {
-        eprintln!("heavy: could not write history: {e}");
+        eprintln!("stokehold: could not write history: {e}");
     }
     log::record(
         dir.base(),
