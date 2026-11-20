@@ -1,4 +1,4 @@
-//! `history.jsonl`: one line per finished job; the median of past peaks (whole process tree) is the default weight.
+//! `history.jsonl`: one line per finished job; the median of past peaks (whole process tree) is the default weight (the max for the pooled last tier).
 //!
 //! Lookup goes from the most to the least specific match: the same command in the same cwd; else the same command in
 //! the same place of the same repository (any worktree or clone of it: `repo`); else the same program and first
@@ -106,22 +106,42 @@ const PROGRAM_WORDS: usize = 2;
 pub fn defaults_with(entries: &[Entry], cmd: &[String], cwd: &str, repo: Option<&str>, min_v: u32) -> Option<Defaults> {
     let ok: Vec<&Entry> = entries.iter().filter(|e| e.v >= min_v && e.exit_code == 0).collect();
     let same_repo = |e: &Entry| repo.is_some() && e.repo.as_deref() == repo;
-    let program = cmd.get(..PROGRAM_WORDS).unwrap_or(cmd);
-    let tiers: [&dyn Fn(&Entry) -> bool; 3] = [
-        &|e| e.cwd == cwd && e.cmd == cmd,
-        &|e| same_repo(e) && e.cmd == cmd,
-        &|e| same_repo(e) && e.cmd.starts_with(program),
-    ];
-    tiers.iter().find_map(|tier| median_of(&ok.iter().copied().filter(|e| tier(e)).collect::<Vec<_>>()))
+    let pick = |tier: &dyn Fn(&Entry) -> bool| ok.iter().copied().filter(|e| tier(e)).collect::<Vec<_>>();
+    if let Some(d) = aggregate(&pick(&|e| e.cwd == cwd && e.cmd == cmd), median) {
+        return Some(d);
+    }
+    if let Some(d) = aggregate(&pick(&|e| same_repo(e) && e.cmd == cmd), median) {
+        return Some(d);
+    }
+    // Third tier pools different commands, so it takes the largest peak, never the median, and only for a real
+    // program with a subcommand: not wrappers, not a bare program, not a flag first argument.
+    if !program_pools(cmd) {
+        return None;
+    }
+    let program = &cmd[..PROGRAM_WORDS];
+    aggregate(&pick(&|e| same_repo(e) && e.cmd.starts_with(program)), |v| v.into_iter().max())
 }
 
-fn median_of(mine: &[&Entry]) -> Option<Defaults> {
+/// Wrappers and shells: what they run says nothing about the first argument's weight.
+const WRAPPERS: [&str; 11] = ["env", "bash", "sh", "zsh", "sudo", "nice", "time", "nohup", "xargs", "stokehold", "heavy"];
+
+/// Whether `cmd` may use the pooled program + first argument tier: more than two words, the program is no wrapper,
+/// the first argument is no flag.
+fn program_pools(cmd: &[String]) -> bool {
+    if cmd.len() <= PROGRAM_WORDS {
+        return false;
+    }
+    let base = Path::new(&cmd[0]).file_name().and_then(|n| n.to_str()).unwrap_or(&cmd[0]);
+    !WRAPPERS.contains(&base) && !cmd[1].starts_with('-')
+}
+
+fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<Defaults> {
     let mine = &mine[mine.len().saturating_sub(KEEP)..];
     // Peaks of the whole process tree; runs too short to sample (or old entries) fall back to the average
     // cores and the largest single process.
-    let cores = median(mine.iter().map(|e| if e.measured.peak_centi_cores > 0 { e.measured.peak_centi_cores } else { e.measured.centi_cores }).collect())?;
-    let mem = median(mine.iter().map(|e| e.measured.peak_tree_rss.max(e.measured.peak_rss)).collect())?;
-    let vram = median(mine.iter().filter_map(|e| e.measured.peak_vram).collect());
+    let cores = pick(mine.iter().map(|e| if e.measured.peak_centi_cores > 0 { e.measured.peak_centi_cores } else { e.measured.centi_cores }).collect())?;
+    let mem = pick(mine.iter().map(|e| e.measured.peak_tree_rss.max(e.measured.peak_rss)).collect())?;
+    let vram = pick(mine.iter().filter_map(|e| e.measured.peak_vram).collect());
     Some(Defaults { cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX), mem, vram })
 }
 
@@ -234,6 +254,38 @@ mod tests {
         assert!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", Some("/code/bdg/.git:web")).is_none());
         assert!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", None).is_none());
         assert!(defaults_from(&all, &s(&["make", "test"]), "/s/wt225/apple", Some(bdg)).is_none());
+    }
+
+    #[test]
+    fn pooled_tier_uses_the_max_not_the_median() {
+        let s = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = "/c/.git:a";
+        let all = vec![
+            in_repo(&["cargo", "test", "-p", "a"], "/w1", r, 200),
+            in_repo(&["cargo", "test", "-p", "b"], "/w1", r, 300),
+            in_repo(&["cargo", "test", "-p", "c"], "/w1", r, 1600),
+        ];
+        assert_eq!(defaults_from(&all, &s(&["cargo", "test", "-p", "d"]), "/w2", Some(r)).unwrap().cpu, 16);
+    }
+
+    #[test]
+    fn pooled_tier_skips_bare_programs_wrappers_and_flags() {
+        let s = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let r = "/c/.git:a";
+        let all = vec![
+            in_repo(&["make", "lint"], "/w1", r, 100),
+            in_repo(&["bash", "-c", "x"], "/w1", r, 100),
+            in_repo(&["env", "A=1", "make"], "/w1", r, 100),
+            in_repo(&["xcodebuild", "-scheme", "A"], "/w1", r, 100),
+        ];
+        let d = |c: &[&str]| defaults_from(&all, &s(c), "/w2", Some(r));
+        assert!(d(&["make"]).is_none(), "a bare program is not pooled");
+        assert!(d(&["make", "other"]).is_none(), "two words is not pooled");
+        assert!(d(&["bash", "-c", "y"]).is_none());
+        assert!(d(&["env", "A=1", "make"]).is_none());
+        assert!(d(&["xcodebuild", "-scheme", "B"]).is_none());
+        assert!(d(&["/usr/bin/sudo", "make", "lint"]).is_none());
+        assert!(d(&["make", "lint", "X=1"]).is_some());
     }
 
     #[test]
