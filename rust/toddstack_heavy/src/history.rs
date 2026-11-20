@@ -21,7 +21,14 @@ pub struct Entry {
     pub requested: Weights,
     pub measured: Stats,
     pub exit_code: i32,
+    /// History version: 0 (absent) before 0.3.2, 1 from 0.3.2 on. On Linux, v0 peaks counted threads as child
+    /// processes (about 17x inflated), so learned defaults ignore them there.
+    #[serde(default)]
+    pub v: u32,
 }
+
+/// The version written into new entries.
+pub const VERSION: u32 = 1;
 
 /// # Errors
 /// Fails on I/O or serialization errors.
@@ -54,7 +61,14 @@ fn median(mut v: Vec<u64>) -> Option<u64> {
 
 #[must_use]
 pub fn defaults_from(entries: &[Entry], cmd: &[String], cwd: &str) -> Option<Defaults> {
-    let mine: Vec<&Entry> = entries.iter().filter(|e| e.exit_code == 0 && e.cwd == cwd && e.cmd == cmd).collect();
+    // macOS never counted threads as children (sysinfo reports no thread kind there), so old entries stay valid.
+    defaults_with(entries, cmd, cwd, if cfg!(target_os = "linux") { VERSION } else { 0 })
+}
+
+/// Like `defaults_from`, using only entries whose version is at least `min_v`.
+#[must_use]
+pub fn defaults_with(entries: &[Entry], cmd: &[String], cwd: &str, min_v: u32) -> Option<Defaults> {
+    let mine: Vec<&Entry> = entries.iter().filter(|e| e.v >= min_v && e.exit_code == 0 && e.cwd == cwd && e.cmd == cmd).collect();
     let mine = &mine[mine.len().saturating_sub(KEEP)..];
     // Peaks of the whole process tree; runs too short to sample (or old entries) fall back to the average
     // cores and the largest single process.
@@ -84,6 +98,7 @@ mod tests {
             requested: Weights::default(),
             measured: Stats { centi_cores: centi, peak_rss: rss, ..Stats::default() },
             exit_code: code,
+            v: VERSION,
         }
     }
 
@@ -102,6 +117,32 @@ mod tests {
         e.measured.peak_tree_rss = 900;
         let d = defaults_from(&[e], &["t".to_string()], "/a").unwrap();
         assert_eq!(d, Defaults { cpu: 7, mem: 900, vram: None });
+    }
+
+    #[test]
+    fn v0_entries_are_ignored_when_min_version_is_one() {
+        let mut old = entry("t", "/a", 100, 46_000, 0);
+        old.v = 0;
+        let new = entry("t", "/a", 100, 2_600, 0);
+        let c = ["t".to_string()];
+        assert_eq!(defaults_with(&[old.clone()], &c, "/a", 1), None);
+        assert_eq!(defaults_with(&[old, new], &c, "/a", 1).unwrap().mem, 2_600);
+    }
+
+    #[test]
+    fn v0_entries_are_used_when_min_version_is_zero() {
+        let mut old = entry("t", "/a", 100, 700, 0);
+        old.v = 0;
+        assert_eq!(defaults_with(&[old], &["t".to_string()], "/a", 0).unwrap().mem, 700);
+    }
+
+    #[test]
+    fn entries_without_a_version_field_parse_as_v0_and_new_ones_write_v1() {
+        let mut value = serde_json::to_value(entry("t", "/a", 1, 1, 0)).unwrap();
+        value.as_object_mut().unwrap().remove("v");
+        assert_eq!(serde_json::from_value::<Entry>(value).unwrap().v, 0);
+        let json = serde_json::to_string(&entry("t", "/a", 1, 1, 0)).unwrap();
+        assert!(json.contains("\"v\":1"), "{json}");
     }
 
     #[test]

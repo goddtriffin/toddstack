@@ -200,7 +200,7 @@ pub fn ramp_hold(peak: u64, machine: u64, elapsed_ms: i64, cpu_pct: u64, vm: boo
 /// the CPU rises, slow to release after a dip: a 250 ms window between build steps is not free CPU.
 #[must_use]
 pub fn sustained_pct(latest: u64, readings: &[(i64, u64)], now_ms: i64) -> u64 {
-    let recent: Vec<u64> = readings.iter().filter(|(ts, _)| now_ms - *ts <= BUSY_WINDOW_MS).map(|(_, pct)| *pct).collect();
+    let recent: Vec<u64> = readings.iter().filter(|(ts, _)| *ts <= now_ms && now_ms - *ts <= BUSY_WINDOW_MS).map(|(_, pct)| *pct).collect();
     let n = u64::try_from(recent.len()).unwrap_or(u64::MAX);
     recent.iter().sum::<u64>().checked_div(n).unwrap_or(0).max(latest)
 }
@@ -927,6 +927,7 @@ mod tests {
     #[test]
     fn sustained_cpu_rises_at_once_and_falls_slowly() {
         assert_eq!(sustained_pct(70, &[], 0), 70, "no readings: the latest");
+        assert_eq!(sustained_pct(10, &[(0, 10), (90_000, 100)], 5_000), 10, "a reading from the future (clock skew) is dropped");
         assert_eq!(sustained_pct(100, &[(0, 40), (5_000, 40)], 5_000), 100, "a rise counts at once");
         assert_eq!(sustained_pct(40, &[(0, 100), (10_000, 100), (20_000, 40)], 20_000), 80, "a fall is averaged");
         assert_eq!(sustained_pct(40, &[(0, 100), (25_000, 40)], 25_000), 40, "readings over 20 s old are dropped");
