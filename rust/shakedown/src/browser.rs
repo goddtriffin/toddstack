@@ -1,7 +1,7 @@
 //! The pinned Chrome for Testing: where it lives, and `shakedown browser install`.
 //!
 //! One exact build, downloaded from Google's Chrome for Testing bucket, checked against a SHA-256 kept in this
-//! tool, unpacked with macOS `ditto` (an `.app` bundle holds symlinks and code signatures that `ditto` keeps) into
+//! tool, unpacked with macOS `ditto` (Linux: `unzip`; an `.app` bundle holds symlinks and code signatures that `ditto` keeps) into
 //! `~/Library/Caches/shakedown/chrome/<version>/`, shared by every project. Bumping the version is a tool release
 //! plus a reviewed `update --screens all` in each project.
 
@@ -16,22 +16,41 @@ use crate::error::Error;
 /// The Chrome for Testing build every reference is made with.
 pub const CHROME_VERSION: &str = "149.0.7827.55";
 /// SHA-256 of `chrome-mac-arm64.zip` for [`CHROME_VERSION`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CHROME_SHA256: &str = "311211b54c429245e2cec0314ee1e314085e9c00350215b95e1a879350786630";
+/// SHA-256 of `chrome-linux64.zip` for [`CHROME_VERSION`].
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const CHROME_SHA256: &str = "13113b963ac22fffdad898a677591028e4397c46c1daa9e61811258eed6e35b5";
+/// No pinned build for this platform: [`install`] refuses before any download.
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64")
+)))]
+const CHROME_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PLATFORM: &str = "mac-arm64";
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+const PLATFORM: &str = "linux64";
 
 fn url() -> String {
     format!(
-        "https://storage.googleapis.com/chrome-for-testing-public/{CHROME_VERSION}/mac-arm64/chrome-mac-arm64.zip"
+        "https://storage.googleapis.com/chrome-for-testing-public/{CHROME_VERSION}/{PLATFORM}/chrome-{PLATFORM}.zip"
     )
 }
 
-/// `$SHAKEDOWN_CACHE`, else `~/Library/Caches/shakedown`.
+/// `$SHAKEDOWN_CACHE`, else `~/Library/Caches/shakedown` (macOS) or `~/.cache/shakedown` (elsewhere).
 pub fn cache_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("SHAKEDOWN_CACHE") {
         return PathBuf::from(p);
     }
     std::env::var_os("HOME")
         .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
-        .join("Library/Caches/shakedown")
+        .join(if cfg!(target_os = "macos") {
+            "Library/Caches/shakedown"
+        } else {
+            ".cache/shakedown"
+        })
 }
 
 /// The directory the pinned build unpacks into.
@@ -41,9 +60,12 @@ pub fn chrome_dir() -> PathBuf {
 
 /// The Chrome executable.
 pub fn binary() -> PathBuf {
-    chrome_dir().join(
-        "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-    )
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let rel =
+        "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let rel = "chrome-linux64/chrome";
+    chrome_dir().join(rel)
 }
 
 /// The pinned build is installed.
@@ -84,14 +106,16 @@ pub fn sha256_file(path: &std::path::Path) -> Result<String, Error> {
 ///
 /// # Errors
 ///
-/// Not an Apple Silicon Mac, the download fails or does not match the pinned checksum, or unpacking fails.
+/// Not an Apple Silicon Mac or `x86_64` Linux, the download fails or does not match the pinned checksum, or unpacking fails.
 pub fn install() -> Result<PathBuf, Error> {
     if installed() {
         return Ok(binary());
     }
-    if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
+    let supported = (cfg!(target_os = "macos") && cfg!(target_arch = "aarch64"))
+        || (cfg!(target_os = "linux") && cfg!(target_arch = "x86_64"));
+    if !supported {
         return Err(Error::Environment(
-            "the pinned Chrome for Testing is mac-arm64 only (Todd's Mac)".into(),
+            "the pinned Chrome for Testing exists for macOS arm64 and Linux x86_64 only".into(),
         ));
     }
     let env = |what: &str, e: &dyn std::fmt::Display| Error::Environment(format!("{what}: {e}"));
@@ -119,14 +143,21 @@ pub fn install() -> Result<PathBuf, Error> {
             )));
         }
         let unpacked = work.join("unpacked");
-        let st = Command::new("ditto")
-            .args(["-x", "-k"])
-            .arg(&zip)
-            .arg(&unpacked)
-            .status()
-            .map_err(|e| env("ditto", &e))?;
+        let (tool, mut unpack) = if cfg!(target_os = "macos") {
+            ("ditto", Command::new("ditto"))
+        } else {
+            ("unzip", Command::new("unzip"))
+        };
+        if cfg!(target_os = "macos") {
+            unpack.args(["-x", "-k"]).arg(&zip).arg(&unpacked);
+        } else {
+            unpack.arg("-q").arg(&zip).arg("-d").arg(&unpacked);
+        }
+        let st = unpack.status().map_err(|e| env(tool, &e))?;
         if !st.success() {
-            return Err(Error::Environment("ditto could not unpack Chrome".into()));
+            return Err(Error::Environment(format!(
+                "{tool} could not unpack Chrome"
+            )));
         }
         if let Err(e) = std::fs::rename(&unpacked, chrome_dir()) {
             // Another session finished first: fine, as long as it is there.
