@@ -87,14 +87,19 @@ RUN printf '%s\n' '#!/bin/sh' \
 ENV CC_x86_64_unknown_linux_musl=/usr/local/bin/x86_64-linux-musl-zigcc \
     AR_x86_64_unknown_linux_musl=/usr/local/bin/x86_64-linux-musl-zigar
 
-# rustc links: rust-lld with the self-contained musl CRT (rcrt1.o, libc.a,
-# libunwind.a) shipped with the target, position independent and statically
-# linked, so the binary is static-pie (ASLR). rust-lld honours `--strip-debug`
-# (the release profile's default strip), so the symbol table stays. A GNU
-# build ID (a hash of the output, so still reproducible) is added, as gcc did,
-# for matching debug files in Sentry.
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C linker-flavor=ld.lld -C link-self-contained=yes -C relocation-model=pie -C target-feature=+crt-static -C link-arg=--build-id=sha1"
+# rustc links the TARGET with rust-lld and the self-contained musl CRT (rcrt1.o,
+# libc.a, libunwind.a) shipped with the target, position independent and
+# statically linked, so the binary is static-pie (ASLR). rust-lld honours
+# `--strip-debug` (the release profile's default strip), so the symbol table
+# stays. A GNU build ID (a hash of the output, so still reproducible) is added,
+# as gcc did, for matching debug files in Sentry.
+#
+# The builder image is Alpine, so on an amd64 machine the host triple IS the
+# target triple, and cargo's target `linker` setting would also hit host build
+# scripts and proc-macros (which must link with the system cc). Target RUSTFLAGS
+# never reach host artifacts when `--target` is passed, so `-C linker=rust-lld`
+# goes in the rustflags, and every cargo call below passes `--target`.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=yes -C relocation-model=pie -C target-feature=+crt-static -C link-arg=--build-id=sha1"
 
 WORKDIR /toddstack/rust
 
@@ -128,6 +133,14 @@ COPY rust/ ./
 # generate binary
 RUN cargo build --release --target ${TARGET} --package template-web-server --bin template-web-server \
  && cp target/${TARGET}/release/template-web-server /template-web-server-bin
+
+# Fail the build if the binary is not static: a dynamic one has an INTERP
+# program header (a dynamic loader path).
+# readelf (binutils) ships in the rust alpine image.
+RUN readelf -l /template-web-server-bin > /tmp/program-headers && \
+    if grep -q INTERP /tmp/program-headers; then \
+      echo "error: /template-web-server-bin is dynamically linked (has an INTERP header)" >&2; exit 1; \
+    fi
 
 #######
 # CSS #
