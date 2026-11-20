@@ -243,7 +243,10 @@ fn acquire(state: &StateDir, cwd: &Path, cap: &Capacity, job: &mut Job, rx: &Rec
             let _lock = state.lock()?;
             let jobs = state.live_jobs();
             live.stopped = machine::stopped_ids(&jobs);
-            let d = evaluate(job, &jobs, cap, &live, now_ms());
+            let now = now_ms();
+            state.push_busy(now, live.cpu_pct, crate::admit::BUSY_WINDOW_MS);
+            live.cpu_sustained_pct = crate::admit::sustained_pct(live.cpu_pct, &state.busy_readings(), now);
+            let d = evaluate(job, &jobs, cap, &live, now);
             let by = match &d {
                 Decision::Wait { block, .. } => Some(block.name().to_string()),
                 _ => None,

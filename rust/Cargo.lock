@@ -4002,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "toddstack-heavy"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "jiff 1.0.1",
  "nix",
