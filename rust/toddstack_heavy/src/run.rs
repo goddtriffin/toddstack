@@ -114,8 +114,8 @@ fn now_ms() -> i64 {
 }
 
 /// The CPU ask of a job with no history: the whole machine. A whole-machine ramp hold is never released early, so cold
-/// jobs start at least 10 s apart; after one run, history gives the real peak. Docker commands (the work runs in Docker's
-/// VM, outside the process tree) get the same default.
+/// jobs start at least 10 s apart; after one run, history gives the real peak. The full 10 s hold covers cold jobs,
+/// Docker/VM jobs (the work runs in Docker's VM, outside the process tree) and peaks of 75% of the machine or more.
 fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
     cap.cpu
 }
@@ -378,8 +378,8 @@ fn p90(samples: &mut [u64]) -> u64 {
     samples[(samples.len() * 9).div_ceil(10) - 1]
 }
 
-/// Only Docker-style jobs run their work outside the process tree (in a VM), so only they learn from the machine.
-fn hosts_vm_work(cmd: &[String]) -> bool {
+/// Only Docker-style jobs run their work outside the process tree (in a VM), so only they learn from the machine, and their ramp hold is always the full 10 s.
+pub(crate) fn hosts_vm_work(cmd: &[String]) -> bool {
     cmd.iter().any(|a| a.contains("docker"))
 }
 
