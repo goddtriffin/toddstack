@@ -16,7 +16,7 @@
 //! a rise blocks at once and a fall is released slowly. Live guards (load, memory, disk) can only veto.
 //!
 //! Load: a 1-minute load of 4 x cores blocks whatever the CPU says (an I/O storm; on 2026-11-19 load 120 on 16 cores
-//! killed Docker). From 2 x cores up, a load that is still rising (load1 > load5) blocks, because builds could
+//! killed Docker). From 2 x cores up, a load that is still rising (load1 > 1.1 x load5) blocks, because builds could
 //! otherwise pile up during low-CPU phases until the lagging load1 reaches the hard limit. A load at 2 x cores or more
 //! that is flat or falling blocks only while the CPU is also busy: on macOS load also counts threads blocked in I/O,
 //! so it can read 20-30 with the CPU nearly idle. Memory pressure (macOS level, Linux PSI) also blocks.
@@ -176,8 +176,11 @@ pub fn disk_full(req: Weights, cap: &Capacity, live: &Live) -> Option<String> {
     })
 }
 
+/// Load counts as rising only when load1 exceeds load5 by this factor, so jitter at steady load does not flip it.
+const RISING_MARGIN: f64 = 1.1;
+
 /// Live guards, a veto only. The 1-minute load blocks at 4 x cores always (runaway load). From 2 x cores up it blocks
-/// while it is still rising (load1 > load5), and while the CPU is at least 90% busy; a flat or falling load with a
+/// while it is still rising (load1 > 1.1 x load5), and while the CPU is at least 90% busy; a flat or falling load with a
 /// calmer CPU is I/O wait (macOS counts blocked threads), so it admits. Memory used at 90% or memory pressure blocks.
 #[must_use]
 pub fn guard_block(cap: &Capacity, live: &Live) -> Option<(String, Block)> {
@@ -187,7 +190,7 @@ pub fn guard_block(cap: &Capacity, live: &Live) -> Option<(String, Block)> {
         return Some((format!("1-minute load {:.1} >= {hard:.0} (4 x {} cores)", live.load1, cap.cpu), Block::Load1));
     }
     if live.load1 >= soft {
-        if live.load1 > live.load5 {
+        if live.load1 > live.load5 * RISING_MARGIN {
             return Some((format!("1-minute load {:.1} >= {soft:.0} (2 x {} cores) and still rising (5-minute {:.1})", live.load1, cap.cpu, live.load5), Block::Load1));
         }
         if live.cpu_pct >= LOAD_BUSY_CPU_PCT {
@@ -411,6 +414,8 @@ mod tests {
         assert_eq!(evaluate(&me, one, &cap(), &falling, 0), Decision::Start, "falling and CPU under 90%");
         let level = Live { load1: 30.0, load5: 30.0, cpu_pct: 30, ..calm() };
         assert_eq!(evaluate(&me, one, &cap(), &level, 0), Decision::Start, "load1 <= load5 is not rising");
+        let jitter = Live { load1: 31.5, load5: 30.0, cpu_pct: 30, ..calm() };
+        assert_eq!(evaluate(&me, one, &cap(), &jitter, 0), Decision::Start, "load1 = load5 x 1.05 is jitter, not rising");
         // Falling but the CPU is busy: still blocked.
         let falling_busy = Live { cpu_pct: 92, ..falling.clone() };
         assert!(waits(&evaluate(&me, one, &cap(), &falling_busy, 0)));

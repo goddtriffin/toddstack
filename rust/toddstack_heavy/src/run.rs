@@ -347,20 +347,39 @@ fn other_sampler(dir: &StateDir, own_pid: u32, cores: u32) -> Option<OtherHandle
         r
     };
     sampler.sample(&roots(dir));
-    std::thread::sleep(Duration::from_millis(250));
-    let baseline = sampler.sample(&roots(dir));
+    // Baseline: the mean of four samples over about 1 s before the job starts.
+    let mut sum = 0;
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(250));
+        sum += sampler.sample(&roots(dir));
+    }
+    let baseline = sum / 4;
     let (stop_tx, stop_rx) = channel::<()>();
     let dir = dir.clone();
     let handle = std::thread::spawn(move || {
-        let mut peak = baseline;
+        let mut samples = vec![];
         loop {
-            peak = peak.max(sampler.sample(&roots(&dir)));
+            samples.push(sampler.sample(&roots(&dir)).saturating_sub(baseline));
             if !matches!(stop_rx.recv_timeout(OTHER_SAMPLE), Err(RecvTimeoutError::Timeout)) {
-                return peak;
+                return p90(&mut samples);
             }
         }
     });
     Some(OtherHandle { stop: stop_tx, handle, baseline })
+}
+
+/// The 90th percentile (nearest rank) of the samples: a sustained level, not a one-second spike.
+fn p90(samples: &mut [u64]) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    samples[(samples.len() * 9).div_ceil(10) - 1]
+}
+
+/// Only Docker-style jobs run their work outside the process tree (in a VM), so only they learn from the machine.
+fn hosts_vm_work(cmd: &[String]) -> bool {
+    cmd.iter().any(|a| a.contains("docker"))
 }
 
 struct OtherHandle {
@@ -403,7 +422,7 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
     let steal_before = cpu_times().map(|t| t.steal);
     let sampler = vram_sampler(cap);
     let tree = tree_sampler(job.pid);
-    let other = other_sampler(dir, job.pid, cap.cpu);
+    let other = if hosts_vm_work(&job.cmd) { other_sampler(dir, job.pid, cap.cpu) } else { None };
     let started = Instant::now();
     let child = match command.spawn() {
         Ok(c) => c,
@@ -464,9 +483,9 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
         stats.peak_tree_rss = peak.mem;
         stats.peak_centi_cores = peak.cpu;
     }
-    if let Some((peak, baseline)) = other_peak {
-        stats.peak_other_centi_cores = peak.saturating_sub(baseline);
-        stats.peak_centi_cores = effective_peak(stats.peak_centi_cores, peak, baseline, cap.cpu);
+    if let Some((rise, _)) = other_peak {
+        stats.peak_other_centi_cores = rise;
+        stats.peak_centi_cores = effective_peak(stats.peak_centi_cores, rise, 0, cap.cpu);
     }
     stats.timed_out = timed_out;
     eprintln!("{}", format_stats(&stats));
@@ -502,6 +521,17 @@ mod tests {
         assert_eq!(cold(&["docker", "build", "."]), 16);
         assert_eq!(cold(&["docker", "compose", "up"]), 16);
         assert_eq!(cold(&["make", "docker-build"]), 16);
+    }
+
+    #[test]
+    fn p90_is_sustained_not_a_spike_and_only_docker_uses_the_machine() {
+        let mut s: Vec<u64> = (1..=10).map(|i| if i == 10 { 1500 } else { 100 }).collect();
+        assert_eq!(p90(&mut s), 100);
+        assert_eq!(p90(&mut []), 0);
+        let c = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        assert!(hosts_vm_work(&c(&["docker", "build"])));
+        assert!(hosts_vm_work(&c(&["make", "docker-build"])));
+        assert!(!hosts_vm_work(&c(&["cargo", "test"])));
     }
 
     #[test]
