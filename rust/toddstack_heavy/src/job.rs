@@ -63,6 +63,8 @@ pub struct Live {
     pub mem_used_pct: u64,
     /// Machine-wide CPU busy, 0 to 100.
     pub cpu_pct: u64,
+    /// The system reports memory pressure (macOS level 2 or more, Linux PSI); false when it cannot be read.
+    pub mem_pressure: bool,
     pub disk_free: u64,
     /// Machine-wide usage minus the process trees of running heavy jobs (smoothed by the caller).
     pub non_heavy: Usage,
