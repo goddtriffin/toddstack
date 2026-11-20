@@ -107,9 +107,7 @@ impl StateDir {
     /// Every readable job file, oldest first.
     #[must_use]
     pub fn read_jobs(&self) -> Vec<Job> {
-        let Ok(rd) = fs::read_dir(self.jobs_dir()) else {
-            return Vec::new();
-        };
+        let Ok(rd) = fs::read_dir(self.jobs_dir()) else { return Vec::new() };
         let mut jobs: Vec<Job> = rd
             .filter_map(Result::ok)
             .filter(|e| e.file_name().to_str().is_some_and(|n| !n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "json")))
@@ -122,9 +120,7 @@ impl StateDir {
     /// Removes leftover `.tmp` files of writers that died mid-write. Writers hold the lock, so with the lock
     /// held every `.tmp` file is stale.
     fn sweep_tmp(&self) {
-        let Ok(rd) = fs::read_dir(self.jobs_dir()) else {
-            return;
-        };
+        let Ok(rd) = fs::read_dir(self.jobs_dir()) else { return };
         for e in rd.filter_map(Result::ok) {
             if e.file_name().to_str().is_some_and(|n| n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "tmp")) {
                 let _ = fs::remove_file(e.path());
@@ -148,9 +144,7 @@ impl StateDir {
 /// the process start (here or when the file was written) never makes a live job look dead.
 #[must_use]
 pub fn is_alive(job: &Job) -> bool {
-    let Ok(pid) = i32::try_from(job.pid) else {
-        return false;
-    };
+    let Ok(pid) = i32::try_from(job.pid) else { return false };
     match kill(Pid::from_raw(pid), None) {
         Ok(()) | Err(nix::errno::Errno::EPERM) => {}
         Err(_) => return false,
@@ -167,7 +161,7 @@ mod tests {
     use crate::job::{State, Weights};
 
     pub fn job(id: &str, pid: u32, start: u64, state: State) -> Job {
-        Job { id: id.into(), pid, start_time: start, weights: Weights::default(), cmd: vec!["x".into()], cwd: "/".into(), state, enqueued_ms: 1, started_ms: None }
+        Job { id: id.into(), pid, start_time: start, weights: Weights::default(), cmd: vec!["x".into()], cwd: "/".into(), state, enqueued_ms: 1, started_ms: None, blocked_by: None }
     }
 
     fn dir() -> (tempfile::TempDir, StateDir) {

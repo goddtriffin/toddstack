@@ -94,4 +94,8 @@ pub struct Job {
     pub state: State,
     pub enqueued_ms: i64,
     pub started_ms: Option<i64>,
+    /// The check that blocks this waiter right now (as the waiter itself last decided, with its smoothed data).
+    /// The sampler reads it instead of re-evaluating.
+    #[serde(default)]
+    pub blocked_by: Option<String>,
 }

@@ -3,9 +3,9 @@
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
@@ -161,6 +161,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         state: State::Queued,
         enqueued_ms,
         started_ms: None,
+        blocked_by: None,
     };
     let _guard = JobGuard { state, id: job.id.clone() };
     {
@@ -234,7 +235,16 @@ fn acquire(state: &StateDir, cwd: &Path, cap: &Capacity, job: &mut Job, rx: &Rec
             let jobs = state.live_jobs();
             live.stopped = machine::stopped_ids(&jobs);
             let d = evaluate(job, &jobs, cap, &live, now_ms());
+            let by = match &d {
+                Decision::Wait { block, .. } => Some(block.name().to_string()),
+                _ => None,
+            };
+            if d != Decision::Start && job.blocked_by != by {
+                job.blocked_by = by;
+                state.write_job(job)?;
+            }
             if d == Decision::Start {
+                job.blocked_by = None;
                 job.state = State::Running;
                 job.started_ms = Some(now_ms());
                 state.write_job(job)?;
@@ -259,9 +269,7 @@ fn acquire(state: &StateDir, cwd: &Path, cap: &Capacity, job: &mut Job, rx: &Rec
             Ok(WaitEvent::Stop) => park(state, job)?,
             Ok(WaitEvent::Fs) => while rx.try_recv().is_ok_and(|e| matches!(e, WaitEvent::Fs)) {},
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(Error::Probe("event channel closed".into()));
-            }
+            Err(RecvTimeoutError::Disconnected) => return Err(Error::Probe("event channel closed".into())),
         }
     }
 }
