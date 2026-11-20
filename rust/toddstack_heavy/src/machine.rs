@@ -165,16 +165,25 @@ fn children_of(procs: impl Iterator<Item = (Pid, Option<Pid>, bool)>) -> HashMap
 /// peaks recorded in history).
 fn tree_usage(sys: &System, children: &HashMap<Pid, Vec<Pid>>, root: u32, gpu: &[(u32, u64)]) -> Usage {
     let mut total = Usage::default();
-    let mut stack = vec![Pid::from_u32(root)];
-    while let Some(pid) = stack.pop() {
+    for pid in tree_pids(children, Pid::from_u32(root)) {
         if let Some(p) = sys.process(pid) {
             total.cpu += whole(p.cpu_usage());
             total.mem += p.memory();
             total.vram += gpu.iter().filter(|(g, _)| *g == pid.as_u32()).map(|(_, m)| m).sum::<u64>();
         }
-        stack.extend(children.get(&pid).into_iter().flatten().copied());
     }
     total
+}
+
+/// The root and every descendant process (what `tree_usage` sums).
+fn tree_pids(children: &HashMap<Pid, Vec<Pid>>, root: Pid) -> Vec<Pid> {
+    let mut seen = Vec::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        seen.push(pid);
+        stack.extend(children.get(&pid).into_iter().flatten().copied());
+    }
+    seen
 }
 
 /// Keeps one `System` between samples so per-process CPU percentages are valid from the second sample on.
@@ -409,12 +418,7 @@ mod tests {
         let children = children_of(procs);
         assert_eq!(children.get(&p(10)), Some(&vec![p(30)]), "threads are not children");
         let rss = |pid: Pid| if pid == p(30) { 512 } else { 2_600 };
-        let mut total = 0;
-        let mut stack = vec![p(10)];
-        while let Some(pid) = stack.pop() {
-            total += rss(pid);
-            stack.extend(children.get(&pid).into_iter().flatten().copied());
-        }
+        let total: u64 = tree_pids(&children, p(10)).into_iter().map(rss).sum();
         assert_eq!(total, 3_112, "MB: the process plus its child, not 17 x 2.6 GB");
     }
 

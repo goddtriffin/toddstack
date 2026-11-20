@@ -78,7 +78,7 @@ impl StateDir {
     pub fn push_busy(&self, now_ms: i64, pct: u64, keep_ms: i64) {
         let mut all = self.busy_readings();
         all.push((now_ms, pct));
-        all.retain(|(ts, _)| now_ms - *ts <= keep_ms);
+        all.retain(|(ts, _)| *ts <= now_ms && now_ms - *ts <= keep_ms);
         all.sort_unstable();
         let text = all.iter().map(|(ts, pct)| format!("{ts} {pct}")).collect::<Vec<_>>().join("\n");
         let tmp = self.base.join(".busy.tmp");

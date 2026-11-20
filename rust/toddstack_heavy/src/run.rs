@@ -495,7 +495,7 @@ fn execute(dir: &StateDir, cap: &Capacity, job: &Job, info: &JobInfo, sig: &Sig,
     eprintln!("{}", format_stats(&stats));
 
     let code = if timed_out { i32::from(TIMEOUT_EXIT) } else { exit_code(exit) };
-    let entry = Entry { ts: Timestamp::now(), cmd: job.cmd.clone(), cwd: job.cwd.clone(), requested: job.weights, measured: stats, exit_code: code };
+    let entry = Entry { ts: Timestamp::now(), cmd: job.cmd.clone(), cwd: job.cwd.clone(), requested: job.weights, measured: stats, exit_code: code, v: crate::history::VERSION };
     if let Err(e) = history::append(&dir.history_path(), &entry) {
         eprintln!("heavy: could not write history: {e}");
     }
