@@ -113,9 +113,9 @@ fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
 
-/// The CPU ask of a job with no history: the whole machine. Its ramp hold then lets one cold job in per ramp, so a burst
-/// of cold builds is staggered 10 s apart; after one run, history gives the real peak. Docker commands (the work runs
-/// in Docker's VM, outside the process tree) get the same default.
+/// The CPU ask of a job with no history: the whole machine. Its ramp hold then keeps cold jobs at least 3 s apart (up to
+/// 10 s while the CPU is busy); after one run, history gives the real peak. Docker commands (the work runs in Docker's
+/// VM, outside the process tree) get the same default.
 fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
     cap.cpu
 }
@@ -219,8 +219,8 @@ fn watch(dir: &Path, tx: Sender<WaitEvent>) -> Result<notify::RecommendedWatcher
     Ok(w)
 }
 
-/// How long a waiter sleeps before looking again. A ramp blocks until a known moment, so it sleeps until the earliest
-/// ramp ends (capped at `LIVE_RESAMPLE`, and never a busy spin); other live blockers re-sample every `LIVE_RESAMPLE`;
+/// How long a waiter sleeps before looking again. A ramp blocks until a known moment, so it sleeps until the moment
+/// admission names (the first time the shrinking holds leave room) (capped at `LIVE_RESAMPLE`, and never a busy spin); other live blockers re-sample every `LIVE_RESAMPLE`;
 /// anything else waits for a file event (with the safety sweep as the backstop).
 fn wait_timeout(live_blocked: bool, ramp_end_ms: Option<i64>, now_ms: i64) -> Duration {
     if let Some(end) = ramp_end_ms {
