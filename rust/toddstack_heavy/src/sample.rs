@@ -1,7 +1,8 @@
 //! Machine samples for `heavy history`. While any heavy job waits or runs, each heavy process checks every 10 s
 //! whether a sample is due; the one that finds it due and takes the lock writes it. So samples are at most 30 s apart
 //! in the log, whoever writes them, and none are written when no job exists. This is monitoring (exempt from the
-//! no-polling rule).
+//! no-polling rule). The same check keeps the shared CPU readings (`admit::sustained_pct`) at most 10 s old while any
+//! job exists, so a waiter that arrives on a busy machine sees the last seconds, not only its own 250 ms window.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 
+use crate::admit::BUSY_WINDOW_MS;
 use crate::error::Error;
 use crate::job::{Capacity, Job, State};
 use crate::log::{self, Event};
@@ -24,12 +26,13 @@ fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
 
-/// Writes a sample if one is due and some job exists.
+/// Writes a sample if one is due and some job exists, and adds a shared CPU reading if the newest is `CHECK` old.
 ///
 /// # Errors
 /// Fails when the machine cannot be probed or the state dir cannot be locked.
 pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> Result<bool, Error> {
-    if now_ms() - state.last_sample_ms() < SAMPLE_EVERY_MS {
+    let due = |now: i64| (now - state.last_sample_ms() >= SAMPLE_EVERY_MS, busy_due(state, now));
+    if due(now_ms()) == (false, false) {
         return Ok(false);
     }
     // Measure before taking the lock (it takes a quarter of a second); recheck under it.
@@ -37,11 +40,15 @@ pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> R
     let mut live = machine::live(cwd, cap, &running)?;
     let _lock = state.lock()?;
     let now = now_ms();
-    if now - state.last_sample_ms() < SAMPLE_EVERY_MS {
-        return Ok(false);
-    }
+    let (sample_due, reading_due) = due(now);
     let jobs = state.live_jobs();
     if jobs.is_empty() {
+        return Ok(false);
+    }
+    if reading_due {
+        state.push_busy(now, live.cpu_pct, BUSY_WINDOW_MS);
+    }
+    if !sample_due {
         return Ok(false);
     }
     live.stopped = machine::stopped_ids(&jobs);
@@ -63,6 +70,12 @@ pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> R
     );
     state.set_last_sample_ms(now);
     Ok(true)
+}
+
+/// Is the newest shared CPU reading at least `CHECK` old (or missing)?
+fn busy_due(state: &StateDir, now: i64) -> bool {
+    let every = i64::try_from(CHECK.as_millis()).unwrap_or(i64::MAX);
+    state.busy_readings().last().is_none_or(|(ts, _)| now - ts >= every)
 }
 
 /// Counts the waiters and what blocks them. Only queued jobs that have evaluated (have a reason) wait: a stopped one (Ctrl-Z) cannot start, so it is

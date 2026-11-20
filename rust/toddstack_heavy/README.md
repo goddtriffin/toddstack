@@ -30,22 +30,30 @@ the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
 All of these must hold:
 
 - Reservations: running RAM and VRAM reservations plus this request are at most 90% of capacity.
-- CPU headroom: `all cores - non-heavy usage - live CPU of running jobs` leaves one free core (on 16 cores, jobs
-  start until the CPU is about 94% busy). A job admitted in the last 10 s holds its peak cores (from history) while it
+- CPU headroom: `90% of all cores - max(instant use, sustained use)` leaves one free core. Instant use is non-heavy
+  usage plus the live CPU (or ramp hold) of running jobs; sustained use is the machine's CPU over the last 20 s plus
+  the ramp holds not yet in use. So jobs start while the CPU is at most about 84% busy (83% on 16 cores) and, while
+  jobs wait, the CPU settles in an 80-90% band, never pinned at 100%. The sustained CPU is max(latest, mean of the
+  readings in `~/.local/state/heavy/busy`), which every heavy process adds to (waiters as they re-evaluate, and while any
+  job exists one reading at least every 10 s): a single 250 ms window that falls between build steps can read 80% on a
+  pinned machine, and is not free CPU. A job admitted in the last 10 s holds its peak cores (from history) while it
   ramps up, so a burst of waiters is staggered. The full 10 s hold covers cold jobs, Docker/VM jobs and learned peaks of 75% of
   the machine or more, so those start at least 10 s apart. Any smaller learned peak is full for 3 s; after that, if the machine reads
   under 50% CPU the job has shown its real use and the hold is released, otherwise it shrinks linearly to nothing at
   10 s. A waiter held back by a ramp
   sleeps until the first moment the shrinking holds leave room. A job's recorded peak is the larger of its process tree's peak and the
   machine-wide CPU rise of other programs over the pre-start baseline, so work hosted in Docker's VM (outside the
-  tree) also teaches a real peak.
+  tree) also teaches a real peak. On Linux a process's threads are not counted as children (sysinfo lists each thread
+  with its whole process's RSS and CPU; before 0.3.2 a 16-thread rustc counted 17 times, so learned memory peaks were
+  inflated about 17x and their reservations blocked idle machines on "mem").
 - Memory headroom: `90% of RAM - non-heavy usage - sum over running jobs of max(reservation, live usage)` fits the
   request. Non-heavy usage is machine-wide use minus the process trees of heavy's own jobs (Chrome, Discord, other
   CLIs), smoothed as max(latest sample, mean of the last 3, 10 s apart): a rise blocks at once, a fall is released slowly. On
   Linux CPU includes steal time (`/proc/stat` field 8), which WSL2 and VMs otherwise hide.
 - Guards (veto only): 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16
   cores killed Docker on 2026-11-19). From 2 x cores up, load blocks while it is still rising (load1 > 1.1 x load5)
-  and the CPU is at least 60% busy, or while the CPU is at least 90% busy. Load without CPU is not CPU overload: on
+  and the CPU is at least 75% busy, or while the CPU is at least 90% busy (the CPU here is the larger of the latest
+  and the sustained reading). Load without CPU is not CPU overload: on
   macOS load also counts threads blocked in I/O (network, disk), so it can read 20-60 on an idle CPU (load1 58 at 26%
   CPU during a network outage on 2026-11-20). Memory used below 90%, and no memory
   pressure: macOS `kern.memorystatus_vm_pressure_level` of 2 or more, Linux `/proc/pressure/memory` (`some avg10`

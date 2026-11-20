@@ -144,10 +144,18 @@ fn whole(x: f32) -> u64 {
 }
 
 fn child_map(sys: &System) -> HashMap<Pid, Vec<Pid>> {
+    children_of(sys.processes().iter().map(|(pid, p)| (*pid, p.parent(), p.thread_kind().is_some())))
+}
+
+/// Parent to child processes, threads left out. On Linux sysinfo also lists every thread (task) as a "process" whose
+/// parent is its own process, and a thread reports its whole process's RSS and CPU: summed as children, a rustc with 16
+/// threads counted 17 times its memory (a 46 GB "peak" for a `cargo install` on the rig while the machine used 3 GB).
+/// The process's own entry already covers all its threads.
+fn children_of(procs: impl Iterator<Item = (Pid, Option<Pid>, bool)>) -> HashMap<Pid, Vec<Pid>> {
     let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
-    for (pid, p) in sys.processes() {
-        if let Some(parent) = p.parent() {
-            children.entry(parent).or_default().push(*pid);
+    for (pid, parent, thread) in procs {
+        if let Some(parent) = parent.filter(|_| !thread) {
+            children.entry(parent).or_default().push(pid);
         }
     }
     children
@@ -318,7 +326,7 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         let trees = per_job.iter().fold(Usage::default(), |a, (_, u)| Usage { cpu: a.cpu + u.cpu, mem: a.mem + u.mem, vram: a.vram + u.vram });
         (non_heavy(machine, trees), per_job, (machine.cpu / u64::from(cap.cpu.max(1))).min(100))
     };
-    Ok(Live { load1, load5, mem_used_pct, cpu_pct, mem_pressure, disk_free, non_heavy, per_job, stopped: Vec::new() })
+    Ok(Live { load1, load5, mem_used_pct, cpu_pct, cpu_sustained_pct: 0, mem_pressure, disk_free, non_heavy, per_job, stopped: Vec::new() })
 }
 
 /// Ids of the jobs whose process is stopped (state T).
@@ -388,6 +396,26 @@ mod tests {
         let a = parse_cpu_line("cpu  10 0 10 100 0 0 0 0").unwrap();
         let b = parse_cpu_line("cpu  10 0 10 200 0 0 0 0").unwrap();
         assert_eq!(busy_pct(a, b), 0);
+    }
+
+    #[test]
+    fn threads_are_not_counted_as_child_processes() {
+        // 2026-11-20 on the rig: `cargo install` learned a 46 GB tree peak (largest process 2.6 GB) while the machine
+        // used 3 GB, so its reservation blocked every other job on "mem" at 6-8% memory used. A rustc (pid 10) with 16
+        // threads (pids 11-26, each reporting the process's 2.6 GB) and one child process (pid 30, 0.5 GB).
+        let p = Pid::from_u32;
+        let threads = (11..27).map(|t| (p(t), Some(p(10)), true));
+        let procs = std::iter::once((p(10), Some(p(1)), false)).chain(threads).chain(std::iter::once((p(30), Some(p(10)), false)));
+        let children = children_of(procs);
+        assert_eq!(children.get(&p(10)), Some(&vec![p(30)]), "threads are not children");
+        let rss = |pid: Pid| if pid == p(30) { 512 } else { 2_600 };
+        let mut total = 0;
+        let mut stack = vec![p(10)];
+        while let Some(pid) = stack.pop() {
+            total += rss(pid);
+            stack.extend(children.get(&pid).into_iter().flatten().copied());
+        }
+        assert_eq!(total, 3_112, "MB: the process plus its child, not 17 x 2.6 GB");
     }
 
     #[test]

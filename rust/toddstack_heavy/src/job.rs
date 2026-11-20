@@ -61,8 +61,11 @@ pub struct Live {
     pub load1: f64,
     pub load5: f64,
     pub mem_used_pct: u64,
-    /// Machine-wide CPU busy, 0 to 100.
+    /// Machine-wide CPU busy, 0 to 100, over this sample's short window.
     pub cpu_pct: u64,
+    /// The machine's sustained CPU busy, 0 to 100: max(latest, mean of every heavy process's readings in the last
+    /// `admit::BUSY_WINDOW_MS`). 0 when unknown (then only the latest sample counts).
+    pub cpu_sustained_pct: u64,
     /// The system reports memory pressure (macOS level 2 or more, Linux PSI); false when it cannot be read.
     pub mem_pressure: bool,
     pub disk_free: u64,

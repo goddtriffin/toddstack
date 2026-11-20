@@ -61,6 +61,32 @@ impl StateDir {
         let _ = fs::write(self.base.join("last_sample"), ms.to_string());
     }
 
+    /// Recent machine-wide CPU readings `(ms since the epoch, busy %)`, oldest first. Every heavy process that measures
+    /// the machine adds one, so a waiter that has only just arrived still sees the last seconds, not one 250 ms window.
+    #[must_use]
+    pub fn busy_readings(&self) -> Vec<(i64, u64)> {
+        let text = fs::read_to_string(self.base.join("busy")).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| {
+                let (ts, pct) = l.split_once(' ')?;
+                Some((ts.parse().ok()?, pct.parse().ok()?))
+            })
+            .collect()
+    }
+
+    /// Call with the lock held: records a reading and keeps only those from the last `keep_ms`.
+    pub fn push_busy(&self, now_ms: i64, pct: u64, keep_ms: i64) {
+        let mut all = self.busy_readings();
+        all.push((now_ms, pct));
+        all.retain(|(ts, _)| now_ms - *ts <= keep_ms);
+        all.sort_unstable();
+        let text = all.iter().map(|(ts, pct)| format!("{ts} {pct}")).collect::<Vec<_>>().join("\n");
+        let tmp = self.base.join(".busy.tmp");
+        if fs::write(&tmp, text).is_ok() {
+            let _ = fs::rename(tmp, self.base.join("busy"));
+        }
+    }
+
     #[must_use]
     pub fn history_path(&self) -> PathBuf {
         self.base.join("history.jsonl")
@@ -169,6 +195,16 @@ mod tests {
         let s = StateDir::at(t.path().to_path_buf());
         s.ensure().unwrap();
         (t, s)
+    }
+
+    #[test]
+    fn busy_readings_keep_only_the_window() {
+        let (_t, s) = dir();
+        assert_eq!(s.busy_readings(), vec![]);
+        s.push_busy(1_000, 100, 20_000);
+        s.push_busy(15_000, 98, 20_000);
+        s.push_busy(25_000, 60, 20_000);
+        assert_eq!(s.busy_readings(), vec![(15_000, 98), (25_000, 60)], "the reading from 24 s ago is dropped");
     }
 
     #[test]
