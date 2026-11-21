@@ -390,8 +390,8 @@ pub fn headroom_for(
     now_ms: i64,
     small: bool,
 ) -> Usage {
-    let (mut held, unmet, (pre_peak, tail)) = running.iter().fold(
-        (Usage::default(), 0, (0u64, 0u64)),
+    let (mut held, (unmet, unmet_small), (pre_peak, tail)) = running.iter().fold(
+        (Usage::default(), (0, 0), (0u64, 0u64)),
         |(a, unmet, learned), j| {
             let l = live
                 .per_job
@@ -442,7 +442,13 @@ pub fn headroom_for(
                     mem: a.mem + mem,
                     vram: a.vram + l.vram.max(j.weights.vram),
                 },
-                unmet + hold.saturating_sub(l.cpu),
+                {
+                    let own = hold.saturating_sub(l.cpu);
+                    // A small job's own unrealized hold is not part of the capped big reservation: it stacks.
+                    let is_small =
+                        small && centi(j.weights.cpu).min(centi(cap.cpu)) <= backfill(cap);
+                    (unmet.0 + own, unmet.1 + if is_small { own } else { 0 })
+                },
                 (learned.0 + learned_unmet.0, learned.1 + learned_unmet.1),
             )
         },
@@ -464,14 +470,18 @@ pub fn headroom_for(
     } else {
         u64::MAX
     };
+    // The backfill share is one shared budget: the big holds are capped to leave it free, and every admitted small
+    // job's own unrealized hold (`unmet_small`) is then spent from it, on top of the cap.
     let live_jobs = held.cpu.saturating_sub(unmet);
     let held_cpu = held
         .cpu
+        .saturating_sub(unmet_small)
         .min(limit.saturating_sub(live.non_heavy.cpu))
-        .max(live_jobs);
+        .max(live_jobs)
+        + unmet_small;
     let measured = live.cpu_sustained_pct * centi(cap.cpu) / 100;
     let instant = live.non_heavy.cpu + held_cpu;
-    let sustained = (measured + unmet).min(limit).max(measured);
+    let sustained = (measured + unmet - unmet_small).min(limit).max(measured) + unmet_small;
     let room = ceiling(cap)
         .saturating_sub(live.non_heavy)
         .saturating_sub(held);
@@ -557,8 +567,12 @@ fn blocker(
         if !fits_reservations(w, running, cap) {
             return Some(blocked("vram reservations full", false, Block::Vram));
         }
-        let ask = request(w);
         let small = centi(w.cpu) <= backfill(cap);
+        let mut ask = request(w);
+        if small {
+            // A small waiter's learned peak must fit in what the band has left after every outstanding hold.
+            ask.cpu = ask.cpu.max(centi(w.cpu));
+        }
         let room_at = |t: i64| headroom_for(running, cap, live, t, small);
         if !fits(ask, room_at(now_ms)) {
             // Would it fit without the ramp holds? Then the ramp is the blocker, and the holds shrink on a known schedule:
@@ -2675,6 +2689,79 @@ mod tests {
             &busy,
             20_000
         )));
+    }
+
+    fn six_small_waiters(live: &Live, run: &Job, now: i64) -> usize {
+        let c = mac();
+        let mut running = vec![run.clone()];
+        for i in 0..6 {
+            let id = format!("s{i}");
+            let w = job(&id, 2, 1, State::Queued, 1);
+            let mut jobs = running.clone();
+            jobs.push(w.clone());
+            if evaluate(&w, &jobs, &c, live, now) == Decision::Start {
+                running.push(Job {
+                    state: State::Running,
+                    started_ms: Some(now),
+                    cpu_hold_ms: Some(40_000),
+                    ..w
+                });
+            }
+        }
+        running.len() - 1
+    }
+
+    fn held_big() -> (Job, Live) {
+        let run = Job {
+            state: State::Running,
+            started_ms: Some(0),
+            cpu_hold_ms: Some(40_000),
+            ..job("r", 16, 2, State::Running, 0)
+        };
+        let live = Live {
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: 200,
+                    mem: 2 * G,
+                    vram: 0,
+                },
+            )],
+            cpu_pct: 13,
+            cpu_sustained_pct: 13,
+            ..calm()
+        };
+        (run, live)
+    }
+
+    #[test]
+    fn small_waiters_share_one_backfill_budget_under_a_held_peak() {
+        let (run, live) = held_big();
+        // Band 14.4 cores, big hold capped to leave 2 free: only one 2-core waiter fits, not all six.
+        assert_eq!(six_small_waiters(&live, &run, 20_000), 1);
+    }
+
+    #[test]
+    fn the_rest_start_once_the_big_peak_shows_or_its_hold_expires() {
+        let (run, live) = held_big();
+        // Peak shows (1200+ cores-centi in live use at 75% of 16): live use counts, holds are gone; 6 x 2 cores fit
+        // only as far as the measured 75% leaves room.
+        let shown = Live {
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: 1_200,
+                    mem: 2 * G,
+                    vram: 0,
+                },
+            )],
+            cpu_pct: 75,
+            cpu_sustained_pct: 75,
+            ..live.clone()
+        };
+        assert_eq!(six_small_waiters(&shown, &run, 20_000), 1);
+        // Hold expired with the machine reading low (an incremental build): all six are admitted.
+        assert_eq!(six_small_waiters(&live, &run, 41_000), 6);
     }
 
     #[test]
