@@ -49,10 +49,19 @@ All of these must hold:
   tree) also teaches a real peak. On Linux a process's threads are not counted as children (sysinfo lists each thread
   with its whole process's RSS and CPU; before 0.3.2 a 16-thread rustc counted 17 times, so learned memory peaks were
   inflated about 17x and their reservations blocked idle machines on "mem").
-- Memory headroom: `90% of RAM - non-heavy usage - live memory of running jobs - the unused part of the reservation of jobs admitted in the last 10 s` fits the
-  request. Declared (`--mem`) or learned sizes never block once their job is past the ramp (before 0.4.2 reservations summing over 85% blocked jobs at 43% memory used). Non-heavy usage is machine-wide use minus the process trees of stokehold's own jobs (Chrome, Discord, other
+- Memory headroom: `90% of RAM - non-heavy usage - live memory of running jobs - the unused part of each job's reservation` fits the
+  request. The unused part (reservation minus live use) of a declared (`--mem`) size is held for the whole run. A learned
+  size's is held until the job's learned time to peak (history records when memory peaked; 60 s when unknown, at least 10 s),
+  then shrinks to nothing over 60 s; those learned holds together take at most 3/4 of the memory still free. Reservations
+  that merely sum high never block (before 0.4.2 reservations summing over 85% blocked jobs at 43% memory used), but a
+  burst of late-peaking jobs cannot all start either (12 jobs of a 12G peak on a 64G Mac: 3 start, not 12). Docker and
+  WSL VM memory is outside the job's process tree, so for docker jobs the learned peak also counts the machine-wide
+  memory rise over the pre-start baseline, as CPU does. Non-heavy usage is machine-wide use minus the process trees of stokehold's own jobs (Chrome, Discord, other
   CLIs), smoothed as max(latest sample, mean of the last 3, 10 s apart): a rise blocks at once, a fall is released slowly. On
   Linux CPU includes steal time (`/proc/stat` field 8), which WSL2 and VMs otherwise hide.
+- Known limit: the memory and pressure guards only veto new starts. A gate cannot stop jobs already running, and
+  stokehold does not kill them: if running jobs all grow past their learned peaks, memory can still run out. The unused
+  reservation holds above are what protect against this, not the guards.
 - Guards (veto only): 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16
   cores killed Docker on 2026-11-19). From 2 x cores up, load blocks while it is still rising (load1 > 1.1 x load5)
   and the CPU is at least 75% busy, or while the CPU is at least 90% busy (the CPU here is the larger of the latest

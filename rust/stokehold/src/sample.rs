@@ -136,6 +136,8 @@ mod tests {
             state,
             enqueued_ms: 1,
             started_ms: None,
+            mem_declared: false,
+            mem_peak_at_ms: None,
             blocked_by: by.map(Into::into),
         }
     }

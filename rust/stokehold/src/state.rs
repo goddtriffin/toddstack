@@ -365,6 +365,8 @@ mod tests {
             enqueued_ms: 1,
             started_ms: None,
             blocked_by: None,
+            mem_declared: false,
+            mem_peak_at_ms: None,
         }
     }
 

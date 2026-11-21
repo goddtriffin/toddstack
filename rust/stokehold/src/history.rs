@@ -87,6 +87,8 @@ pub struct Defaults {
     pub cpu: u32,
     pub mem: u64,
     pub vram: Option<u64>,
+    /// Median time (ms after the start) of the memory peak; `None` when no run recorded it.
+    pub mem_peak_at_ms: Option<u64>,
 }
 
 fn median(mut v: Vec<u64>) -> Option<u64> {
@@ -205,10 +207,17 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
             .collect(),
     )?;
     let vram = pick(mine.iter().filter_map(|e| e.measured.peak_vram).collect());
+    let mem_peak_at_ms = pick(
+        mine.iter()
+            .map(|e| e.measured.peak_mem_at_ms)
+            .filter(|ms| *ms > 0)
+            .collect(),
+    );
     Some(Defaults {
         cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX),
         mem,
         vram,
+        mem_peak_at_ms,
     })
 }
 
@@ -264,7 +273,8 @@ mod tests {
             Defaults {
                 cpu: 3,
                 mem: 200,
-                vram: None
+                vram: None,
+                mem_peak_at_ms: None
             }
         );
         assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
@@ -281,7 +291,8 @@ mod tests {
             Defaults {
                 cpu: 7,
                 mem: 900,
-                vram: None
+                vram: None,
+                mem_peak_at_ms: None
             }
         );
     }

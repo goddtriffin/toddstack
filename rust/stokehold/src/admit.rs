@@ -1,9 +1,13 @@
 //! Admission: pure decisions.
 //!
 //! Memory is judged by measured headroom, like CPU: 90% of RAM minus non-heavy use, minus each running job's live use,
-//! minus the part of a reservation a job admitted within `RAMP_MS` has not yet used. A declared or learned size never
-//! blocks once its job is past the ramp (2026-11-20: reservations summing over 85% blocked jobs at 43% memory used and
-//! left the Mac idle). VRAM stays reservation-based: running reservations plus the request within 90% of capacity.
+//! minus the part of each running job's reservation it has not yet used (its unmet part). A declared (`--mem`) size is
+//! held for the whole run. A learned size is held until the job's learned time to peak (`mem_peak_at_ms`; at least
+//! `RAMP_MS`, and `MEM_FALLBACK_HOLD_MS` when unknown), then decays linearly to nothing over `MEM_DECAY_MS`: builds
+//! peak late, and a hold cut at 10 s let 12 jobs of a 12G peak start on a 64G Mac (reviewer's simulation). The learned
+//! holds together take at most `MEM_HELD_CAP` of the free memory, so measured use still admits jobs. Reservations that
+//! only sum high never block (2026-11-20: reservations summing over 85% blocked jobs at 43% memory used and left the
+//! Mac idle). VRAM stays reservation-based: running reservations plus the request within 90% of capacity.
 //! CPU is judged by live headroom only, never by peak-core reservations (a build
 //! that peaks near all cores would otherwise block everything on an idle machine):
 //!
@@ -61,6 +65,13 @@ pub const RAMP_FULL_MS: i64 = 3_000;
 /// A learned peak of at least this fraction (3/4) of the machine keeps the full `RAMP_MS` hold, like a whole-machine hold: two
 /// such jobs together would overload it, and an idle reading right after the floor proves nothing yet.
 const FULL_HOLD_FRACTION: (u64, u64) = (3, 4);
+/// A learned memory size with no known time to peak is held this long after admission.
+pub const MEM_FALLBACK_HOLD_MS: i64 = 60_000;
+/// After its hold, a learned size's unused part shrinks linearly to nothing over this long.
+pub const MEM_DECAY_MS: i64 = 60_000;
+/// The learned unused parts together may take at most this fraction (3/4) of the memory still free (ceiling minus
+/// machine use), so a burst cannot all peak at once while measured use still admits jobs.
+const MEM_HELD_CAP: (u64, u64) = (3, 4);
 /// After `RAMP_FULL_MS`, a machine measured under this CPU % has room the ramping job is not using: its hold is released.
 const RAMP_IDLE_CPU_PCT: u64 = 50;
 /// Granularity of the search for the moment a ramp-blocked waiter will fit.
@@ -206,14 +217,29 @@ pub fn fits_reservations(req: Weights, running: &[&Job], cap: &Capacity) -> bool
     req.vram <= ceiling(cap).vram.saturating_sub(used)
 }
 
-/// The part of a reservation a job `elapsed_ms` after admission has not yet used: held until `RAMP_MS`, then released
-/// whatever the job's live memory is.
+/// The part of a reservation a job `elapsed_ms` after admission has not yet used. A `declared` size is held for the
+/// whole run. A learned one is held until `peak_at_ms` (at least `RAMP_MS`; `MEM_FALLBACK_HOLD_MS` when unknown), then
+/// shrinks linearly to nothing over `MEM_DECAY_MS`.
 #[must_use]
-pub fn mem_unmet(reserved: u64, live: u64, elapsed_ms: i64) -> u64 {
-    if elapsed_ms >= RAMP_MS {
+pub fn mem_unmet(
+    reserved: u64,
+    live: u64,
+    elapsed_ms: i64,
+    declared: bool,
+    peak_at_ms: Option<i64>,
+) -> u64 {
+    let unmet = reserved.saturating_sub(live);
+    if declared {
+        return unmet;
+    }
+    let hold = peak_at_ms.unwrap_or(MEM_FALLBACK_HOLD_MS).max(RAMP_MS);
+    if elapsed_ms <= hold {
+        unmet
+    } else if elapsed_ms >= hold + MEM_DECAY_MS {
         0
     } else {
-        reserved.saturating_sub(live)
+        unmet * u64::try_from(hold + MEM_DECAY_MS - elapsed_ms).unwrap_or(0)
+            / u64::try_from(MEM_DECAY_MS).unwrap_or(1)
     }
 }
 
@@ -263,36 +289,66 @@ pub fn sustained_pct(latest: u64, readings: &[(i64, u64)], now_ms: i64) -> u64 {
 /// ramp holds not yet in use.
 #[must_use]
 pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> Usage {
-    let (held, unmet) = running.iter().fold((Usage::default(), 0), |(a, unmet), j| {
-        let l = live
-            .per_job
+    let (mut held, unmet, learned) =
+        running
             .iter()
-            .find(|(id, _)| *id == j.id)
-            .map_or_else(Usage::default, |(_, u)| *u);
-        let hold = j.started_ms.map_or(0, |t| {
-            ramp_hold(
-                centi(j.weights.cpu).min(centi(cap.cpu)),
-                centi(cap.cpu),
-                now_ms.saturating_sub(t).max(0),
-                live.cpu_pct,
-                crate::run::hosts_vm_work(&j.cmd),
-            )
-        });
-        let cpu = l.cpu.max(hold);
-        let mem = l.mem
-            + j.started_ms
-                .map_or(j.weights.mem.saturating_sub(l.mem), |t| {
-                    mem_unmet(j.weights.mem, l.mem, now_ms.saturating_sub(t).max(0))
+            .fold((Usage::default(), 0, 0u64), |(a, unmet, learned), j| {
+                let l = live
+                    .per_job
+                    .iter()
+                    .find(|(id, _)| *id == j.id)
+                    .map_or_else(Usage::default, |(_, u)| *u);
+                let hold = j.started_ms.map_or(0, |t| {
+                    ramp_hold(
+                        centi(j.weights.cpu).min(centi(cap.cpu)),
+                        centi(cap.cpu),
+                        now_ms.saturating_sub(t).max(0),
+                        live.cpu_pct,
+                        crate::run::hosts_vm_work(&j.cmd),
+                    )
                 });
-        (
-            Usage {
-                cpu: a.cpu + cpu,
-                mem: a.mem + mem,
-                vram: a.vram + l.vram.max(j.weights.vram),
-            },
-            unmet + hold.saturating_sub(l.cpu),
-        )
-    });
+                let cpu = l.cpu.max(hold);
+                // A running job not yet stamped, or one with a declared size, holds its whole unused part; a learned size holds
+                // it by schedule, and those holds are capped together below.
+                let (mem, learned_unmet) = match j.started_ms {
+                    Some(t) if !j.mem_declared => (
+                        l.mem,
+                        mem_unmet(
+                            j.weights.mem,
+                            l.mem,
+                            now_ms.saturating_sub(t).max(0),
+                            false,
+                            j.mem_peak_at_ms,
+                        ),
+                    ),
+                    Some(t) => (
+                        l.mem
+                            + mem_unmet(
+                                j.weights.mem,
+                                l.mem,
+                                now_ms.saturating_sub(t).max(0),
+                                true,
+                                None,
+                            ),
+                        0,
+                    ),
+                    None => (l.mem + j.weights.mem.saturating_sub(l.mem), 0),
+                };
+                (
+                    Usage {
+                        cpu: a.cpu + cpu,
+                        mem: a.mem + mem,
+                        vram: a.vram + l.vram.max(j.weights.vram),
+                    },
+                    unmet + hold.saturating_sub(l.cpu),
+                    learned + learned_unmet,
+                )
+            });
+    let free = ceiling(cap)
+        .mem
+        .saturating_sub(live.non_heavy.mem)
+        .saturating_sub(held.mem);
+    held.mem += learned.min(free / MEM_HELD_CAP.1 * MEM_HELD_CAP.0);
     let instant = live.non_heavy.cpu + held.cpu;
     let sustained = live.cpu_sustained_pct * centi(cap.cpu) / 100 + unmet;
     let room = ceiling(cap)
@@ -523,6 +579,8 @@ mod tests {
             enqueued_ms: enq,
             started_ms: None,
             blocked_by: None,
+            mem_declared: false,
+            mem_peak_at_ms: None,
         }
     }
     fn waits(d: &Decision) -> bool {
@@ -662,14 +720,137 @@ mod tests {
     }
 
     #[test]
-    fn mem_unmet_is_held_only_through_the_ramp() {
-        assert_eq!(mem_unmet(10 * G, 3 * G, 0), 7 * G);
+    fn mem_unmet_is_held_to_the_learned_peak_then_decays() {
+        let unmet = |at: i64, declared, peak| mem_unmet(10 * G, 3 * G, at, declared, peak);
         assert_eq!(
-            mem_unmet(10 * G, 12 * G, 0),
+            mem_unmet(10 * G, 12 * G, 0, false, None),
             0,
             "live use over the reservation leaves nothing unmet"
         );
-        assert_eq!(mem_unmet(10 * G, 3 * G, RAMP_MS), 0);
+        // Learned peak at 90 s: held in full until then, half left 30 s later, nothing after the decay.
+        assert_eq!(unmet(RAMP_MS, false, Some(90_000)), 7 * G);
+        assert_eq!(unmet(90_000, false, Some(90_000)), 7 * G);
+        assert_eq!(
+            unmet(90_000 + MEM_DECAY_MS / 2, false, Some(90_000)),
+            7 * G / 2
+        );
+        assert_eq!(unmet(90_000 + MEM_DECAY_MS, false, Some(90_000)), 0);
+        // A peak earlier than the ramp still holds through the ramp; an unknown peak uses the fallback hold.
+        assert_eq!(unmet(RAMP_MS, false, Some(2_000)), 7 * G);
+        assert_eq!(unmet(MEM_FALLBACK_HOLD_MS, false, None), 7 * G);
+        assert_eq!(unmet(MEM_FALLBACK_HOLD_MS + MEM_DECAY_MS, false, None), 0);
+        // A declared size is held for the whole run.
+        assert_eq!(unmet(10_000_000, true, None), 7 * G);
+    }
+
+    fn big_mac() -> Capacity {
+        Capacity {
+            cpu: 16,
+            mem: 64 * G,
+            vram: 0,
+            disk_total: 1000 * G,
+            vram_is_ram: false,
+        }
+    }
+
+    /// How many of 12 waiters, each with a learned 12G peak that use 1G for their first minutes, start in turn on a
+    /// 64G Mac with 10G of other programs.
+    fn admitted_of_twelve(declared: bool, now: impl Fn(usize) -> i64) -> usize {
+        let cap = big_mac();
+        let mut running: Vec<Job> = vec![];
+        for i in 0..12_i64 {
+            let w = Job {
+                mem_declared: declared,
+                mem_peak_at_ms: Some(120_000),
+                ..job(&format!("w{i:02}"), 1, 12, State::Queued, i)
+            };
+            let live = Live {
+                non_heavy: Usage {
+                    cpu: 0,
+                    mem: 10 * G,
+                    vram: 0,
+                },
+                per_job: running
+                    .iter()
+                    .map(|j: &Job| {
+                        (
+                            j.id.clone(),
+                            Usage {
+                                cpu: 50,
+                                mem: G,
+                                vram: 0,
+                            },
+                        )
+                    })
+                    .collect(),
+                ..calm()
+            };
+            let mut all = running.clone();
+            all.push(w.clone());
+            if evaluate(&w, &all, &cap, &live, now(usize::try_from(i).unwrap_or(0)))
+                == Decision::Start
+            {
+                running.push(Job {
+                    state: State::Running,
+                    started_ms: Some(0),
+                    ..w
+                });
+            }
+        }
+        running.len()
+    }
+
+    #[test]
+    fn twelve_late_peaking_jobs_do_not_all_start_on_a_64g_mac() {
+        // Reviewer's case: 144G of peaks on 64G. 0.4.1 admitted 4; releasing every hold at 10 s admitted all 12.
+        // Held until the learned peak (120 s), 30 s in: a few start, never all.
+        let n = admitted_of_twelve(false, |_| 30_000);
+        assert!((2..=5).contains(&n), "{n} admitted");
+        // Past peak and decay (3 minutes) the holds are gone and measured use (1G each) admits them all.
+        assert_eq!(admitted_of_twelve(false, |_| 180_000), 12);
+        // Declared sizes are held whatever the time.
+        let n = admitted_of_twelve(true, |_| 3_600_000);
+        assert!((2..=5).contains(&n), "{n} admitted");
+    }
+
+    #[test]
+    fn a_declared_mem_is_held_for_the_whole_run() {
+        let cap = big_mac();
+        let live = Live {
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: 100,
+                    mem: 2 * G,
+                    vram: 0,
+                },
+            )],
+            ..calm()
+        };
+        let me = job("w", 1, 30, State::Queued, 1);
+        let held = |declared: bool, now: i64| {
+            let r = Job {
+                started_ms: Some(0),
+                mem_declared: declared,
+                mem_peak_at_ms: Some(5_000),
+                ..job("r", 1, 40, State::Running, 0)
+            };
+            evaluate(&me, &[r, me.clone()], &cap, &live, now)
+        };
+        // Declared 40G, using 2G, an hour in: 38G still held, so 30G does not fit under the 57.6G ceiling.
+        assert!(
+            matches!(
+                held(true, 3_600_000),
+                Decision::Wait {
+                    block: Block::Mem,
+                    ..
+                }
+            ),
+            "{:?}",
+            held(true, 3_600_000)
+        );
+        // The same learned size is gone after its peak time and decay.
+        assert_eq!(held(false, 3_600_000), Decision::Start);
     }
 
     #[test]
@@ -711,7 +892,7 @@ mod tests {
         let over = job("o", 5, 41, State::Queued, 1);
         let d = evaluate(&over, &[run.clone(), over.clone()], &cap(), &live, 2);
         assert!(matches!(d, Decision::Wait { live: true, .. }), "{d:?}");
-        // Past the ramp an unused reservation holds nothing; CPU and memory are both just live.
+        // Past its hold and decay an unused reservation holds nothing; CPU and memory are both just live.
         let idle = Live {
             per_job: vec![("r".into(), Usage::default())],
             non_heavy: Usage::default(),
@@ -721,7 +902,7 @@ mod tests {
             started_ms: Some(0),
             ..run
         };
-        let room = headroom(&[&run], &cap(), &idle, 100_000);
+        let room = headroom(&[&run], &cap(), &idle, 200_000);
         assert_eq!((room.cpu, room.mem), (900, 90 * G));
         // Inside the ramp the unused part of the reservation still counts.
         let room = headroom(&[&run], &cap(), &idle, 1_000);
