@@ -43,8 +43,8 @@
 //! least 75% busy, and any load there blocks while the CPU is at least 90% busy. Load without CPU is not CPU overload:
 //! on macOS load also counts threads blocked in I/O (network, disk), so it can read 20-60 with the CPU nearly idle
 //! (a power or network outage on 2026-11-20 read load1 58 at 26% CPU with nothing heavy running). Critical memory
-//! pressure (macOS level 4, Linux PSI) blocks; macOS warn (level 2) only with memory 85% used. A job that would run
-//! alone on a CPU under 75% busy is vetoed only by the hard guards (see `guard_block`).
+//! pressure (macOS level 4, Linux PSI) blocks; macOS warn (level 2) only with memory 85% used. Memory used at 95%
+//! blocks even a lone job.
 
 use std::collections::VecDeque;
 
@@ -64,8 +64,11 @@ const CPU_PCT: u64 = 95;
 /// nothing running at 27% CPU). Level 4 ("critical") always blocks.
 const WARN_MEM_PCT: u64 = 85;
 /// A tiny job (at most the backfill share of cores and this fraction, 1/32, of RAM) may pass a head that is blocked by
-/// memory, VRAM, a guard, or a ramp hold it does not prolong, however long the head has waited.
+/// memory, VRAM or a guard (for up to `TINY_BYPASS_MS` of its wait), or a ramp hold it does not prolong.
 const TINY_MEM: (u64, u64) = (1, 32);
+/// Tiny jobs pass a head blocked by memory, VRAM or a guard only while it has waited under this long: a stream of them
+/// (up to 1/32 of RAM each) could otherwise hold its memory away until its timeout.
+pub const TINY_BYPASS_MS: i64 = 5 * 60_000;
 /// How far back the shared CPU readings count towards the sustained CPU.
 pub const BUSY_WINDOW_MS: i64 = 20_000;
 /// Load at or over this many times the core count blocks only while the CPU is also this busy.
@@ -585,11 +588,11 @@ const RISING_MARGIN: f64 = 1.1;
 /// pressure (macOS level 4, Linux PSI). From 2 x cores up the load blocks while it is still rising (load1 > 1.1 x load5)
 /// with the CPU at least 75% busy, and while the CPU is at least 90% busy (the CPU is the larger of the latest and the
 /// sustained reading); a high load with a calm CPU is I/O wait (macOS counts blocked threads), so it admits. Memory used
-/// at 95%, or macOS warn pressure with memory used at 85%, blocks too, except for a job that would run `alone` on a CPU
-/// under 75% busy: the deadlock breaker, so queued jobs never sit behind an idle machine (2026-11-21: three jobs queued
-/// 40+ minutes with nothing running at 27% CPU, on warn pressure).
+/// at 95% blocks too, even a lone job (no exception: a lone 8 GB job at 97% used thrashes), and so does macOS warn
+/// pressure with memory used at 85%. Warn alone never blocks (2026-11-21: three jobs queued 40+ minutes with nothing
+/// running at 27% CPU, on warn pressure at 49% used).
 #[must_use]
-pub fn guard_block(cap: &Capacity, live: &Live, alone: bool) -> Option<(String, Block)> {
+pub fn guard_block(cap: &Capacity, live: &Live) -> Option<(String, Block)> {
     let cores = f64::from(cap.cpu);
     let (soft, hard) = (LOAD_SOFT * cores, LOAD_HARD * cores);
     let cpu = live.cpu_pct.max(live.cpu_sustained_pct);
@@ -604,9 +607,6 @@ pub fn guard_block(cap: &Capacity, live: &Live, alone: bool) -> Option<(String, 
     }
     if live.mem_pressure {
         return Some(("critical memory pressure".into(), Block::Mem));
-    }
-    if alone && cpu < LOAD_RISING_CPU_PCT {
-        return None;
     }
     if live.load1 >= soft {
         if live.load1 > live.load5 * RISING_MARGIN && cpu >= LOAD_RISING_CPU_PCT {
@@ -749,7 +749,7 @@ fn blocker(
             return Some(blocked(reason, true, block));
         }
     }
-    guard_block(cap, live, running.is_empty()).map(|(why, block)| blocked(why, true, block))
+    guard_block(cap, live).map(|(why, block)| blocked(why, true, block))
 }
 
 /// Can `job` start now, given every job file (already pruned of dead ones)?
@@ -812,10 +812,10 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
                     after.block != Block::Ramp
                         || after.ramp_end_ms.unwrap_or(i64::MAX) > b.ramp_end_ms.unwrap_or(i64::MAX)
                 }),
-                _ => false,
+                _ => now_ms - head.enqueued_ms >= TINY_BYPASS_MS,
             })
         {
-            // A tiny job passes a head blocked by memory, VRAM or a guard at any age, and one held back by ramp holds
+            // A tiny job passes a head blocked by memory, VRAM or a guard until it has waited `TINY_BYPASS_MS`, and one held back by ramp holds
             // when it does not delay the head's start: it takes next to nothing of what the head waits for. Behind CPU
             // room it would, and a stream of them could starve the head.
             if now_ms - head.enqueued_ms >= BACKFILL_WINDOW_MS {
@@ -1417,19 +1417,28 @@ mod tests {
             ),
             "4 x cores blocks whatever the CPU says"
         );
-        // Memory used at 95% blocks while a job runs; alone on a calm CPU the deadlock breaker starts the job.
+        // Memory used at 95% blocks, a lone job too.
         let mem = Live {
             mem_used_pct: 95,
             ..calm()
         };
         let run = job("r", 1, 1, State::Running, 0);
         assert!(waits(&evaluate(&me, &[run, me.clone()], &cap(), &mem, 0)));
-        assert_eq!(evaluate(&me, one, &cap(), &mem, 0), Decision::Start);
-        let mem_busy = Live { cpu_pct: 80, ..mem };
-        assert!(
-            waits(&evaluate(&me, one, &cap(), &mem_busy, 0)),
-            "the breaker needs a calm CPU"
-        );
+        assert!(waits(&evaluate(&me, one, &cap(), &mem, 0)), "even alone");
+        // 2026-11-21 review: 97% used, level 2 pressure, nothing running: an 8 GB job must not start.
+        let thrash = Live {
+            mem_used_pct: 97,
+            mem_pressure_warn: true,
+            ..calm()
+        };
+        let big = job("b", 1, 8, State::Queued, 0);
+        assert!(waits(&evaluate(
+            &big,
+            std::slice::from_ref(&big),
+            &cap(),
+            &thrash,
+            0
+        )));
     }
 
     #[test]
@@ -3015,7 +3024,7 @@ mod tests {
             cpu_sustained_pct: 97,
             ..calm()
         };
-        let (why, block) = guard_block(&c, &over, false).unwrap();
+        let (why, block) = guard_block(&c, &over).unwrap();
         assert_eq!(block, Block::Load1);
         assert!(
             why.contains("2 x 16 cores") && why.contains("cpu 97% busy"),
@@ -3036,7 +3045,7 @@ mod tests {
             cpu_sustained_pct: 30,
             ..over
         };
-        assert_eq!(guard_block(&c, &io, false), None);
+        assert_eq!(guard_block(&c, &io), None);
     }
 
     #[test]
@@ -3242,7 +3251,7 @@ mod tests {
                     ..
                 }
             ),
-            "69% busy + 5.2 cores > 16"
+            "68% busy + 5.2 cores > 16"
         );
         assert_eq!(onto_busy_mac(1_080, 13), Decision::Start, "67% + 5.2 fits");
         assert_eq!(
@@ -3481,34 +3490,42 @@ mod tests {
     }
 
     #[test]
-    fn the_deadlock_breaker_starts_a_lone_head_on_a_calm_cpu_but_keeps_the_hard_guards() {
+    fn a_lone_job_is_held_by_the_memory_and_runaway_guards_but_not_by_warn_alone() {
         let me = job("a", 16, 8, State::Queued, 0);
         let one = std::slice::from_ref(&me);
         let c = mac();
-        let soft = Live {
-            mem_used_pct: 96,
+        // 2026-11-21: warn pressure at 49% used with nothing running starts the job.
+        let warn = Live {
+            mem_used_pct: 49,
             mem_pressure_warn: true,
-            cpu_pct: 40,
-            cpu_sustained_pct: 40,
+            cpu_pct: 27,
             ..calm()
         };
-        assert_eq!(evaluate(&me, one, &c, &soft, 0), Decision::Start);
-        // A busy CPU (other programs) keeps the soft guards.
-        let busy = Live {
-            cpu_pct: 80,
-            ..soft.clone()
-        };
-        assert!(waits(&evaluate(&me, one, &c, &busy, 0)));
-        // The hard guards never break: critical pressure, and the load-120 runaway (4 x cores).
+        assert_eq!(evaluate(&me, one, &c, &warn, 0), Decision::Start);
+        // 95% used blocks a lone job, with or without warn.
+        for warn_on in [false, true] {
+            let full = Live {
+                mem_used_pct: 97,
+                mem_pressure_warn: warn_on,
+                ..calm()
+            };
+            assert!(matches!(
+                evaluate(&me, one, &c, &full, 0),
+                Decision::Wait {
+                    block: Block::Mem,
+                    ..
+                }
+            ));
+        }
         let critical = Live {
             mem_pressure: true,
-            ..soft.clone()
+            ..warn.clone()
         };
         assert!(waits(&evaluate(&me, one, &c, &critical, 0)));
         let runaway = Live {
             load1: 64.0,
             load5: 30.0,
-            ..soft
+            ..warn
         };
         assert!(matches!(
             evaluate(&me, one, &c, &runaway, 0),
@@ -3517,6 +3534,118 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tiny_jobs_stop_passing_a_memory_blocked_head_after_the_bypass_window() {
+        let c = mac();
+        let run = Job {
+            started_ms: Some(0),
+            mem_declared: true,
+            ..job("r", 2, 40, State::Running, 0)
+        };
+        let head = job("head", 4, 30, State::Queued, 1_000);
+        let tiny_one = job("tiny", 1, 1, State::Queued, 2_000);
+        let all = [run, head.clone(), tiny_one.clone()];
+        let live = Live {
+            non_heavy: Usage {
+                cpu: 200,
+                mem: 15 * G,
+                vram: 0,
+            },
+            ..calm()
+        };
+        let before = 1_000 + TINY_BYPASS_MS - 1;
+        assert_eq!(
+            evaluate(&tiny_one, &all, &c, &live, before),
+            Decision::Start
+        );
+        let after = 1_000 + TINY_BYPASS_MS;
+        assert!(matches!(
+            evaluate(&tiny_one, &all, &c, &live, after),
+            Decision::Wait {
+                block: Block::Queue,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_tiny_job_passes_a_vram_blocked_head_until_the_bypass_window_ends() {
+        let c = Capacity {
+            vram: 100 * G,
+            ..cap()
+        };
+        let vr = |id: &str, g: u64, state| {
+            let j = job(id, 1, 1, state, 0);
+            Job {
+                weights: Weights {
+                    vram: g * G,
+                    ..j.weights
+                },
+                started_ms: Some(0),
+                ..j
+            }
+        };
+        let run = vr("r", 50, State::Running);
+        let head = Job {
+            enqueued_ms: 1_000,
+            ..vr("head", 41, State::Queued)
+        };
+        let tiny_one = Job {
+            enqueued_ms: 2_000,
+            ..vr("tiny", 0, State::Queued)
+        };
+        let all = [run, head.clone(), tiny_one.clone()];
+        let t = 1_000 + BACKFILL_WINDOW_MS + 1;
+        assert!(matches!(
+            evaluate(&head, &all, &c, &calm(), t),
+            Decision::Wait {
+                block: Block::Vram,
+                ..
+            }
+        ));
+        assert_eq!(evaluate(&tiny_one, &all, &c, &calm(), t), Decision::Start);
+        assert!(waits(&evaluate(
+            &tiny_one,
+            &all,
+            &c,
+            &calm(),
+            1_000 + TINY_BYPASS_MS
+        )));
+    }
+
+    #[test]
+    fn a_tiny_job_passes_a_ramp_blocked_head_only_if_the_head_is_not_delayed() {
+        let c = mac();
+        let ra = Job {
+            started_ms: Some(10),
+            ..job("a", 16, 8, State::Running, 0)
+        };
+        let head = job("b", 16, 8, State::Queued, 2);
+        let tiny_one = job("t", 1, 1, State::Queued, 3);
+        let all = [ra, head.clone(), tiny_one.clone()];
+        let live = Live {
+            non_heavy: Usage {
+                cpu: 320,
+                mem: 8 * G,
+                vram: 0,
+            },
+            ..calm()
+        };
+        let d = evaluate(&head, &all, &c, &live, 500);
+        assert!(
+            matches!(
+                d,
+                Decision::Wait {
+                    block: Block::Ramp,
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+        // The tiny job takes next to nothing of the held CPU: it starts, and the head's ramp end does not move.
+        assert_eq!(evaluate(&tiny_one, &all, &c, &live, 500), Decision::Start);
     }
 
     #[test]
