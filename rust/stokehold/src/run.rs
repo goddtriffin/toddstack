@@ -112,7 +112,7 @@ impl Drop for JobGuard<'_> {
     }
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
 

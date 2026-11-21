@@ -1,7 +1,7 @@
 //! Probing the machine: capacity, live samples, process liveness, network and VRAM counters.
 //!
 //! `STOKEHOLD_CAPACITY` (`cpu=8,mem=16G,vram=0,disk=100G`) and `STOKEHOLD_LIVE` (`load=0.5,load5=0.5,mem_pct=10,disk_free=50G,nonheavy_cpu=200,nonheavy_mem=8G,nonheavy_vram=0`)
-//! override probed numbers; the tests use them (`mem_pressure=2` fakes memory pressure; with any override set, the real
+//! override probed numbers; the tests use them (`mem_pressure=2` fakes warn, `mem_pressure=4` critical pressure; with any override set, the real
 //! pressure is not read).
 
 use std::collections::HashMap;
@@ -261,10 +261,15 @@ impl TreeSampler {
     }
 }
 
-/// macOS: `kern.memorystatus_vm_pressure_level` is 1 normal, 2 warn, 4 critical; pressure is level 2 or more.
+/// macOS: `kern.memorystatus_vm_pressure_level` is 1 normal, 2 warn, 4 critical. Returns `(warn, critical)`. Level 2 is
+/// common and sticky (2026-11-21: level 2 for hours at 49% memory used and 1.8 of 3 GB swap), so only level 4 is
+/// pressure on its own; `admit::guard_block` counts warn only with memory nearly used up.
 #[must_use]
-pub fn mac_pressure(sysctl_out: &str) -> bool {
-    sysctl_out.trim().parse::<u32>().is_ok_and(|l| l >= 2)
+pub fn mac_pressure(sysctl_out: &str) -> (bool, bool) {
+    sysctl_out
+        .trim()
+        .parse::<u32>()
+        .map_or((false, false), |l| (l >= 2, l >= 4))
 }
 
 /// Linux PSI (`/proc/pressure/memory`): tasks stalled on memory. Pressure is `some avg10` of 25 or more, or
@@ -282,17 +287,21 @@ pub fn psi_pressure(text: &str) -> bool {
     })
 }
 
-/// Whether the system is under memory pressure. Cheap, and fails open (false) when it cannot be read.
-fn memory_pressure() -> bool {
+/// Whether the system is under memory pressure, as `(warn, critical)`. Cheap, and fails open (false) when it cannot be
+/// read. Linux PSI counts stalled time, a real signal: it is critical.
+fn memory_pressure() -> (bool, bool) {
     if cfg!(target_os = "macos") {
         return Command::new("sysctl")
             .args(["-n", "kern.memorystatus_vm_pressure_level"])
             .output()
-            .is_ok_and(|o| {
-                o.status.success() && mac_pressure(&String::from_utf8_lossy(&o.stdout))
+            .ok()
+            .filter(|o| o.status.success())
+            .map_or((false, false), |o| {
+                mac_pressure(&String::from_utf8_lossy(&o.stdout))
             });
     }
-    std::fs::read_to_string("/proc/pressure/memory").is_ok_and(|t| psi_pressure(&t))
+    let p = std::fs::read_to_string("/proc/pressure/memory").is_ok_and(|t| psi_pressure(&t));
+    (p, p)
 }
 
 /// Samples what the other programs (not heavy's own job trees) use: machine CPU and memory minus every heavy job's
@@ -425,9 +434,14 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
     let fake = ["nonheavy_cpu", "nonheavy_mem", "nonheavy_vram"]
         .iter()
         .any(|k| get(&o, k).is_some());
-    let mem_pressure = match get(&o, "mem_pressure") {
-        Some(v) => v.parse::<u32>().map_err(|_| bad("mem_pressure", v))? >= 2,
-        None => o.is_empty() && memory_pressure(),
+    // The override is a macOS level: 2 fakes warn, 4 critical.
+    let (mem_pressure_warn, mem_pressure) = match get(&o, "mem_pressure") {
+        Some(v) => {
+            let l = v.parse::<u32>().map_err(|_| bad("mem_pressure", v))?;
+            (l >= 2, l >= 4)
+        }
+        None if o.is_empty() => memory_pressure(),
+        None => (false, false),
     };
     let (non_heavy, per_job, cpu_pct) = if fake {
         let num = |k: &str| -> Result<u64, Error> {
@@ -469,6 +483,7 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         cpu_pct,
         cpu_sustained_pct: 0,
         mem_pressure,
+        mem_pressure_warn,
         disk_free,
         non_heavy,
         per_job,
@@ -539,10 +554,14 @@ mod tests {
 
     #[test]
     fn memory_pressure_levels() {
-        assert!(!mac_pressure("1\n"));
-        assert!(mac_pressure("2\n"));
-        assert!(mac_pressure("4"));
-        assert!(!mac_pressure("garbage"), "fails open");
+        assert_eq!(mac_pressure("1\n"), (false, false));
+        assert_eq!(
+            mac_pressure("2\n"),
+            (true, false),
+            "warn is not pressure on its own"
+        );
+        assert_eq!(mac_pressure("4"), (true, true));
+        assert_eq!(mac_pressure("garbage"), (false, false), "fails open");
         assert!(!psi_pressure(
             "some avg10=3.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=0.50 avg60=0.0 avg300=0.0 total=0\n"
         ));
