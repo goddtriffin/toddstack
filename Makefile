@@ -112,7 +112,7 @@ dev: assets ## runs the template web server's development binary
 		./template-web-server
 
 .PHONY: lint
-lint: ## lints the codebase
+lint: ## @factory lints and formats the codebase
 	cd $(TS) && deno lint webserver-base/
 	cd $(TS) && deno doc --lint webserver-base/
 	cd $(TS) && deno fmt webserver-base/
@@ -122,7 +122,7 @@ lint: ## lints the codebase
 	cd $(RUST) && cargo fmt
 
 .PHONY: test
-test: assets ## runs tests; the template's tests serve the bin/ that assets builds
+test: assets ## @factory runs tests; the template's tests serve the bin/ that assets builds
 	cd $(TS) && deno check webserver-base/
 	# --allow-net: free-port's tests bind real sockets to verify port detection
 	cd $(TS) && deno test --allow-net webserver-base/
