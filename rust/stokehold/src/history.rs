@@ -216,12 +216,13 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
             .filter(|ms| *ms > 0)
             .collect(),
     );
-    let cpu_peak_at_ms = pick(
-        mine.iter()
-            .map(|e| e.measured.peak_cpu_at_ms)
-            .filter(|ms| *ms > 0)
-            .collect(),
-    );
+    // The slowest recent ramp, not the median: about half of all runs ramp later than their median, and a hold that
+    // ended there let the next build in before their CPU showed.
+    let cpu_peak_at_ms = mine
+        .iter()
+        .map(|e| e.measured.peak_cpu_at_ms)
+        .filter(|ms| *ms > 0)
+        .max();
     Some(Defaults {
         cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX),
         mem,
@@ -292,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_time_to_peak_is_the_median_of_the_runs_that_recorded_it() {
+    fn cpu_time_to_peak_is_the_slowest_of_the_runs_that_recorded_it() {
         let runs: Vec<Entry> = [0, 20_000, 30_000, 40_000]
             .into_iter()
             .map(|ms| {
@@ -302,7 +303,7 @@ mod tests {
             })
             .collect();
         let d = defaults_from(&runs, &["t".to_string()], "/a", None).unwrap();
-        assert_eq!(d.cpu_peak_at_ms, Some(30_000), "0 (unknown) is left out");
+        assert_eq!(d.cpu_peak_at_ms, Some(40_000), "0 (unknown) is left out");
         let old = defaults_from(&runs[..1], &["t".to_string()], "/a", None).unwrap();
         assert_eq!(old.cpu_peak_at_ms, None);
     }

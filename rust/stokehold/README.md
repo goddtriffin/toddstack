@@ -41,7 +41,7 @@ All of these must hold:
   job exists one reading at least every 10 s): a single 250 ms window that falls between build steps can read 80% on a
   pinned machine, and is not free CPU. A job with a learned (or `--cpu`) size holds its peak cores until that peak shows
   in its live use (3/4 of it) or its learned time to peak passes (history records when the CPU first reached 3/4 of its
-  peak; the median, at least 10 s, at most 2 min, 30 s when unknown), the same way a learned memory size is held. So a
+  peak; the slowest recent ramp plus 25%, at least 10 s, at most 2 min, 30 s when unknown), the same way a learned memory size is held. So a
   burst of builds starts one at a time as their peaks show (0.4.3: in 0.4.2 holds ended after 10 s, or after 3 s on a
   machine reading under 50%, so several 16-core cargo builds started before their CPU showed and the Mac sat at 95-100%
   CPU with load1 up to 184). Cold jobs (the whole machine for 10 s, so they start at least 10 s apart) and Docker/VM

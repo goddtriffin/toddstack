@@ -22,7 +22,7 @@
 //! read 90-100%).
 //!
 //! A job with a learned (or declared) CPU size holds its peak cores (clamped to the machine) until that peak shows in its
-//! live use (3/4 of it) or its learned time to peak passes (`cpu_hold_ms`: history's median, 10 s to 2 min, 30 s when
+//! live use (3/4 of it) or its learned time to peak passes (`cpu_hold_ms`: history's slowest recent time to peak plus 25%, 10 s to 2 min, 30 s when
 //! unknown), the same way a learned memory size is held. A burst of builds then starts one at a time as their peaks
 //! show: after 0.4.2, holds that ended after 10 s (or at once on an idle-looking machine) let several 16-core cargo builds
 //! in before their CPU showed, and 42% of the samples while jobs waited read CPU over 95% with load1 over 3 x cores.
@@ -300,12 +300,12 @@ pub fn ramp_hold(peak: u64, machine: u64, elapsed_ms: i64, cpu_pct: u64, vm: boo
     peak * left / span
 }
 
-/// How long a learned or declared CPU peak is held, from history's median time to peak (`None`: unknown): at least
-/// `RAMP_MS`, at most `CPU_MAX_HOLD_MS`, and `CPU_FALLBACK_HOLD_MS` when unknown.
+/// How long a learned or declared CPU peak is held, from history's slowest recent time to peak (`None`: unknown) plus
+/// a 25% margin: at least `RAMP_MS`, at most `CPU_MAX_HOLD_MS`, and `CPU_FALLBACK_HOLD_MS` when unknown.
 #[must_use]
 pub fn cpu_hold_ms(peak_at_ms: Option<u64>) -> i64 {
     peak_at_ms
-        .and_then(|ms| i64::try_from(ms).ok())
+        .and_then(|ms| i64::try_from(ms.saturating_add(ms / 4)).ok())
         .unwrap_or(CPU_FALLBACK_HOLD_MS)
         .clamp(RAMP_MS, CPU_MAX_HOLD_MS)
 }
@@ -2558,10 +2558,24 @@ mod tests {
     }
 
     #[test]
+    fn a_hold_from_the_slowest_ramp_outlasts_a_median_length_ramp() {
+        // Runs peaked at 20, 30 and 40 s: the median is 30 s. A build that ramps for 38 s is still ramping when a
+        // median-length hold ends, but not when the hold is the slowest ramp plus a margin.
+        let median_hold = 30_000;
+        let hold = cpu_hold_ms(Some(40_000));
+        assert!(hold > 40_000, "{hold}");
+        let (peak, machine) = (1_600, 1_600);
+        let still_ramping = |at, h| cpu_hold(peak, machine, at, 10, false, 200, Some(h));
+        assert_eq!(still_ramping(38_000, median_hold), 0);
+        assert_eq!(still_ramping(38_000, hold), peak);
+        assert_eq!(still_ramping(hold, hold), 0, "still bounded");
+    }
+
+    #[test]
     fn a_learned_cpu_peak_is_held_until_it_shows_or_its_time_passes() {
         let (peak, machine) = (1_600, 1_600);
-        let hold = Some(cpu_hold_ms(Some(40_000)));
-        assert_eq!(hold, Some(40_000));
+        let hold = Some(cpu_hold_ms(Some(32_000)));
+        assert_eq!(hold, Some(40_000), "the slowest ramp plus 25%");
         // Before the floor: full, whatever the job shows.
         assert_eq!(cpu_hold(peak, machine, 1_000, 10, false, 1_600, hold), peak);
         // After the 0.4.2 ramp end and on an idle-looking machine, a peak that has not shown is still held.
@@ -2574,7 +2588,7 @@ mod tests {
         assert_eq!(cpu_hold(peak, machine, 9_000, 10, true, 0, hold), peak);
         assert_eq!(cpu_hold(peak, machine, RAMP_MS, 10, true, 0, hold), 0);
         assert_eq!(cpu_hold(peak, machine, RAMP_MS, 10, false, 0, None), 0);
-        // The hold length: history's median clamped to 10 s .. 2 min, 30 s when unknown.
+        // The hold length: history's slowest ramp plus 25%, clamped to 10 s .. 2 min, 30 s when unknown.
         assert_eq!(cpu_hold_ms(None), CPU_FALLBACK_HOLD_MS);
         assert_eq!(cpu_hold_ms(Some(500)), RAMP_MS);
         assert_eq!(cpu_hold_ms(Some(3_600_000)), CPU_MAX_HOLD_MS);
