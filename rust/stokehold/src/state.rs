@@ -457,6 +457,7 @@ mod tests {
             mem_declared: false,
             mem_peak_at_ms: None,
             cpu_hold_ms: None,
+            cpu_settled: false,
         }
     }
 

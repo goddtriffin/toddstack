@@ -132,4 +132,8 @@ pub struct Job {
     /// short `admit::RAMP_MS` ramp hold.
     #[serde(default)]
     pub cpu_hold_ms: Option<i64>,
+    /// Set by the running job itself once its CPU has plateaued past its learned median time to peak (`admit::cpu_plateaued`):
+    /// it has shown its real use, so its CPU hold is released early.
+    #[serde(default)]
+    pub cpu_settled: bool,
 }

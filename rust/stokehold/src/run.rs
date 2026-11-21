@@ -129,6 +129,9 @@ struct Resolved {
     weights: Weights,
     mem_peak_at_ms: Option<i64>,
     cpu_hold_ms: Option<i64>,
+    /// A learned CPU size: when (ms after the start) its CPU may count as plateaued, the median time to peak (0 when
+    /// unknown). `None` for cold and declared-only sizes, whose hold is never released by a plateau.
+    cpu_settle_after_ms: Option<u64>,
 }
 
 fn resolve_weights(
@@ -162,6 +165,7 @@ fn resolve_weights(
         cpu_hold_ms: Some(crate::admit::cpu_hold_ms(
             hist.and_then(|d| d.cpu_peak_at_ms),
         )),
+        cpu_settle_after_ms: hist.map(|d| d.cpu_peak_median_ms.unwrap_or(0)),
     }
 }
 
@@ -193,6 +197,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         weights,
         mem_peak_at_ms,
         cpu_hold_ms,
+        cpu_settle_after_ms,
     } = resolve_weights(state, flags, cmd, &cwd_str, &cap);
 
     let (tx, rx) = channel();
@@ -219,6 +224,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
             mem_peak_at_ms
         },
         cpu_hold_ms,
+        cpu_settled: false,
     };
     let _guard = JobGuard {
         state,
@@ -265,7 +271,16 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
             reasons: tally.reasons(),
         },
     );
-    execute(state, &cap, &job, &info, &sig, flags.timeout(), queued_ms)
+    execute(
+        state,
+        &cap,
+        &job,
+        &info,
+        &sig,
+        flags.timeout(),
+        queued_ms,
+        cpu_settle_after_ms,
+    )
 }
 
 /// The process start time, retried; when it cannot be read, the marker that makes liveness check the pid only
@@ -437,13 +452,31 @@ fn cpu_peak_at(samples: &[(u64, u64)]) -> u64 {
         .map_or(0, |(ms, _)| *ms)
 }
 
+/// Marks the running job's file `cpu_settled`, which releases its CPU hold. The file change is the event that wakes the
+/// waiters. A job file already gone (the job ended) is not written again.
+fn mark_settled(dir: &StateDir, id: &str) {
+    let Ok(_lock) = dir.lock() else { return };
+    if let Some(mut job) = dir
+        .read_job(id)
+        .filter(|j| j.state == State::Running && !j.cpu_settled)
+    {
+        job.cpu_settled = true;
+        let _ = dir.write_job(&job);
+    }
+}
+
 /// Samples the whole process tree (heavy's own pid down) while the job runs; returns the peak CPU and RSS.
-/// Uses the same sampler as the live accounting of running jobs.
-fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<TreePeak>)> {
+/// Uses the same sampler as the live accounting of running jobs. With `settle` (the state dir, the job id and its
+/// learned median time to peak), it marks the job settled once its CPU plateaus (`admit::cpu_plateaued`).
+fn tree_sampler(
+    root: u32,
+    settle: Option<(StateDir, String, u64)>,
+) -> Option<(Sender<()>, std::thread::JoinHandle<TreePeak>)> {
     let mut sampler = TreeSampler::new(root).ok()?;
     let (stop_tx, stop_rx) = channel::<()>();
     let started = Instant::now();
     let handle = std::thread::spawn(move || {
+        let mut settle = settle;
         let mut peak = TreePeak::default();
         let mut cpu = Vec::new();
         loop {
@@ -454,6 +487,12 @@ fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<TreePe
             }
             cpu.push((at, s.cpu));
             peak.usage = peak.usage.max(s);
+            if let Some((dir, id, after)) = &settle
+                && crate::admit::cpu_plateaued(&cpu, *after)
+            {
+                mark_settled(dir, id);
+                settle = None;
+            }
             if !matches!(
                 stop_rx.recv_timeout(TREE_SAMPLE),
                 Err(RecvTimeoutError::Timeout)
@@ -622,6 +661,11 @@ fn record_finished(
     code
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the run context plus the learned settle time, in one place"
+)]
 fn execute(
     dir: &StateDir,
     cap: &Capacity,
@@ -630,6 +674,7 @@ fn execute(
     sig: &Sig,
     timeout: Duration,
     queued_ms: u64,
+    settle_after_ms: Option<u64>,
 ) -> Result<u8, Error> {
     let (first, rest) = job
         .cmd
@@ -646,7 +691,11 @@ fn execute(
     let net_before = net_bytes();
     let steal_before = cpu_times().map(|t| t.steal);
     let sampler = vram_sampler(cap);
-    let tree = tree_sampler(job.pid);
+    // Docker/VM work runs outside the tree, so its tree CPU says nothing: its hold is never released by a plateau.
+    let settle = settle_after_ms
+        .filter(|_| !hosts_vm_work(&job.cmd))
+        .map(|after| (dir.clone(), job.id.clone(), after));
+    let tree = tree_sampler(job.pid, settle);
     let other = if hosts_vm_work(&job.cmd) {
         other_sampler(dir, job.pid, cap.cpu)
     } else {

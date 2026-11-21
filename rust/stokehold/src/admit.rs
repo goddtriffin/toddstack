@@ -94,6 +94,14 @@ const CPU_ASK: u64 = 100;
 const BACKFILL_CPU: u64 = 200;
 /// How many recent non-heavy samples the smoother averages (waiters re-sample every 10 s).
 pub const SMOOTH_WINDOW: usize = 3;
+/// A running job's CPU has plateaued once it has not risen for this long (`cpu_plateaued`).
+pub const PLATEAU_MS: u64 = 10_000;
+/// A rise of at most this much (1 core, or 1/8 of the level reached if more) still counts as flat.
+const PLATEAU_SLACK_CPU: u64 = 100;
+/// A big waiter's own learned peak, projected: this fraction (1/2) of it must fit on top of the projected CPU (measured
+/// use plus the unrealized holds of the jobs still ramping) within every core. Learned peaks are the highest 500 ms tree
+/// sample, well above what a build sustains, so the whole peak would keep big jobs off a half-busy machine.
+const PROJECTED_PEAK: (u64, u64) = (1, 2);
 
 /// Which check blocked a waiter (recorded in the history; a disk that is too full fails instead of waiting).
 #[derive(
@@ -314,12 +322,17 @@ pub fn cpu_hold_ms(peak_at_ms: Option<u64>) -> i64 {
 }
 
 /// The CPU a running job holds beyond its live use. A job with a learned or declared size (`hold_ms`) holds its whole
-/// peak until the peak shows in its live use (3/4 of it) or `hold_ms` has passed, like a learned memory size, never
+/// peak until the peak shows in its live use (3/4 of it), its CPU plateaus past its median time to peak (`settled`, see
+/// `cpu_plateaued`) or `hold_ms` has passed, like a learned memory size, never
 /// less than the `RAMP_FULL_MS` floor: a cargo build spends its first 10-30 s on a few cores, and a hold that ended
 /// sooner (or was released because the machine read idle) let several 16-core builds in before any of their CPU showed
 /// (2026-11-20). Docker/VM work (its CPU never shows in the tree) and job files without `hold_ms` keep the
 /// `RAMP_MS` schedule of `ramp_hold`.
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one job's hold inputs: its size, age, live use and learned schedule"
+)]
 pub fn cpu_hold(
     peak: u64,
     machine: u64,
@@ -328,12 +341,14 @@ pub fn cpu_hold(
     vm: bool,
     live_cpu: u64,
     hold_ms: Option<i64>,
+    settled: bool,
 ) -> u64 {
     match hold_ms {
         Some(hold) if !vm => {
             if elapsed_ms < RAMP_FULL_MS {
                 peak
-            } else if elapsed_ms >= hold || live_cpu * CPU_SHOWN.1 >= peak * CPU_SHOWN.0 {
+            } else if settled || elapsed_ms >= hold || live_cpu * CPU_SHOWN.1 >= peak * CPU_SHOWN.0
+            {
                 0
             } else {
                 peak
@@ -350,6 +365,35 @@ fn cpu_hold_end(j: &Job, started_ms: i64) -> i64 {
             Some(h) if !crate::run::hosts_vm_work(&j.cmd) => h.max(RAMP_FULL_MS),
             _ => RAMP_MS,
         }
+}
+
+/// Whether a running job's CPU has plateaued: `samples` are `(ms after the start, centi-cores)` of its process tree,
+/// oldest first. From `PLATEAU_MS` after `settle_after_ms` (its learned median time to peak, at least `RAMP_MS`) on,
+/// the highest reading of the last `PLATEAU_MS` must not exceed the highest before it by more than 1 core (or 1/8).
+/// Such a run has shown its real use: an incremental build, or a test run whose learned peak is one 500 ms spike
+/// (2026-11-21: `make check` learned 15 cores, ran on 1.5, and its 2-minute hold kept waiters out at 10-50% CPU).
+/// Before its median time to peak a flat run is not settled: a cargo build spends 10-30 s on a few cores first.
+#[must_use]
+pub fn cpu_plateaued(samples: &[(u64, u64)], settle_after_ms: u64) -> bool {
+    let Some(&(now, _)) = samples.last() else {
+        return false;
+    };
+    let from = settle_after_ms.max(u64::try_from(RAMP_MS).unwrap_or(0)) + PLATEAU_MS;
+    if now < from {
+        return false;
+    }
+    let cut = now - PLATEAU_MS;
+    let max_of = |keep: &dyn Fn(u64) -> bool| {
+        samples
+            .iter()
+            .filter(|(ms, _)| keep(*ms))
+            .map(|(_, c)| *c)
+            .max()
+            .unwrap_or(0)
+    };
+    let before = max_of(&|ms| ms <= cut);
+    let recent = max_of(&|ms| ms > cut);
+    recent <= before + (before / 8).max(PLATEAU_SLACK_CPU)
 }
 
 /// The machine's sustained CPU %: max(latest, mean of the readings from the last `BUSY_WINDOW_MS`). Fast to block when
@@ -407,6 +451,7 @@ pub fn headroom_for(
                     crate::run::hosts_vm_work(&j.cmd),
                     l.cpu,
                     j.cpu_hold_ms,
+                    j.cpu_settled,
                 )
             });
             let cpu = l.cpu.max(hold);
@@ -572,6 +617,14 @@ fn blocker(
         if small {
             // A small waiter's learned peak must fit in what the band has left after every outstanding hold.
             ask.cpu = ask.cpu.max(centi(w.cpu));
+        } else {
+            // A big waiter's projected peak (half its learned peak) must fit within every core on top of the projected
+            // CPU: one free core under the band let 13-core builds in at 83% busy, and they took the machine to 100%
+            // with load1 at 34 (2026-11-21). room = band - projected, so projected + peak/2 <= all cores is this ask.
+            let projected_peak =
+                centi(w.cpu).min(centi(cap.cpu)) * PROJECTED_PEAK.0 / PROJECTED_PEAK.1;
+            let over_band = centi(cap.cpu) - ceiling(cap).cpu;
+            ask.cpu = ask.cpu.max(projected_peak.saturating_sub(over_band));
         }
         let room_at = |t: i64| headroom_for(running, cap, live, t, small);
         if !fits(ask, room_at(now_ms)) {
@@ -718,6 +771,7 @@ mod tests {
             mem_declared: false,
             mem_peak_at_ms: None,
             cpu_hold_ms: None,
+            cpu_settled: false,
         }
     }
     fn waits(d: &Decision) -> bool {
@@ -1381,11 +1435,11 @@ mod tests {
             starts.windows(2).all(|w| w[1] - w[0] >= RAMP_MS),
             "one cold build per ramp: {starts:?}"
         );
-        // Same with the CPU measured 60% busy.
+        // Same with the CPU measured 40% busy (a whole-machine waiter needs half the machine free, so not 60%).
         let busy = Live {
-            cpu_pct: 60,
+            cpu_pct: 40,
             non_heavy: Usage {
-                cpu: 960,
+                cpu: 640,
                 mem: 0,
                 vram: 0,
             },
@@ -1551,6 +1605,8 @@ mod tests {
             started_ms: Some(10),
             ..job("l", 8, 8, State::Running, 0)
         };
+        // A 4-core waiter asks for one free core (a whole-machine one would need half the machine free).
+        let b = job("b", 4, 8, State::Queued, 2);
         let d = evaluate(&b, &[rl.clone(), b.clone()], &c, &live, 500);
         assert!(
             matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), .. } if e == 10 + RAMP_FULL_MS),
@@ -1881,12 +1937,12 @@ mod tests {
     fn ramp_hold_is_released_while_measured_cpu_is_low() {
         // 2026-11-20 07:01:33: cpu 20%, one job running (ramping), one waiting, blocked by ramp.
         // 0.3.0 held the running job's peak for the whole 10 s ramp, so the waiter sat with 80% of the CPU idle.
-        // Here the running job has a learned 8-core peak (under 75% of the machine).
+        // Here the running job has a learned 8-core peak (under 75% of the machine), and the waiter a 4-core one.
         let run = Job {
             started_ms: Some(0),
             ..job("r", 8, 4, State::Running, 0)
         };
-        let me = job("a", 16, 4, State::Queued, 1);
+        let me = job("a", 4, 4, State::Queued, 1);
         let all = [run.clone(), me.clone()];
         let live = Live {
             load1: 29.4,
@@ -1954,7 +2010,7 @@ mod tests {
 
     #[test]
     fn ramp_hold_shrinks_for_a_recent_job_with_a_learned_peak() {
-        let me = job("a", 16, 4, State::Queued, 1);
+        let me = job("a", 4, 4, State::Queued, 1);
         // 06:22:23: cpu 24%, four running (three ramped, one admitted 5 s ago with a learned 8-core peak), one waiting.
         let mut all: Vec<Job> = (0..3)
             .map(|i| Job {
@@ -2609,7 +2665,7 @@ mod tests {
         let hold = cpu_hold_ms(Some(40_000));
         assert!(hold > 40_000, "{hold}");
         let (peak, machine) = (1_600, 1_600);
-        let still_ramping = |at, h| cpu_hold(peak, machine, at, 10, false, 200, Some(h));
+        let still_ramping = |at, h| cpu_hold(peak, machine, at, 10, false, 200, Some(h), false);
         assert_eq!(still_ramping(38_000, median_hold), 0);
         assert_eq!(still_ramping(38_000, hold), peak);
         assert_eq!(still_ramping(hold, hold), 0, "still bounded");
@@ -2621,17 +2677,38 @@ mod tests {
         let hold = Some(cpu_hold_ms(Some(32_000)));
         assert_eq!(hold, Some(40_000), "the slowest ramp plus 25%");
         // Before the floor: full, whatever the job shows.
-        assert_eq!(cpu_hold(peak, machine, 1_000, 10, false, 1_600, hold), peak);
+        assert_eq!(
+            cpu_hold(peak, machine, 1_000, 10, false, 1_600, hold, false),
+            peak
+        );
         // After the 0.4.2 ramp end and on an idle-looking machine, a peak that has not shown is still held.
-        assert_eq!(cpu_hold(peak, machine, 20_000, 10, false, 200, hold), peak);
+        assert_eq!(
+            cpu_hold(peak, machine, 20_000, 10, false, 200, hold, false),
+            peak
+        );
         // Shown (3/4 of it in live use): live use counts instead.
-        assert_eq!(cpu_hold(peak, machine, 20_000, 90, false, 1_200, hold), 0);
+        assert_eq!(
+            cpu_hold(peak, machine, 20_000, 90, false, 1_200, hold, false),
+            0
+        );
         // Its time to peak passed without it showing (an incremental build): released, so the machine is not kept idle.
-        assert_eq!(cpu_hold(peak, machine, 40_000, 10, false, 200, hold), 0);
+        assert_eq!(
+            cpu_hold(peak, machine, 40_000, 10, false, 200, hold, false),
+            0
+        );
         // Docker work and old job files keep the 10 s ramp schedule.
-        assert_eq!(cpu_hold(peak, machine, 9_000, 10, true, 0, hold), peak);
-        assert_eq!(cpu_hold(peak, machine, RAMP_MS, 10, true, 0, hold), 0);
-        assert_eq!(cpu_hold(peak, machine, RAMP_MS, 10, false, 0, None), 0);
+        assert_eq!(
+            cpu_hold(peak, machine, 9_000, 10, true, 0, hold, false),
+            peak
+        );
+        assert_eq!(
+            cpu_hold(peak, machine, RAMP_MS, 10, true, 0, hold, false),
+            0
+        );
+        assert_eq!(
+            cpu_hold(peak, machine, RAMP_MS, 10, false, 0, None, false),
+            0
+        );
         // The hold length: history's slowest ramp plus 25%, clamped to 10 s .. 2 min, 30 s when unknown.
         assert_eq!(cpu_hold_ms(None), CPU_FALLBACK_HOLD_MS);
         assert_eq!(cpu_hold_ms(Some(500)), RAMP_MS);
@@ -2837,5 +2914,240 @@ mod tests {
             ..over
         };
         assert_eq!(guard_block(&c, &io), None);
+    }
+
+    #[test]
+    fn a_run_plateaus_once_its_cpu_stops_rising_past_its_median_time_to_peak() {
+        let run = |f: &dyn Fn(u64) -> u64, until: u64| -> Vec<(u64, u64)> {
+            (0..=until / 500).map(|k| (k * 500, f(k * 500))).collect()
+        };
+        // Flat at 1.5 cores (an incremental `make check` with a learned 15-core spike): settled 10 s after its
+        // 9 s median time to peak (at least the 10 s ramp), not before.
+        let flat = |_| 150;
+        assert!(!cpu_plateaued(&run(&flat, 19_500), 9_000));
+        assert!(cpu_plateaued(&run(&flat, 20_000), 9_000));
+        // Still rising: never settled.
+        let rising = |ms| 100 + ms / 50;
+        assert!(!cpu_plateaued(&run(&rising, 60_000), 9_000));
+        // A cargo build flat on 2 cores before its 30 s median ramp is not settled while it waits to ramp.
+        let cargo = |ms| if ms < 30_000 { 200 } else { 1_600 };
+        assert!(!cpu_plateaued(&run(&cargo, 29_500), 30_000));
+        assert!(!cpu_plateaued(&run(&cargo, 35_000), 30_000));
+        // Jitter within a core (or 1/8 of the level) is flat; an empty run is not.
+        let jitter = |ms| if (ms / 500) % 2 == 0 { 800 } else { 880 };
+        assert!(cpu_plateaued(&run(&jitter, 20_000), 0));
+        assert!(!cpu_plateaued(&[], 0));
+    }
+
+    /// A running 15-core-peak job (a 2-minute learned hold) on 1.5 cores, the Mac at 15%, and an 8-core waiter.
+    fn low_cpu_hold(settled: bool) -> Decision {
+        let c = mac();
+        let run = Job {
+            state: State::Running,
+            started_ms: Some(0),
+            cpu_hold_ms: Some(CPU_MAX_HOLD_MS),
+            cpu_settled: settled,
+            ..job("r", 15, 2, State::Running, 0)
+        };
+        let me = job("w", 8, 2, State::Queued, 1);
+        let live = Live {
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: 150,
+                    mem: 2 * G,
+                    vram: 0,
+                },
+            )],
+            non_heavy: Usage {
+                cpu: 100,
+                ..Usage::default()
+            },
+            cpu_pct: 15,
+            cpu_sustained_pct: 15,
+            ..calm()
+        };
+        evaluate(&me, &[run, me.clone()], &c, &live, 30_000)
+    }
+
+    #[test]
+    fn a_plateaued_hold_is_released_while_the_machine_reads_low() {
+        // 2026-11-21: ramp holds kept waiters out at 10-50% CPU on the Mac (and 2-9% on the rig) for up to 2 minutes.
+        assert!(
+            matches!(
+                low_cpu_hold(false),
+                Decision::Wait {
+                    block: Block::Ramp,
+                    ..
+                }
+            ),
+            "an unsettled hold still holds"
+        );
+        assert_eq!(
+            low_cpu_hold(true),
+            Decision::Start,
+            "settled: the job's real use counts"
+        );
+        // Docker/VM work keeps its full 10 s ramp hold whatever the file says (its CPU never shows in the tree).
+        assert_eq!(
+            cpu_hold(
+                1_500,
+                1_600,
+                5_000,
+                15,
+                true,
+                0,
+                Some(CPU_MAX_HOLD_MS),
+                true
+            ),
+            1_500
+        );
+        // The stagger floor holds even a settled job.
+        assert_eq!(
+            cpu_hold(
+                1_500,
+                1_600,
+                1_000,
+                15,
+                false,
+                0,
+                Some(CPU_MAX_HOLD_MS),
+                true
+            ),
+            1_500
+        );
+    }
+
+    /// The Mac with one running job past its hold on `busy` centi-cores, and a waiter with a learned `cpu` peak.
+    fn onto_busy_mac(busy: u64, cpu: u32) -> Decision {
+        let c = mac();
+        let run = Job {
+            state: State::Running,
+            started_ms: Some(0),
+            cpu_hold_ms: Some(RAMP_MS),
+            ..job("r", 13, 2, State::Running, 0)
+        };
+        let me = job("w", cpu, 2, State::Queued, 1);
+        let pct = busy * 100 / 1_600;
+        let live = Live {
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: busy,
+                    mem: 2 * G,
+                    vram: 0,
+                },
+            )],
+            cpu_pct: pct,
+            cpu_sustained_pct: pct,
+            ..calm()
+        };
+        evaluate(&me, &[run, me.clone()], &c, &live, 60_000)
+    }
+
+    #[test]
+    fn a_big_waiter_starts_only_where_half_its_peak_fits_on_the_projected_cpu() {
+        // 2026-11-21: 13-core builds admitted at up to 83% busy took the Mac to 100% with load1 34.
+        assert!(
+            matches!(
+                onto_busy_mac(1_100, 13),
+                Decision::Wait {
+                    block: Block::Cpu,
+                    ..
+                }
+            ),
+            "69% busy + 6.5 cores > 16"
+        );
+        assert_eq!(onto_busy_mac(900, 13), Decision::Start, "56% + 6.5 fits");
+        // A small or mid-size waiter still fills the band up to one free core.
+        assert_eq!(onto_busy_mac(1_200, 2), Decision::Start);
+        assert_eq!(onto_busy_mac(1_200, 4), Decision::Start);
+        // A whole-machine (cold) waiter needs half the machine free.
+        assert!(waits(&onto_busy_mac(900, 16)));
+        assert_eq!(onto_busy_mac(700, 16), Decision::Start);
+    }
+
+    /// Eight 13-core-peak jobs queued at once on the 16-core Mac. Each runs 150 s: 3 s on 1 core, then cycles of 15 s
+    /// at its 13-core peak and 25 s on 2 cores (compile, then test). Demand over 16 cores is scaled down. Returns the
+    /// share (%) of the samples where demand exceeded the machine, the share where jobs waited at under 75% CPU, and
+    /// when the last job started.
+    fn bursty_eight() -> (u64, u64, i64) {
+        let c = mac();
+        let mut jobs: Vec<Job> = (0..8)
+            .map(|i| Job {
+                cpu_hold_ms: Some(cpu_hold_ms(Some(4_000))),
+                ..job(&format!("b{i}"), 13, 2, State::Queued, i)
+            })
+            .collect();
+        let demand_at = |since: i64| -> u64 {
+            if since < 3_000 {
+                100
+            } else if (since - 3_000) % 40_000 < 15_000 {
+                1_300
+            } else {
+                200
+            }
+        };
+        let (mut samples, mut over, mut under, mut last) = (0u64, 0u64, 0u64, 0);
+        let mut readings: Vec<(i64, u64)> = Vec::new();
+        let mut t = 0;
+        while t <= 1_200_000 && !jobs.is_empty() {
+            jobs.retain(|j| j.started_ms.is_none_or(|s| t - s < 150_000));
+            let demand: Vec<(String, u64)> = jobs
+                .iter()
+                .filter_map(|j| j.started_ms.map(|s| (j.id.clone(), demand_at(t - s))))
+                .collect();
+            let total: u64 = demand.iter().map(|d| d.1).sum();
+            let pct = total.min(1_600) * 100 / 1_600;
+            readings.push((t, pct));
+            readings.retain(|(ts, _)| t - ts <= BUSY_WINDOW_MS);
+            let live = Live {
+                cpu_pct: pct,
+                cpu_sustained_pct: sustained_pct(pct, &readings, t),
+                per_job: demand
+                    .iter()
+                    .map(|(id, d)| {
+                        let cpu = if total > 1_600 { d * 1_600 / total } else { *d };
+                        (
+                            id.clone(),
+                            Usage {
+                                cpu,
+                                mem: 2 * G,
+                                vram: 0,
+                            },
+                        )
+                    })
+                    .collect(),
+                ..calm()
+            };
+            let waiting = jobs.iter().any(|j| j.state == State::Queued);
+            samples += 1;
+            over += u64::from(total > 1_600);
+            under += u64::from(waiting && pct < 75);
+            for i in 0..jobs.len() {
+                if jobs[i].state == State::Queued
+                    && evaluate(&jobs[i].clone(), &jobs, &c, &live, t) == Decision::Start
+                {
+                    jobs[i].state = State::Running;
+                    jobs[i].started_ms = Some(t);
+                    last = t;
+                }
+            }
+            t += 500;
+        }
+        assert!(jobs.is_empty(), "every job ran");
+        (over * 100 / samples, under * 100 / samples, last)
+    }
+
+    #[test]
+    fn bursty_big_jobs_start_one_at_a_time_without_pinning_the_machine() {
+        let (over, under, last) = bursty_eight();
+        // 0.4.3 (one free core under the band) read over the machine 67% of the time; 0.4.4 reads 0% over, 22% under.
+        assert!(over <= 10, "demand over the machine {over}% of the time");
+        assert!(
+            under <= 30,
+            "jobs waited at under 75% CPU {under}% of the time"
+        );
+        assert!(last <= 600_000, "the last job started at {last} ms");
     }
 }
