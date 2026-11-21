@@ -12,8 +12,8 @@ use std::time::Duration;
 use nix::sys::statvfs::statvfs;
 use sysinfo::{Networks, Pid, ProcessesToUpdate, System};
 
-use crate::error::Error;
 use crate::admit::non_heavy;
+use crate::error::Error;
 use crate::job::{Capacity, Job, Live, Usage};
 use crate::sizes::parse_size;
 
@@ -22,7 +22,9 @@ pub fn to_u64<T: TryInto<u64>>(x: T) -> u64 {
 }
 
 fn overrides(var: &str) -> Result<Vec<(String, String)>, Error> {
-    let Some(text) = crate::state::env_var(var).and_then(|v| v.into_string().ok()) else { return Ok(Vec::new()) };
+    let Some(text) = crate::state::env_var(var).and_then(|v| v.into_string().ok()) else {
+        return Ok(Vec::new());
+    };
     text.split(',')
         .filter(|s| !s.trim().is_empty())
         .map(|kv| {
@@ -41,13 +43,22 @@ fn get<'a>(list: &'a [(String, String)], key: &str) -> Option<&'a str> {
 fn disk(path: &Path) -> Result<(u64, u64), Error> {
     let s = statvfs(path)?;
     let unit = to_u64(s.fragment_size());
-    Ok((to_u64(s.blocks()).saturating_mul(unit), to_u64(s.blocks_available()).saturating_mul(unit)))
+    Ok((
+        to_u64(s.blocks()).saturating_mul(unit),
+        to_u64(s.blocks_available()).saturating_mul(unit),
+    ))
 }
 
 /// Total GPU memory and currently used, in bytes, via `nvidia-smi`; `None` without an NVIDIA GPU.
 #[must_use]
 pub fn vram() -> Option<(u64, u64)> {
-    let out = Command::new("nvidia-smi").args(["--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"]).output().ok()?;
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -69,19 +80,34 @@ pub fn capacity(cwd: &Path) -> Result<Capacity, Error> {
     sys.refresh_memory();
     let (disk_total, _) = disk(cwd)?;
     let on_mac = cfg!(target_os = "macos");
-    let probed_cpu = std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX));
+    let probed_cpu = std::thread::available_parallelism()
+        .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX));
     let cpu = match get(&o, "cpu") {
-        Some(v) => v.parse().map_err(|_| Error::Usage(format!("STOKEHOLD_CAPACITY cpu: {v:?}")))?,
+        Some(v) => v
+            .parse()
+            .map_err(|_| Error::Usage(format!("STOKEHOLD_CAPACITY cpu: {v:?}")))?,
         None => probed_cpu,
     };
-    let mem = get(&o, "mem").map(parse_size).transpose()?.unwrap_or_else(|| sys.total_memory());
+    let mem = get(&o, "mem")
+        .map(parse_size)
+        .transpose()?
+        .unwrap_or_else(|| sys.total_memory());
     let vram = match get(&o, "vram") {
         Some(v) => parse_size(v)?,
         None if on_mac => 0,
         None => vram().map_or(0, |(t, _)| t),
     };
-    let disk_total = get(&o, "disk").map(parse_size).transpose()?.unwrap_or(disk_total);
-    Ok(Capacity { cpu, mem, vram, disk_total, vram_is_ram: on_mac })
+    let disk_total = get(&o, "disk")
+        .map(parse_size)
+        .transpose()?
+        .unwrap_or(disk_total);
+    Ok(Capacity {
+        cpu,
+        mem,
+        vram,
+        disk_total,
+        vram_is_ram: on_mac,
+    })
 }
 
 /// Cumulative CPU ticks from the first line of `/proc/stat`.
@@ -108,13 +134,19 @@ pub fn parse_cpu_line(line: &str) -> Option<CpuTimes> {
     let idle = at(3) + at(4);
     let steal = at(7);
     let busy = at(0) + at(1) + at(2) + at(5) + at(6) + steal;
-    Some(CpuTimes { busy, total: busy + idle, steal })
+    Some(CpuTimes {
+        busy,
+        total: busy + idle,
+        steal,
+    })
 }
 
 #[must_use]
 pub fn busy_pct(a: CpuTimes, b: CpuTimes) -> u64 {
     let total = b.total.saturating_sub(a.total);
-    (b.busy.saturating_sub(a.busy) * 100).checked_div(total).unwrap_or(0)
+    (b.busy.saturating_sub(a.busy) * 100)
+        .checked_div(total)
+        .unwrap_or(0)
 }
 
 /// Reads `/proc/stat` (Linux only).
@@ -126,7 +158,13 @@ pub fn cpu_times() -> Option<CpuTimes> {
 
 /// Per-process GPU memory (pid, bytes) from `nvidia-smi`; empty where it is not reported.
 fn vram_by_pid() -> Vec<(u32, u64)> {
-    let Ok(out) = Command::new("nvidia-smi").args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).output() else {
+    let Ok(out) = Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+    else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)
@@ -144,7 +182,11 @@ fn whole(x: f32) -> u64 {
 }
 
 fn child_map(sys: &System) -> HashMap<Pid, Vec<Pid>> {
-    children_of(sys.processes().iter().map(|(pid, p)| (*pid, p.parent(), p.thread_kind().is_some())))
+    children_of(
+        sys.processes()
+            .iter()
+            .map(|(pid, p)| (*pid, p.parent(), p.thread_kind().is_some())),
+    )
 }
 
 /// Parent to child processes, threads left out. On Linux sysinfo also lists every thread (task) as a "process" whose
@@ -163,13 +205,22 @@ fn children_of(procs: impl Iterator<Item = (Pid, Option<Pid>, bool)>) -> HashMap
 
 /// Live usage of the process tree rooted at `root` (the one accounting used for running jobs and for the
 /// peaks recorded in history).
-fn tree_usage(sys: &System, children: &HashMap<Pid, Vec<Pid>>, root: u32, gpu: &[(u32, u64)]) -> Usage {
+fn tree_usage(
+    sys: &System,
+    children: &HashMap<Pid, Vec<Pid>>,
+    root: u32,
+    gpu: &[(u32, u64)],
+) -> Usage {
     let mut total = Usage::default();
     for pid in tree_pids(children, Pid::from_u32(root)) {
         if let Some(p) = sys.process(pid) {
             total.cpu += whole(p.cpu_usage());
             total.mem += p.memory();
-            total.vram += gpu.iter().filter(|(g, _)| *g == pid.as_u32()).map(|(_, m)| m).sum::<u64>();
+            total.vram += gpu
+                .iter()
+                .filter(|(g, _)| *g == pid.as_u32())
+                .map(|(_, m)| m)
+                .sum::<u64>();
         }
     }
     total
@@ -196,7 +247,10 @@ impl TreeSampler {
     /// # Errors
     /// Fails when the system cannot be probed.
     pub fn new(root: u32) -> Result<Self, Error> {
-        Ok(Self { sys: System::new()?, root })
+        Ok(Self {
+            sys: System::new()?,
+            root,
+        })
     }
 
     /// Current CPU (centi-cores) and RSS of the whole process tree.
@@ -217,8 +271,15 @@ pub fn mac_pressure(sysctl_out: &str) -> bool {
 /// `full avg10` of 5 or more.
 #[must_use]
 pub fn psi_pressure(text: &str) -> bool {
-    let avg10 = |line: &str| line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-    text.lines().any(|l| (l.starts_with("some ") && avg10(l) >= 25.0) || (l.starts_with("full ") && avg10(l) >= 5.0))
+    let avg10 = |line: &str| {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix("avg10="))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    text.lines().any(|l| {
+        (l.starts_with("some ") && avg10(l) >= 25.0) || (l.starts_with("full ") && avg10(l) >= 5.0)
+    })
 }
 
 /// Whether the system is under memory pressure. Cheap, and fails open (false) when it cannot be read.
@@ -227,7 +288,9 @@ fn memory_pressure() -> bool {
         return Command::new("sysctl")
             .args(["-n", "kern.memorystatus_vm_pressure_level"])
             .output()
-            .is_ok_and(|o| o.status.success() && mac_pressure(&String::from_utf8_lossy(&o.stdout)));
+            .is_ok_and(|o| {
+                o.status.success() && mac_pressure(&String::from_utf8_lossy(&o.stdout))
+            });
     }
     std::fs::read_to_string("/proc/pressure/memory").is_ok_and(|t| psi_pressure(&t))
 }
@@ -244,7 +307,10 @@ impl OtherSampler {
     /// # Errors
     /// Fails when the system cannot be probed.
     pub fn new(cores: u32) -> Result<Self, Error> {
-        Ok(Self { sys: System::new()?, cores: u64::from(cores) })
+        Ok(Self {
+            sys: System::new()?,
+            cores: u64::from(cores),
+        })
     }
 
     /// CPU (centi-cores) of the machine minus the process trees rooted at `roots`.
@@ -253,7 +319,10 @@ impl OtherSampler {
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
         let machine = whole(self.sys.global_cpu_usage()) * self.cores;
         let children = child_map(&self.sys);
-        let trees: u64 = roots.iter().map(|r| tree_usage(&self.sys, &children, *r, &[]).cpu).sum();
+        let trees: u64 = roots
+            .iter()
+            .map(|r| tree_usage(&self.sys, &children, *r, &[]).cpu)
+            .sum();
         machine.saturating_sub(trees)
     }
 }
@@ -262,11 +331,17 @@ impl OtherSampler {
 /// larger (work in a VM, such as Docker builds, is outside the tree), capped at the whole machine.
 #[must_use]
 pub fn effective_peak(tree_peak: u64, other_peak: u64, baseline: u64, cores: u32) -> u64 {
-    tree_peak.max(other_peak.saturating_sub(baseline)).min(u64::from(cores) * 100)
+    tree_peak
+        .max(other_peak.saturating_sub(baseline))
+        .min(u64::from(cores) * 100)
 }
 
 /// Machine-wide usage and the live usage of each running job's process tree, over a short window.
-fn measure(jobs: &[Job], cpu_count: u32, want_vram: bool) -> Result<(Usage, Vec<(String, Usage)>), Error> {
+fn measure(
+    jobs: &[Job],
+    cpu_count: u32,
+    want_vram: bool,
+) -> Result<(Usage, Vec<(String, Usage)>), Error> {
     let mut sys = System::new()?;
     sys.refresh_memory();
     sys.refresh_processes(ProcessesToUpdate::All, true);
@@ -284,10 +359,17 @@ fn measure(jobs: &[Job], cpu_count: u32, want_vram: bool) -> Result<(Usage, Vec<
     let machine = Usage {
         cpu: pct * u64::from(cpu_count),
         mem: sys.total_memory().saturating_sub(sys.available_memory()),
-        vram: if want_vram { vram().map_or(0, |(_, used)| used) } else { 0 },
+        vram: if want_vram {
+            vram().map_or(0, |(_, used)| used)
+        } else {
+            0
+        },
     };
     let children = child_map(&sys);
-    let per_job = jobs.iter().map(|j| (j.id.clone(), tree_usage(&sys, &children, j.pid, &gpu))).collect();
+    let per_job = jobs
+        .iter()
+        .map(|j| (j.id.clone(), tree_usage(&sys, &children, j.pid, &gpu)))
+        .collect();
     Ok((machine, per_job))
 }
 
@@ -321,30 +403,75 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         None => disk(cwd)?.1,
     };
     // Tests fake the other programs' usage: nonheavy_cpu (centi-cores), nonheavy_mem, nonheavy_vram.
-    let fake = ["nonheavy_cpu", "nonheavy_mem", "nonheavy_vram"].iter().any(|k| get(&o, k).is_some());
+    let fake = ["nonheavy_cpu", "nonheavy_mem", "nonheavy_vram"]
+        .iter()
+        .any(|k| get(&o, k).is_some());
     let mem_pressure = match get(&o, "mem_pressure") {
         Some(v) => v.parse::<u32>().map_err(|_| bad("mem_pressure", v))? >= 2,
         None => o.is_empty() && memory_pressure(),
     };
     let (non_heavy, per_job, cpu_pct) = if fake {
-        let num = |k: &str| -> Result<u64, Error> { get(&o, k).map_or(Ok(0), |v| if k == "nonheavy_cpu" { v.parse().map_err(|_| bad(k, v)) } else { parse_size(v) }) };
-        let nh = Usage { cpu: num("nonheavy_cpu")?, mem: num("nonheavy_mem")?, vram: num("nonheavy_vram")? };
-        (nh, Vec::new(), (nh.cpu / u64::from(cap.cpu.max(1))).min(100))
+        let num = |k: &str| -> Result<u64, Error> {
+            get(&o, k).map_or(Ok(0), |v| {
+                if k == "nonheavy_cpu" {
+                    v.parse().map_err(|_| bad(k, v))
+                } else {
+                    parse_size(v)
+                }
+            })
+        };
+        let nh = Usage {
+            cpu: num("nonheavy_cpu")?,
+            mem: num("nonheavy_mem")?,
+            vram: num("nonheavy_vram")?,
+        };
+        (
+            nh,
+            Vec::new(),
+            (nh.cpu / u64::from(cap.cpu.max(1))).min(100),
+        )
     } else {
         let (machine, per_job) = measure(running, cap.cpu, cap.vram > 0)?;
-        let trees = per_job.iter().fold(Usage::default(), |a, (_, u)| Usage { cpu: a.cpu + u.cpu, mem: a.mem + u.mem, vram: a.vram + u.vram });
-        (non_heavy(machine, trees), per_job, (machine.cpu / u64::from(cap.cpu.max(1))).min(100))
+        let trees = per_job.iter().fold(Usage::default(), |a, (_, u)| Usage {
+            cpu: a.cpu + u.cpu,
+            mem: a.mem + u.mem,
+            vram: a.vram + u.vram,
+        });
+        (
+            non_heavy(machine, trees),
+            per_job,
+            (machine.cpu / u64::from(cap.cpu.max(1))).min(100),
+        )
     };
-    Ok(Live { load1, load5, mem_used_pct, cpu_pct, cpu_sustained_pct: 0, mem_pressure, disk_free, non_heavy, per_job, stopped: Vec::new() })
+    Ok(Live {
+        load1,
+        load5,
+        mem_used_pct,
+        cpu_pct,
+        cpu_sustained_pct: 0,
+        mem_pressure,
+        disk_free,
+        non_heavy,
+        per_job,
+        stopped: Vec::new(),
+    })
 }
 
 /// Ids of the jobs whose process is stopped (state T).
 #[must_use]
 pub fn stopped_ids(jobs: &[Job]) -> Vec<String> {
     let pids: Vec<Pid> = jobs.iter().map(|j| Pid::from_u32(j.pid)).collect();
-    let Ok(mut sys) = System::new() else { return Vec::new() };
+    let Ok(mut sys) = System::new() else {
+        return Vec::new();
+    };
     sys.refresh_processes(ProcessesToUpdate::Some(&pids), true);
-    jobs.iter().filter(|j| sys.process(Pid::from_u32(j.pid)).is_some_and(|p| matches!(p.status(), sysinfo::ProcessStatus::Stop))).map(|j| j.id.clone()).collect()
+    jobs.iter()
+        .filter(|j| {
+            sys.process(Pid::from_u32(j.pid))
+                .is_some_and(|p| matches!(p.status(), sysinfo::ProcessStatus::Stop))
+        })
+        .map(|j| j.id.clone())
+        .collect()
 }
 
 /// The start time of a live process (seconds since the epoch), or `None` when it does not exist.
@@ -359,8 +486,14 @@ pub fn process_start(pid: u32) -> Option<u64> {
 /// Machine-wide network bytes (in, out), loopback excluded.
 #[must_use]
 pub fn net_bytes() -> (u64, u64) {
-    let Ok(nets) = Networks::new_with_refreshed_list() else { return (0, 0) };
-    nets.iter().filter(|(name, _)| !name.to_string_lossy().starts_with("lo")).fold((0, 0), |(i, o), (_, d)| (i + d.total_received(), o + d.total_transmitted()))
+    let Ok(nets) = Networks::new_with_refreshed_list() else {
+        return (0, 0);
+    };
+    nets.iter()
+        .filter(|(name, _)| !name.to_string_lossy().starts_with("lo"))
+        .fold((0, 0), |(i, o), (_, d)| {
+            (i + d.total_received(), o + d.total_transmitted())
+        })
 }
 
 #[cfg(test)]
@@ -373,9 +506,15 @@ mod tests {
         assert!(mac_pressure("2\n"));
         assert!(mac_pressure("4"));
         assert!(!mac_pressure("garbage"), "fails open");
-        assert!(!psi_pressure("some avg10=3.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=0.50 avg60=0.0 avg300=0.0 total=0\n"));
-        assert!(psi_pressure("some avg10=30.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=0.50 avg60=0.0 avg300=0.0 total=0\n"));
-        assert!(psi_pressure("some avg10=3.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=6.00 avg60=0.0 avg300=0.0 total=0\n"));
+        assert!(!psi_pressure(
+            "some avg10=3.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=0.50 avg60=0.0 avg300=0.0 total=0\n"
+        ));
+        assert!(psi_pressure(
+            "some avg10=30.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=0.50 avg60=0.0 avg300=0.0 total=0\n"
+        ));
+        assert!(psi_pressure(
+            "some avg10=3.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=6.00 avg60=0.0 avg300=0.0 total=0\n"
+        ));
         assert!(!psi_pressure(""));
     }
 
@@ -414,12 +553,21 @@ mod tests {
         // threads (pids 11-26, each reporting the process's 2.6 GB) and one child process (pid 30, 0.5 GB).
         let p = Pid::from_u32;
         let threads = (11..27).map(|t| (p(t), Some(p(10)), true));
-        let procs = std::iter::once((p(10), Some(p(1)), false)).chain(threads).chain(std::iter::once((p(30), Some(p(10)), false)));
+        let procs = std::iter::once((p(10), Some(p(1)), false))
+            .chain(threads)
+            .chain(std::iter::once((p(30), Some(p(10)), false)));
         let children = children_of(procs);
-        assert_eq!(children.get(&p(10)), Some(&vec![p(30)]), "threads are not children");
+        assert_eq!(
+            children.get(&p(10)),
+            Some(&vec![p(30)]),
+            "threads are not children"
+        );
         let rss = |pid: Pid| if pid == p(30) { 512 } else { 2_600 };
         let total: u64 = tree_pids(&children, p(10)).into_iter().map(rss).sum();
-        assert_eq!(total, 3_112, "MB: the process plus its child, not 17 x 2.6 GB");
+        assert_eq!(
+            total, 3_112,
+            "MB: the process plus its child, not 17 x 2.6 GB"
+        );
     }
 
     #[test]
