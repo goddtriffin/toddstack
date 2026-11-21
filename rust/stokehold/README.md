@@ -39,12 +39,14 @@ All of these must hold:
   jobs wait, the CPU settles in an 80-90% band, never pinned at 100%. The sustained CPU is max(latest, mean of the
   readings in `~/.local/state/stokehold/busy`), which every stokehold process adds to (waiters as they re-evaluate, and while any
   job exists one reading at least every 10 s): a single 250 ms window that falls between build steps can read 80% on a
-  pinned machine, and is not free CPU. A job admitted in the last 10 s holds its peak cores (from history) while it
-  ramps up, so a burst of waiters is staggered. The full 10 s hold covers cold jobs, Docker/VM jobs and learned peaks of 75% of
-  the machine or more, so those start at least 10 s apart. Any smaller learned peak is full for 3 s; after that, if the machine reads
-  under 50% CPU the job has shown its real use and the hold is released, otherwise it shrinks linearly to nothing at
-  10 s. A waiter held back by a ramp
-  sleeps until the first moment the shrinking holds leave room. A job's recorded peak is the larger of its process tree's peak and the
+  pinned machine, and is not free CPU. A job with a learned (or `--cpu`) size holds its peak cores until that peak shows
+  in its live use (3/4 of it) or its learned time to peak passes (history records when the CPU first reached 3/4 of its
+  peak; the median, at least 10 s, at most 2 min, 30 s when unknown), the same way a learned memory size is held. So a
+  burst of builds starts one at a time as their peaks show (0.4.3: in 0.4.2 holds ended after 10 s, or after 3 s on a
+  machine reading under 50%, so several 16-core cargo builds started before their CPU showed and the Mac sat at 95-100%
+  CPU with load1 up to 184). Cold jobs (the whole machine for 10 s, so they start at least 10 s apart) and Docker/VM
+  jobs (their CPU never shows in the tree) keep the 10 s ramp hold. A waiter held back by a hold sleeps until the first
+  moment the holds leave room, and re-samples at least every 10 s, so a peak that shows sooner releases it. A job's recorded peak is the larger of its process tree's peak and the
   machine-wide CPU rise of other programs over the pre-start baseline, so work hosted in Docker's VM (outside the
   tree) also teaches a real peak. On Linux a process's threads are not counted as children (sysinfo lists each thread
   with its whole process's RSS and CPU; before 0.3.2 a 16-thread rustc counted 17 times, so learned memory peaks were
@@ -62,7 +64,8 @@ All of these must hold:
 - Known limit: the memory and pressure guards only veto new starts. A gate cannot stop jobs already running, and
   stokehold does not kill them: if running jobs all grow past their learned peaks, memory can still run out. The unused
   reservation holds above are what protect against this, not the guards.
-- Guards (veto only): 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16
+- Guards (veto only): 1-minute load at or over 3 x cores with the CPU at least 95% busy is overload and always blocks,
+  even a job that would run alone. 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16
   cores killed Docker on 2026-11-19). From 2 x cores up, load blocks while it is still rising (load1 > 1.1 x load5)
   and the CPU is at least 75% busy, or while the CPU is at least 90% busy (the CPU here is the larger of the latest
   and the sustained reading). Load without CPU is not CPU overload: on
@@ -82,11 +85,16 @@ head has waited under 60 s.
 
 `~/.local/state/stokehold/jobs/` holds one JSON file per job (pid, process start time, reservation, cmd, cwd, state).
 Decisions are made under a `flock`, which the kernel releases if a process dies. Files of dead jobs are dropped.
+Each job's `stokehold` also holds a `flock` on its own `<id>.lock` for its whole life (opened close-on-exec, so a server
+the job leaves behind never inherits it). A job whose lock can be taken is dead, however it died (SIGKILL included), and
+whatever process now has its pid: its file is deleted and it never keeps a reservation (0.4.3: in 0.4.2 `status` could
+list a `running` job whose pid no longer existed).
 Waiters watch the directory (kqueue/inotify) and re-evaluate when a job file changes or disappears. Only while live
 data blocks a job is there a 10 s re-sample (monitoring; a waiter held back by a ramp sleeps until the first moment it fits instead, not until the ramp ends); a 30 s safety sweep catches jobs killed with SIGKILL.
 
-A job's file is never deleted while its pid exists: if the process start time cannot be read, a marker is stored and
-liveness checks the pid only. Leftover `.tmp` files are swept with the dead jobs.
+Job files without a lock file (written by 0.4.2 and older) fall back to the pid: dead when the pid is gone, a zombie,
+or started at another time than the file says (pid reuse); if the process start time cannot be read, a marker is
+stored and liveness checks the pid only. Leftover `.tmp` files are swept with the dead jobs.
 
 If `STOKEHOLD_JOB` names a live running job, `stokehold` execs the command directly.
 

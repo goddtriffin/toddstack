@@ -496,10 +496,28 @@ pub fn stopped_ids(jobs: &[Job]) -> Vec<String> {
 /// The start time of a live process (seconds since the epoch), or `None` when it does not exist.
 #[must_use]
 pub fn process_start(pid: u32) -> Option<u64> {
+    process_probe(pid).map(|p| p.start)
+}
+
+/// What the process table says about one pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessProbe {
+    /// Start time, seconds since the epoch.
+    pub start: u64,
+    /// The process has exited and waits for its parent to reap it.
+    pub zombie: bool,
+}
+
+/// The start time and zombie state of `pid`, or `None` when the process table has no such process (or cannot be read).
+#[must_use]
+pub fn process_probe(pid: u32) -> Option<ProcessProbe> {
     let mut sys = System::new().ok()?;
     let p = Pid::from_u32(pid);
     sys.refresh_processes(ProcessesToUpdate::Some(&[p]), true);
-    sys.process(p).map(sysinfo::Process::start_time)
+    sys.process(p).map(|proc| ProcessProbe {
+        start: proc.start_time(),
+        zombie: proc.status() == sysinfo::ProcessStatus::Zombie,
+    })
 }
 
 /// Machine-wide network bytes (in, out), loopback excluded.

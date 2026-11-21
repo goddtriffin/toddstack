@@ -1,7 +1,9 @@
 //! The shared state dir: one JSON file per job, coordinated with `flock`.
 //!
-//! The kernel drops a flock when its holder dies, so there is no stale-mutex reaping. Dead jobs (pid plus
-//! start time no longer match) are removed whenever someone holds the lock.
+//! The kernel drops a flock when its holder dies, so there is no stale-mutex reaping. Each job's process also holds a
+//! flock on its own `<id>.lock` for as long as it lives: a job whose lock can be taken is dead, however it died
+//! (SIGKILL included), and whatever process now has its pid. Job files without a lock file (written by 0.4.2 and
+//! older) fall back to the pid plus its start time. Dead jobs are removed whenever someone holds the state lock.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -13,7 +15,7 @@ use nix::unistd::Pid;
 
 use crate::error::Error;
 use crate::job::{Job, START_UNKNOWN};
-use crate::machine::process_start;
+use crate::machine::{ProcessProbe, process_probe};
 
 /// Reads `STOKEHOLD_<X>`, falling back to the legacy `HEAVY_<X>` (pass the `STOKEHOLD_` name). Empty counts as unset.
 #[must_use]
@@ -278,6 +280,36 @@ impl StateDir {
 
     pub fn remove_job(&self, id: &str) {
         let _ = fs::remove_file(self.jobs_dir().join(format!("{id}.json")));
+        let _ = fs::remove_file(self.job_lock_path(id));
+    }
+
+    fn job_lock_path(&self, id: &str) -> PathBuf {
+        self.jobs_dir().join(format!("{id}.lock"))
+    }
+
+    /// Creates and locks the job's own lock file. The caller holds the guard for the job's whole life; the kernel drops
+    /// the lock when the process dies. The file is opened close-on-exec, so the job's children never inherit (and
+    /// never keep holding) it: a server the job left behind cannot keep a dead job alive.
+    ///
+    /// # Errors
+    /// Fails when the lock file cannot be opened or locked.
+    pub fn hold_job_lock(&self, id: &str) -> Result<Flock<File>, Error> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.job_lock_path(id))?;
+        Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| Error::Sys(e))
+    }
+
+    /// Is the job's process alive? Its lock file decides when there is one: held means alive, takeable means its
+    /// holder is gone. Without one (a job of an older binary), the pid and its start time decide (`is_alive`).
+    #[must_use]
+    pub fn job_alive(&self, job: &Job) -> bool {
+        match job_lock_held(&self.job_lock_path(&job.id)) {
+            Some(held) => held,
+            None => is_alive(job),
+        }
     }
 
     #[must_use]
@@ -319,20 +351,55 @@ impl StateDir {
         }
     }
 
-    /// Reads the jobs and deletes the files of dead ones and stale `.tmp` files (call with the lock held).
+    /// Removes lock files whose job file is gone and whose holder is dead (call with the lock held: a job takes its
+    /// lock and writes its file under it, so a live job never has a lock file without a job file then).
+    fn sweep_locks(&self) {
+        let Ok(rd) = fs::read_dir(self.jobs_dir()) else {
+            return;
+        };
+        for e in rd.filter_map(Result::ok) {
+            let path = e.path();
+            if path.extension().is_some_and(|x| x == "lock")
+                && !path.with_extension("json").exists()
+                && job_lock_held(&path) == Some(false)
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Reads the jobs and deletes the files of dead ones, stale `.tmp` files and orphaned lock files (call with the
+    /// lock held). A dead job never keeps a reservation: it is gone from the result.
     #[must_use]
     pub fn live_jobs(&self) -> Vec<Job> {
         self.sweep_tmp();
-        let (alive, dead): (Vec<Job>, Vec<Job>) = self.read_jobs().into_iter().partition(is_alive);
+        let (alive, dead): (Vec<Job>, Vec<Job>) = self
+            .read_jobs()
+            .into_iter()
+            .partition(|j| self.job_alive(j));
         for j in dead {
             self.remove_job(&j.id);
         }
+        self.sweep_locks();
         alive
     }
 }
 
-/// A job is alive when its pid exists and that process started when the job file says. A failed probe of
-/// the process start (here or when the file was written) never makes a live job look dead.
+/// Whether a job lock file is held by a live process: `Some(true)` held, `Some(false)` takeable (its holder is dead, or
+/// it never had one), `None` when there is no lock file or it cannot be probed. Flock conflicts between separate opens
+/// even within one process, so a job sees its own lock as held.
+fn job_lock_held(path: &Path) -> Option<bool> {
+    let file = OpenOptions::new().write(true).open(path).ok()?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(_probe) => Some(false),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// The fallback for a job file without a lock file: alive when its pid exists, is no zombie (an exited process its
+/// parent has not reaped still answers `kill(pid, 0)`), and started when the job file says (pid reuse). A failed probe
+/// of the process start (here or when the file was written) never makes a live job look dead.
 #[must_use]
 pub fn is_alive(job: &Job) -> bool {
     let Ok(pid) = i32::try_from(job.pid) else {
@@ -342,16 +409,38 @@ pub fn is_alive(job: &Job) -> bool {
         Ok(()) | Err(nix::errno::Errno::EPERM) => {}
         Err(_) => return false,
     }
-    match process_start(job.pid) {
-        Some(t) => job.start_time == START_UNKNOWN || t == job.start_time,
-        None => true,
+    match process_probe(job.pid) {
+        Some(ProcessProbe { zombie: true, .. }) => false,
+        Some(ProcessProbe { start, .. }) => {
+            job.start_time == START_UNKNOWN || start == job.start_time
+        }
+        // sysinfo lists no zombies on macOS: ask `ps`, which does.
+        None => ps_says_alive(job.pid),
+    }
+}
+
+/// `ps -o stat= -p <pid>`: alive unless `ps` ran and lists no such process or a zombie (`Z`). A `ps` that cannot run
+/// never makes a live job look dead.
+fn ps_says_alive(pid: u32) -> bool {
+    match std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) => {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            !stat.is_empty() && !stat.starts_with('Z')
+        }
+        Err(_) => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{State, Weights};
+    use crate::job::{Capacity, State, Weights};
+    use crate::machine::process_start;
 
     pub fn job(id: &str, pid: u32, start: u64, state: State) -> Job {
         Job {
@@ -367,6 +456,7 @@ mod tests {
             blocked_by: None,
             mem_declared: false,
             mem_peak_at_ms: None,
+            cpu_hold_ms: None,
         }
     }
 
@@ -527,6 +617,151 @@ mod tests {
         let ids: Vec<String> = s.live_jobs().into_iter().map(|j| j.id).collect();
         assert_eq!(ids, vec!["unknown".to_string()]);
         assert!(!s.jobs_dir().join(".stale.tmp").exists());
+    }
+
+    /// A process that holds `path`'s flock until killed, like a job's stokehold. Perl is on macOS and every Linux here.
+    fn lock_holder(path: &Path) -> std::process::Child {
+        let mut child = std::process::Command::new("perl")
+            .args([
+                "-e",
+                "use Fcntl qw(:flock); open(my $f, '>>', $ARGV[0]) or die; flock($f, LOCK_EX) or die; print qq(ok\n); \
+                 $| = 1; sleep 600",
+            ])
+            .arg(path)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        assert_eq!(line.trim(), "ok", "the holder has the lock");
+        child
+    }
+
+    fn ids(s: &StateDir) -> Vec<String> {
+        s.live_jobs().into_iter().map(|j| j.id).collect()
+    }
+
+    #[test]
+    fn a_sigkilled_job_is_reaped_at_once_and_its_reservation_released() {
+        // 2026-11-20 on the Mac: `stokehold status` listed `running 50052 16 cores make dev` with no pid 50052.
+        let (_t, s) = dir();
+        let lock = s.job_lock_path("phantom");
+        let mut holder = lock_holder(&lock);
+        let pid = holder.id();
+        let start = process_start(pid).unwrap();
+        let phantom = Job {
+            weights: Weights {
+                cpu: 16,
+                mem: 4 << 30,
+                ..Weights::default()
+            },
+            started_ms: Some(1_000),
+            ..job("phantom", pid, start, State::Running)
+        };
+        s.write_job(&phantom).unwrap();
+        let waiter = Job {
+            weights: Weights {
+                cpu: 1,
+                ..Weights::default()
+            },
+            ..job("waiter", std::process::id(), START_UNKNOWN, State::Queued)
+        };
+        let cap = Capacity {
+            cpu: 16,
+            mem: 64 << 30,
+            vram: 0,
+            disk_total: 1 << 40,
+            vram_is_ram: true,
+        };
+        let live = crate::job::Live {
+            load1: 1.0,
+            disk_free: 1 << 39,
+            ..crate::job::Live::default()
+        };
+        let decide = |jobs: &[Job]| {
+            let mut all = jobs.to_vec();
+            all.push(waiter.clone());
+            crate::admit::evaluate(&waiter, &all, &cap, &live, 2_000)
+        };
+        assert_eq!(
+            ids(&s),
+            vec!["phantom".to_string()],
+            "alive while its lock is held"
+        );
+        assert!(matches!(
+            decide(&s.live_jobs()),
+            crate::admit::Decision::Wait { .. }
+        ));
+        holder.kill().unwrap();
+        // Not waited for yet: the process is a zombie, which still answers kill(pid, 0). The kernel dropped its lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ids(&s).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "never reaped");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            s.read_jobs().is_empty() && !lock.exists(),
+            "job and lock files deleted"
+        );
+        assert_eq!(
+            decide(&s.live_jobs()),
+            crate::admit::Decision::Start,
+            "reservation released"
+        );
+        holder.wait().unwrap();
+    }
+
+    #[test]
+    fn the_job_lock_decides_over_a_reused_pid() {
+        let (_t, s) = dir();
+        let me = std::process::id();
+        let start = process_start(me).unwrap();
+        // Our own pid and start time, as if the pid had been reused by a live process that started at that second:
+        // the lock is free, so the job's process is gone.
+        s.write_job(&job("reused", me, start, State::Running))
+            .unwrap();
+        drop(s.hold_job_lock("reused").unwrap());
+        // A live job: its lock is held (by this process, through another open: flock conflicts anyway).
+        let held = s.hold_job_lock("live").unwrap();
+        s.write_job(&job("live", me, start, State::Running))
+            .unwrap();
+        // An old binary's job file (no lock file) whose pid now belongs to another process: the start time differs.
+        s.write_job(&job("old-reused", me, start + 10_000, State::Running))
+            .unwrap();
+        assert_eq!(ids(&s), vec!["live".to_string()]);
+        // An orphaned lock file (its job file gone, holder dead) is swept; a held one is kept.
+        drop(s.hold_job_lock("orphan").unwrap());
+        let _ = s.live_jobs();
+        assert!(!s.job_lock_path("orphan").exists());
+        assert!(s.job_lock_path("live").exists());
+        drop(held);
+        assert!(ids(&s).is_empty(), "released with its holder");
+    }
+
+    #[test]
+    fn a_zombie_without_a_lock_file_is_dead() {
+        let (_t, s) = dir();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ps_says_alive(pid) {
+            assert!(std::time::Instant::now() < deadline, "never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        s.write_job(&job("zombie", pid, START_UNKNOWN, State::Running))
+            .unwrap();
+        assert!(
+            ids(&s).is_empty(),
+            "an unreaped exited process is no live job"
+        );
+        child.wait().unwrap();
     }
 
     #[test]
