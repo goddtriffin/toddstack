@@ -94,66 +94,19 @@ fn p95(sorted: &[u64]) -> u64 {
     sorted.get(rank - 1).copied().unwrap_or(0)
 }
 
-#[must_use]
-pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
-    let mut waits: Vec<u64> = Vec::new();
-    let mut repos: BTreeMap<String, RepoRow> = BTreeMap::new();
-    let mut samples: Vec<Sample> = Vec::new();
-    for e in events {
-        let ts = e.ts().as_millisecond();
-        if ts < since_ms || ts > until_ms {
-            continue;
-        }
-        match e {
-            Event::Started { job, wait_ms, .. } => {
-                waits.push(*wait_ms);
-                let row = repos
-                    .entry(job.repo.clone().unwrap_or_else(|| "(no repo)".into()))
-                    .or_insert_with_key(|k| RepoRow {
-                        repo: k.clone(),
-                        jobs: 0,
-                        wait_ms: 0,
-                        cpu_ms: 0,
-                    });
-                row.jobs += 1;
-                row.wait_ms += wait_ms;
-            }
-            Event::Finished { job, cpu_ms, .. } => {
-                let row = repos
-                    .entry(job.repo.clone().unwrap_or_else(|| "(no repo)".into()))
-                    .or_insert_with_key(|k| RepoRow {
-                        repo: k.clone(),
-                        jobs: 0,
-                        wait_ms: 0,
-                        cpu_ms: 0,
-                    });
-                row.cpu_ms += cpu_ms;
-            }
-            Event::Sample {
-                cpu_pct,
-                mem_pct,
-                running,
-                waiting,
-                blocked,
-                ..
-            } => {
-                samples.push(Sample {
-                    ts,
-                    cpu_pct: *cpu_pct,
-                    mem_pct: *mem_pct,
-                    running: *running,
-                    waiting: *waiting,
-                    blocked: blocked.clone(),
-                });
-            }
-            Event::Queued { .. } => {}
-        }
-    }
-    samples.sort_by_key(|s| s.ts);
-    waits.sort_unstable();
-    let wait_total_ms: u64 = waits.iter().sum();
-    let jobs = waits.len();
+fn repo_row<'a>(repos: &'a mut BTreeMap<String, RepoRow>, repo: Option<&str>) -> &'a mut RepoRow {
+    repos
+        .entry(repo.unwrap_or("(no repo)").to_string())
+        .or_insert_with_key(|k| RepoRow {
+            repo: k.clone(),
+            jobs: 0,
+            wait_ms: 0,
+            cpu_ms: 0,
+        })
+}
 
+/// Returns (waiting span, idle span, weighted cpu, idle reasons sorted by time).
+fn idle_analysis(samples: &[Sample]) -> (u64, u64, u64, Vec<(String, u64)>) {
     let (mut waiting_span_ms, mut idle_ms, mut cpu_ms) = (0u64, 0u64, 0u64);
     let mut reasons: BTreeMap<String, u64> = BTreeMap::new();
     for pair in samples.windows(2) {
@@ -182,6 +135,56 @@ pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
             .then_with(|| reason_rank(&a.0).cmp(&reason_rank(&b.0)))
             .then_with(|| a.0.cmp(&b.0))
     });
+    (waiting_span_ms, idle_ms, cpu_ms, idle_reasons)
+}
+
+#[must_use]
+pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
+    let mut waits: Vec<u64> = Vec::new();
+    let mut repos: BTreeMap<String, RepoRow> = BTreeMap::new();
+    let mut samples: Vec<Sample> = Vec::new();
+    for e in events {
+        let ts = e.ts().as_millisecond();
+        if ts < since_ms || ts > until_ms {
+            continue;
+        }
+        match e {
+            Event::Started { job, wait_ms, .. } => {
+                waits.push(*wait_ms);
+                let row = repo_row(&mut repos, job.repo.as_deref());
+                row.jobs += 1;
+                row.wait_ms += wait_ms;
+            }
+            Event::Finished { job, cpu_ms, .. } => {
+                let row = repo_row(&mut repos, job.repo.as_deref());
+                row.cpu_ms += cpu_ms;
+            }
+            Event::Sample {
+                cpu_pct,
+                mem_pct,
+                running,
+                waiting,
+                blocked,
+                ..
+            } => {
+                samples.push(Sample {
+                    ts,
+                    cpu_pct: *cpu_pct,
+                    mem_pct: *mem_pct,
+                    running: *running,
+                    waiting: *waiting,
+                    blocked: blocked.clone(),
+                });
+            }
+            Event::Queued { .. } => {}
+        }
+    }
+    samples.sort_by_key(|s| s.ts);
+    waits.sort_unstable();
+    let wait_total_ms: u64 = waits.iter().sum();
+    let jobs = waits.len();
+
+    let (waiting_span_ms, idle_ms, cpu_ms, idle_reasons) = idle_analysis(&samples);
 
     let mut repo_rows: Vec<RepoRow> = repos.into_values().collect();
     repo_rows.sort_by(|a, b| {
@@ -308,6 +311,52 @@ pub fn spark(values: &[Option<f64>], max: f64) -> String {
         .collect()
 }
 
+fn write_timeline(o: &mut String, buckets: &[Bucket]) {
+    let shown = &buckets[buckets.len().saturating_sub(TEXT_BUCKETS)..];
+    let note = if shown.len() < buckets.len() {
+        format!(
+            ", last {} of {} (use --html for all)",
+            shown.len(),
+            buckets.len()
+        )
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        o,
+        "\ntimeline, 5-minute buckets{note}; cpu 0-100%, running and waiting scaled to their max"
+    );
+    let max_run = shown
+        .iter()
+        .filter_map(|b| b.running)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let max_wait = shown
+        .iter()
+        .filter_map(|b| b.waiting)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    for chunk in shown.chunks(ROW) {
+        let _ = writeln!(o, "{} UTC", stamp(chunk[0].start_ms));
+        let cpu: Vec<_> = chunk.iter().map(|b| b.cpu).collect();
+        let run: Vec<_> = chunk.iter().map(|b| b.running.map(f64::from)).collect();
+        let wait: Vec<_> = chunk.iter().map(|b| b.waiting.map(f64::from)).collect();
+        let _ = writeln!(o, "  cpu     {}", spark(&cpu, 100.0));
+        let _ = writeln!(
+            o,
+            "  running {}  (max {max_run})",
+            spark(&run, f64::from(max_run))
+        );
+        let _ = writeln!(
+            o,
+            "  waiting {}  (max {max_wait})",
+            spark(&wait, f64::from(max_wait))
+        );
+    }
+}
+
 #[must_use]
 pub fn render_text(r: &Report) -> String {
     let mut o = String::new();
@@ -369,49 +418,7 @@ pub fn render_text(r: &Report) -> String {
         let _ = writeln!(o, "\nno machine samples in this window");
         return o;
     }
-    let shown = &r.buckets[r.buckets.len().saturating_sub(TEXT_BUCKETS)..];
-    let note = if shown.len() < r.buckets.len() {
-        format!(
-            ", last {} of {} (use --html for all)",
-            shown.len(),
-            r.buckets.len()
-        )
-    } else {
-        String::new()
-    };
-    let _ = writeln!(
-        o,
-        "\ntimeline, 5-minute buckets{note}; cpu 0-100%, running and waiting scaled to their max"
-    );
-    let max_run = shown
-        .iter()
-        .filter_map(|b| b.running)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let max_wait = shown
-        .iter()
-        .filter_map(|b| b.waiting)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    for chunk in shown.chunks(ROW) {
-        let _ = writeln!(o, "{} UTC", stamp(chunk[0].start_ms));
-        let cpu: Vec<_> = chunk.iter().map(|b| b.cpu).collect();
-        let run: Vec<_> = chunk.iter().map(|b| b.running.map(f64::from)).collect();
-        let wait: Vec<_> = chunk.iter().map(|b| b.waiting.map(f64::from)).collect();
-        let _ = writeln!(o, "  cpu     {}", spark(&cpu, 100.0));
-        let _ = writeln!(
-            o,
-            "  running {}  (max {max_run})",
-            spark(&run, f64::from(max_run))
-        );
-        let _ = writeln!(
-            o,
-            "  waiting {}  (max {max_wait})",
-            spark(&wait, f64::from(max_wait))
-        );
-    }
+    write_timeline(&mut o, &r.buckets);
     o
 }
 
@@ -492,6 +499,33 @@ fn chart(
     s
 }
 
+fn push_blockers(h: &mut String, reasons: &[(String, u64)]) {
+    h.push_str("<section><h2>Blockers while idle</h2>");
+    if reasons.is_empty() {
+        h.push_str("<p class=\"mut\">None: stokehold never waited with room on the machine in this window.</p>");
+    } else {
+        let top = reasons.first().map_or(1, |(_, ms)| *ms).max(1);
+        let _ = write!(
+            h,
+            "<svg viewBox=\"0 0 {W} {}\" role=\"img\" aria-label=\"blocking reasons during idle minutes\">",
+            reasons.len() * 24 + 4
+        );
+        for (i, (k, ms)) in reasons.iter().enumerate() {
+            let y = i * 24 + 2;
+            let w = 600.0 * f(*ms) / f(top);
+            let _ = write!(
+                h,
+                "<text x=\"0\" y=\"{}\" class=\"lbl\">{}</text><rect class=\"barbg\" x=\"90\" y=\"{y}\" width=\"600\" height=\"16\"/><rect class=\"bar\" x=\"90\" y=\"{y}\" width=\"{w:.1}\" height=\"16\"/><text x=\"700\" y=\"{}\" class=\"lbl\">{}</text>",
+                y + 13,
+                esc(k),
+                y + 13,
+                fmt_dur(*ms)
+            );
+        }
+        h.push_str("</svg>");
+    }
+}
+
 /// One self-contained HTML page: inline SVG, no scripts, light and dark.
 #[must_use]
 pub fn render_html(r: &Report) -> String {
@@ -568,30 +602,7 @@ pub fn render_html(r: &Report) -> String {
         &last,
         None,
     ));
-    h.push_str("<section><h2>Blockers while idle</h2>");
-    if r.idle_reasons.is_empty() {
-        h.push_str("<p class=\"mut\">None: stokehold never waited with room on the machine in this window.</p>");
-    } else {
-        let top = r.idle_reasons.first().map_or(1, |(_, ms)| *ms).max(1);
-        let _ = write!(
-            h,
-            "<svg viewBox=\"0 0 {W} {}\" role=\"img\" aria-label=\"blocking reasons during idle minutes\">",
-            r.idle_reasons.len() * 24 + 4
-        );
-        for (i, (k, ms)) in r.idle_reasons.iter().enumerate() {
-            let y = i * 24 + 2;
-            let w = 600.0 * f(*ms) / f(top);
-            let _ = write!(
-                h,
-                "<text x=\"0\" y=\"{}\" class=\"lbl\">{}</text><rect class=\"barbg\" x=\"90\" y=\"{y}\" width=\"600\" height=\"16\"/><rect class=\"bar\" x=\"90\" y=\"{y}\" width=\"{w:.1}\" height=\"16\"/><text x=\"700\" y=\"{}\" class=\"lbl\">{}</text>",
-                y + 13,
-                esc(k),
-                y + 13,
-                fmt_dur(*ms)
-            );
-        }
-        h.push_str("</svg>");
-    }
+    push_blockers(&mut h, &r.idle_reasons);
     h.push_str("</section><section><h2>Per repo</h2><table><tr><th>repo</th><th>jobs</th><th>wait</th><th>avg wait</th><th>cpu-hours</th></tr>");
     for row in &r.repos {
         let avg = if row.jobs == 0 {
