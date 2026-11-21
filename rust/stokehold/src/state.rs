@@ -18,11 +18,17 @@ use crate::machine::process_start;
 /// Reads `STOKEHOLD_<X>`, falling back to the legacy `HEAVY_<X>` (pass the `STOKEHOLD_` name). Empty counts as unset.
 #[must_use]
 pub fn env_var(name: &str) -> Option<std::ffi::OsString> {
-    prefer(std::env::var_os(name), || std::env::var_os(name.replacen("STOKEHOLD_", "HEAVY_", 1)))
+    prefer(std::env::var_os(name), || {
+        std::env::var_os(name.replacen("STOKEHOLD_", "HEAVY_", 1))
+    })
 }
 
-fn prefer(new: Option<std::ffi::OsString>, legacy: impl FnOnce() -> Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
-    new.filter(|v| !v.is_empty()).or_else(|| legacy().filter(|v| !v.is_empty()))
+fn prefer(
+    new: Option<std::ffi::OsString>,
+    legacy: impl FnOnce() -> Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    new.filter(|v| !v.is_empty())
+        .or_else(|| legacy().filter(|v| !v.is_empty()))
 }
 
 /// What `migrate_legacy` found and did.
@@ -72,18 +78,30 @@ pub fn migrate_legacy(old: &Path, new: &Path) -> Migration {
         .ok()
         .and_then(|f| Flock::lock(f, FlockArg::LockExclusive).ok());
     let points_at_new = |old: &Path| match fs::read_link(old) {
-        Ok(t) => t == new || (t.is_relative() && old.parent().map(|p| p.join(&t)).as_deref() == Some(new)),
+        Ok(t) => {
+            t == new
+                || (t.is_relative() && old.parent().map(|p| p.join(&t)).as_deref() == Some(new))
+        }
         Err(_) => false,
     };
     let link_over_old = |old: &Path| -> bool {
         let tmp = old.with_extension(format!("link-{}", std::process::id()));
         let _ = fs::remove_file(&tmp);
-        symlink(new, &tmp).is_ok() && fs::rename(&tmp, old).map_err(|_| { let _ = fs::remove_file(&tmp); }).is_ok()
+        symlink(new, &tmp).is_ok()
+            && fs::rename(&tmp, old)
+                .map_err(|_| {
+                    let _ = fs::remove_file(&tmp);
+                })
+                .is_ok()
     };
     match fs::symlink_metadata(old) {
         Err(_) => {
             let _ = fs::create_dir_all(new);
-            if link_over_old(old) { Migration::LinkCreated } else { Migration::Split }
+            if link_over_old(old) {
+                Migration::LinkCreated
+            } else {
+                Migration::Split
+            }
         }
         Ok(m) if m.file_type().is_symlink() => {
             if points_at_new(old) {
@@ -121,7 +139,9 @@ pub fn migrate_legacy(old: &Path, new: &Path) -> Migration {
 fn merge_jobs(old: &Path, new: &Path) {
     let dest = new.join("jobs");
     let _ = fs::create_dir_all(&dest);
-    let Ok(entries) = fs::read_dir(old.join("jobs")) else { return };
+    let Ok(entries) = fs::read_dir(old.join("jobs")) else {
+        return;
+    };
     for e in entries.flatten() {
         let to = dest.join(e.file_name());
         if fs::symlink_metadata(&to).is_err() {
@@ -149,7 +169,8 @@ impl StateDir {
         if let Some(dir) = env_var("STOKEHOLD_STATE_DIR") {
             return Ok(Self { base: dir.into() });
         }
-        let home = std::env::var_os("HOME").ok_or_else(|| Error::Usage("HOME is not set".into()))?;
+        let home =
+            std::env::var_os("HOME").ok_or_else(|| Error::Usage("HOME is not set".into()))?;
         let base = PathBuf::from(home).join(".local/state");
         let (new, old) = (base.join("stokehold"), base.join("heavy"));
         migrate_legacy(&old, &new);
@@ -176,7 +197,10 @@ impl StateDir {
     /// When the last machine sample was written (ms since the epoch; 0 for never). Shared by every heavy process.
     #[must_use]
     pub fn last_sample_ms(&self) -> i64 {
-        fs::read_to_string(self.base.join("last_sample")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0)
+        fs::read_to_string(self.base.join("last_sample"))
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     /// Call with the lock held.
@@ -203,7 +227,11 @@ impl StateDir {
         all.push((now_ms, pct));
         all.retain(|(ts, _)| *ts <= now_ms && now_ms - *ts <= keep_ms);
         all.sort_unstable();
-        let text = all.iter().map(|(ts, pct)| format!("{ts} {pct}")).collect::<Vec<_>>().join("\n");
+        let text = all
+            .iter()
+            .map(|(ts, pct)| format!("{ts} {pct}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let tmp = self.base.join(".busy.tmp");
         if fs::write(&tmp, text).is_ok() {
             let _ = fs::rename(tmp, self.base.join("busy"));
@@ -227,7 +255,11 @@ impl StateDir {
     /// # Errors
     /// Fails when the lock file cannot be opened or locked.
     pub fn lock(&self) -> Result<Flock<File>, Error> {
-        let file = OpenOptions::new().create(true).truncate(false).write(true).open(self.base.join("lock"))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.base.join("lock"))?;
         Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| Error::Sys(e))
     }
 
@@ -256,10 +288,16 @@ impl StateDir {
     /// Every readable job file, oldest first.
     #[must_use]
     pub fn read_jobs(&self) -> Vec<Job> {
-        let Ok(rd) = fs::read_dir(self.jobs_dir()) else { return Vec::new() };
+        let Ok(rd) = fs::read_dir(self.jobs_dir()) else {
+            return Vec::new();
+        };
         let mut jobs: Vec<Job> = rd
             .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_str().is_some_and(|n| !n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "json")))
+            .filter(|e| {
+                e.file_name().to_str().is_some_and(|n| {
+                    !n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "json")
+                })
+            })
             .filter_map(|e| serde_json::from_slice(&fs::read(e.path()).ok()?).ok())
             .collect();
         jobs.sort_by(|a: &Job, b: &Job| (a.enqueued_ms, &a.id).cmp(&(b.enqueued_ms, &b.id)));
@@ -269,9 +307,13 @@ impl StateDir {
     /// Removes leftover `.tmp` files of writers that died mid-write. Writers hold the lock, so with the lock
     /// held every `.tmp` file is stale.
     fn sweep_tmp(&self) {
-        let Ok(rd) = fs::read_dir(self.jobs_dir()) else { return };
+        let Ok(rd) = fs::read_dir(self.jobs_dir()) else {
+            return;
+        };
         for e in rd.filter_map(Result::ok) {
-            if e.file_name().to_str().is_some_and(|n| n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "tmp")) {
+            if e.file_name().to_str().is_some_and(|n| {
+                n.starts_with('.') && Path::new(n).extension().is_some_and(|x| x == "tmp")
+            }) {
                 let _ = fs::remove_file(e.path());
             }
         }
@@ -293,7 +335,9 @@ impl StateDir {
 /// the process start (here or when the file was written) never makes a live job look dead.
 #[must_use]
 pub fn is_alive(job: &Job) -> bool {
-    let Ok(pid) = i32::try_from(job.pid) else { return false };
+    let Ok(pid) = i32::try_from(job.pid) else {
+        return false;
+    };
     match kill(Pid::from_raw(pid), None) {
         Ok(()) | Err(nix::errno::Errno::EPERM) => {}
         Err(_) => return false,
@@ -310,7 +354,18 @@ mod tests {
     use crate::job::{State, Weights};
 
     pub fn job(id: &str, pid: u32, start: u64, state: State) -> Job {
-        Job { id: id.into(), pid, start_time: start, weights: Weights::default(), cmd: vec!["x".into()], cwd: "/".into(), state, enqueued_ms: 1, started_ms: None, blocked_by: None }
+        Job {
+            id: id.into(),
+            pid,
+            start_time: start,
+            weights: Weights::default(),
+            cmd: vec!["x".into()],
+            cwd: "/".into(),
+            state,
+            enqueued_ms: 1,
+            started_ms: None,
+            blocked_by: None,
+        }
     }
 
     fn dir() -> (tempfile::TempDir, StateDir) {
@@ -374,10 +429,24 @@ mod tests {
         fs::write(old.join("jobs/b.json"), "old-b").unwrap();
         fs::write(new.join("jobs/b.json"), "new-b").unwrap();
         assert_eq!(migrate_legacy(&old, &new), Migration::Split);
-        assert_eq!(fs::read_to_string(new.join("jobs/a.json")).unwrap(), "old-a");
-        assert_eq!(fs::read_to_string(new.join("jobs/b.json")).unwrap(), "new-b", "no overwrite");
-        assert_eq!(fs::read_to_string(old.join("jobs/b.json")).unwrap(), "old-b", "collision left behind");
-        assert!(old.is_dir() && !fs::symlink_metadata(&old).unwrap().file_type().is_symlink(), "old dir untouched");
+        assert_eq!(
+            fs::read_to_string(new.join("jobs/a.json")).unwrap(),
+            "old-a"
+        );
+        assert_eq!(
+            fs::read_to_string(new.join("jobs/b.json")).unwrap(),
+            "new-b",
+            "no overwrite"
+        );
+        assert_eq!(
+            fs::read_to_string(old.join("jobs/b.json")).unwrap(),
+            "old-b",
+            "collision left behind"
+        );
+        assert!(
+            old.is_dir() && !fs::symlink_metadata(&old).unwrap().file_type().is_symlink(),
+            "old dir untouched"
+        );
     }
 
     #[test]
@@ -417,7 +486,11 @@ mod tests {
         s.push_busy(1_000, 100, 20_000);
         s.push_busy(15_000, 98, 20_000);
         s.push_busy(25_000, 60, 20_000);
-        assert_eq!(s.busy_readings(), vec![(15_000, 98), (25_000, 60)], "the reading from 24 s ago is dropped");
+        assert_eq!(
+            s.busy_readings(),
+            vec![(15_000, 98), (25_000, 60)],
+            "the reading from 24 s ago is dropped"
+        );
     }
 
     #[test]
@@ -425,8 +498,10 @@ mod tests {
         let (_t, s) = dir();
         let me = std::process::id();
         let start = process_start(me).unwrap();
-        s.write_job(&job("alive", me, start, State::Running)).unwrap();
-        s.write_job(&job("reused-pid", me, start + 10_000, State::Running)).unwrap();
+        s.write_job(&job("alive", me, start, State::Running))
+            .unwrap();
+        s.write_job(&job("reused-pid", me, start + 10_000, State::Running))
+            .unwrap();
         let mut gone = std::process::Command::new("true").spawn().unwrap();
         let dead = gone.id();
         gone.wait().unwrap();
@@ -439,7 +514,13 @@ mod tests {
     #[test]
     fn unknown_start_time_is_alive_while_the_pid_exists_and_tmp_files_are_swept() {
         let (_t, s) = dir();
-        s.write_job(&job("unknown", std::process::id(), START_UNKNOWN, State::Running)).unwrap();
+        s.write_job(&job(
+            "unknown",
+            std::process::id(),
+            START_UNKNOWN,
+            State::Running,
+        ))
+        .unwrap();
         std::fs::write(s.jobs_dir().join(".stale.tmp"), "{").unwrap();
         let ids: Vec<String> = s.live_jobs().into_iter().map(|j| j.id).collect();
         assert_eq!(ids, vec!["unknown".to_string()]);

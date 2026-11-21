@@ -31,12 +31,21 @@ fn now_ms() -> i64 {
 /// # Errors
 /// Fails when the machine cannot be probed or the state dir cannot be locked.
 pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> Result<bool, Error> {
-    let due = |now: i64| (now - state.last_sample_ms() >= SAMPLE_EVERY_MS, busy_due(state, now));
+    let due = |now: i64| {
+        (
+            now - state.last_sample_ms() >= SAMPLE_EVERY_MS,
+            busy_due(state, now),
+        )
+    };
     if due(now_ms()) == (false, false) {
         return Ok(false);
     }
     // Measure before taking the lock (it takes a quarter of a second); recheck under it.
-    let running: Vec<_> = state.read_jobs().into_iter().filter(|j| j.state == State::Running).collect();
+    let running: Vec<_> = state
+        .read_jobs()
+        .into_iter()
+        .filter(|j| j.state == State::Running)
+        .collect();
     let mut live = machine::live(cwd, cap, &running)?;
     let _lock = state.lock()?;
     let now = now_ms();
@@ -53,7 +62,8 @@ pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> R
     }
     live.stopped = machine::stopped_ids(&jobs);
     let (waiting, blocked) = tally(&jobs, &live.stopped);
-    let running = u32::try_from(jobs.iter().filter(|j| j.state == State::Running).count()).unwrap_or(u32::MAX);
+    let running = u32::try_from(jobs.iter().filter(|j| j.state == State::Running).count())
+        .unwrap_or(u32::MAX);
     log::record(
         state.base(),
         &Event::Sample {
@@ -75,7 +85,10 @@ pub fn sample_once(state: &StateDir, cwd: &std::path::Path, cap: &Capacity) -> R
 /// Is the newest shared CPU reading at least `CHECK` old (or missing)?
 fn busy_due(state: &StateDir, now: i64) -> bool {
     let every = i64::try_from(CHECK.as_millis()).unwrap_or(i64::MAX);
-    state.busy_readings().last().is_none_or(|(ts, _)| now - ts >= every)
+    state
+        .busy_readings()
+        .last()
+        .is_none_or(|(ts, _)| now - ts >= every)
 }
 
 /// Counts the waiters and what blocks them. Only queued jobs that have evaluated (have a reason) wait: a stopped one (Ctrl-Z) cannot start, so it is
@@ -84,7 +97,10 @@ fn busy_due(state: &StateDir, now: i64) -> bool {
 fn tally(jobs: &[Job], stopped: &[String]) -> (u32, BTreeMap<String, u32>) {
     let mut blocked: BTreeMap<String, u32> = BTreeMap::new();
     let mut waiting = 0;
-    for j in jobs.iter().filter(|j| j.state == State::Queued && !stopped.contains(&j.id)) {
+    for j in jobs
+        .iter()
+        .filter(|j| j.state == State::Queued && !stopped.contains(&j.id))
+    {
         // No reason yet: the waiter has not evaluated, so it is not known to wait.
         let Some(b) = &j.blocked_by else { continue };
         waiting += 1;
@@ -126,15 +142,26 @@ mod tests {
 
     #[test]
     fn the_sampler_reads_the_reasons_the_waiters_wrote() {
-        let jobs = [job("r", State::Running, None), job("a", State::Queued, Some("cpu")), job("b", State::Queued, Some("ramp")), job("c", State::Queued, Some("cpu"))];
+        let jobs = [
+            job("r", State::Running, None),
+            job("a", State::Queued, Some("cpu")),
+            job("b", State::Queued, Some("ramp")),
+            job("c", State::Queued, Some("cpu")),
+        ];
         let (waiting, blocked) = tally(&jobs, &[]);
         assert_eq!(waiting, 3);
-        assert_eq!(blocked, BTreeMap::from([("cpu".to_string(), 2), ("ramp".to_string(), 1)]));
+        assert_eq!(
+            blocked,
+            BTreeMap::from([("cpu".to_string(), 2), ("ramp".to_string(), 1)])
+        );
     }
 
     #[test]
     fn unevaluated_waiters_are_not_counted() {
-        let jobs = [job("a", State::Queued, None), job("b", State::Queued, Some("cpu"))];
+        let jobs = [
+            job("a", State::Queued, None),
+            job("b", State::Queued, Some("cpu")),
+        ];
         let (waiting, blocked) = tally(&jobs, &[]);
         assert_eq!(waiting, 1);
         assert_eq!(blocked, BTreeMap::from([("cpu".to_string(), 1)]));
@@ -142,7 +169,11 @@ mod tests {
 
     #[test]
     fn stopped_jobs_do_not_wait() {
-        let jobs = [job("a", State::Stopped, Some("cpu")), job("b", State::Queued, Some("cpu")), job("c", State::Queued, Some("ramp"))];
+        let jobs = [
+            job("a", State::Stopped, Some("cpu")),
+            job("b", State::Queued, Some("cpu")),
+            job("c", State::Queued, Some("ramp")),
+        ];
         let (waiting, blocked) = tally(&jobs, &["c".to_string()]);
         assert_eq!(waiting, 1);
         assert_eq!(blocked, BTreeMap::from([("cpu".to_string(), 1)]));

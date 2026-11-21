@@ -55,7 +55,9 @@ pub fn repo_key(cwd: &Path) -> Option<String> {
         }
     };
     let common = common.canonicalize().unwrap_or(common);
-    let rel = cwd.strip_prefix(root).map_or_else(|_| PathBuf::new(), Path::to_path_buf);
+    let rel = cwd
+        .strip_prefix(root)
+        .map_or_else(|_| PathBuf::new(), Path::to_path_buf);
     Some(format!("{}:{}", common.display(), rel.display()))
 }
 
@@ -71,7 +73,11 @@ pub fn append(path: &Path, entry: &Entry) -> Result<(), Error> {
     let mut line = serde_json::to_vec(entry)?;
     line.push(b'\n');
     // One write call on an O_APPEND file: concurrent writers do not interleave.
-    OpenOptions::new().create(true).append(true).open(path)?.write_all(&line)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(&line)?;
     Ok(())
 }
 
@@ -92,9 +98,24 @@ fn median(mut v: Vec<u64>) -> Option<u64> {
 }
 
 #[must_use]
-pub fn defaults_from(entries: &[Entry], cmd: &[String], cwd: &str, repo: Option<&str>) -> Option<Defaults> {
+pub fn defaults_from(
+    entries: &[Entry],
+    cmd: &[String],
+    cwd: &str,
+    repo: Option<&str>,
+) -> Option<Defaults> {
     // macOS never counted threads as children (sysinfo reports no thread kind there), so old entries stay valid.
-    defaults_with(entries, cmd, cwd, repo, if cfg!(target_os = "linux") { VERSION } else { 0 })
+    defaults_with(
+        entries,
+        cmd,
+        cwd,
+        repo,
+        if cfg!(target_os = "linux") {
+            VERSION
+        } else {
+            0
+        },
+    )
 }
 
 /// How many leading words of the command the last lookup tier compares (`make ui-check`, `cargo test`).
@@ -103,10 +124,20 @@ const PROGRAM_WORDS: usize = 2;
 /// Like `defaults_from`, using only entries whose version is at least `min_v`. Tries the same command in the same
 /// cwd, then the same command in the same repository place, then the same program and first argument there.
 #[must_use]
-pub fn defaults_with(entries: &[Entry], cmd: &[String], cwd: &str, repo: Option<&str>, min_v: u32) -> Option<Defaults> {
-    let ok: Vec<&Entry> = entries.iter().filter(|e| e.v >= min_v && e.exit_code == 0).collect();
+pub fn defaults_with(
+    entries: &[Entry],
+    cmd: &[String],
+    cwd: &str,
+    repo: Option<&str>,
+    min_v: u32,
+) -> Option<Defaults> {
+    let ok: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.v >= min_v && e.exit_code == 0)
+        .collect();
     let same_repo = |e: &Entry| repo.is_some() && e.repo.as_deref() == repo;
-    let pick = |tier: &dyn Fn(&Entry) -> bool| ok.iter().copied().filter(|e| tier(e)).collect::<Vec<_>>();
+    let pick =
+        |tier: &dyn Fn(&Entry) -> bool| ok.iter().copied().filter(|e| tier(e)).collect::<Vec<_>>();
     if let Some(d) = aggregate(&pick(&|e| e.cwd == cwd && e.cmd == cmd), median) {
         return Some(d);
     }
@@ -119,11 +150,26 @@ pub fn defaults_with(entries: &[Entry], cmd: &[String], cwd: &str, repo: Option<
         return None;
     }
     let program = &cmd[..PROGRAM_WORDS];
-    aggregate(&pick(&|e| same_repo(e) && e.cmd.starts_with(program)), |v| v.into_iter().max())
+    aggregate(
+        &pick(&|e| same_repo(e) && e.cmd.starts_with(program)),
+        |v| v.into_iter().max(),
+    )
 }
 
 /// Wrappers and shells: what they run says nothing about the first argument's weight.
-const WRAPPERS: [&str; 11] = ["env", "bash", "sh", "zsh", "sudo", "nice", "time", "nohup", "xargs", "stokehold", "heavy"];
+const WRAPPERS: [&str; 11] = [
+    "env",
+    "bash",
+    "sh",
+    "zsh",
+    "sudo",
+    "nice",
+    "time",
+    "nohup",
+    "xargs",
+    "stokehold",
+    "heavy",
+];
 
 /// Whether `cmd` may use the pooled program + first argument tier: more than two words, the program is no wrapper,
 /// the first argument is no flag.
@@ -131,7 +177,10 @@ fn program_pools(cmd: &[String]) -> bool {
     if cmd.len() <= PROGRAM_WORDS {
         return false;
     }
-    let base = Path::new(&cmd[0]).file_name().and_then(|n| n.to_str()).unwrap_or(&cmd[0]);
+    let base = Path::new(&cmd[0])
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&cmd[0]);
     !WRAPPERS.contains(&base) && !cmd[1].starts_with('-')
 }
 
@@ -139,17 +188,43 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
     let mine = &mine[mine.len().saturating_sub(KEEP)..];
     // Peaks of the whole process tree; runs too short to sample (or old entries) fall back to the average
     // cores and the largest single process.
-    let cores = pick(mine.iter().map(|e| if e.measured.peak_centi_cores > 0 { e.measured.peak_centi_cores } else { e.measured.centi_cores }).collect())?;
-    let mem = pick(mine.iter().map(|e| e.measured.peak_tree_rss.max(e.measured.peak_rss)).collect())?;
+    let cores = pick(
+        mine.iter()
+            .map(|e| {
+                if e.measured.peak_centi_cores > 0 {
+                    e.measured.peak_centi_cores
+                } else {
+                    e.measured.centi_cores
+                }
+            })
+            .collect(),
+    )?;
+    let mem = pick(
+        mine.iter()
+            .map(|e| e.measured.peak_tree_rss.max(e.measured.peak_rss))
+            .collect(),
+    )?;
     let vram = pick(mine.iter().filter_map(|e| e.measured.peak_vram).collect());
-    Some(Defaults { cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX), mem, vram })
+    Some(Defaults {
+        cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX),
+        mem,
+        vram,
+    })
 }
 
 /// Reads the history file (a missing or damaged one just means no defaults).
 #[must_use]
-pub fn defaults_for(path: &Path, cmd: &[String], cwd: &str, repo: Option<&str>) -> Option<Defaults> {
+pub fn defaults_for(
+    path: &Path,
+    cmd: &[String],
+    cwd: &str,
+    repo: Option<&str>,
+) -> Option<Defaults> {
     let text = fs::read_to_string(path).ok()?;
-    let entries: Vec<Entry> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let entries: Vec<Entry> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
     defaults_from(&entries, cmd, cwd, repo)
 }
 
@@ -163,7 +238,11 @@ mod tests {
             cmd: vec![cmd.into()],
             cwd: cwd.into(),
             requested: Weights::default(),
-            measured: Stats { centi_cores: centi, peak_rss: rss, ..Stats::default() },
+            measured: Stats {
+                centi_cores: centi,
+                peak_rss: rss,
+                ..Stats::default()
+            },
             exit_code: code,
             v: VERSION,
             repo: None,
@@ -172,9 +251,22 @@ mod tests {
 
     #[test]
     fn median_defaults_for_same_cmd_and_cwd() {
-        let all = vec![entry("t", "/a", 150, 100, 0), entry("t", "/a", 350, 300, 0), entry("t", "/a", 250, 200, 0), entry("t", "/b", 900, 900, 0), entry("t", "/a", 900, 900, 1)];
+        let all = vec![
+            entry("t", "/a", 150, 100, 0),
+            entry("t", "/a", 350, 300, 0),
+            entry("t", "/a", 250, 200, 0),
+            entry("t", "/b", 900, 900, 0),
+            entry("t", "/a", 900, 900, 1),
+        ];
         let d = defaults_from(&all, &["t".to_string()], "/a", None).unwrap();
-        assert_eq!(d, Defaults { cpu: 3, mem: 200, vram: None });
+        assert_eq!(
+            d,
+            Defaults {
+                cpu: 3,
+                mem: 200,
+                vram: None
+            }
+        );
         assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
     }
 
@@ -184,7 +276,14 @@ mod tests {
         e.measured.peak_centi_cores = 650;
         e.measured.peak_tree_rss = 900;
         let d = defaults_from(&[e], &["t".to_string()], "/a", None).unwrap();
-        assert_eq!(d, Defaults { cpu: 7, mem: 900, vram: None });
+        assert_eq!(
+            d,
+            Defaults {
+                cpu: 7,
+                mem: 900,
+                vram: None
+            }
+        );
     }
 
     #[test]
@@ -194,14 +293,22 @@ mod tests {
         let new = entry("t", "/a", 100, 2_600, 0);
         let c = ["t".to_string()];
         assert_eq!(defaults_with(&[old.clone()], &c, "/a", None, 1), None);
-        assert_eq!(defaults_with(&[old, new], &c, "/a", None, 1).unwrap().mem, 2_600);
+        assert_eq!(
+            defaults_with(&[old, new], &c, "/a", None, 1).unwrap().mem,
+            2_600
+        );
     }
 
     #[test]
     fn v0_entries_are_used_when_min_version_is_zero() {
         let mut old = entry("t", "/a", 100, 700, 0);
         old.v = 0;
-        assert_eq!(defaults_with(&[old], &["t".to_string()], "/a", None, 0).unwrap().mem, 700);
+        assert_eq!(
+            defaults_with(&[old], &["t".to_string()], "/a", None, 0)
+                .unwrap()
+                .mem,
+            700
+        );
     }
 
     #[test]
@@ -220,7 +327,12 @@ mod tests {
         append(&p, &entry("t", "/a", 100, 1, 0)).unwrap();
         append(&p, &entry("t", "/a", 100, 1, 0)).unwrap();
         assert_eq!(fs::read_to_string(&p).unwrap().lines().count(), 2);
-        assert_eq!(defaults_for(&p, &["t".to_string()], "/a", None).unwrap().cpu, 1);
+        assert_eq!(
+            defaults_for(&p, &["t".to_string()], "/a", None)
+                .unwrap()
+                .cpu,
+            1
+        );
     }
 
     fn in_repo(cmd: &[&str], cwd: &str, repo: &str, peak: u64) -> Entry {
@@ -242,16 +354,49 @@ mod tests {
             in_repo(&["make", "ui-check"], "/s/wt218/apple", bdg, 300),
             in_repo(&["make", "ui-check"], "/s/wt219/apple", bdg, 250),
             in_repo(&["make", "lint"], "/s/wt216/apple", bdg, 900),
-            in_repo(&["make", "ui-check"], "/s/wt9/web", "/code/other/.git:web", 1600),
+            in_repo(
+                &["make", "ui-check"],
+                "/s/wt9/web",
+                "/code/other/.git:web",
+                1600,
+            ),
         ];
         // Same cwd first.
-        assert_eq!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt218/apple", Some(bdg)).unwrap().cpu, 3);
+        assert_eq!(
+            defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt218/apple", Some(bdg))
+                .unwrap()
+                .cpu,
+            3
+        );
         // A new worktree of the same repo: the median of the same command there.
-        assert_eq!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", Some(bdg)).unwrap().cpu, 3);
+        assert_eq!(
+            defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", Some(bdg))
+                .unwrap()
+                .cpu,
+            3
+        );
         // A command never run in this repo place, but the same program and first argument: `make ui-check SCREENS=a`.
-        assert_eq!(defaults_from(&all, &s(&["make", "ui-check", "SCREENS=a"]), "/s/wt225/apple", Some(bdg)).unwrap().cpu, 3);
+        assert_eq!(
+            defaults_from(
+                &all,
+                &s(&["make", "ui-check", "SCREENS=a"]),
+                "/s/wt225/apple",
+                Some(bdg)
+            )
+            .unwrap()
+            .cpu,
+            3
+        );
         // Another repo, another directory or no repo at all stays cold.
-        assert!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", Some("/code/bdg/.git:web")).is_none());
+        assert!(
+            defaults_from(
+                &all,
+                &s(&["make", "ui-check"]),
+                "/s/wt225/apple",
+                Some("/code/bdg/.git:web")
+            )
+            .is_none()
+        );
         assert!(defaults_from(&all, &s(&["make", "ui-check"]), "/s/wt225/apple", None).is_none());
         assert!(defaults_from(&all, &s(&["make", "test"]), "/s/wt225/apple", Some(bdg)).is_none());
     }
@@ -265,7 +410,12 @@ mod tests {
             in_repo(&["cargo", "test", "-p", "b"], "/w1", r, 300),
             in_repo(&["cargo", "test", "-p", "c"], "/w1", r, 1600),
         ];
-        assert_eq!(defaults_from(&all, &s(&["cargo", "test", "-p", "d"]), "/w2", Some(r)).unwrap().cpu, 16);
+        assert_eq!(
+            defaults_from(&all, &s(&["cargo", "test", "-p", "d"]), "/w2", Some(r))
+                .unwrap()
+                .cpu,
+            16
+        );
     }
 
     #[test]
@@ -297,16 +447,34 @@ mod tests {
         fs::write(main.join(".git/worktrees/wt1/commondir"), "../..\n").unwrap();
         let wt = t.path().join("scratch/wt1");
         fs::create_dir_all(wt.join("apple")).unwrap();
-        fs::write(wt.join(".git"), format!("gitdir: {}\n", main.join(".git/worktrees/wt1").display())).unwrap();
+        fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt1").display()),
+        )
+        .unwrap();
         let a = repo_key(&main.join("apple")).unwrap();
-        assert_eq!(repo_key(&wt.join("apple")).unwrap(), a, "a worktree shares the main checkout's key");
+        assert_eq!(
+            repo_key(&wt.join("apple")).unwrap(),
+            a,
+            "a worktree shares the main checkout's key"
+        );
         assert!(a.ends_with(":apple"), "{a}");
-        assert_ne!(repo_key(&wt).unwrap(), a, "the worktree root is another place in the repo");
+        assert_ne!(
+            repo_key(&wt).unwrap(),
+            a,
+            "the worktree root is another place in the repo"
+        );
         assert_eq!(repo_key(t.path()), None);
         // Entries without the field (before 0.4.1) still parse.
         let mut value = serde_json::to_value(entry("t", "/a", 1, 1, 0)).unwrap();
         assert!(value.get("repo").is_none(), "absent repo is not written");
-        value.as_object_mut().unwrap().insert("repo".into(), a.clone().into());
-        assert_eq!(serde_json::from_value::<Entry>(value).unwrap().repo, Some(a));
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("repo".into(), a.clone().into());
+        assert_eq!(
+            serde_json::from_value::<Entry>(value).unwrap().repo,
+            Some(a)
+        );
     }
 }
