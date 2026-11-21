@@ -38,7 +38,7 @@
 //! Non-heavy usage (Chrome, Discord, other CLIs) is smoothed by the caller: max(latest sample, mean of the last 3), so
 //! a rise blocks at once and a fall is released slowly. Live guards (load, memory, disk) can only veto.
 //!
-//! Load: a 1-minute load of 3 x cores with the CPU at least 95% busy is overload and always blocks. A 1-minute load of 4 x cores blocks whatever the CPU says (an I/O storm; on 2026-11-19 load 120 on 16 cores
+//! Load: a 1-minute load of 4 x cores blocks whatever the CPU says (an I/O storm; on 2026-11-19 load 120 on 16 cores
 //! killed Docker). From 2 x cores up, a load that is still rising (load1 > 1.1 x load5) blocks while the CPU is at
 //! least 75% busy, and any load there blocks while the CPU is at least 90% busy. Load without CPU is not CPU overload:
 //! on macOS load also counts threads blocked in I/O (network, disk), so it can read 20-60 with the CPU nearly idle
@@ -73,10 +73,6 @@ pub const CPU_FALLBACK_HOLD_MS: i64 = 30_000;
 pub const CPU_MAX_HOLD_MS: i64 = 120_000;
 /// A held CPU peak has shown up once the job's live use reaches this fraction (3/4) of it.
 const CPU_SHOWN: (u64, u64) = (3, 4);
-/// Load at or over this many times the core count, with the CPU at least `OVERLOAD_CPU_PCT` busy, is overload: a hard
-/// block (2026-11-20: after 0.4.2, 42% of the samples while jobs waited read CPU over 95% and load1 over 48, up to 184).
-const LOAD_OVERLOAD: f64 = 3.0;
-const OVERLOAD_CPU_PCT: u64 = 95;
 /// For this long after admission a ramping job holds its full peak, whatever the machine reads: the stagger floor.
 pub const RAMP_FULL_MS: i64 = 3_000;
 /// A learned peak of at least this fraction (3/4) of the machine keeps the full `RAMP_MS` hold, like a whole-machine hold: two
@@ -510,17 +506,6 @@ pub fn guard_block(cap: &Capacity, live: &Live) -> Option<(String, Block)> {
     let cores = f64::from(cap.cpu);
     let (soft, hard) = (LOAD_SOFT * cores, LOAD_HARD * cores);
     let cpu = live.cpu_pct.max(live.cpu_sustained_pct);
-    if live.load1 >= LOAD_OVERLOAD * cores && cpu >= OVERLOAD_CPU_PCT {
-        return Some((
-            format!(
-                "overloaded: 1-minute load {:.1} >= {:.0} (3 x {} cores) and cpu {cpu}% busy",
-                live.load1,
-                LOAD_OVERLOAD * cores,
-                cap.cpu
-            ),
-            Block::Load1,
-        ));
-    }
     if live.load1 >= hard {
         return Some((
             format!(
@@ -2734,7 +2719,7 @@ mod tests {
     }
 
     #[test]
-    fn sustained_overload_is_a_hard_block() {
+    fn sustained_overload_is_blocked_by_the_two_times_cores_rule() {
         let c = mac();
         let over = Live {
             load1: 49.0,
@@ -2745,7 +2730,10 @@ mod tests {
         };
         let (why, block) = guard_block(&c, &over).unwrap();
         assert_eq!(block, Block::Load1);
-        assert!(why.starts_with("overloaded"), "{why}");
+        assert!(
+            why.contains("2 x 16 cores") && why.contains("cpu 97% busy"),
+            "{why}"
+        );
         // Alone on the machine it still waits: overload protection has no exception.
         let me = job("a", 1, 1, State::Queued, 0);
         assert!(waits(&evaluate(
