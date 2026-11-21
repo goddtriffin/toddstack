@@ -94,6 +94,8 @@ const RAMP_IDLE_CPU_PCT: u64 = 50;
 /// Granularity of the search for the moment a ramp-blocked waiter will fit.
 const RAMP_STEP_MS: i64 = 250;
 const CPU_ASK: u64 = 100;
+/// The least CPU (2 cores) a held peak leaves free in the band for small waiters (`backfill`).
+const BACKFILL_CPU: u64 = 200;
 /// How many recent non-heavy samples the smoother averages (waiters re-sample every 10 s).
 pub const SMOOTH_WINDOW: usize = 3;
 
@@ -213,6 +215,11 @@ fn ceiling(cap: &Capacity) -> Usage {
         mem: cap.mem / 100 * PCT,
         vram: cap.vram / 100 * PCT,
     }
+}
+
+/// The CPU (centi-cores) kept out of the hold reservation for small waiters: 2 cores, or 1/8 of the machine if more.
+fn backfill(cap: &Capacity) -> u64 {
+    (centi(cap.cpu) / 8).max(BACKFILL_CPU)
 }
 
 fn request(w: Weights) -> Usage {
@@ -370,8 +377,23 @@ pub fn sustained_pct(latest: u64, readings: &[(i64, u64)], now_ms: i64) -> u64 {
 /// What is left for a new job once the other programs and the running jobs' real use are counted. CPU counts the
 /// larger of the instant use (non-heavy plus each job's live use or ramp hold) and the sustained machine CPU plus the
 /// ramp holds not yet in use.
+#[cfg(test)]
 #[must_use]
 pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> Usage {
+    headroom_for(running, cap, live, now_ms, false)
+}
+
+/// `headroom` for a request that is `small` (at most `backfill` cores): the unrealized part of the held peaks leaves
+/// that backfill share of the CPU band free, so a 1-core waiter is not blocked by a 16-core hold at 13% CPU. A big
+/// request sees the whole hold.
+#[must_use]
+pub fn headroom_for(
+    running: &[&Job],
+    cap: &Capacity,
+    live: &Live,
+    now_ms: i64,
+    small: bool,
+) -> Usage {
     let (mut held, unmet, (pre_peak, tail)) = running.iter().fold(
         (Usage::default(), 0, (0u64, 0u64)),
         |(a, unmet, learned), j| {
@@ -438,8 +460,22 @@ pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> U
     held.mem += pre_peak;
     let free = free.saturating_sub(pre_peak);
     held.mem += tail.min(free / MEM_HELD_CAP.1 * MEM_HELD_CAP.0);
-    let instant = live.non_heavy.cpu + held.cpu;
-    let sustained = live.cpu_sustained_pct * centi(cap.cpu) / 100 + unmet;
+    // The unrealized part of a held peak reserves the CPU band, except a backfill share: a big hold (16 cores on 16)
+    // would otherwise block even a 1-core waiter for its whole hold while the machine reads 13%. Real use still counts in
+    // full, so the band is never exceeded by what is measured, only by what is merely expected.
+    let limit = if small {
+        ceiling(cap).cpu.saturating_sub(backfill(cap))
+    } else {
+        u64::MAX
+    };
+    let live_jobs = held.cpu.saturating_sub(unmet);
+    let held_cpu = held
+        .cpu
+        .min(limit.saturating_sub(live.non_heavy.cpu))
+        .max(live_jobs);
+    let measured = live.cpu_sustained_pct * centi(cap.cpu) / 100;
+    let instant = live.non_heavy.cpu + held_cpu;
+    let sustained = (measured + unmet).min(limit).max(measured);
     let room = ceiling(cap)
         .saturating_sub(live.non_heavy)
         .saturating_sub(held);
@@ -537,10 +573,12 @@ fn blocker(
             return Some(blocked("vram reservations full", false, Block::Vram));
         }
         let ask = request(w);
-        if !fits(ask, headroom(running, cap, live, now_ms)) {
+        let small = centi(w.cpu) <= backfill(cap);
+        let room_at = |t: i64| headroom_for(running, cap, live, t, small);
+        if !fits(ask, room_at(now_ms)) {
             // Would it fit without the ramp holds? Then the ramp is the blocker, and the holds shrink on a known schedule:
             // name the first moment it fits with the machine as measured now (at the latest, when the last ramp ends).
-            if fits(ask, headroom(running, cap, live, i64::MAX)) {
+            if fits(ask, room_at(i64::MAX)) {
                 let last = running
                     .iter()
                     .filter_map(|j| j.started_ms.map(|t| cpu_hold_end(j, t)))
@@ -559,7 +597,7 @@ fn blocker(
                         .collect();
                     at.sort_unstable();
                     at.into_iter()
-                        .find(|t| fits(ask, headroom(running, cap, live, *t)))
+                        .find(|t| fits(ask, room_at(*t)))
                         .unwrap_or(last)
                 });
                 return Some(Blocked {
@@ -569,7 +607,7 @@ fn blocker(
                     ramp_end_ms: end,
                 });
             }
-            let room = headroom(running, cap, live, now_ms);
+            let room = room_at(now_ms);
             let block = if ask.cpu > room.cpu {
                 Block::Cpu
             } else if ask.mem > room.mem {
@@ -2602,6 +2640,59 @@ mod tests {
     }
 
     #[test]
+    fn a_small_waiter_starts_under_a_held_16_core_peak_when_the_band_has_room() {
+        let c = mac();
+        let run = Job {
+            state: State::Running,
+            started_ms: Some(0),
+            cpu_hold_ms: Some(40_000),
+            ..job("r", 16, 2, State::Running, 0)
+        };
+        // The 16-core build ramps on 2 cores; the machine reads 13%.
+        let live = Live {
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: 200,
+                    mem: 2 * G,
+                    vram: 0,
+                },
+            )],
+            cpu_pct: 13,
+            cpu_sustained_pct: 13,
+            ..calm()
+        };
+        let one = job("one", 1, 1, State::Queued, 1);
+        assert_eq!(
+            evaluate(&one, &[run.clone(), one.clone()], &c, &live, 20_000),
+            Decision::Start,
+            "a 1-core waiter fits in the band minus the held reservation"
+        );
+        // A big waiter still waits for the hold: it sees the whole 16-core reservation.
+        let big = job("big", 16, 1, State::Queued, 1);
+        assert!(waits(&evaluate(
+            &big,
+            &[run.clone(), big.clone()],
+            &c,
+            &live,
+            20_000
+        )));
+        // Real use counts in full: with the machine measured at 85% the small waiter waits too.
+        let busy = Live {
+            cpu_pct: 85,
+            cpu_sustained_pct: 85,
+            ..live
+        };
+        assert!(waits(&evaluate(
+            &one,
+            &[run, one.clone()],
+            &c,
+            &busy,
+            20_000
+        )));
+    }
+
+    #[test]
     fn a_ramp_blocker_on_a_learned_hold_names_the_hold_end() {
         let c = mac();
         let run = Job {
@@ -2610,7 +2701,7 @@ mod tests {
             cpu_hold_ms: Some(40_000),
             ..job("r", 16, 2, State::Running, 0)
         };
-        let me = job("w", 2, 2, State::Queued, 1);
+        let me = job("w", 8, 2, State::Queued, 1);
         let live = Live {
             per_job: vec![(
                 "r".into(),
