@@ -81,7 +81,7 @@ All of these must hold:
 - Known limit: the memory and pressure guards only veto new starts. A gate cannot stop jobs already running, and
   stokehold does not kill them: if running jobs all grow past their learned peaks, memory can still run out. The unused
   reservation holds above are what protect against this, not the guards.
-- Hard guards (veto only, they block even a job that would run alone): 1-minute load at or over 4 x cores blocks
+- Hard guards (veto only, they block even a job that would run alone): memory used at 95% or more (90% before 0.4.5, on Linux too), 1-minute load at or over 4 x cores blocks
   whatever the CPU says (runaway load: 120 on 16 cores killed Docker on 2026-11-19), and so does critical memory
   pressure: macOS `kern.memorystatus_vm_pressure_level` 4, Linux `/proc/pressure/memory` (`some avg10` 25 or more, or
   `full avg10` 5 or more; the Windows rig's WSL Ubuntu). An unreadable pressure source never blocks.
@@ -89,20 +89,18 @@ All of these must hold:
   and the CPU is at least 75% busy, or while the CPU is at least 90% busy (the CPU here is the larger of the latest
   and the sustained reading). Load without CPU is not CPU overload: on
   macOS load also counts threads blocked in I/O (network, disk), so it can read 20-60 on an idle CPU (load1 58 at 26%
-  CPU during a network outage on 2026-11-20). Memory used at 95% blocks, and macOS
+  CPU during a network outage on 2026-11-20). macOS
   pressure level 2 ("warn") blocks only with memory at least 85% used. Level 2 is common and sticky: on 2026-11-21 it
   held for hours at 49-58% used (1.8 of 3 GB swap), and 0.4.4, which treated it as pressure, kept three jobs queued for
   40+ minutes with nothing running at 27% CPU.
-- Deadlock breaker (0.4.5): a job that would run alone (nothing running) on a CPU under 75% busy (latest and sustained)
-  skips the soft guards; only the hard guards can hold it. Queued jobs never wait behind an idle machine.
 - Disk: free space on the cwd's filesystem must be at least `--disk` plus 10% of the disk. If it is not, waiting
   cannot help, so `stokehold` exits 75 at once and says the disk is full (clean up, or ask Todd).
-- A job running alone always passes the resource checks. There is no cap on the number of jobs.
+- A job running alone always passes the CPU and memory headroom checks (but not the guards above: 95% memory used still blocks it). There is no cap on the number of jobs.
 
 Queue: first in, first out. A job behind the head starts when the head and it fit together (it never stops the
 head from fitting). When the head does not fit now, a job no bigger than the head may backfill past it while the
-head has waited under 60 s. A tiny job (at most the backfill share of cores and 1/32 of RAM) may pass a head of any age
-that is blocked by memory, VRAM, a guard, or a ramp hold it does not make end later (0.4.5: in 24 h on the Mac, 393
+head has waited under 60 s. A tiny job (at most the backfill share of cores and 1/32 of RAM) may pass a head that is blocked
+by memory, VRAM or a guard while the head has waited under 5 minutes, or by a ramp hold it does not make end later (0.4.5: in 24 h on the Mac, 393
 job-samples sat queued behind a head under 60% CPU); behind a head blocked on CPU room it keeps the 60 s rule, so a
 stream of small jobs cannot starve a big one.
 

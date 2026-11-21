@@ -91,13 +91,45 @@ pub fn print(state: &StateDir) -> Result<(), Error> {
         );
         // Why a waiter waits, judged now by the same rules it uses, with the numbers.
         if j.state == State::Queued {
-            let why = match admit::evaluate(j, &jobs, &cap, &live, now) {
-                Decision::Start => "fits now (starts at its next look)".to_string(),
-                Decision::Fail(why) => why,
-                Decision::Wait { reason, block, .. } => format!("{}: {reason}", block.name()),
-            };
+            let why = why_waiting(&admit::evaluate(j, &jobs, &cap, &live, now));
             println!("{:<8} blocked: {why}", "");
         }
     }
     Ok(())
+}
+
+/// The `blocked:` text for a waiter's decision.
+fn why_waiting(d: &Decision) -> String {
+    match d {
+        Decision::Start => "fits now (starts at its next look)".to_string(),
+        Decision::Fail(why) => why.clone(),
+        Decision::Wait { reason, block, .. } => format!("{}: {reason}", block.name()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admit::Block;
+
+    #[test]
+    fn why_waiting_names_the_block_and_the_numbers() {
+        assert_eq!(
+            why_waiting(&Decision::Wait {
+                reason: "mem: needs 30 GB, 5 GB free".into(),
+                live: true,
+                block: Block::Mem,
+                ramp_end_ms: None,
+            }),
+            "mem: mem: needs 30 GB, 5 GB free"
+        );
+        assert_eq!(
+            why_waiting(&Decision::Start),
+            "fits now (starts at its next look)"
+        );
+        assert_eq!(
+            why_waiting(&Decision::Fail("disk full".into())),
+            "disk full"
+        );
+    }
 }
