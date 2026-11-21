@@ -1834,7 +1834,11 @@ mod tests {
             evaluate(&me, &all_cold, &mac(), &live, RAMP_MS),
             Decision::Start
         );
+    }
 
+    #[test]
+    fn ramp_hold_shrinks_for_a_recent_job_with_a_learned_peak() {
+        let me = job("a", 16, 4, State::Queued, 1);
         // 06:22:23: cpu 24%, four running (three ramped, one admitted 5 s ago with a learned 8-core peak), one waiting.
         let mut all: Vec<Job> = (0..3)
             .map(|i| Job {
