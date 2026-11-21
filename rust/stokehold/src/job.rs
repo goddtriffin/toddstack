@@ -128,7 +128,7 @@ pub struct Job {
     #[serde(default)]
     pub mem_peak_at_ms: Option<i64>,
     /// A learned or declared CPU size: how long (ms after the start) its peak cores are held while they have not shown
-    /// up in the job's live use (`admit::cpu_hold_ms`). `None` for a cold job (and job files from before 0.4.3): the
+    /// up in the job's live use (`admit::cpu_hold_ms`). `None` only for job files from before 0.4.3 (cold jobs hold the whole machine for the fallback time): the
     /// short `admit::RAMP_MS` ramp hold.
     #[serde(default)]
     pub cpu_hold_ms: Option<i64>,

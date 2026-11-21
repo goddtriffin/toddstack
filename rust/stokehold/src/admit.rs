@@ -27,7 +27,7 @@
 //! show: after 0.4.2, holds that ended after 10 s (or at once on an idle-looking machine) let several 16-core cargo builds
 //! in before their CPU showed, and 42% of the samples while jobs waited read CPU over 95% with load1 over 3 x cores.
 //!
-//! Cold jobs, Docker/VM work and job files from before 0.4.3 keep the ramp schedule: a job admitted in the last
+//! Cold jobs hold the whole machine like that, for the 30 s fallback. Docker/VM work and job files from before 0.4.3 keep the ramp schedule: a job admitted in the last
 //! `RAMP_MS` holds its peak cores while its CPU ramps up, so a burst of waiters cannot all start at once. A full 10 s hold (`RAMP_MS`) covers cold jobs, Docker/VM jobs and
 //! learned peaks of 75% of the machine or more (`FULL_HOLD_FRACTION`), so those start at least 10 s apart: their real use
 //! is unknown or large and may show up late. Any smaller learned peak is full for the first `RAMP_FULL_MS` (the stagger floor); after that the measured machine decides:
@@ -314,7 +314,7 @@ pub fn cpu_hold_ms(peak_at_ms: Option<u64>) -> i64 {
 /// peak until the peak shows in its live use (3/4 of it) or `hold_ms` has passed, like a learned memory size, never
 /// less than the `RAMP_FULL_MS` floor: a cargo build spends its first 10-30 s on a few cores, and a hold that ended
 /// sooner (or was released because the machine read idle) let several 16-core builds in before any of their CPU showed
-/// (2026-11-20). Docker/VM work (its CPU never shows in the tree), cold jobs and job files without `hold_ms` keep the
+/// (2026-11-20). Docker/VM work (its CPU never shows in the tree) and job files without `hold_ms` keep the
 /// `RAMP_MS` schedule of `ramp_hold`.
 #[must_use]
 pub fn cpu_hold(
@@ -2555,6 +2555,13 @@ mod tests {
         // A history from before 0.4.3 (time to peak unknown) holds for the 30 s fallback: still one at a time.
         let (starts, ramping) = burst_of_six(Some(cpu_hold_ms(None)), 20_000, 60_000);
         assert_eq!((ramping, starts.len()), (1, 6), "{starts:?}");
+        // Cold jobs (whole machine, nothing learned) get the same hold: never admitted 10 s apart.
+        let (starts, ramping) = burst_of_six(Some(CPU_FALLBACK_HOLD_MS), 25_000, 60_000);
+        assert_eq!((ramping, starts.len()), (1, 6), "{starts:?}");
+        assert!(
+            starts.windows(2).all(|w| w[1] - w[0] >= 25_000),
+            "cold jobs wait for each other's peak: {starts:?}"
+        );
     }
 
     #[test]
@@ -2584,7 +2591,7 @@ mod tests {
         assert_eq!(cpu_hold(peak, machine, 20_000, 90, false, 1_200, hold), 0);
         // Its time to peak passed without it showing (an incremental build): released, so the machine is not kept idle.
         assert_eq!(cpu_hold(peak, machine, 40_000, 10, false, 200, hold), 0);
-        // Docker work and cold jobs keep the 10 s ramp schedule.
+        // Docker work and old job files keep the 10 s ramp schedule.
         assert_eq!(cpu_hold(peak, machine, 9_000, 10, true, 0, hold), peak);
         assert_eq!(cpu_hold(peak, machine, RAMP_MS, 10, true, 0, hold), 0);
         assert_eq!(cpu_hold(peak, machine, RAMP_MS, 10, false, 0, None), 0);

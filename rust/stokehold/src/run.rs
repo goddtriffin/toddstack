@@ -153,14 +153,15 @@ fn resolve_weights(
         vram: flags.vram.or(hist.and_then(|d| d.vram)).unwrap_or(0),
         disk: flags.disk.unwrap_or(0),
     });
-    let cpu_known = flags.cpu.is_some() || hist.is_some();
     Resolved {
         weights,
         mem_peak_at_ms: hist
             .and_then(|d| d.mem_peak_at_ms)
             .and_then(|ms| i64::try_from(ms).ok()),
-        cpu_hold_ms: cpu_known
-            .then(|| crate::admit::cpu_hold_ms(hist.and_then(|d| d.cpu_peak_at_ms))),
+        // Cold jobs too: they hold the whole machine (`default_cpu`) until it shows or the fallback time passes.
+        cpu_hold_ms: Some(crate::admit::cpu_hold_ms(
+            hist.and_then(|d| d.cpu_peak_at_ms),
+        )),
     }
 }
 
@@ -739,6 +740,35 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cold_job_holds_the_whole_machine_for_the_fallback_time_not_ten_seconds() {
+        let t = tempfile::tempdir().unwrap();
+        let state = StateDir::at(t.path().to_path_buf());
+        let cap = Capacity {
+            cpu: 16,
+            mem: 64 << 30,
+            vram: 0,
+            disk_total: 1 << 40,
+            vram_is_ram: true,
+        };
+        let flags = Flags {
+            cpu: None,
+            mem: None,
+            vram: None,
+            disk: None,
+            timeout: None,
+        };
+        let r = resolve_weights(
+            &state,
+            &flags,
+            &["cargo".into(), "build".into()],
+            "/x",
+            &cap,
+        );
+        assert_eq!(r.weights.cpu, 16);
+        assert_eq!(r.cpu_hold_ms, Some(crate::admit::CPU_FALLBACK_HOLD_MS));
+    }
 
     #[test]
     fn cold_and_docker_jobs_ask_for_the_whole_machine() {
