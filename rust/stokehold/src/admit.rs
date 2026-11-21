@@ -486,77 +486,80 @@ pub fn headroom_for(
     now_ms: i64,
     small: bool,
 ) -> Usage {
-    let (mut held, (mut unmet, mut unmet_small), (pre_peak, tail), vm_own) = running.iter().fold(
-        (Usage::default(), (0, 0), (0u64, 0u64), 0u64),
-        |(a, unmet, learned, vm_own), j| {
-            let l = live
-                .per_job
-                .iter()
-                .find(|(id, _)| *id == j.id)
-                .map_or_else(Usage::default, |(_, u)| *u);
-            let vm = crate::run::hosts_vm_work(&j.cmd);
-            let hold = j.started_ms.map_or(0, |t| {
-                cpu_hold(
-                    centi(j.weights.cpu).min(centi(cap.cpu)),
-                    centi(cap.cpu),
-                    now_ms.saturating_sub(t).max(0),
-                    live.cpu_pct,
-                    vm,
-                    l.cpu,
-                    j.cpu_hold_ms,
-                    j.cpu_settled,
-                )
-            });
-            let cpu = l.cpu.max(hold);
-            // A running job not yet stamped, or one with a declared size, holds its whole unused part; a learned size holds
-            // it by schedule, and those holds are capped together below.
-            let (mem, learned_unmet) = match j.started_ms {
-                Some(t) if !j.mem_declared => (
-                    l.mem,
-                    mem_unmet_split(
-                        j.weights.mem,
-                        l.mem,
+    let (mut held, (mut unmet, mut unmet_small), (pre_peak, tail), vm_own, vm_base) =
+        running.iter().fold(
+            (Usage::default(), (0, 0), (0u64, 0u64), 0u64, 0u64),
+            |(a, unmet, learned, vm_own, vm_base), j| {
+                let l = live
+                    .per_job
+                    .iter()
+                    .find(|(id, _)| *id == j.id)
+                    .map_or_else(Usage::default, |(_, u)| *u);
+                let vm = crate::run::hosts_vm_work(&j.cmd);
+                let hold = j.started_ms.map_or(0, |t| {
+                    cpu_hold(
+                        centi(j.weights.cpu).min(centi(cap.cpu)),
+                        centi(cap.cpu),
                         now_ms.saturating_sub(t).max(0),
-                        false,
-                        j.mem_peak_at_ms,
-                    ),
-                ),
-                Some(t) => (
-                    l.mem
-                        + mem_unmet(
+                        live.cpu_pct,
+                        vm,
+                        l.cpu,
+                        j.cpu_hold_ms,
+                        j.cpu_settled,
+                    )
+                });
+                let cpu = l.cpu.max(hold);
+                // A running job not yet stamped, or one with a declared size, holds its whole unused part; a learned size holds
+                // it by schedule, and those holds are capped together below.
+                let (mem, learned_unmet) = match j.started_ms {
+                    Some(t) if !j.mem_declared => (
+                        l.mem,
+                        mem_unmet_split(
                             j.weights.mem,
                             l.mem,
                             now_ms.saturating_sub(t).max(0),
-                            true,
-                            None,
+                            false,
+                            j.mem_peak_at_ms,
                         ),
-                    (0, 0),
-                ),
-                None => (l.mem + j.weights.mem.saturating_sub(l.mem), (0, 0)),
-            };
-            (
-                Usage {
-                    cpu: a.cpu + cpu,
-                    mem: a.mem + mem,
-                    vram: a.vram + l.vram.max(j.weights.vram),
-                },
-                {
-                    let own = hold.saturating_sub(l.cpu);
-                    // A small job's own unrealized hold is not part of the capped big reservation: it stacks.
-                    let is_small =
-                        small && centi(j.weights.cpu).min(centi(cap.cpu)) <= backfill(cap);
-                    (unmet.0 + own, unmet.1 + if is_small { own } else { 0 })
-                },
-                (learned.0 + learned_unmet.0, learned.1 + learned_unmet.1),
-                // Netted only past `RAMP_MS`: before that, other programs' CPU is not yet this job's.
-                vm_own
-                    + u64::from(vm && j.started_ms.is_some_and(|t| now_ms - t >= RAMP_MS))
-                        * hold.saturating_sub(l.cpu),
-            )
-        },
-    );
+                    ),
+                    Some(t) => (
+                        l.mem
+                            + mem_unmet(
+                                j.weights.mem,
+                                l.mem,
+                                now_ms.saturating_sub(t).max(0),
+                                true,
+                                None,
+                            ),
+                        (0, 0),
+                    ),
+                    None => (l.mem + j.weights.mem.saturating_sub(l.mem), (0, 0)),
+                };
+                (
+                    Usage {
+                        cpu: a.cpu + cpu,
+                        mem: a.mem + mem,
+                        vram: a.vram + l.vram.max(j.weights.vram),
+                    },
+                    {
+                        let own = hold.saturating_sub(l.cpu);
+                        // A small job's own unrealized hold is not part of the capped big reservation: it stacks.
+                        let is_small =
+                            small && centi(j.weights.cpu).min(centi(cap.cpu)) <= backfill(cap);
+                        (unmet.0 + own, unmet.1 + if is_small { own } else { 0 })
+                    },
+                    (learned.0 + learned_unmet.0, learned.1 + learned_unmet.1),
+                    // Netted only past `RAMP_MS`: before that, other programs' CPU is not yet this job's.
+                    vm_own
+                        + u64::from(vm && j.started_ms.is_some_and(|t| now_ms - t >= RAMP_MS))
+                            * hold.saturating_sub(l.cpu),
+                    // What other programs already used when this job started is not its CPU.
+                    vm_base + u64::from(vm) * j.non_heavy_cpu_at_start,
+                )
+            },
+        );
     // A Docker/VM job's CPU shows as other programs' CPU: what shows there is not counted twice with its hold.
-    let vm_shown = vm_own.min(live.non_heavy.cpu);
+    let vm_shown = vm_own.min(live.non_heavy.cpu.saturating_sub(vm_base));
     held.cpu = held.cpu.saturating_sub(vm_shown);
     unmet = unmet.saturating_sub(vm_shown);
     unmet_small = unmet_small.min(unmet);
@@ -930,6 +933,7 @@ mod tests {
             mem_peak_at_ms: None,
             cpu_hold_ms: None,
             cpu_settled: false,
+            non_heavy_cpu_at_start: 0,
         }
     }
     fn waits(d: &Decision) -> bool {
@@ -3838,6 +3842,53 @@ mod tests {
         assert_eq!(headroom(&[&d8], &c, &showing, 20_000).cpu, 1_520 - 800);
         // In its first 10 s the hold still counts on top of everything else, as before.
         assert_eq!(headroom(&[&d8], &c, &showing, 5_000).cpu, 1_520 - 1_400);
+    }
+
+    /// A docker build WITH history: its VM CPU peaked 20 s in (learned from the other-programs sampler), so it holds
+    /// 8 cores for 25 s, not the 10 s a docker CLI tree peak would give.
+    #[test]
+    fn a_docker_build_with_history_holds_until_its_learned_vm_cpu_time() {
+        let c = mac();
+        let d8 = Job {
+            started_ms: Some(0),
+            cmd: vec!["docker".into(), "build".into(), ".".into()],
+            cpu_hold_ms: Some(cpu_hold_ms(Some(20_000))),
+            ..job("d8", 8, 4, State::Running, 0)
+        };
+        assert_eq!(d8.cpu_hold_ms, Some(25_000));
+        let live = Live {
+            per_job: vec![],
+            ..calm()
+        };
+        assert_eq!(headroom(&[&d8], &c, &live, 15_000).cpu, 1_520 - 800);
+        assert_eq!(headroom(&[&d8], &c, &live, 24_000).cpu, 1_520 - 800);
+        assert_eq!(headroom(&[&d8], &c, &live, 26_000).cpu, 1_520);
+    }
+
+    /// 4 cores of unrelated other-program CPU were already there when the 8-core docker build started: the hold at 11 s
+    /// counts 12 cores (4 + 8), not 8. Only the rise above that baseline is the build's.
+    #[test]
+    fn a_docker_hold_is_netted_only_against_the_rise_above_its_start_baseline() {
+        let c = mac();
+        let d8 = Job {
+            started_ms: Some(0),
+            cmd: vec!["docker".into(), "build".into(), ".".into()],
+            cpu_hold_ms: Some(cpu_hold_ms(Some(20_000))),
+            non_heavy_cpu_at_start: 400,
+            ..job("d8", 8, 4, State::Running, 0)
+        };
+        let live = |other| Live {
+            non_heavy: Usage {
+                cpu: other,
+                mem: 20 * G,
+                vram: 0,
+            },
+            per_job: vec![],
+            ..calm()
+        };
+        assert_eq!(headroom(&[&d8], &c, &live(400), 11_000).cpu, 1_520 - 1_200);
+        // The VM's own 3 cores showing (400 + 300) are netted once: 7 cores in all.
+        assert_eq!(headroom(&[&d8], &c, &live(700), 11_000).cpu, 1_520 - 1_200);
     }
 
     /// 2026-11-21, 20:19-20:48 UTC: one long 10-core job, the Mac at 70%, a 13-core head that needs 4.4 free cores, and

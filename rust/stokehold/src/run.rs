@@ -227,6 +227,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         },
         cpu_hold_ms,
         cpu_settled: false,
+        non_heavy_cpu_at_start: 0,
     };
     let _guard = JobGuard {
         state,
@@ -358,6 +359,7 @@ fn acquire(
                 job.blocked_by = None;
                 job.state = State::Running;
                 job.started_ms = Some(now_ms());
+                job.non_heavy_cpu_at_start = live.non_heavy.cpu;
                 state.write_job(job)?;
             }
             d
@@ -548,10 +550,16 @@ fn other_sampler(dir: &StateDir, own_pid: u32, cores: u32) -> Option<OtherHandle
     let started = Instant::now();
     let handle = std::thread::spawn(move || {
         let (mut cpu, mut mem) = (vec![], vec![]);
+        let mut cpu_timed = vec![];
         let (mut max_mem, mut mem_at_ms) = (0, 0);
         loop {
             let s = sampler.sample(&roots(&dir));
-            cpu.push(s.cpu.saturating_sub(baseline.cpu));
+            let c = s.cpu.saturating_sub(baseline.cpu);
+            cpu_timed.push((
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                c,
+            ));
+            cpu.push(c);
             let rise = s.mem.saturating_sub(baseline.mem);
             if rise > max_mem {
                 max_mem = rise;
@@ -566,6 +574,7 @@ fn other_sampler(dir: &StateDir, own_pid: u32, cores: u32) -> Option<OtherHandle
                     cpu: p90(&mut cpu),
                     mem: p90(&mut mem),
                     mem_at_ms,
+                    cpu_at_ms: cpu_peak_at(&cpu_timed),
                 };
             }
         }
@@ -595,6 +604,8 @@ struct OtherPeak {
     cpu: u64,
     mem: u64,
     mem_at_ms: u64,
+    /// When the other programs' CPU first reached 3/4 of its peak (a VM job's CPU ramp).
+    cpu_at_ms: u64,
 }
 
 struct OtherHandle {
@@ -777,6 +788,9 @@ fn execute(
     }
     if let Some(other) = other_peak {
         stats.peak_other_centi_cores = other.cpu;
+        if other.cpu > stats.peak_centi_cores {
+            stats.peak_cpu_at_ms = other.cpu_at_ms;
+        }
         stats.peak_centi_cores = effective_peak(stats.peak_centi_cores, other.cpu, 0, cap.cpu);
         stats.peak_other_mem = other.mem;
         if other.mem > stats.peak_tree_rss {
@@ -820,6 +834,7 @@ mod tests {
             mem_peak_at_ms: None,
             cpu_hold_ms: Some(1),
             cpu_settled: false,
+            non_heavy_cpu_at_start: 0,
         };
         dir.write_job(&mk("run", State::Running)).unwrap();
         dir.write_job(&mk("wait", State::Queued)).unwrap();
