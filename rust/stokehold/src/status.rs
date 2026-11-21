@@ -1,5 +1,6 @@
 //! `stokehold status`: for humans only. Agents never need it; `heavy` decides by itself.
 
+use crate::admit::{self, Decision};
 use crate::error::Error;
 use crate::job::State;
 use crate::machine;
@@ -12,16 +13,19 @@ pub fn print(state: &StateDir) -> Result<(), Error> {
     state.ensure()?;
     let cwd = std::env::current_dir()?;
     let cap = machine::capacity(&cwd)?;
-    let jobs = {
+    let (jobs, busy) = {
         let _lock = state.lock()?;
-        state.live_jobs()
+        (state.live_jobs(), state.busy_readings())
     };
     let running: Vec<_> = jobs
         .iter()
         .filter(|j| j.state == State::Running)
         .cloned()
         .collect();
-    let live = machine::live(&cwd, &cap, &running)?;
+    let mut live = machine::live(&cwd, &cap, &running)?;
+    live.stopped = machine::stopped_ids(&jobs);
+    let now = crate::run::now_ms();
+    live.cpu_sustained_pct = admit::sustained_pct(live.cpu_pct, &busy, now);
     println!(
         "capacity   {} cores, {} ram, {} vram, {} disk here",
         cap.cpu,
@@ -30,9 +34,18 @@ pub fn print(state: &StateDir) -> Result<(), Error> {
         fmt_size(cap.disk_total)
     );
     println!(
-        "live       load {:.1}, memory {}% used, {} disk free, other programs use {}.{:02} cores / {} ram / {} vram",
+        "live       cpu {}% busy ({}% sustained), load {:.1}, memory {}% used{}, {} disk free, other programs use {}.{:02} cores / {} ram / {} vram",
+        live.cpu_pct,
+        live.cpu_sustained_pct,
         live.load1,
         live.mem_used_pct,
+        if live.mem_pressure {
+            ", critical memory pressure"
+        } else if live.mem_pressure_warn {
+            ", memory pressure warn"
+        } else {
+            ""
+        },
         fmt_size(live.disk_free),
         live.non_heavy.cpu / 100,
         live.non_heavy.cpu % 100,
@@ -76,6 +89,15 @@ pub fn print(state: &StateDir) -> Result<(), Error> {
             fmt_size(j.weights.disk),
             j.cmd.join(" ")
         );
+        // Why a waiter waits, judged now by the same rules it uses, with the numbers.
+        if j.state == State::Queued {
+            let why = match admit::evaluate(j, &jobs, &cap, &live, now) {
+                Decision::Start => "fits now (starts at its next look)".to_string(),
+                Decision::Fail(why) => why,
+                Decision::Wait { reason, block, .. } => format!("{}: {reason}", block.name()),
+            };
+            println!("{:<8} blocked: {why}", "");
+        }
     }
     Ok(())
 }

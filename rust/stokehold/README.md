@@ -6,7 +6,7 @@ whether to start at once or wait in the queue. Nobody polls or checks a status.
 
 ```
 stokehold [--cpu N] [--mem SIZE] [--vram SIZE] [--disk SIZE] [--timeout DURATION] [--] cmd args...
-stokehold status        # for humans: running and queued jobs, reservations, live usage (`--status` works too)
+stokehold status        # for humans: running and queued jobs, why each waiter waits (with numbers), live usage (`--status` works too)
 stokehold history [--since 2h|1d|7d] [--html PATH]   # how well stokehold used the machine (default: 1d)
 ```
 
@@ -33,10 +33,11 @@ History entries carry a version (`v`); on Linux, entries from before 0.3.2 (no `
 All of these must hold:
 
 - VRAM reservations: running VRAM reservations plus this request are at most 90% of capacity. RAM has no reservation sum (see Memory headroom).
-- CPU headroom: `90% of all cores - max(instant use, sustained use)` leaves one free core. Instant use is non-heavy
+- CPU headroom: `95% of all cores - max(instant use, sustained use)` leaves one free core (90% before 0.4.5; Todd wants
+  the machine about 95% hot). Instant use is non-heavy
   usage plus the live CPU (or ramp hold) of running jobs; sustained use is the machine's CPU over the last 20 s plus
-  the ramp holds not yet in use. So jobs start while the CPU is at most about 84% busy (83% on 16 cores) and, while
-  jobs wait, the CPU settles in an 80-90% band, never pinned at 100%. The sustained CPU is max(latest, mean of the
+  the ramp holds not yet in use. So jobs start while the CPU is at most about 89% busy (88% on 16 cores) and, while
+  jobs wait, the CPU settles in an 88-95% band, never pinned at 100%. The sustained CPU is max(latest, mean of the
   readings in `~/.local/state/stokehold/busy`), which every stokehold process adds to (waiters as they re-evaluate, and while any
   job exists one reading at least every 10 s): a single 250 ms window that falls between build steps can read 80% on a
   pinned machine, and is not free CPU. A job with a learned (or `--cpu`) size holds its peak cores until that peak shows
@@ -55,17 +56,19 @@ All of these must hold:
   real work runs in the VM; the measured machine CPU still counts it.
   A whole-machine (cold) waiter that has waited 60 s (it holds the queue) skips the projected-peak test and starts under the band as in
   0.4.3, so one long job cannot leave the machine at 50-60% with jobs queued.
-- Projected peak (0.4.4): a waiter bigger than the backfill share starts only while half its learned peak fits within
+- Projected peak (0.4.4): a waiter bigger than the backfill share starts only while 2/5 of its learned peak fits within
   every core on top of the projected CPU (the measured use plus the unrealized holds of the jobs still ramping). A
-  13-core build starts up to about 59% busy on 16 cores, a whole-machine one up to 50%; smaller waiters still fill the
-  band up to one free core. In 0.4.3 any waiter started with one free core under the band, so 13-core builds started
+  13-core build starts up to about 67% busy on 16 cores, a whole-machine one up to 60%; smaller waiters still fill the
+  band up to one free core. 0.4.5 cut it from half: over 575 runs peaking at 6+ cores, average / peak cores is p50 0.18,
+  p75 0.32, p90 0.51, and half kept 13-core builds off a Mac under 59% busy. A third or a quarter overran the machine
+  43-47% of the time in the bursty-builds test; 2/5 keeps it at 0%. In 0.4.3 any waiter started with one free core under the band, so 13-core builds started
   at 83% busy and took the Mac to 100% with load1 34. A waiter held back by a hold sleeps until the first
   moment the holds leave room, and re-samples at least every 10 s, so a peak that shows sooner releases it. A job's recorded peak is the larger of its process tree's peak and the
   machine-wide CPU rise of other programs over the pre-start baseline, so work hosted in Docker's VM (outside the
   tree) also teaches a real peak. On Linux a process's threads are not counted as children (sysinfo lists each thread
   with its whole process's RSS and CPU; before 0.3.2 a 16-thread rustc counted 17 times, so learned memory peaks were
   inflated about 17x and their reservations blocked idle machines on "mem").
-- Memory headroom: `90% of RAM - non-heavy usage - live memory of running jobs - the unused part of each job's reservation` fits the
+- Memory headroom: `95% of RAM - non-heavy usage - live memory of running jobs - the unused part of each job's reservation` fits the
   request. The unused part (reservation minus live use) of a declared (`--mem`) size is held for the whole run. A learned
   size's is held until the job's learned time to peak (history records when memory peaked; 60 s when unknown, at least 10 s),
   then shrinks to nothing over 60 s; those learned holds together take at most 3/4 of the memory still free. Reservations
@@ -78,21 +81,34 @@ All of these must hold:
 - Known limit: the memory and pressure guards only veto new starts. A gate cannot stop jobs already running, and
   stokehold does not kill them: if running jobs all grow past their learned peaks, memory can still run out. The unused
   reservation holds above are what protect against this, not the guards.
-- Guards (veto only, they block even a job that would run alone): 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16
-  cores killed Docker on 2026-11-19). From 2 x cores up, load blocks while it is still rising (load1 > 1.1 x load5)
+- Hard guards (veto only, they block even a job that would run alone): 1-minute load at or over 4 x cores blocks
+  whatever the CPU says (runaway load: 120 on 16 cores killed Docker on 2026-11-19), and so does critical memory
+  pressure: macOS `kern.memorystatus_vm_pressure_level` 4, Linux `/proc/pressure/memory` (`some avg10` 25 or more, or
+  `full avg10` 5 or more; the Windows rig's WSL Ubuntu). An unreadable pressure source never blocks.
+- Soft guards (veto only): from 2 x cores up, load blocks while it is still rising (load1 > 1.1 x load5)
   and the CPU is at least 75% busy, or while the CPU is at least 90% busy (the CPU here is the larger of the latest
   and the sustained reading). Load without CPU is not CPU overload: on
   macOS load also counts threads blocked in I/O (network, disk), so it can read 20-60 on an idle CPU (load1 58 at 26%
-  CPU during a network outage on 2026-11-20). Memory used below 90%, and no memory
-  pressure: macOS `kern.memorystatus_vm_pressure_level` of 2 or more, Linux `/proc/pressure/memory` (`some avg10`
-  25 or more, or `full avg10` 5 or more; the Windows rig's WSL Ubuntu). An unreadable pressure source never blocks.
+  CPU during a network outage on 2026-11-20). Memory used at 95% blocks, and macOS
+  pressure level 2 ("warn") blocks only with memory at least 85% used. Level 2 is common and sticky: on 2026-11-21 it
+  held for hours at 49-58% used (1.8 of 3 GB swap), and 0.4.4, which treated it as pressure, kept three jobs queued for
+  40+ minutes with nothing running at 27% CPU.
+- Deadlock breaker (0.4.5): a job that would run alone (nothing running) on a CPU under 75% busy (latest and sustained)
+  skips the soft guards; only the hard guards can hold it. Queued jobs never wait behind an idle machine.
 - Disk: free space on the cwd's filesystem must be at least `--disk` plus 10% of the disk. If it is not, waiting
   cannot help, so `stokehold` exits 75 at once and says the disk is full (clean up, or ask Todd).
 - A job running alone always passes the resource checks. There is no cap on the number of jobs.
 
 Queue: first in, first out. A job behind the head starts when the head and it fit together (it never stops the
 head from fitting). When the head does not fit now, a job no bigger than the head may backfill past it while the
-head has waited under 60 s.
+head has waited under 60 s. A tiny job (at most the backfill share of cores and 1/32 of RAM) may pass a head of any age
+that is blocked by memory, VRAM, a guard, or a ramp hold it does not make end later (0.4.5: in 24 h on the Mac, 393
+job-samples sat queued behind a head under 60% CPU); behind a head blocked on CPU room it keeps the 60 s rule, so a
+stream of small jobs cannot starve a big one.
+
+`stokehold status` evaluates every waiter by these rules and prints why it waits, with the numbers (`cpu: needs 4.40
+cores, 4.20 free under the 95% band (machine 68% busy)`, `mem: needs 6.5G, 2.1G free under 95% of RAM after running
+jobs' holds`, a guard's reading), and the machine's CPU, sustained CPU and pressure level.
 
 ## State and waiting
 
@@ -140,7 +156,7 @@ waiter had not yet woken). `--html PATH` writes one self-contained page (inline 
 ## Configuration
 
 `STOKEHOLD_STATE_DIR`, `STOKEHOLD_TIMEOUT` (default 60m). Test overrides: `STOKEHOLD_CAPACITY`
-(`cpu=8,mem=16G,vram=0,disk=100G`), `STOKEHOLD_LIVE` (`load=,load5=,mem_pct=,mem_pressure=,disk_free=,nonheavy_cpu=,nonheavy_mem=,nonheavy_vram=`),
+(`cpu=8,mem=16G,vram=0,disk=100G`), `STOKEHOLD_LIVE` (`load=,load5=,mem_pct=,mem_pressure=,disk_free=,nonheavy_cpu=,nonheavy_mem=,nonheavy_vram=`; `mem_pressure` is a macOS level: 2 warn, 4 critical),
 `STOKEHOLD_KILL_GRACE_MS`.
 
 ## Renamed from `heavy` (0.4.0)

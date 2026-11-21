@@ -83,8 +83,10 @@ pub struct Live {
     /// The machine's sustained CPU busy, 0 to 100: max(latest, mean of every heavy process's readings in the last
     /// `admit::BUSY_WINDOW_MS`). 0 when unknown (then only the latest sample counts).
     pub cpu_sustained_pct: u64,
-    /// The system reports memory pressure (macOS level 2 or more, Linux PSI); false when it cannot be read.
+    /// The system reports critical memory pressure (macOS level 4, Linux PSI); false when it cannot be read.
     pub mem_pressure: bool,
+    /// macOS level 2 ("warn"): common and sticky, so it blocks only with memory nearly used up (`admit::guard_block`).
+    pub mem_pressure_warn: bool,
     pub disk_free: u64,
     /// Machine-wide usage minus the process trees of running heavy jobs (smoothed by the caller).
     pub non_heavy: Usage,
