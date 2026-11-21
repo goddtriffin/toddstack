@@ -32,7 +32,7 @@ History entries carry a version (`v`); on Linux, entries from before 0.3.2 (no `
 
 All of these must hold:
 
-- Reservations: running RAM and VRAM reservations plus this request are at most 90% of capacity.
+- VRAM reservations: running VRAM reservations plus this request are at most 90% of capacity. RAM has no reservation sum (see Memory headroom).
 - CPU headroom: `90% of all cores - max(instant use, sustained use)` leaves one free core. Instant use is non-heavy
   usage plus the live CPU (or ramp hold) of running jobs; sustained use is the machine's CPU over the last 20 s plus
   the ramp holds not yet in use. So jobs start while the CPU is at most about 84% busy (83% on 16 cores) and, while
@@ -49,8 +49,8 @@ All of these must hold:
   tree) also teaches a real peak. On Linux a process's threads are not counted as children (sysinfo lists each thread
   with its whole process's RSS and CPU; before 0.3.2 a 16-thread rustc counted 17 times, so learned memory peaks were
   inflated about 17x and their reservations blocked idle machines on "mem").
-- Memory headroom: `90% of RAM - non-heavy usage - sum over running jobs of max(reservation, live usage)` fits the
-  request. Non-heavy usage is machine-wide use minus the process trees of stokehold's own jobs (Chrome, Discord, other
+- Memory headroom: `90% of RAM - non-heavy usage - live memory of running jobs - the unused part of the reservation of jobs admitted in the last 10 s` fits the
+  request. Declared (`--mem`) or learned sizes never block once their job is past the ramp (before 0.4.2 reservations summing over 85% blocked jobs at 43% memory used). Non-heavy usage is machine-wide use minus the process trees of stokehold's own jobs (Chrome, Discord, other
   CLIs), smoothed as max(latest sample, mean of the last 3, 10 s apart): a rise blocks at once, a fall is released slowly. On
   Linux CPU includes steal time (`/proc/stat` field 8), which WSL2 and VMs otherwise hide.
 - Guards (veto only): 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16

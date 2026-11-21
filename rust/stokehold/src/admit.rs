@@ -1,7 +1,10 @@
 //! Admission: pure decisions.
 //!
-//! Memory and VRAM are reservation-based (real safety): running reservations plus the request must fit
-//! within 90% of capacity. CPU is judged by live headroom only, never by peak-core reservations (a build
+//! Memory is judged by measured headroom, like CPU: 90% of RAM minus non-heavy use, minus each running job's live use,
+//! minus the part of a reservation a job admitted within `RAMP_MS` has not yet used. A declared or learned size never
+//! blocks once its job is past the ramp (2026-11-20: reservations summing over 85% blocked jobs at 43% memory used and
+//! left the Mac idle). VRAM stays reservation-based: running reservations plus the request within 90% of capacity.
+//! CPU is judged by live headroom only, never by peak-core reservations (a build
 //! that peaks near all cores would otherwise block everything on an idle machine):
 //!
 //! cpu headroom = 90% of all cores - max(instant use, sustained use)
@@ -19,8 +22,8 @@
 //! learned peaks of 75% of the machine or more (`FULL_HOLD_FRACTION`), so those start at least 10 s apart: their real use
 //! is unknown or large and may show up late. Any smaller learned peak is full for the first `RAMP_FULL_MS` (the stagger floor); after that the measured machine decides:
 //! under `RAMP_IDLE_CPU_PCT` busy the job has shown its real use and the hold is released, otherwise it shrinks linearly
-//! to nothing at `RAMP_MS`. After the ramp only live use counts. Memory headroom uses max(reservation, live usage) per
-//! running job.
+//! to nothing at `RAMP_MS`. After the ramp only live use counts. Memory headroom likewise holds a job's unused
+//! reservation only until `RAMP_MS` after admission.
 //!
 //! Non-heavy usage (Chrome, Discord, other CLIs) is smoothed by the caller: max(latest sample, mean of the last 3), so
 //! a rise blocks at once and a fall is released slowly. Live guards (load, memory, disk) can only veto.
@@ -196,22 +199,22 @@ fn fits(ask: Usage, room: Usage) -> bool {
     ask.cpu <= room.cpu && ask.mem <= room.mem && ask.vram <= room.vram
 }
 
-/// Memory and VRAM reservations only: running sums plus the request within 90% of capacity. CPU is live.
+/// VRAM reservations only: running sums plus the request within 90% of capacity. Memory and CPU are live.
 #[must_use]
 pub fn fits_reservations(req: Weights, running: &[&Job], cap: &Capacity) -> bool {
-    let used = running.iter().fold(Usage::default(), |a, j| Usage {
-        cpu: 0,
-        mem: a.mem + j.weights.mem,
-        vram: a.vram + j.weights.vram,
-    });
-    let room = ceiling(cap).saturating_sub(used);
-    fits(
-        Usage {
-            cpu: 0,
-            ..request(req)
-        },
-        room,
-    )
+    let used: u64 = running.iter().map(|j| j.weights.vram).sum();
+    req.vram <= ceiling(cap).vram.saturating_sub(used)
+}
+
+/// The part of a reservation a job `elapsed_ms` after admission has not yet used: held until `RAMP_MS`, then released
+/// whatever the job's live memory is.
+#[must_use]
+pub fn mem_unmet(reserved: u64, live: u64, elapsed_ms: i64) -> u64 {
+    if elapsed_ms >= RAMP_MS {
+        0
+    } else {
+        reserved.saturating_sub(live)
+    }
 }
 
 /// The CPU a job `elapsed_ms` into its ramp still holds beyond its live use (`peak` already clamped to `machine`). A
@@ -276,10 +279,15 @@ pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> U
             )
         });
         let cpu = l.cpu.max(hold);
+        let mem = l.mem
+            + j.started_ms
+                .map_or(j.weights.mem.saturating_sub(l.mem), |t| {
+                    mem_unmet(j.weights.mem, l.mem, now_ms.saturating_sub(t).max(0))
+                });
         (
             Usage {
                 cpu: a.cpu + cpu,
-                mem: a.mem + l.mem.max(j.weights.mem),
+                mem: a.mem + mem,
                 vram: a.vram + l.vram.max(j.weights.vram),
             },
             unmet + hold.saturating_sub(l.cpu),
@@ -370,25 +378,7 @@ fn blocker(
 ) -> Option<Blocked> {
     if !running.is_empty() {
         if !fits_reservations(w, running, cap) {
-            let vram = Usage {
-                cpu: 0,
-                mem: 0,
-                vram: w.vram,
-            };
-            let used_vram: u64 = running.iter().map(|j| j.weights.vram).sum();
-            let block = if fits(
-                vram,
-                ceiling(cap).saturating_sub(Usage {
-                    cpu: 0,
-                    mem: 0,
-                    vram: used_vram,
-                }),
-            ) {
-                Block::Mem
-            } else {
-                Block::Vram
-            };
-            return Some(blocked("memory reservations full", false, block));
+            return Some(blocked("vram reservations full", false, Block::Vram));
         }
         let ask = request(w);
         if !fits(ask, headroom(running, cap, live, now_ms)) {
@@ -557,16 +547,129 @@ mod tests {
     }
 
     #[test]
-    fn ninety_percent_reservation_ceiling() {
-        let run = job("r", 5, 50, State::Running, 0);
-        let fits = job("a", 4, 40, State::Queued, 1);
-        let over = job("b", 5, 41, State::Queued, 1);
+    fn ninety_percent_vram_reservation_ceiling() {
+        let c = Capacity {
+            vram: 100 * G,
+            ..cap()
+        };
+        let with_vram = |id: &str, g: u64, state| {
+            let j = job(id, 1, 1, state, 0);
+            Job {
+                weights: Weights {
+                    vram: g * G,
+                    ..j.weights
+                },
+                ..j
+            }
+        };
+        let run = with_vram("r", 50, State::Running);
+        let fits = with_vram("a", 40, State::Queued);
+        let over = with_vram("b", 41, State::Queued);
         assert_eq!(
-            evaluate(&fits, &[run.clone(), fits.clone()], &cap(), &calm(), 2),
+            evaluate(&fits, &[run.clone(), fits.clone()], &c, &calm(), 2),
             Decision::Start
         );
-        let d = evaluate(&over, &[run, over.clone()], &cap(), &calm(), 2);
-        assert!(matches!(d, Decision::Wait { live: false, .. }), "{d:?}");
+        let d = evaluate(&over, &[run, over.clone()], &c, &calm(), 2);
+        assert!(
+            matches!(
+                d,
+                Decision::Wait {
+                    live: false,
+                    block: Block::Vram,
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn declared_reservations_over_the_ceiling_admit_when_measured_use_is_low() {
+        // The wtlayer case: running reservations (learned/declared) total 88G of 100G, measured memory 43% used.
+        let c = cap();
+        let live = Live {
+            mem_used_pct: 43,
+            non_heavy: Usage {
+                cpu: 0,
+                mem: 20 * G,
+                vram: 0,
+            },
+            per_job: vec![
+                (
+                    "r1".into(),
+                    Usage {
+                        cpu: 100,
+                        mem: 12 * G,
+                        vram: 0,
+                    },
+                ),
+                (
+                    "r2".into(),
+                    Usage {
+                        cpu: 100,
+                        mem: 11 * G,
+                        vram: 0,
+                    },
+                ),
+            ],
+            ..calm()
+        };
+        let old = |id: &str| Job {
+            started_ms: Some(0),
+            ..job(id, 2, 44, State::Running, 0)
+        };
+        let me = job("w", 2, 20, State::Queued, 1);
+        let jobs = [old("r1"), old("r2"), me.clone()];
+        assert_eq!(
+            evaluate(&me, &jobs, &c, &live, 100_000),
+            Decision::Start,
+            "reservations 88G + 20G > 90G, measured 43G"
+        );
+        // Right after admission the unused reservation still counts: the same pair blocks as a ramp, then releases.
+        let d = evaluate(&me, &jobs, &c, &live, 1_000);
+        assert!(
+            matches!(
+                d,
+                Decision::Wait {
+                    block: Block::Ramp,
+                    ramp_end_ms: Some(_),
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+        // Real pressure still blocks: measured use leaves no room for the request.
+        let full = Live {
+            non_heavy: Usage {
+                cpu: 0,
+                mem: 60 * G,
+                vram: 0,
+            },
+            ..live.clone()
+        };
+        let d = evaluate(&me, &jobs, &c, &full, 100_000);
+        assert!(
+            matches!(
+                d,
+                Decision::Wait {
+                    block: Block::Mem,
+                    live: true,
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn mem_unmet_is_held_only_through_the_ramp() {
+        assert_eq!(mem_unmet(10 * G, 3 * G, 0), 7 * G);
+        assert_eq!(
+            mem_unmet(10 * G, 12 * G, 0),
+            0,
+            "live use over the reservation leaves nothing unmet"
+        );
+        assert_eq!(mem_unmet(10 * G, 3 * G, RAMP_MS), 0);
     }
 
     #[test]
@@ -608,14 +711,21 @@ mod tests {
         let over = job("o", 5, 41, State::Queued, 1);
         let d = evaluate(&over, &[run.clone(), over.clone()], &cap(), &live, 2);
         assert!(matches!(d, Decision::Wait { live: true, .. }), "{d:?}");
-        // The memory reservation is the floor when live usage is lower; CPU is just live.
+        // Past the ramp an unused reservation holds nothing; CPU and memory are both just live.
         let idle = Live {
             per_job: vec![("r".into(), Usage::default())],
             non_heavy: Usage::default(),
             ..calm()
         };
+        let run = Job {
+            started_ms: Some(0),
+            ..run
+        };
         let room = headroom(&[&run], &cap(), &idle, 100_000);
-        assert_eq!((room.cpu, room.mem), (900, 80 * G));
+        assert_eq!((room.cpu, room.mem), (900, 90 * G));
+        // Inside the ramp the unused part of the reservation still counts.
+        let room = headroom(&[&run], &cap(), &idle, 1_000);
+        assert_eq!(room.mem, 80 * G);
     }
 
     #[test]
@@ -1978,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_inflated_memory_reservations_starve_an_idle_rig() {
+    fn thread_inflated_memory_reservations_no_longer_starve_an_idle_rig() {
         // 2026-11-20 09:00 on the rig: cpu 21%, memory 6% used, 3 running, a waiter blocked on "mem". Each `cargo
         // install` had learned a 46 GB peak by summing every rustc thread's copy of its process RSS (2.6 GB real).
         let rig = Capacity {
@@ -2006,16 +2116,8 @@ mod tests {
             &live,
             100_000,
         );
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Mem,
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
+        // Past the ramp the inflated reservations are only a number: measured memory is 6% used, so the job starts.
+        assert_eq!(d, Decision::Start, "{d:?}");
         // Learned without threads (3 GB, 4 cores) the same job starts.
         let real = |id: &str| Job {
             started_ms: Some(0),
