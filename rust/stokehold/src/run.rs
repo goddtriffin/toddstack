@@ -28,7 +28,7 @@ use crate::machine::{
 };
 use crate::sample;
 use crate::state::{StateDir, is_alive};
-use crate::stats::{children_usage, compute, format_stats};
+use crate::stats::{Stats, children_usage, compute, format_stats};
 use crate::tty::{Terminal, TerminalGuard};
 
 const DEFAULT_MEM: u64 = 4 << 30;
@@ -543,6 +543,46 @@ fn wait_child(pid: Pid, term: Option<Terminal>) -> Result<ExitStatus, nix::Error
     }
 }
 
+fn record_finished(
+    dir: &StateDir,
+    job: &Job,
+    info: &JobInfo,
+    stats: Stats,
+    exit: ExitStatus,
+    timed_out: bool,
+) -> i32 {
+    let code = if timed_out {
+        i32::from(TIMEOUT_EXIT)
+    } else {
+        exit_code(exit)
+    };
+    let entry = Entry {
+        ts: Timestamp::now(),
+        cmd: job.cmd.clone(),
+        cwd: job.cwd.clone(),
+        requested: job.weights,
+        measured: stats,
+        exit_code: code,
+        v: crate::history::VERSION,
+        repo: history::repo_key(Path::new(&job.cwd)),
+    };
+    if let Err(e) = history::append(&dir.history_path(), &entry) {
+        eprintln!("stokehold: could not write history: {e}");
+    }
+    log::record(
+        dir.base(),
+        &Event::Finished {
+            ts: Timestamp::now(),
+            job: info.clone(),
+            exit: code,
+            wall_ms: stats.run_ms,
+            cpu_ms: stats.cpu_user_ms + stats.cpu_sys_ms,
+            peak_rss: stats.peak_tree_rss.max(stats.peak_rss),
+        },
+    );
+    code
+}
+
 fn execute(
     dir: &StateDir,
     cap: &Capacity,
@@ -653,35 +693,7 @@ fn execute(
     stats.timed_out = timed_out;
     eprintln!("{}", format_stats(&stats));
 
-    let code = if timed_out {
-        i32::from(TIMEOUT_EXIT)
-    } else {
-        exit_code(exit)
-    };
-    let entry = Entry {
-        ts: Timestamp::now(),
-        cmd: job.cmd.clone(),
-        cwd: job.cwd.clone(),
-        requested: job.weights,
-        measured: stats,
-        exit_code: code,
-        v: crate::history::VERSION,
-        repo: history::repo_key(Path::new(&job.cwd)),
-    };
-    if let Err(e) = history::append(&dir.history_path(), &entry) {
-        eprintln!("stokehold: could not write history: {e}");
-    }
-    log::record(
-        dir.base(),
-        &Event::Finished {
-            ts: Timestamp::now(),
-            job: info.clone(),
-            exit: code,
-            wall_ms: stats.run_ms,
-            cpu_ms: stats.cpu_user_ms + stats.cpu_sys_ms,
-            peak_rss: stats.peak_tree_rss.max(stats.peak_rss),
-        },
-    );
+    let code = record_finished(dir, job, info, stats, exit, timed_out);
     Ok(u8::try_from(code & 0xff).unwrap_or(1))
 }
 
