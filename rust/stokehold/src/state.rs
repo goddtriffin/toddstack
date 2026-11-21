@@ -458,6 +458,7 @@ mod tests {
             mem_peak_at_ms: None,
             cpu_hold_ms: None,
             cpu_settled: false,
+            non_heavy_cpu_at_start: 0,
         }
     }
 

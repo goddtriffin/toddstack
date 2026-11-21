@@ -138,4 +138,8 @@ pub struct Job {
     /// it has shown its real use, so its CPU hold is released early.
     #[serde(default)]
     pub cpu_settled: bool,
+    /// Centi-cores of other programs' CPU (not heavy jobs) when this job started: a Docker/VM job's hold is netted only
+    /// against the rise above it, so unrelated apps and always-on containers do not cancel the hold.
+    #[serde(default)]
+    pub non_heavy_cpu_at_start: u64,
 }
