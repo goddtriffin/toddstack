@@ -4,8 +4,8 @@
 //! minus the part of each running job's reservation it has not yet used (its unmet part). A declared (`--mem`) size is
 //! held for the whole run. A learned size is held until the job's learned time to peak (`mem_peak_at_ms`; at least
 //! `RAMP_MS`, and `MEM_FALLBACK_HOLD_MS` when unknown), then decays linearly to nothing over `MEM_DECAY_MS`: builds
-//! peak late, and a hold cut at 10 s let 12 jobs of a 12G peak start on a 64G Mac (reviewer's simulation). The learned
-//! holds together take at most `MEM_HELD_CAP` of the free memory, so measured use still admits jobs. Reservations that
+//! peak late, and a hold cut at 10 s let 12 jobs of a 12G peak start on a 64G Mac (reviewer's simulation). Only the decaying tails after
+//! the peak time are capped, together at `MEM_HELD_CAP` of the free memory, so measured use still admits jobs. Reservations that
 //! only sum high never block (2026-11-20: reservations summing over 85% blocked jobs at 43% memory used and left the
 //! Mac idle). VRAM stays reservation-based: running reservations plus the request within 90% of capacity.
 //! CPU is judged by live headroom only, never by peak-core reservations (a build
@@ -228,18 +228,35 @@ pub fn mem_unmet(
     declared: bool,
     peak_at_ms: Option<i64>,
 ) -> u64 {
+    let (full, tail) = mem_unmet_split(reserved, live, elapsed_ms, declared, peak_at_ms);
+    full + tail
+}
+
+/// `mem_unmet` split into `(full, tail)`: `full` is held in full (a declared size, or a learned one before its
+/// time-to-peak); `tail` is the decaying part after the peak time.
+#[must_use]
+pub fn mem_unmet_split(
+    reserved: u64,
+    live: u64,
+    elapsed_ms: i64,
+    declared: bool,
+    peak_at_ms: Option<i64>,
+) -> (u64, u64) {
     let unmet = reserved.saturating_sub(live);
     if declared {
-        return unmet;
+        return (unmet, 0);
     }
     let hold = peak_at_ms.unwrap_or(MEM_FALLBACK_HOLD_MS).max(RAMP_MS);
     if elapsed_ms <= hold {
-        unmet
+        (unmet, 0)
     } else if elapsed_ms >= hold + MEM_DECAY_MS {
-        0
+        (0, 0)
     } else {
-        unmet * u64::try_from(hold + MEM_DECAY_MS - elapsed_ms).unwrap_or(0)
-            / u64::try_from(MEM_DECAY_MS).unwrap_or(1)
+        (
+            0,
+            unmet * u64::try_from(hold + MEM_DECAY_MS - elapsed_ms).unwrap_or(0)
+                / u64::try_from(MEM_DECAY_MS).unwrap_or(1),
+        )
     }
 }
 
@@ -289,66 +306,70 @@ pub fn sustained_pct(latest: u64, readings: &[(i64, u64)], now_ms: i64) -> u64 {
 /// ramp holds not yet in use.
 #[must_use]
 pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> Usage {
-    let (mut held, unmet, learned) =
-        running
-            .iter()
-            .fold((Usage::default(), 0, 0u64), |(a, unmet, learned), j| {
-                let l = live
-                    .per_job
-                    .iter()
-                    .find(|(id, _)| *id == j.id)
-                    .map_or_else(Usage::default, |(_, u)| *u);
-                let hold = j.started_ms.map_or(0, |t| {
-                    ramp_hold(
-                        centi(j.weights.cpu).min(centi(cap.cpu)),
-                        centi(cap.cpu),
-                        now_ms.saturating_sub(t).max(0),
-                        live.cpu_pct,
-                        crate::run::hosts_vm_work(&j.cmd),
-                    )
-                });
-                let cpu = l.cpu.max(hold);
-                // A running job not yet stamped, or one with a declared size, holds its whole unused part; a learned size holds
-                // it by schedule, and those holds are capped together below.
-                let (mem, learned_unmet) = match j.started_ms {
-                    Some(t) if !j.mem_declared => (
+    let (mut held, unmet, (pre_peak, tail)) = running.iter().fold(
+        (Usage::default(), 0, (0u64, 0u64)),
+        |(a, unmet, learned), j| {
+            let l = live
+                .per_job
+                .iter()
+                .find(|(id, _)| *id == j.id)
+                .map_or_else(Usage::default, |(_, u)| *u);
+            let hold = j.started_ms.map_or(0, |t| {
+                ramp_hold(
+                    centi(j.weights.cpu).min(centi(cap.cpu)),
+                    centi(cap.cpu),
+                    now_ms.saturating_sub(t).max(0),
+                    live.cpu_pct,
+                    crate::run::hosts_vm_work(&j.cmd),
+                )
+            });
+            let cpu = l.cpu.max(hold);
+            // A running job not yet stamped, or one with a declared size, holds its whole unused part; a learned size holds
+            // it by schedule, and those holds are capped together below.
+            let (mem, learned_unmet) = match j.started_ms {
+                Some(t) if !j.mem_declared => (
+                    l.mem,
+                    mem_unmet_split(
+                        j.weights.mem,
                         l.mem,
-                        mem_unmet(
+                        now_ms.saturating_sub(t).max(0),
+                        false,
+                        j.mem_peak_at_ms,
+                    ),
+                ),
+                Some(t) => (
+                    l.mem
+                        + mem_unmet(
                             j.weights.mem,
                             l.mem,
                             now_ms.saturating_sub(t).max(0),
-                            false,
-                            j.mem_peak_at_ms,
+                            true,
+                            None,
                         ),
-                    ),
-                    Some(t) => (
-                        l.mem
-                            + mem_unmet(
-                                j.weights.mem,
-                                l.mem,
-                                now_ms.saturating_sub(t).max(0),
-                                true,
-                                None,
-                            ),
-                        0,
-                    ),
-                    None => (l.mem + j.weights.mem.saturating_sub(l.mem), 0),
-                };
-                (
-                    Usage {
-                        cpu: a.cpu + cpu,
-                        mem: a.mem + mem,
-                        vram: a.vram + l.vram.max(j.weights.vram),
-                    },
-                    unmet + hold.saturating_sub(l.cpu),
-                    learned + learned_unmet,
-                )
-            });
+                    (0, 0),
+                ),
+                None => (l.mem + j.weights.mem.saturating_sub(l.mem), (0, 0)),
+            };
+            (
+                Usage {
+                    cpu: a.cpu + cpu,
+                    mem: a.mem + mem,
+                    vram: a.vram + l.vram.max(j.weights.vram),
+                },
+                unmet + hold.saturating_sub(l.cpu),
+                (learned.0 + learned_unmet.0, learned.1 + learned_unmet.1),
+            )
+        },
+    );
     let free = ceiling(cap)
         .mem
         .saturating_sub(live.non_heavy.mem)
         .saturating_sub(held.mem);
-    held.mem += learned.min(free / MEM_HELD_CAP.1 * MEM_HELD_CAP.0);
+    // Before a job's learned time-to-peak its hold is full (the cap would leave free memory unprotected while peaks are
+    // still coming); only the decaying tail after the peak is capped to a fraction of what is still free.
+    held.mem += pre_peak;
+    let free = free.saturating_sub(pre_peak);
+    held.mem += tail.min(free / MEM_HELD_CAP.1 * MEM_HELD_CAP.0);
     let instant = live.non_heavy.cpu + held.cpu;
     let sustained = live.cpu_sustained_pct * centi(cap.cpu) / 100 + unmet;
     let room = ceiling(cap)
@@ -804,13 +825,61 @@ mod tests {
     fn twelve_late_peaking_jobs_do_not_all_start_on_a_64g_mac() {
         // Reviewer's case: 144G of peaks on 64G. 0.4.1 admitted 4; releasing every hold at 10 s admitted all 12.
         // Held until the learned peak (120 s), 30 s in: a few start, never all.
-        let n = admitted_of_twelve(false, |_| 30_000);
-        assert!((2..=5).contains(&n), "{n} admitted");
+        assert_eq!(admitted_of_twelve(false, |_| 30_000), 3);
         // Past peak and decay (3 minutes) the holds are gone and measured use (1G each) admits them all.
         assert_eq!(admitted_of_twelve(false, |_| 180_000), 12);
         // Declared sizes are held whatever the time.
-        let n = admitted_of_twelve(true, |_| 3_600_000);
-        assert!((2..=5).contains(&n), "{n} admitted");
+        assert_eq!(admitted_of_twelve(true, |_| 3_600_000), 3);
+    }
+
+    #[test]
+    fn the_free_memory_cap_binds_only_the_decaying_tail_not_the_hold_before_the_peak() {
+        // 64G Mac (57.6G usable), 10G other programs, one learned 40G job (peak at 120 s) using nothing yet.
+        // Old cap: min(40G, 3/4 of 47.6G free = 35.7G) left 4.3G of its reservation unprotected before the peak.
+        let cap = big_mac();
+        let live = Live {
+            non_heavy: Usage {
+                cpu: 0,
+                mem: 10 * G,
+                vram: 0,
+            },
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: 50,
+                    mem: 0,
+                    vram: 0,
+                },
+            )],
+            ..calm()
+        };
+        let r = Job {
+            started_ms: Some(0),
+            mem_peak_at_ms: Some(120_000),
+            ..job("r", 1, 40, State::Running, 0)
+        };
+        let usable = ceiling(&cap).mem;
+        let at = |ms| headroom(&[&r], &cap, &live, ms).mem;
+        // Before the learned peak the hold is full: free = usable - 10G - 40G exactly.
+        assert_eq!(at(30_000), usable - 50 * G);
+        assert_eq!(at(120_000), usable - 50 * G);
+        // After the peak, the decaying tail (here 20G at the midpoint) is still under the cap, so it is held as is.
+        assert_eq!(at(150_000), usable - 30 * G);
+        // A tail larger than 3/4 of what is free is capped: 3/4 of 47.6G, not the whole hold.
+        let big = Job {
+            weights: Weights {
+                mem: 80 * G,
+                ..r.weights
+            },
+            ..r.clone()
+        };
+        let free = usable - 10 * G;
+        let tail = 80 * G / 2;
+        assert!(tail > free / 4 * 3);
+        assert_eq!(
+            headroom(&[&big], &cap, &live, 150_000).mem,
+            free - free / 4 * 3
+        );
     }
 
     #[test]
