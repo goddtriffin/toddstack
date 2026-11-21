@@ -64,8 +64,7 @@ All of these must hold:
 - Known limit: the memory and pressure guards only veto new starts. A gate cannot stop jobs already running, and
   stokehold does not kill them: if running jobs all grow past their learned peaks, memory can still run out. The unused
   reservation holds above are what protect against this, not the guards.
-- Guards (veto only): 1-minute load at or over 3 x cores with the CPU at least 95% busy is overload and always blocks,
-  even a job that would run alone. 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16
+- Guards (veto only, they block even a job that would run alone): 1-minute load at or over 4 x cores blocks whatever the CPU says (runaway load: 120 on 16
   cores killed Docker on 2026-11-19). From 2 x cores up, load blocks while it is still rising (load1 > 1.1 x load5)
   and the CPU is at least 75% busy, or while the CPU is at least 90% busy (the CPU here is the larger of the latest
   and the sustained reading). Load without CPU is not CPU overload: on
