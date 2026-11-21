@@ -663,9 +663,10 @@ mod tests {
             ..job("phantom", pid, start, State::Running)
         };
         s.write_job(&phantom).unwrap();
+        // A whole-machine waiter: a 1-core one would backfill next to the phantom's held peak.
         let waiter = Job {
             weights: Weights {
-                cpu: 1,
+                cpu: 16,
                 ..Weights::default()
             },
             ..job("waiter", std::process::id(), START_UNKNOWN, State::Queued)
