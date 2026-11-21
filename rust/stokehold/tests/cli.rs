@@ -311,6 +311,17 @@ fn ctrl_c_sigint_is_forwarded_and_hup_too() {
     );
 }
 
+/// Job files in `<state>/jobs`, leaving out the per-job `.lock` files.
+fn job_files(state: &std::path::Path) -> usize {
+    std::fs::read_dir(state.join("jobs"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "json"))
+        })
+        .count()
+}
+
 #[test]
 fn signal_while_queued_removes_the_job_file() {
     let t = TempDir::new().unwrap();
@@ -321,17 +332,13 @@ fn signal_while_queued_removes_the_job_file() {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while std::fs::read_dir(t.path().join("jobs")).unwrap().count() < 2 {
+    while job_files(t.path()) < 2 {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(20));
     }
     kill(&waiter, "-TERM");
     assert_eq!(waiter.wait().unwrap().code(), Some(143));
-    assert_eq!(
-        std::fs::read_dir(t.path().join("jobs")).unwrap().count(),
-        1,
-        "only the holder's file is left"
-    );
+    assert_eq!(job_files(t.path()), 1, "only the holder's file is left");
     kill(&holder, "-TERM");
     let _ = holder.wait_with_output();
 }

@@ -89,6 +89,9 @@ pub struct Defaults {
     pub vram: Option<u64>,
     /// Median time (ms after the start) of the memory peak; `None` when no run recorded it.
     pub mem_peak_at_ms: Option<u64>,
+    /// Median time (ms after the start) at which the CPU reached 3/4 of its peak; `None` when no run recorded it
+    /// (history from before 0.4.3).
+    pub cpu_peak_at_ms: Option<u64>,
 }
 
 fn median(mut v: Vec<u64>) -> Option<u64> {
@@ -213,11 +216,18 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
             .filter(|ms| *ms > 0)
             .collect(),
     );
+    let cpu_peak_at_ms = pick(
+        mine.iter()
+            .map(|e| e.measured.peak_cpu_at_ms)
+            .filter(|ms| *ms > 0)
+            .collect(),
+    );
     Some(Defaults {
         cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX),
         mem,
         vram,
         mem_peak_at_ms,
+        cpu_peak_at_ms,
     })
 }
 
@@ -274,10 +284,27 @@ mod tests {
                 cpu: 3,
                 mem: 200,
                 vram: None,
-                mem_peak_at_ms: None
+                mem_peak_at_ms: None,
+                cpu_peak_at_ms: None
             }
         );
         assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
+    }
+
+    #[test]
+    fn cpu_time_to_peak_is_the_median_of_the_runs_that_recorded_it() {
+        let runs: Vec<Entry> = [0, 20_000, 30_000, 40_000]
+            .into_iter()
+            .map(|ms| {
+                let mut e = entry("t", "/a", 100, 50, 0);
+                e.measured.peak_cpu_at_ms = ms;
+                e
+            })
+            .collect();
+        let d = defaults_from(&runs, &["t".to_string()], "/a", None).unwrap();
+        assert_eq!(d.cpu_peak_at_ms, Some(30_000), "0 (unknown) is left out");
+        let old = defaults_from(&runs[..1], &["t".to_string()], "/a", None).unwrap();
+        assert_eq!(old.cpu_peak_at_ms, None);
     }
 
     #[test]
@@ -292,7 +319,8 @@ mod tests {
                 cpu: 7,
                 mem: 900,
                 vram: None,
-                mem_peak_at_ms: None
+                mem_peak_at_ms: None,
+                cpu_peak_at_ms: None
             }
         );
     }

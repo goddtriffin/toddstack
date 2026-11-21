@@ -138,6 +138,7 @@ mod tests {
             started_ms: None,
             mem_declared: false,
             mem_peak_at_ms: None,
+            cpu_hold_ms: None,
             blocked_by: by.map(Into::into),
         }
     }

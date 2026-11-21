@@ -43,6 +43,10 @@ pub struct Stats {
     /// reservation's unused part is held.
     #[serde(default)]
     pub peak_mem_at_ms: u64,
+    /// Milliseconds after the start at which the process tree's CPU first reached 3/4 of its peak (0 when unknown):
+    /// how long a learned CPU peak is held while it has not shown up (`admit::cpu_hold_ms`).
+    #[serde(default)]
+    pub peak_cpu_at_ms: u64,
     pub blocks_in: u64,
     pub blocks_out: u64,
     /// Machine-wide, not just this job.
@@ -180,6 +184,7 @@ mod tests {
             peak_other_centi_cores: 0,
             peak_other_mem: 0,
             peak_mem_at_ms: 0,
+            peak_cpu_at_ms: 0,
             peak_tree_rss: 3 << 30,
             peak_centi_cores: 450,
             blocks_in: 5,

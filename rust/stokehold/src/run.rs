@@ -27,7 +27,7 @@ use crate::machine::{
     process_start, vram,
 };
 use crate::sample;
-use crate::state::{StateDir, is_alive};
+use crate::state::StateDir;
 use crate::stats::{Stats, children_usage, compute, format_stats};
 use crate::tty::{Terminal, TerminalGuard};
 
@@ -123,14 +123,21 @@ fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
     cap.cpu
 }
 
-/// The job's weights and, for a learned memory size, when (ms after the start) past runs peaked in memory.
+/// What `resolve_weights` decided: the weights, for a learned memory size when (ms after the start) past runs peaked
+/// in memory, and for a learned or declared CPU size how long its peak is held until it shows (`None`: cold).
+struct Resolved {
+    weights: Weights,
+    mem_peak_at_ms: Option<i64>,
+    cpu_hold_ms: Option<i64>,
+}
+
 fn resolve_weights(
     state: &StateDir,
     flags: &Flags,
     cmd: &[String],
     cwd: &str,
     cap: &Capacity,
-) -> (Weights, Option<i64>) {
+) -> Resolved {
     let hist = history::defaults_for(
         &state.history_path(),
         cmd,
@@ -146,17 +153,21 @@ fn resolve_weights(
         vram: flags.vram.or(hist.and_then(|d| d.vram)).unwrap_or(0),
         disk: flags.disk.unwrap_or(0),
     });
-    (
+    let cpu_known = flags.cpu.is_some() || hist.is_some();
+    Resolved {
         weights,
-        hist.and_then(|d| d.mem_peak_at_ms)
+        mem_peak_at_ms: hist
+            .and_then(|d| d.mem_peak_at_ms)
             .and_then(|ms| i64::try_from(ms).ok()),
-    )
+        cpu_hold_ms: cpu_known
+            .then(|| crate::admit::cpu_hold_ms(hist.and_then(|d| d.cpu_peak_at_ms))),
+    }
 }
 
 fn exec_nested(state: &StateDir, cmd: &[String]) -> Option<Error> {
     let id = crate::state::env_var("STOKEHOLD_JOB")?.into_string().ok()?;
     let job = state.read_job(&id)?;
-    if job.state != State::Running || !is_alive(&job) {
+    if job.state != State::Running || !state.job_alive(&job) {
         return None;
     }
     let (first, rest) = cmd.split_first()?;
@@ -177,7 +188,11 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
     let cwd = std::env::current_dir()?;
     let cwd_str = cwd.to_string_lossy().into_owned();
     let cap = machine::capacity(&cwd)?;
-    let (weights, mem_peak_at_ms) = resolve_weights(state, flags, cmd, &cwd_str, &cap);
+    let Resolved {
+        weights,
+        mem_peak_at_ms,
+        cpu_hold_ms,
+    } = resolve_weights(state, flags, cmd, &cwd_str, &cap);
 
     let (tx, rx) = channel();
     let sig = spawn_signal_thread(tx.clone())?;
@@ -202,15 +217,20 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         } else {
             mem_peak_at_ms
         },
+        cpu_hold_ms,
     };
     let _guard = JobGuard {
         state,
         id: job.id.clone(),
     };
-    {
+    // The job lock is held by this process until it exits: the kernel drops it when the process dies however it dies
+    // (SIGKILL included), which is how every other process tells this job is gone. Taken before the job file appears.
+    let _job_lock = {
         let _lock = state.lock()?;
+        let held = state.hold_job_lock(&job.id)?;
         state.write_job(&job)?;
-    }
+        held
+    };
     let info = JobInfo::new(&job.id, pid, &job.cwd, cmd, weights);
     log::prune(state.base());
     log::record(
@@ -395,11 +415,25 @@ fn vram_sampler(cap: &Capacity) -> Option<(Sender<()>, std::thread::JoinHandle<u
     Some((stop_tx, handle))
 }
 
-/// The peaks of one job's process tree, and when (ms after sampling began) its memory peaked.
+/// The peaks of one job's process tree, when (ms after sampling began) its memory peaked, and when its CPU first
+/// reached 3/4 of its peak.
 #[derive(Default)]
 struct TreePeak {
     usage: Usage,
     mem_at_ms: u64,
+    cpu_at_ms: u64,
+}
+
+/// When (ms) the CPU samples `(ms, centi-cores)` first reached 3/4 of their peak; 0 with no CPU at all.
+fn cpu_peak_at(samples: &[(u64, u64)]) -> u64 {
+    let peak = samples.iter().map(|(_, c)| *c).max().unwrap_or(0);
+    if peak == 0 {
+        return 0;
+    }
+    samples
+        .iter()
+        .find(|(_, c)| c * 4 >= peak * 3)
+        .map_or(0, |(ms, _)| *ms)
 }
 
 /// Samples the whole process tree (heavy's own pid down) while the job runs; returns the peak CPU and RSS.
@@ -410,16 +444,20 @@ fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<TreePe
     let started = Instant::now();
     let handle = std::thread::spawn(move || {
         let mut peak = TreePeak::default();
+        let mut cpu = Vec::new();
         loop {
             let s = sampler.sample();
+            let at = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             if s.mem > peak.usage.mem {
-                peak.mem_at_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                peak.mem_at_ms = at;
             }
+            cpu.push((at, s.cpu));
             peak.usage = peak.usage.max(s);
             if !matches!(
                 stop_rx.recv_timeout(TREE_SAMPLE),
                 Err(RecvTimeoutError::Timeout)
             ) {
+                peak.cpu_at_ms = cpu_peak_at(&cpu);
                 return peak;
             }
         }
@@ -680,6 +718,7 @@ fn execute(
         stats.peak_tree_rss = peak.usage.mem;
         stats.peak_centi_cores = peak.usage.cpu;
         stats.peak_mem_at_ms = peak.mem_at_ms;
+        stats.peak_cpu_at_ms = peak.cpu_at_ms;
     }
     if let Some(other) = other_peak {
         stats.peak_other_centi_cores = other.cpu;
@@ -731,6 +770,21 @@ mod tests {
         assert!(hosts_vm_work(&c(&["docker", "build"])));
         assert!(hosts_vm_work(&c(&["make", "docker-build"])));
         assert!(!hosts_vm_work(&c(&["cargo", "test"])));
+    }
+
+    #[test]
+    fn cpu_time_to_peak_is_when_three_quarters_of_the_peak_first_showed() {
+        // A cargo build: a few cores while it resolves and builds scripts, then all 16 from 24 s on.
+        let samples = [
+            (0, 50),
+            (8_000, 200),
+            (16_000, 400),
+            (24_000, 1_300),
+            (30_000, 1_600),
+        ];
+        assert_eq!(cpu_peak_at(&samples), 24_000);
+        assert_eq!(cpu_peak_at(&[]), 0);
+        assert_eq!(cpu_peak_at(&[(500, 0)]), 0);
     }
 
     #[test]
