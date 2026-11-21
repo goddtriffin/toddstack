@@ -129,8 +129,8 @@ struct Resolved {
     weights: Weights,
     mem_peak_at_ms: Option<i64>,
     cpu_hold_ms: Option<i64>,
-    /// A learned CPU size: when (ms after the start) its CPU may count as plateaued, the median time to peak (0 when
-    /// unknown). `None` for cold and declared-only sizes, whose hold is never released by a plateau.
+    /// A learned CPU size: when (ms after the start) its CPU may count as plateaued, the slowest time to peak. `None` for
+    /// cold, declared (`--cpu`) and no-ramp-history sizes, whose hold is never released by a plateau.
     cpu_settle_after_ms: Option<u64>,
 }
 
@@ -165,7 +165,9 @@ fn resolve_weights(
         cpu_hold_ms: Some(crate::admit::cpu_hold_ms(
             hist.and_then(|d| d.cpu_peak_at_ms),
         )),
-        cpu_settle_after_ms: hist.map(|d| d.cpu_peak_median_ms.unwrap_or(0)),
+        cpu_settle_after_ms: hist
+            .filter(|_| flags.cpu.is_none())
+            .and_then(|d| d.cpu_peak_at_ms),
     }
 }
 
@@ -452,22 +454,24 @@ fn cpu_peak_at(samples: &[(u64, u64)]) -> u64 {
         .map_or(0, |(ms, _)| *ms)
 }
 
-/// Marks the running job's file `cpu_settled`, which releases its CPU hold. The file change is the event that wakes the
-/// waiters. A job file already gone (the job ended) is not written again.
-fn mark_settled(dir: &StateDir, id: &str) {
-    let Ok(_lock) = dir.lock() else { return };
+/// Sets the running job's file `cpu_settled` (releasing its CPU hold) or clears it (a risen CPU takes the hold again).
+/// The file change is the event that wakes the waiters. A job file already gone (the job ended) is not written again.
+/// Returns false when the lock could not be taken, so the caller retries.
+fn mark_settled(dir: &StateDir, id: &str, settled: bool) -> bool {
+    let Ok(_lock) = dir.lock() else { return false };
     if let Some(mut job) = dir
         .read_job(id)
-        .filter(|j| j.state == State::Running && !j.cpu_settled)
+        .filter(|j| j.state == State::Running && j.cpu_settled != settled)
     {
-        job.cpu_settled = true;
+        job.cpu_settled = settled;
         let _ = dir.write_job(&job);
     }
+    true
 }
 
 /// Samples the whole process tree (heavy's own pid down) while the job runs; returns the peak CPU and RSS.
 /// Uses the same sampler as the live accounting of running jobs. With `settle` (the state dir, the job id and its
-/// learned median time to peak), it marks the job settled once its CPU plateaus (`admit::cpu_plateaued`).
+/// learned slowest time to peak), it marks the job settled once its CPU plateaus (and unmarks it if it rises again) (`admit::cpu_plateaued`).
 fn tree_sampler(
     root: u32,
     settle: Option<(StateDir, String, u64)>,
@@ -476,7 +480,8 @@ fn tree_sampler(
     let (stop_tx, stop_rx) = channel::<()>();
     let started = Instant::now();
     let handle = std::thread::spawn(move || {
-        let mut settle = settle;
+        let settle = settle;
+        let mut marked = false;
         let mut peak = TreePeak::default();
         let mut cpu = Vec::new();
         loop {
@@ -487,11 +492,11 @@ fn tree_sampler(
             }
             cpu.push((at, s.cpu));
             peak.usage = peak.usage.max(s);
-            if let Some((dir, id, after)) = &settle
-                && crate::admit::cpu_plateaued(&cpu, *after)
-            {
-                mark_settled(dir, id);
-                settle = None;
+            if let Some((dir, id, after)) = &settle {
+                let plateaued = crate::admit::cpu_plateaued(&cpu, *after);
+                if plateaued != marked && mark_settled(dir, id, plateaued) {
+                    marked = plateaued;
+                }
             }
             if !matches!(
                 stop_rx.recv_timeout(TREE_SAMPLE),
@@ -789,6 +794,47 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mark_settled_sets_and_clears_the_flag_of_a_running_job_only() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = StateDir::at(t.path().to_path_buf());
+        dir.ensure().unwrap();
+        let mk = |id: &str, state| Job {
+            id: id.into(),
+            pid: 1,
+            start_time: 0,
+            weights: Weights {
+                cpu: 1,
+                mem: 0,
+                vram: 0,
+                disk: 0,
+            },
+            cmd: vec!["x".into()],
+            cwd: "/".into(),
+            state,
+            enqueued_ms: 0,
+            started_ms: Some(0),
+            blocked_by: None,
+            mem_declared: false,
+            mem_peak_at_ms: None,
+            cpu_hold_ms: Some(1),
+            cpu_settled: false,
+        };
+        dir.write_job(&mk("run", State::Running)).unwrap();
+        dir.write_job(&mk("wait", State::Queued)).unwrap();
+        assert!(mark_settled(&dir, "run", true));
+        assert!(dir.read_job("run").unwrap().cpu_settled);
+        assert!(mark_settled(&dir, "run", false));
+        assert!(!dir.read_job("run").unwrap().cpu_settled);
+        assert!(mark_settled(&dir, "wait", true));
+        assert!(!dir.read_job("wait").unwrap().cpu_settled, "not Running");
+        assert!(mark_settled(&dir, "gone", true));
+        assert!(
+            dir.read_job("gone").is_none(),
+            "an ended job is not rewritten"
+        );
+    }
 
     #[test]
     fn a_cold_job_holds_the_whole_machine_for_the_fallback_time_not_ten_seconds() {

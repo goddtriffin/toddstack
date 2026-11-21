@@ -322,7 +322,7 @@ pub fn cpu_hold_ms(peak_at_ms: Option<u64>) -> i64 {
 }
 
 /// The CPU a running job holds beyond its live use. A job with a learned or declared size (`hold_ms`) holds its whole
-/// peak until the peak shows in its live use (3/4 of it), its CPU plateaus past its median time to peak (`settled`, see
+/// peak until the peak shows in its live use (3/4 of it), its CPU plateaus past its slowest time to peak (`settled`, see
 /// `cpu_plateaued`) or `hold_ms` has passed, like a learned memory size, never
 /// less than the `RAMP_FULL_MS` floor: a cargo build spends its first 10-30 s on a few cores, and a hold that ended
 /// sooner (or was released because the machine read idle) let several 16-core builds in before any of their CPU showed
@@ -368,32 +368,36 @@ fn cpu_hold_end(j: &Job, started_ms: i64) -> i64 {
 }
 
 /// Whether a running job's CPU has plateaued: `samples` are `(ms after the start, centi-cores)` of its process tree,
-/// oldest first. From `PLATEAU_MS` after `settle_after_ms` (its learned median time to peak, at least `RAMP_MS`) on,
-/// the highest reading of the last `PLATEAU_MS` must not exceed the highest before it by more than 1 core (or 1/8).
+/// oldest first. Only from `PLATEAU_MS` after `slowest_ms` (its learned SLOWEST time to peak, at least `RAMP_MS`: a
+/// median would end the hold before the late half of its runs ramp) on, and only when the last `PLATEAU_MS` is flat
+/// within itself: its highest and lowest readings differ by at most 1 core (or 1/8 of the level). A lull between
+/// bursts, or a rise, is not flat; a flat run that later rises is no longer plateaued, so its hold is taken again.
 /// Such a run has shown its real use: an incremental build, or a test run whose learned peak is one 500 ms spike
 /// (2026-11-21: `make check` learned 15 cores, ran on 1.5, and its 2-minute hold kept waiters out at 10-50% CPU).
-/// Before its median time to peak a flat run is not settled: a cargo build spends 10-30 s on a few cores first.
 #[must_use]
-pub fn cpu_plateaued(samples: &[(u64, u64)], settle_after_ms: u64) -> bool {
+pub fn cpu_plateaued(samples: &[(u64, u64)], slowest_ms: u64) -> bool {
     let Some(&(now, _)) = samples.last() else {
         return false;
     };
-    let from = settle_after_ms.max(u64::try_from(RAMP_MS).unwrap_or(0)) + PLATEAU_MS;
+    let from = slowest_ms.max(u64::try_from(RAMP_MS).unwrap_or(0)) + PLATEAU_MS;
     if now < from {
         return false;
     }
     let cut = now - PLATEAU_MS;
-    let max_of = |keep: &dyn Fn(u64) -> bool| {
-        samples
-            .iter()
-            .filter(|(ms, _)| keep(*ms))
-            .map(|(_, c)| *c)
-            .max()
-            .unwrap_or(0)
+    let recent: Vec<u64> = samples
+        .iter()
+        .filter(|(ms, _)| *ms > cut)
+        .map(|(_, c)| *c)
+        .collect();
+    let (Some(&hi), Some(&lo)) = (recent.iter().max(), recent.iter().min()) else {
+        return false;
     };
-    let before = max_of(&|ms| ms <= cut);
-    let recent = max_of(&|ms| ms > cut);
-    recent <= before + (before / 8).max(PLATEAU_SLACK_CPU)
+    // The window must really span PLATEAU_MS, not one late sample.
+    let first = samples
+        .iter()
+        .find(|(ms, _)| *ms > cut)
+        .map_or(now, |s| s.0);
+    first <= cut + PLATEAU_MS / 4 && hi - lo <= (hi / 8).max(PLATEAU_SLACK_CPU)
 }
 
 /// The machine's sustained CPU %: max(latest, mean of the readings from the last `BUSY_WINDOW_MS`). Fast to block when
@@ -607,6 +611,7 @@ fn blocker(
     cap: &Capacity,
     live: &Live,
     now_ms: i64,
+    waited_ms: i64,
 ) -> Option<Blocked> {
     if !running.is_empty() {
         if !fits_reservations(w, running, cap) {
@@ -621,10 +626,15 @@ fn blocker(
             // A big waiter's projected peak (half its learned peak) must fit within every core on top of the projected
             // CPU: one free core under the band let 13-core builds in at 83% busy, and they took the machine to 100%
             // with load1 at 34 (2026-11-21). room = band - projected, so projected + peak/2 <= all cores is this ask.
-            let projected_peak =
-                centi(w.cpu).min(centi(cap.cpu)) * PROJECTED_PEAK.0 / PROJECTED_PEAK.1;
-            let over_band = centi(cap.cpu) - ceiling(cap).cpu;
-            ask.cpu = ask.cpu.max(projected_peak.saturating_sub(over_band));
+            // A whole-machine waiter (cold, or a learned 16-core peak) that has waited past `BACKFILL_WINDOW_MS` (it holds the queue) drops this: a cold head asks for the
+            // whole machine, and its projected peak fits only at 50% busy, which left a machine with one long job at 50-60%
+            // while jobs queued. It then starts under the band like in 0.4.3; the load, memory and stagger guards stay.
+            if waited_ms < BACKFILL_WINDOW_MS || w.cpu < cap.cpu {
+                let projected_peak =
+                    centi(w.cpu).min(centi(cap.cpu)) * PROJECTED_PEAK.0 / PROJECTED_PEAK.1;
+                let over_band = centi(cap.cpu) - ceiling(cap).cpu;
+                ask.cpu = ask.cpu.max(projected_peak.saturating_sub(over_band));
+            }
         }
         let room_at = |t: i64| headroom_for(running, cap, live, t, small);
         if !fits(ask, room_at(now_ms)) {
@@ -692,7 +702,16 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
         return Decision::Fail(why);
     }
     if let Some(head) = queued.first().filter(|h| h.id != job.id) {
-        if blocker(head.weights, &running, cap, live, now_ms).is_none() {
+        if blocker(
+            head.weights,
+            &running,
+            cap,
+            live,
+            now_ms,
+            now_ms - head.enqueued_ms,
+        )
+        .is_none()
+        {
             // The head could start now: this job may go first only if the head still fits next to it.
             let me = Job {
                 state: State::Running,
@@ -701,7 +720,16 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
             };
             let mut with_me = running.clone();
             with_me.push(&me);
-            if blocker(head.weights, &with_me, cap, live, now_ms).is_some() {
+            if blocker(
+                head.weights,
+                &with_me,
+                cap,
+                live,
+                now_ms,
+                now_ms - head.enqueued_ms,
+            )
+            .is_some()
+            {
                 return wait("queued behind a job that fits now", Block::Queue);
             }
         } else {
@@ -717,7 +745,14 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
             }
         }
     }
-    match blocker(job.weights, &running, cap, live, now_ms) {
+    match blocker(
+        job.weights,
+        &running,
+        cap,
+        live,
+        now_ms,
+        now_ms - job.enqueued_ms,
+    ) {
         Some(b) => Decision::Wait {
             reason: b.reason,
             live: b.live,
@@ -2917,26 +2952,88 @@ mod tests {
     }
 
     #[test]
-    fn a_run_plateaus_once_its_cpu_stops_rising_past_its_median_time_to_peak() {
+    fn a_run_plateaus_once_its_cpu_is_flat_past_its_slowest_time_to_peak() {
         let run = |f: &dyn Fn(u64) -> u64, until: u64| -> Vec<(u64, u64)> {
             (0..=until / 500).map(|k| (k * 500, f(k * 500))).collect()
         };
-        // Flat at 1.5 cores (an incremental `make check` with a learned 15-core spike): settled 10 s after its
-        // 9 s median time to peak (at least the 10 s ramp), not before.
+        // Flat at 1.5 cores (an incremental `make check` with a learned 15-core spike): settled 10 s after the
+        // 10 s ramp floor, not before.
         let flat = |_| 150;
         assert!(!cpu_plateaued(&run(&flat, 19_500), 9_000));
         assert!(cpu_plateaued(&run(&flat, 20_000), 9_000));
         // Still rising: never settled.
         let rising = |ms| 100 + ms / 50;
         assert!(!cpu_plateaued(&run(&rising, 60_000), 9_000));
-        // A cargo build flat on 2 cores before its 30 s median ramp is not settled while it waits to ramp.
+        // Step ramp: flat on 2 cores until its 30 s slowest ramp, then 16. Not settled while it waits, nor in the
+        // window that contains the step.
         let cargo = |ms| if ms < 30_000 { 200 } else { 1_600 };
         assert!(!cpu_plateaued(&run(&cargo, 29_500), 30_000));
         assert!(!cpu_plateaued(&run(&cargo, 35_000), 30_000));
+        assert!(!cpu_plateaued(&run(&cargo, 39_500), 30_000));
+        // A step later than a short slowest time (20 s here, ramp at 25 s): the window with the step is not flat.
+        let late = |ms| if ms < 25_000 { 200 } else { 1_600 };
+        assert!(!cpu_plateaued(&run(&late, 25_500), 15_000));
+        // Spike, then a lull, then the real ramp at 40 s (slowest 40 s): the lull never releases, and the ramp
+        // takes it back.
+        let lull = |ms| {
+            if (1_000..40_000).contains(&ms) {
+                150
+            } else {
+                1_500
+            }
+        };
+        assert!(!cpu_plateaued(&run(&lull, 30_000), 40_000));
+        assert!(!cpu_plateaued(&run(&lull, 45_000), 40_000));
+        // Settled in a lull after the slowest time, then the CPU rises: no longer plateaued (re-reserved).
+        let again = |ms| if ms < 30_000 { 150 } else { 1_500 };
+        assert!(cpu_plateaued(&run(&again, 29_500), 5_000));
+        assert!(!cpu_plateaued(&run(&again, 33_000), 5_000));
         // Jitter within a core (or 1/8 of the level) is flat; an empty run is not.
         let jitter = |ms| if (ms / 500) % 2 == 0 { 800 } else { 880 };
         assert!(cpu_plateaued(&run(&jitter, 20_000), 0));
         assert!(!cpu_plateaued(&[], 0));
+    }
+
+    #[test]
+    fn a_cold_head_that_waited_starts_beside_one_long_job_under_the_band() {
+        // One long 9-core job (56% of 16 cores) and a cold whole-machine head: it must not wait for 50% busy for as long as
+        // the job runs. Past the backfill window it starts like in 0.4.3 (the band), with the guards still on.
+        let c = mac();
+        let run = Job {
+            state: State::Running,
+            started_ms: Some(0),
+            cpu_hold_ms: Some(cpu_hold_ms(Some(4_000))),
+            ..job("long", 9, 2, State::Running, 0)
+        };
+        let head = job("cold", 16, 2, State::Queued, 1_000);
+        let behind = job("small", 4, 2, State::Queued, 2_000);
+        let live = Live {
+            per_job: vec![(
+                "long".into(),
+                Usage {
+                    cpu: 900,
+                    mem: 2 * G,
+                    vram: 0,
+                },
+            )],
+            cpu_pct: 56,
+            cpu_sustained_pct: 56,
+            ..calm()
+        };
+        let all = [run, head.clone(), behind.clone()];
+        let t0 = 1_000 + 10_000;
+        assert!(waits(&evaluate(&head, &all, &c, &live, t0)));
+        let t = 1_000 + BACKFILL_WINDOW_MS;
+        assert_eq!(evaluate(&head, &all, &c, &live, t), Decision::Start);
+        // The 4x load guard still blocks it.
+        let hot = Live {
+            load1: 70.0,
+            load5: 70.0,
+            ..live.clone()
+        };
+        assert!(waits(&evaluate(&head, &all, &c, &hot, t)));
+        // Before then the smaller waiter backfills, so the machine is not idle while the head waits.
+        assert_eq!(evaluate(&behind, &all, &c, &live, t0), Decision::Start);
     }
 
     /// A running 15-core-peak job (a 2-minute learned hold) on 1.5 cores, the Mac at 15%, and an 8-core waiter.

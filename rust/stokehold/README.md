@@ -46,10 +46,15 @@ All of these must hold:
   machine reading under 50%, so several 16-core cargo builds started before their CPU showed and the Mac sat at 95-100%
   CPU with load1 up to 184). Cold jobs (the whole machine for 10 s, so they start at least 10 s apart) and Docker/VM
   jobs (their CPU never shows in the tree) keep the 10 s ramp hold. A hold is also released once the job's CPU has
-  plateaued (0.4.4): from 10 s after its median time to peak (at least 20 s after the start), the job's own tree
-  sampler sees no rise over the last 10 s (more than 1 core, or 1/8 of its level) and marks its job file settled, which
+  plateaued (0.4.4): from 10 s after its slowest recent time to peak (at least 20 s after the start), the job's own tree
+  sampler sees the last 10 s flat within itself (highest and lowest differ by at most 1 core, or 1/8 of its level) and marks its job file settled, which
   wakes the waiters. A learned peak is often one 500 ms spike (`make check` learned 15 cores and ran on 1.5), and in
-  0.4.3 its 2-minute hold kept waiters out at 10-50% CPU. Cold and Docker/VM jobs are never released by a plateau.
+  0.4.3 its 2-minute hold kept waiters out at 10-50% CPU. A lull before the slowest ramp never releases, and a settled job whose CPU rises again takes its hold back. Cold,
+  `--cpu` declared and Docker/VM jobs are never released by a plateau. A `make` target that runs containers inside is
+  not detected as Docker/VM work (only `docker` in the command is): its tree CPU reads low, so it may settle while its
+  real work runs in the VM; the measured machine CPU still counts it.
+  A whole-machine (cold) waiter that has waited 60 s (it holds the queue) skips the projected-peak test and starts under the band as in
+  0.4.3, so one long job cannot leave the machine at 50-60% with jobs queued.
 - Projected peak (0.4.4): a waiter bigger than the backfill share starts only while half its learned peak fits within
   every core on top of the projected CPU (the measured use plus the unrealized holds of the jobs still ramping). A
   13-core build starts up to about 59% busy on 16 cores, a whole-machine one up to 50%; smaller waiters still fill the
