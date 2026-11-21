@@ -45,7 +45,16 @@ All of these must hold:
   burst of builds starts one at a time as their peaks show (0.4.3: in 0.4.2 holds ended after 10 s, or after 3 s on a
   machine reading under 50%, so several 16-core cargo builds started before their CPU showed and the Mac sat at 95-100%
   CPU with load1 up to 184). Cold jobs (the whole machine for 10 s, so they start at least 10 s apart) and Docker/VM
-  jobs (their CPU never shows in the tree) keep the 10 s ramp hold. A waiter held back by a hold sleeps until the first
+  jobs (their CPU never shows in the tree) keep the 10 s ramp hold. A hold is also released once the job's CPU has
+  plateaued (0.4.4): from 10 s after its median time to peak (at least 20 s after the start), the job's own tree
+  sampler sees no rise over the last 10 s (more than 1 core, or 1/8 of its level) and marks its job file settled, which
+  wakes the waiters. A learned peak is often one 500 ms spike (`make check` learned 15 cores and ran on 1.5), and in
+  0.4.3 its 2-minute hold kept waiters out at 10-50% CPU. Cold and Docker/VM jobs are never released by a plateau.
+- Projected peak (0.4.4): a waiter bigger than the backfill share starts only while half its learned peak fits within
+  every core on top of the projected CPU (the measured use plus the unrealized holds of the jobs still ramping). A
+  13-core build starts up to about 59% busy on 16 cores, a whole-machine one up to 50%; smaller waiters still fill the
+  band up to one free core. In 0.4.3 any waiter started with one free core under the band, so 13-core builds started
+  at 83% busy and took the Mac to 100% with load1 34. A waiter held back by a hold sleeps until the first
   moment the holds leave room, and re-samples at least every 10 s, so a peak that shows sooner releases it. A job's recorded peak is the larger of its process tree's peak and the
   machine-wide CPU rise of other programs over the pre-start baseline, so work hosted in Docker's VM (outside the
   tree) also teaches a real peak. On Linux a process's threads are not counted as children (sysinfo lists each thread

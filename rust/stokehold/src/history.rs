@@ -92,6 +92,9 @@ pub struct Defaults {
     /// Median time (ms after the start) at which the CPU reached 3/4 of its peak; `None` when no run recorded it
     /// (history from before 0.4.3).
     pub cpu_peak_at_ms: Option<u64>,
+    /// Median time (ms after the start) at which the CPU reached 3/4 of its peak: from then on a run whose CPU has
+    /// stopped rising has shown its real use, and its hold is released (`admit::cpu_plateaued`).
+    pub cpu_peak_median_ms: Option<u64>,
 }
 
 fn median(mut v: Vec<u64>) -> Option<u64> {
@@ -218,17 +221,20 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
     );
     // The slowest recent ramp, not the median: about half of all runs ramp later than their median, and a hold that
     // ended there let the next build in before their CPU showed.
-    let cpu_peak_at_ms = mine
+    let ramps: Vec<u64> = mine
         .iter()
         .map(|e| e.measured.peak_cpu_at_ms)
         .filter(|ms| *ms > 0)
-        .max();
+        .collect();
+    let cpu_peak_at_ms = ramps.iter().copied().max();
+    let cpu_peak_median_ms = median(ramps);
     Some(Defaults {
         cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX),
         mem,
         vram,
         mem_peak_at_ms,
         cpu_peak_at_ms,
+        cpu_peak_median_ms,
     })
 }
 
@@ -286,7 +292,8 @@ mod tests {
                 mem: 200,
                 vram: None,
                 mem_peak_at_ms: None,
-                cpu_peak_at_ms: None
+                cpu_peak_at_ms: None,
+                cpu_peak_median_ms: None
             }
         );
         assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
@@ -304,6 +311,11 @@ mod tests {
             .collect();
         let d = defaults_from(&runs, &["t".to_string()], "/a", None).unwrap();
         assert_eq!(d.cpu_peak_at_ms, Some(40_000), "0 (unknown) is left out");
+        assert_eq!(
+            d.cpu_peak_median_ms,
+            Some(30_000),
+            "the median of 20, 30 and 40 s"
+        );
         let old = defaults_from(&runs[..1], &["t".to_string()], "/a", None).unwrap();
         assert_eq!(old.cpu_peak_at_ms, None);
     }
@@ -321,7 +333,8 @@ mod tests {
                 mem: 900,
                 vram: None,
                 mem_peak_at_ms: None,
-                cpu_peak_at_ms: None
+                cpu_peak_at_ms: None,
+                cpu_peak_median_ms: None
             }
         );
     }
