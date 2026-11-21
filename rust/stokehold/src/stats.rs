@@ -35,6 +35,14 @@ pub struct Stats {
     /// process tree (Docker's VM). `peak_centi_cores` is the larger of this and the tree's peak.
     #[serde(default)]
     pub peak_other_centi_cores: u64,
+    /// Peak machine-wide memory rise over the pre-start baseline: work hosted outside the process tree (Docker's
+    /// or WSL's VM). `peak_tree_rss` is the larger of this and the tree's peak.
+    #[serde(default)]
+    pub peak_other_mem: u64,
+    /// Milliseconds after the start at which the memory peak was seen (0 when unknown): how long a learned
+    /// reservation's unused part is held.
+    #[serde(default)]
+    pub peak_mem_at_ms: u64,
     pub blocks_in: u64,
     pub blocks_out: u64,
     /// Machine-wide, not just this job.
@@ -170,6 +178,8 @@ mod tests {
             centi_cores: 250,
             peak_rss: 1 << 30,
             peak_other_centi_cores: 0,
+            peak_other_mem: 0,
+            peak_mem_at_ms: 0,
             peak_tree_rss: 3 << 30,
             peak_centi_cores: 450,
             blocks_in: 5,

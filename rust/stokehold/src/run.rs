@@ -23,7 +23,8 @@ use crate::history::{self, Entry};
 use crate::job::{Capacity, Job, START_UNKNOWN, State, Usage, Weights};
 use crate::log::{self, Event, JobInfo, WaitTally};
 use crate::machine::{
-    self, OtherSampler, TreeSampler, cpu_times, effective_peak, net_bytes, process_start, vram,
+    self, OtherSampler, TreeSampler, cpu_times, effective_mem_peak, effective_peak, net_bytes,
+    process_start, vram,
 };
 use crate::sample;
 use crate::state::{StateDir, is_alive};
@@ -122,20 +123,21 @@ fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
     cap.cpu
 }
 
+/// The job's weights and, for a learned memory size, when (ms after the start) past runs peaked in memory.
 fn resolve_weights(
     state: &StateDir,
     flags: &Flags,
     cmd: &[String],
     cwd: &str,
     cap: &Capacity,
-) -> Weights {
+) -> (Weights, Option<i64>) {
     let hist = history::defaults_for(
         &state.history_path(),
         cmd,
         cwd,
         history::repo_key(Path::new(cwd)).as_deref(),
     );
-    cap.clamp(Weights {
+    let weights = cap.clamp(Weights {
         cpu: flags
             .cpu
             .or(hist.map(|d| d.cpu))
@@ -143,7 +145,12 @@ fn resolve_weights(
         mem: flags.mem.or(hist.map(|d| d.mem)).unwrap_or(DEFAULT_MEM),
         vram: flags.vram.or(hist.and_then(|d| d.vram)).unwrap_or(0),
         disk: flags.disk.unwrap_or(0),
-    })
+    });
+    (
+        weights,
+        hist.and_then(|d| d.mem_peak_at_ms)
+            .and_then(|ms| i64::try_from(ms).ok()),
+    )
 }
 
 fn exec_nested(state: &StateDir, cmd: &[String]) -> Option<Error> {
@@ -170,7 +177,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
     let cwd = std::env::current_dir()?;
     let cwd_str = cwd.to_string_lossy().into_owned();
     let cap = machine::capacity(&cwd)?;
-    let weights = resolve_weights(state, flags, cmd, &cwd_str, &cap);
+    let (weights, mem_peak_at_ms) = resolve_weights(state, flags, cmd, &cwd_str, &cap);
 
     let (tx, rx) = channel();
     let sig = spawn_signal_thread(tx.clone())?;
@@ -189,6 +196,12 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         enqueued_ms,
         started_ms: None,
         blocked_by: None,
+        mem_declared: flags.mem.is_some(),
+        mem_peak_at_ms: if flags.mem.is_some() {
+            None
+        } else {
+            mem_peak_at_ms
+        },
     };
     let _guard = JobGuard {
         state,
@@ -382,15 +395,27 @@ fn vram_sampler(cap: &Capacity) -> Option<(Sender<()>, std::thread::JoinHandle<u
     Some((stop_tx, handle))
 }
 
+/// The peaks of one job's process tree, and when (ms after sampling began) its memory peaked.
+#[derive(Default)]
+struct TreePeak {
+    usage: Usage,
+    mem_at_ms: u64,
+}
+
 /// Samples the whole process tree (heavy's own pid down) while the job runs; returns the peak CPU and RSS.
 /// Uses the same sampler as the live accounting of running jobs.
-fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<Usage>)> {
+fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<TreePeak>)> {
     let mut sampler = TreeSampler::new(root).ok()?;
     let (stop_tx, stop_rx) = channel::<()>();
+    let started = Instant::now();
     let handle = std::thread::spawn(move || {
-        let mut peak = Usage::default();
+        let mut peak = TreePeak::default();
         loop {
-            peak = peak.max(sampler.sample());
+            let s = sampler.sample();
+            if s.mem > peak.usage.mem {
+                peak.mem_at_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            }
+            peak.usage = peak.usage.max(s);
             if !matches!(
                 stop_rx.recv_timeout(TREE_SAMPLE),
                 Err(RecvTimeoutError::Timeout)
@@ -403,7 +428,7 @@ fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<Usage>
 }
 
 /// Samples the other programs' CPU (machine minus every heavy tree) while the job runs. The baseline is taken before
-/// the job starts; returns (baseline, peak) in centi-cores.
+/// the job starts; once stopped, the handle gives the sustained rises over it.
 fn other_sampler(dir: &StateDir, own_pid: u32, cores: u32) -> Option<OtherHandle> {
     let mut sampler = OtherSampler::new(cores).ok()?;
     let roots = move |d: &StateDir| {
@@ -420,30 +445,51 @@ fn other_sampler(dir: &StateDir, own_pid: u32, cores: u32) -> Option<OtherHandle
     };
     sampler.sample(&roots(dir));
     // Baseline: the mean of four samples over about 1 s before the job starts.
-    let mut sum = 0;
+    let mut sum = Usage::default();
     for _ in 0..4 {
         std::thread::sleep(Duration::from_millis(250));
-        sum += sampler.sample(&roots(dir));
+        let s = sampler.sample(&roots(dir));
+        sum = Usage {
+            cpu: sum.cpu + s.cpu,
+            mem: sum.mem + s.mem,
+            vram: 0,
+        };
     }
-    let baseline = sum / 4;
+    let baseline = Usage {
+        cpu: sum.cpu / 4,
+        mem: sum.mem / 4,
+        vram: 0,
+    };
     let (stop_tx, stop_rx) = channel::<()>();
     let dir = dir.clone();
+    let started = Instant::now();
     let handle = std::thread::spawn(move || {
-        let mut rises = vec![];
+        let (mut cpu, mut mem) = (vec![], vec![]);
+        let (mut max_mem, mut mem_at_ms) = (0, 0);
         loop {
-            rises.push(sampler.sample(&roots(&dir)).saturating_sub(baseline));
+            let s = sampler.sample(&roots(&dir));
+            cpu.push(s.cpu.saturating_sub(baseline.cpu));
+            let rise = s.mem.saturating_sub(baseline.mem);
+            if rise > max_mem {
+                max_mem = rise;
+                mem_at_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            }
+            mem.push(rise);
             if !matches!(
                 stop_rx.recv_timeout(OTHER_SAMPLE),
                 Err(RecvTimeoutError::Timeout)
             ) {
-                return p90(&mut rises);
+                return OtherPeak {
+                    cpu: p90(&mut cpu),
+                    mem: p90(&mut mem),
+                    mem_at_ms,
+                };
             }
         }
     });
     Some(OtherHandle {
         stop: stop_tx,
         handle,
-        baseline,
     })
 }
 
@@ -461,10 +507,16 @@ pub(crate) fn hosts_vm_work(cmd: &[String]) -> bool {
     cmd.iter().any(|a| a.contains("docker"))
 }
 
+/// Sustained (p90) CPU and memory rises over the baseline, and when the largest memory rise was seen.
+struct OtherPeak {
+    cpu: u64,
+    mem: u64,
+    mem_at_ms: u64,
+}
+
 struct OtherHandle {
     stop: Sender<()>,
-    handle: std::thread::JoinHandle<u64>,
-    baseline: u64,
+    handle: std::thread::JoinHandle<OtherPeak>,
 }
 
 /// Waits for the child, also noticing when it stops (Ctrl-Z, SIGTTIN, SIGSTOP). A stopped child stops
@@ -582,15 +634,21 @@ fn execute(
     });
     let other_peak = other.and_then(|o| {
         drop(o.stop);
-        o.handle.join().ok().map(|p| (p, o.baseline))
+        o.handle.join().ok()
     });
     if let Some(peak) = tree_peak {
-        stats.peak_tree_rss = peak.mem;
-        stats.peak_centi_cores = peak.cpu;
+        stats.peak_tree_rss = peak.usage.mem;
+        stats.peak_centi_cores = peak.usage.cpu;
+        stats.peak_mem_at_ms = peak.mem_at_ms;
     }
-    if let Some((rise, _)) = other_peak {
-        stats.peak_other_centi_cores = rise;
-        stats.peak_centi_cores = effective_peak(stats.peak_centi_cores, rise, 0, cap.cpu);
+    if let Some(other) = other_peak {
+        stats.peak_other_centi_cores = other.cpu;
+        stats.peak_centi_cores = effective_peak(stats.peak_centi_cores, other.cpu, 0, cap.cpu);
+        stats.peak_other_mem = other.mem;
+        if other.mem > stats.peak_tree_rss {
+            stats.peak_mem_at_ms = other.mem_at_ms;
+        }
+        stats.peak_tree_rss = effective_mem_peak(stats.peak_tree_rss, other.mem, cap.mem);
     }
     stats.timed_out = timed_out;
     eprintln!("{}", format_stats(&stats));

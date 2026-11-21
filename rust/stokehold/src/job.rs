@@ -120,4 +120,11 @@ pub struct Job {
     /// The sampler reads it instead of re-evaluating.
     #[serde(default)]
     pub blocked_by: Option<String>,
+    /// The memory size came from `--mem`: its unused part is held for the whole run (a human knows this size).
+    #[serde(default)]
+    pub mem_declared: bool,
+    /// A learned size only: milliseconds after the start at which past runs peaked in memory (history median).
+    /// `None` when unknown (cold, or history from before 0.4.2).
+    #[serde(default)]
+    pub mem_peak_at_ms: Option<i64>,
 }

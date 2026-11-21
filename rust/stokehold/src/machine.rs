@@ -295,9 +295,9 @@ fn memory_pressure() -> bool {
     std::fs::read_to_string("/proc/pressure/memory").is_ok_and(|t| psi_pressure(&t))
 }
 
-/// Samples what the other programs (not heavy's own job trees) use: machine CPU minus every heavy job's tree. Work
-/// hosted outside the process tree (Docker's VM) shows up here, so a job's peak can be learned from the machine's
-/// CPU rise over a baseline.
+/// Samples what the other programs (not heavy's own job trees) use: machine CPU and memory minus every heavy job's
+/// tree. Work hosted outside the process tree (Docker's or WSL's VM) shows up here, so a job's peak can be learned from
+/// the machine's CPU and memory rise over a baseline.
 pub struct OtherSampler {
     sys: System,
     cores: u64,
@@ -313,18 +313,37 @@ impl OtherSampler {
         })
     }
 
-    /// CPU (centi-cores) of the machine minus the process trees rooted at `roots`.
-    pub fn sample(&mut self, roots: &[u32]) -> u64 {
+    /// CPU (centi-cores) and memory (bytes) of the machine minus the process trees rooted at `roots`.
+    pub fn sample(&mut self, roots: &[u32]) -> Usage {
         self.sys.refresh_cpu_usage();
+        self.sys.refresh_memory();
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
-        let machine = whole(self.sys.global_cpu_usage()) * self.cores;
+        let machine = Usage {
+            cpu: whole(self.sys.global_cpu_usage()) * self.cores,
+            mem: self
+                .sys
+                .total_memory()
+                .saturating_sub(self.sys.available_memory()),
+            vram: 0,
+        };
         let children = child_map(&self.sys);
-        let trees: u64 = roots
-            .iter()
-            .map(|r| tree_usage(&self.sys, &children, *r, &[]).cpu)
-            .sum();
+        let trees = roots.iter().fold(Usage::default(), |a, r| {
+            let t = tree_usage(&self.sys, &children, *r, &[]);
+            Usage {
+                cpu: a.cpu + t.cpu,
+                mem: a.mem + t.mem,
+                vram: 0,
+            }
+        });
         machine.saturating_sub(trees)
     }
+}
+
+/// A job's memory peak for the history: the process tree's peak, or the machine-wide rise over the baseline when
+/// that is larger (Docker's or WSL's VM memory is outside the tree), capped at the machine's memory.
+#[must_use]
+pub fn effective_mem_peak(tree_peak: u64, other_rise: u64, machine_mem: u64) -> u64 {
+    tree_peak.max(other_rise).min(machine_mem)
 }
 
 /// A job's peak for the history: the process tree's peak, or the machine-wide rise over the baseline when that is
@@ -527,6 +546,16 @@ mod tests {
         // Never below the tree, never above the machine, and a lower-than-baseline machine is no rise.
         assert_eq!(effective_peak(100, 50, 200, 16), 100);
         assert_eq!(effective_peak(100, 5000, 0, 16), 1600);
+    }
+
+    #[test]
+    fn a_vm_hosted_job_learns_the_machine_memory_rise() {
+        const G: u64 = 1 << 30;
+        // The docker client's tree peaked at 100M, the machine's memory rose 9G over the baseline: the peak is 9G.
+        assert_eq!(effective_mem_peak(100 << 20, 9 * G, 64 * G), 9 * G);
+        // A native job: the tree peak wins. Never above the machine.
+        assert_eq!(effective_mem_peak(8 * G, 3 * G, 64 * G), 8 * G);
+        assert_eq!(effective_mem_peak(G, 99 * G, 64 * G), 64 * G);
     }
 
     #[test]
