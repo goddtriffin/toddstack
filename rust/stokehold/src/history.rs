@@ -81,7 +81,7 @@ pub fn append(path: &Path, entry: &Entry) -> Result<(), Error> {
     Ok(())
 }
 
-/// Defaults measured from past successful runs of the same command in the same cwd.
+/// Defaults measured from past runs (successes, and failures that ran `FAILED_RUN_COUNTS_MS`) of the same command in the same cwd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Defaults {
     pub cpu: u32,
@@ -141,7 +141,7 @@ pub fn defaults_with(
 ) -> Option<Defaults> {
     let ok: Vec<&Entry> = entries
         .iter()
-        .filter(|e| e.v >= min_v && e.exit_code == 0)
+        .filter(|e| e.v >= min_v && counts(e))
         .collect();
     let same_repo = |e: &Entry| repo.is_some() && e.repo.as_deref() == repo;
     let pick =
@@ -162,6 +162,19 @@ pub fn defaults_with(
         &pick(&|e| same_repo(e) && e.cmd.starts_with(program)),
         |v| v.into_iter().max(),
     )
+}
+
+/// A failed run counts once it ran this long: it did its real work before it failed.
+pub const FAILED_RUN_COUNTS_MS: u64 = 30_000;
+
+/// Whether a run teaches its command's size: every success, and a failure (or kill) that ran at least
+/// `FAILED_RUN_COUNTS_MS`. Before 0.4.6 only successes counted, and a command that usually fails late learned nothing
+/// of its own: `make lint test-changed` exits 2 after 5-25 minutes on 8-12 cores and 5-9 GB, so it fell through to the
+/// pooled `make lint` tier, whose instant no-op runs taught it 1 core and 0.1 GB (2026-11-21). Those "tiny" jobs then
+/// passed the queue several at once and took the Mac to 100% CPU with load1 over 100. A quick failure (a typo, a missing
+/// file) still teaches nothing.
+fn counts(e: &Entry) -> bool {
+    e.exit_code == 0 || e.measured.run_ms >= FAILED_RUN_COUNTS_MS
 }
 
 /// Wrappers and shells: what they run says nothing about the first argument's weight.
@@ -529,5 +542,36 @@ mod tests {
             serde_json::from_value::<Entry>(value).unwrap().repo,
             Some(a)
         );
+    }
+
+    #[test]
+    fn a_long_failed_run_teaches_its_size_but_a_quick_failure_does_not() {
+        // 2026-11-21: `make lint test-changed` exits 2 after minutes on 10 cores and 6 GB; the only successes of
+        // `make lint` in the repo are instant no-ops. 0.4.5 learned 1 core and 0.1 GB from those (the pooled tier).
+        let run = |cmd: &str, cwd: &str, centi: u64, rss: u64, code: i32, run_ms: u64| Entry {
+            cmd: cmd.split(' ').map(String::from).collect(),
+            measured: Stats {
+                peak_centi_cores: centi,
+                peak_tree_rss: rss,
+                run_ms,
+                ..Stats::default()
+            },
+            repo: Some("r".into()),
+            ..entry("x", cwd, 0, 0, code)
+        };
+        let cmd: Vec<String> = ["make", "lint", "test-changed"].map(String::from).to_vec();
+        let mut all = vec![
+            run("make lint", "/a", 100, 100, 0, 400),
+            run("make lint", "/b", 80, 90, 0, 300),
+            run("make lint test-changed", "/a", 1_000, 6_000, 2, 600_000),
+            run("make lint test-changed", "/b", 1_100, 6_500, 143, 900_000),
+        ];
+        let d = defaults_from(&all, &cmd, "/c", Some("r")).unwrap();
+        assert_eq!((d.cpu, d.mem), (11, 6_500));
+        // A failure in its first seconds (a typo, a missing file) did no real work: it teaches nothing.
+        all.truncate(2);
+        all.push(run("make lint test-changed", "/a", 50, 50, 2, 2_000));
+        let d = defaults_from(&all, &cmd, "/c", Some("r")).unwrap();
+        assert_eq!((d.cpu, d.mem), (1, 100), "the pooled tier, as before");
     }
 }

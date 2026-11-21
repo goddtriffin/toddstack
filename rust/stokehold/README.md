@@ -26,6 +26,9 @@ sampled every 0.5 s while the job runs: peak cores at once and peak RSS) from
 the same repository (any worktree or clone sharing its git dir, so a fresh agent worktree is not cold); else for the
 same program and first argument there (`make ui-check`, `cargo test`); else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 10 s apart; after one run, history gives the real peak). A request larger than
 the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
+Successful runs count, and so do failed or killed runs that ran at least 30 s (0.4.6: `make lint test-changed`
+usually exits 2 after 5-25 minutes on 8-12 cores, so it learned 1 core and 0.1G from instant `make lint` no-ops, and
+several of these "tiny" jobs ran at once on a pinned Mac). A run that fails sooner teaches nothing.
 History entries carry a version (`v`); on Linux, entries from before 0.3.2 (no `v`) are ignored for defaults because they counted threads as processes.
 
 ## Admission
@@ -45,8 +48,10 @@ All of these must hold:
   peak; the slowest recent ramp plus 25%, at least 10 s, at most 2 min, 30 s when unknown), the same way a learned memory size is held (a cold job holds the whole machine for 30 s). The unrealized part of a hold reserves the CPU band except a backfill share (2 cores, or 1/8 of the machine): a waiter of that size or smaller still starts beside a held peak while the machine reads idle. So a
   burst of builds starts one at a time as their peaks show (0.4.3: in 0.4.2 holds ended after 10 s, or after 3 s on a
   machine reading under 50%, so several 16-core cargo builds started before their CPU showed and the Mac sat at 95-100%
-  CPU with load1 up to 184). Cold jobs (the whole machine for 10 s, so they start at least 10 s apart) and Docker/VM
-  jobs (their CPU never shows in the tree) keep the 10 s ramp hold. A hold is also released once the job's CPU has
+  CPU with load1 up to 184). Docker/VM jobs (their CPU never shows in the tree) hold their whole peak for their
+  learned hold time (30 s when cold), never released by the tree's use or a plateau; after the first 10 s the part of
+  other programs' CPU (where the VM's shows) is netted against the hold, so it is not counted twice (0.4.6: a 10 s
+  hold let a second `docker build` in before the first one's VM CPU showed, and the Mac hit 100% with load1 130-330). A hold is also released once the job's CPU has
   plateaued (0.4.4): from 10 s after its slowest recent time to peak (at least 20 s after the start), the job's own tree
   sampler sees the last 10 s flat within itself (highest and lowest differ by at most 1 core, or 1/8 of its level) and marks its job file settled, which
   wakes the waiters. A learned peak is often one 500 ms spike (`make check` learned 15 cores and ran on 1.5), and in
@@ -101,8 +106,10 @@ Queue: first in, first out. A job behind the head starts when the head and it fi
 head from fitting). When the head does not fit now, a job no bigger than the head may backfill past it while the
 head has waited under 60 s. A tiny job (at most the backfill share of cores and 1/32 of RAM) may pass a head that is blocked
 by memory, VRAM or a guard while the head has waited under 5 minutes, or by a ramp hold it does not make end later (0.4.5: in 24 h on the Mac, 393
-job-samples sat queued behind a head under 60% CPU); behind a head blocked on CPU room it keeps the 60 s rule, so a
-stream of small jobs cannot starve a big one.
+job-samples sat queued behind a head under 60% CPU). Behind a head blocked on CPU room (or a ramp hold), a job of at
+most the backfill share passes while the machine reads under 75% busy and the head has waited under 5 minutes (0.4.6:
+strict FIFO past 60 s kept 1-2 core jobs queued up to 30 minutes behind an 11-16 core head at 40-60% CPU); bigger
+jobs keep the 60 s rule, and the 5-minute bound keeps a stream of small jobs from starving a big one.
 
 `stokehold status` evaluates every waiter by these rules and prints why it waits, with the numbers (`cpu: needs 4.40
 cores, 4.20 free under the 95% band (machine 68% busy)`, `mem: needs 6.5G, 2.1G free under 95% of RAM after running

@@ -27,7 +27,8 @@
 //! show: after 0.4.2, holds that ended after 10 s (or at once on an idle-looking machine) let several 16-core cargo builds
 //! in before their CPU showed, and 42% of the samples while jobs waited read CPU over 95% with load1 over 3 x cores.
 //!
-//! Cold jobs hold the whole machine like that, for the 30 s fallback. Docker/VM work and job files from before 0.4.3 keep the ramp schedule: a job admitted in the last
+//! Cold jobs hold the whole machine like that, for the 30 s fallback. Docker/VM work holds its peak for its whole hold
+//! time too (0.4.6), netted after `RAMP_MS` against other programs' CPU, where its VM's CPU shows. Job files from before 0.4.3 keep the ramp schedule: a job admitted in the last
 //! `RAMP_MS` holds its peak cores while its CPU ramps up, so a burst of waiters cannot all start at once. A full 10 s hold (`RAMP_MS`) covers cold jobs, Docker/VM jobs and
 //! learned peaks of 75% of the machine or more (`FULL_HOLD_FRACTION`), so those start at least 10 s apart: their real use
 //! is unknown or large and may show up late. Any smaller learned peak is full for the first `RAMP_FULL_MS` (the stagger floor); after that the measured machine decides:
@@ -120,6 +121,13 @@ const PLATEAU_SLACK_CPU: u64 = 100;
 /// p75 0.32, p90 0.51, so half sat above p90. 1/3 or 1/4 overran the machine 43-47% of the time in
 /// `bursty_big_jobs_start_one_at_a_time_without_pinning_the_machine` (bursts at p90); 2/5 keeps it at 0%.
 const PROJECTED_PEAK: (u64, u64) = (2, 5);
+/// Past `BACKFILL_WINDOW_MS`, a waiter of at most the backfill share of cores may still pass a head blocked on CPU room
+/// (or a ramp hold) while the machine reads under this CPU % and the head has waited under `TINY_BYPASS_MS`. Before
+/// 0.4.6 the queue was strict FIFO there: an 11-16 core head waiting for 4-5 free cores kept 1-2 core jobs queued for
+/// up to 30 minutes while the Mac swung between 30% and 100% (2026-11-21). The 5-minute bound keeps a stream of small
+/// jobs from starving the head. (Shrinking the head's projected peak after the window instead overran the machine 52%
+/// of the time in `bursty_big_jobs_start_one_at_a_time_without_pinning_the_machine`.)
+const UNDERUSED_CPU_PCT: u64 = 75;
 
 /// Which check blocked a waiter (recorded in the history; a disk that is too full fails instead of waiting).
 #[derive(
@@ -354,8 +362,10 @@ pub fn cpu_hold_ms(peak_at_ms: Option<u64>) -> i64 {
 /// `cpu_plateaued`) or `hold_ms` has passed, like a learned memory size, never
 /// less than the `RAMP_FULL_MS` floor: a cargo build spends its first 10-30 s on a few cores, and a hold that ended
 /// sooner (or was released because the machine read idle) let several 16-core builds in before any of their CPU showed
-/// (2026-11-20). Docker/VM work (its CPU never shows in the tree) and job files without `hold_ms` keep the
-/// `RAMP_MS` schedule of `ramp_hold`.
+/// (2026-11-20). Docker/VM work (its CPU never shows in the tree) holds its whole peak for all of `hold_ms` (at least
+/// `RAMP_MS`): before 0.4.6 it kept the 10 s `ramp_hold`, a `docker build` took 10-30 s to show its CPU in the VM, and
+/// a second build or a burst of jobs started in between and took the Mac to 100% CPU with load1 130-330
+/// (2026-11-21). Job files without `hold_ms` keep the `RAMP_MS` schedule of `ramp_hold`.
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
@@ -372,7 +382,16 @@ pub fn cpu_hold(
     settled: bool,
 ) -> u64 {
     match hold_ms {
-        Some(hold) if !vm => {
+        // Docker/VM work: its CPU never shows in the tree (it shows as other programs' CPU, which `headroom_for` nets
+        // against this hold), so neither the 3/4 test nor a plateau can release it; only its time can.
+        Some(hold) if vm => {
+            if elapsed_ms < hold.max(RAMP_MS) {
+                peak
+            } else {
+                0
+            }
+        }
+        Some(hold) => {
             if elapsed_ms < RAMP_FULL_MS {
                 peak
             } else if settled || elapsed_ms >= hold || live_cpu * CPU_SHOWN.1 >= peak * CPU_SHOWN.0
@@ -390,8 +409,9 @@ pub fn cpu_hold(
 fn cpu_hold_end(j: &Job, started_ms: i64) -> i64 {
     started_ms
         + match j.cpu_hold_ms {
-            Some(h) if !crate::run::hosts_vm_work(&j.cmd) => h.max(RAMP_FULL_MS),
-            _ => RAMP_MS,
+            Some(h) if crate::run::hosts_vm_work(&j.cmd) => h.max(RAMP_MS),
+            Some(h) => h.max(RAMP_FULL_MS),
+            None => RAMP_MS,
         }
 }
 
@@ -466,21 +486,22 @@ pub fn headroom_for(
     now_ms: i64,
     small: bool,
 ) -> Usage {
-    let (mut held, (unmet, unmet_small), (pre_peak, tail)) = running.iter().fold(
-        (Usage::default(), (0, 0), (0u64, 0u64)),
-        |(a, unmet, learned), j| {
+    let (mut held, (mut unmet, mut unmet_small), (pre_peak, tail), vm_own) = running.iter().fold(
+        (Usage::default(), (0, 0), (0u64, 0u64), 0u64),
+        |(a, unmet, learned, vm_own), j| {
             let l = live
                 .per_job
                 .iter()
                 .find(|(id, _)| *id == j.id)
                 .map_or_else(Usage::default, |(_, u)| *u);
+            let vm = crate::run::hosts_vm_work(&j.cmd);
             let hold = j.started_ms.map_or(0, |t| {
                 cpu_hold(
                     centi(j.weights.cpu).min(centi(cap.cpu)),
                     centi(cap.cpu),
                     now_ms.saturating_sub(t).max(0),
                     live.cpu_pct,
-                    crate::run::hosts_vm_work(&j.cmd),
+                    vm,
                     l.cpu,
                     j.cpu_hold_ms,
                     j.cpu_settled,
@@ -527,9 +548,18 @@ pub fn headroom_for(
                     (unmet.0 + own, unmet.1 + if is_small { own } else { 0 })
                 },
                 (learned.0 + learned_unmet.0, learned.1 + learned_unmet.1),
+                // Netted only past `RAMP_MS`: before that, other programs' CPU is not yet this job's.
+                vm_own
+                    + u64::from(vm && j.started_ms.is_some_and(|t| now_ms - t >= RAMP_MS))
+                        * hold.saturating_sub(l.cpu),
             )
         },
     );
+    // A Docker/VM job's CPU shows as other programs' CPU: what shows there is not counted twice with its hold.
+    let vm_shown = vm_own.min(live.non_heavy.cpu);
+    held.cpu = held.cpu.saturating_sub(vm_shown);
+    unmet = unmet.saturating_sub(vm_shown);
+    unmet_small = unmet_small.min(unmet);
     let free = ceiling(cap)
         .mem
         .saturating_sub(live.non_heavy.mem)
@@ -818,7 +848,15 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
             // A tiny job passes a head blocked by memory, VRAM or a guard until it has waited `TINY_BYPASS_MS`, and one held back by ramp holds
             // when it does not delay the head's start: it takes next to nothing of what the head waits for. Behind CPU
             // room it would, and a stream of them could starve the head.
-            if now_ms - head.enqueued_ms >= BACKFILL_WINDOW_MS {
+            // Past the window a small waiter still passes a head held back by CPU room while the machine reads
+            // underused (`UNDERUSED_CPU_PCT`), for the first `TINY_BYPASS_MS` of the head's wait.
+            let backfills_idle_cpu = centi(job.weights.cpu) <= backfill(cap)
+                && now_ms - head.enqueued_ms < TINY_BYPASS_MS
+                && live.cpu_pct.max(live.cpu_sustained_pct) < UNDERUSED_CPU_PCT
+                && head_block
+                    .as_ref()
+                    .is_some_and(|b| matches!(b.block, Block::Cpu | Block::Ramp));
+            if now_ms - head.enqueued_ms >= BACKFILL_WINDOW_MS && !backfills_idle_cpu {
                 return wait(
                     format!("queued behind {} (waited over 60 s)", head.id),
                     Block::Queue,
@@ -2828,13 +2866,19 @@ mod tests {
             cpu_hold(peak, machine, 40_000, 10, false, 200, hold, false),
             0
         );
-        // Docker work and old job files keep the 10 s ramp schedule.
+        // Docker work holds for its whole hold time (0.4.6), whatever its tree shows or a plateau says.
         assert_eq!(
             cpu_hold(peak, machine, 9_000, 10, true, 0, hold, false),
             peak
         );
         assert_eq!(
-            cpu_hold(peak, machine, RAMP_MS, 10, true, 0, hold, false),
+            cpu_hold(peak, machine, 39_999, 10, true, 1_600, hold, true),
+            peak
+        );
+        assert_eq!(cpu_hold(peak, machine, 40_000, 10, true, 0, hold, false), 0);
+        // Docker work from old job files keeps the 10 s ramp schedule.
+        assert_eq!(
+            cpu_hold(peak, machine, RAMP_MS, 10, true, 0, None, false),
             0
         );
         assert_eq!(
@@ -3718,5 +3762,155 @@ mod tests {
             reason,
             "cpu: needs 4.40 cores, 4.20 free under the 95% band (machine 68% busy)"
         );
+    }
+
+    /// 2026-11-21, 19:47-20:31 UTC: a cold `docker build` (the whole machine, 30 s fallback hold) on a calm Mac. Its
+    /// work runs in Docker's VM, so its tree reads 0.1 cores and the VM's CPU shows late, as other programs' CPU.
+    fn docker_build_at(other_cpu: u64, pct: u64) -> (Vec<Job>, Live) {
+        let build = |id: &str, state, enq| Job {
+            cmd: vec!["docker".into(), "build".into(), ".".into()],
+            cpu_hold_ms: Some(cpu_hold_ms(None)),
+            ..job(id, 16, 4, state, enq)
+        };
+        let run = Job {
+            started_ms: Some(0),
+            ..build("b1", State::Running, 0)
+        };
+        let live = Live {
+            cpu_pct: pct,
+            cpu_sustained_pct: pct,
+            non_heavy: Usage {
+                cpu: other_cpu,
+                mem: 20 * G,
+                vram: 0,
+            },
+            per_job: vec![(
+                "b1".into(),
+                Usage {
+                    cpu: 10,
+                    mem: G / 10,
+                    vram: 0,
+                },
+            )],
+            ..calm()
+        };
+        (vec![run, build("b2", State::Queued, 1_000)], live)
+    }
+
+    #[test]
+    fn a_docker_build_holds_the_machine_until_its_vm_cpu_shows() {
+        let c = mac();
+        // 15 s in, the VM has not ramped yet (3 cores of other programs, 20% busy). 0.4.5 released the hold at 10 s and
+        // started the second build here; both then ran and the Mac read 100% with load1 130-330.
+        let (jobs, live) = docker_build_at(300, 20);
+        assert!(matches!(
+            evaluate(&jobs[1], &jobs, &c, &live, 15_000),
+            Decision::Wait {
+                block: Block::Ramp,
+                ..
+            }
+        ));
+        let small = job("lint", 4, 2, State::Queued, 2_000);
+        let with_small = [jobs[0].clone(), small.clone()];
+        assert!(waits(&evaluate(&small, &with_small, &c, &live, 15_000)));
+        // Its hold ends with its time (30 s, cold): a lull then admits the next one.
+        assert_eq!(
+            evaluate(&jobs[1], &jobs, &c, &live, CPU_FALLBACK_HOLD_MS),
+            Decision::Start
+        );
+        // While held, the VM CPU that already shows (as other programs) is not counted twice: an 8-core learned build
+        // 20 s in with 6 of its cores showing holds 8 cores in all, not 6 + 8.
+        let d8 = Job {
+            started_ms: Some(0),
+            cmd: vec!["docker".into(), "build".into(), ".".into()],
+            cpu_hold_ms: Some(cpu_hold_ms(None)),
+            ..job("d8", 8, 4, State::Running, 0)
+        };
+        let showing = Live {
+            non_heavy: Usage {
+                cpu: 600,
+                mem: 20 * G,
+                vram: 0,
+            },
+            per_job: vec![],
+            ..calm()
+        };
+        assert_eq!(headroom(&[&d8], &c, &showing, 20_000).cpu, 1_520 - 800);
+        // In its first 10 s the hold still counts on top of everything else, as before.
+        assert_eq!(headroom(&[&d8], &c, &showing, 5_000).cpu, 1_520 - 1_400);
+    }
+
+    /// 2026-11-21, 20:19-20:48 UTC: one long 10-core job, the Mac at 70%, a 13-core head that needs 4.4 free cores, and
+    /// a 2-core waiter behind it.
+    fn big_head_at(pct: u64) -> (Vec<Job>, Live) {
+        let run = Job {
+            started_ms: Some(0),
+            cpu_hold_ms: Some(cpu_hold_ms(Some(4_000))),
+            ..job("long", 10, 6, State::Running, 0)
+        };
+        let head = Job {
+            cpu_hold_ms: Some(CPU_MAX_HOLD_MS),
+            ..job("ui-update", 13, 4, State::Queued, 100_000)
+        };
+        let small = Job {
+            cpu_hold_ms: Some(RAMP_MS),
+            ..job("typecheck", 2, 4, State::Queued, 101_000)
+        };
+        let live = Live {
+            cpu_pct: pct,
+            cpu_sustained_pct: pct,
+            non_heavy: Usage {
+                cpu: 100,
+                mem: 20 * G,
+                vram: 0,
+            },
+            per_job: vec![(
+                "long".into(),
+                Usage {
+                    cpu: 900,
+                    mem: 6 * G,
+                    vram: 0,
+                },
+            )],
+            ..calm()
+        };
+        (vec![run, head, small], live)
+    }
+
+    #[test]
+    fn a_small_job_passes_a_cpu_blocked_head_on_an_underused_machine() {
+        let c = mac();
+        let (jobs, live) = big_head_at(70);
+        let past = 100_000 + BACKFILL_WINDOW_MS + 1;
+        assert!(matches!(
+            evaluate(&jobs[1], &jobs, &c, &live, past),
+            Decision::Wait {
+                block: Block::Cpu,
+                ..
+            }
+        ));
+        // 0.4.5 queued it behind the head (strict FIFO past 60 s) for as long as the head waited.
+        assert_eq!(evaluate(&jobs[2], &jobs, &c, &live, past), Decision::Start);
+        // At 75% busy the machine is in the band's approach: it waits for the head again.
+        let (jobs, warm) = big_head_at(UNDERUSED_CPU_PCT);
+        assert!(matches!(
+            evaluate(&jobs[2], &jobs, &c, &warm, past),
+            Decision::Wait {
+                block: Block::Queue,
+                ..
+            }
+        ));
+        // And once the head has waited 5 minutes, so a stream of small jobs cannot starve it.
+        assert!(matches!(
+            evaluate(&jobs[2], &jobs, &c, &live, 100_000 + TINY_BYPASS_MS),
+            Decision::Wait {
+                block: Block::Queue,
+                ..
+            }
+        ));
+        // A bigger waiter still keeps the 60 s rule.
+        let mid = job("check", 4, 4, State::Queued, 102_000);
+        let all = [jobs[0].clone(), jobs[1].clone(), mid.clone()];
+        assert!(waits(&evaluate(&mid, &all, &c, &live, past)));
     }
 }
