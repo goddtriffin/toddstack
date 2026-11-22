@@ -24,8 +24,7 @@ buffers, limits) report what you got.
 
 A CPU-type adapter (a software Vulkan) is skipped: the tiny-skia path is the one CPU renderer.
 `Options { force, data_texture }` pins a backend; `Options::from_env()` reads `WGPU_BACKEND`
-(`vulkan|dx12|metal|gl|cpu`). Tested (Apple M3 Max): Metal, CPU. Untested: Vulkan, DX12, GLES, WebGPU and WebGL2 in a browser (the web
-build compiles; no browser run yet). `x86_64-pc-windows-gnu` is clippy-checked, not linked or run.
+(`vulkan|dx12|metal|gl|cpu`). Tested: Metal and CPU (Apple M3 Max), WebGPU and WebGL2 in Chrome, Vulkan, DX12 and GLES (RTX 3080). `x86_64-pc-windows-gnu` is clippy-checked, not linked or run.
 
 ## API
 
@@ -37,6 +36,8 @@ scene.rrect(16.0, 16.0, 200.0, 80.0, 12.0, [91, 74, 58, 255]);
 scene.line(20.0, 20.0, 200.0, 90.0, 4.0, [214, 90, 60, 255]);
 scene.text(font, "Qu", 116.0, 70.0, 46.0, [255, 255, 255, 255]);
 let rgba: Vec<u8> = r.render(&scene).await?; // width * height * 4, readback included
+// On the web, draw straight to a canvas instead: no readback, no await.
+// let mut r = Renderer::new(Target::canvas(html_canvas)).await?; r.present(&scene)?;
 ```
 
 **Images**: `r.add_image(w, h, rgba8, Sampling::Linear | Nearest)` takes straight RGBA8; `scene.image(id, x, y, w, h,
@@ -71,7 +72,16 @@ fragment form (render-to-texture; `Binding::Storage` becomes a uniform there), a
 pixels, more than 8 on 0.6%, more than 32 on 0.05%, max 48 (from boggledygook's renderer arena, which measured
 0.909% / 0.258% / 0% / 31 for wgpu on Metal).
 
-Not in v0: drawing straight to a canvas surface (the web wrapper reads back and `putImageData`s), resizing a batch's
+**Presenting**: `r.present(&scene)` draws with no readback. `Target::canvas(HtmlCanvasElement)` and
+`Target::offscreen_canvas(OffscreenCanvas)` (wasm32 only) make a canvas target: the GPU backends draw into the
+canvas surface and present it; the CPU backend `putImageData`s into its 2D context. `resize` reconfigures the
+surface and sets the canvas size, so pass device pixels. A lost or outdated surface is reconfigured and retried once,
+then `Error::Surface`. `render` (readback) is for offscreen targets only, for tests and callers that want pixels.
+A canvas has one context for life: the chain tries WebGPU, then WebGL2, then 2D, so a GPU context that was taken and
+then rejected (a software WebGL2 adapter) leaves the CPU fallback without a context. Native surfaces from a raw window
+handle are left to the iOS and Android integrations.
+
+Not in v0: resizing a batch's
 data, image sub-rects (sprite sheets), even-odd fills, gradients, clipping.
 
 ## Demos and the parity check
@@ -107,6 +117,6 @@ rust/toddstack_renderer/web/build.sh        # wasm + glue (web/pkg) + example bu
 deno run -A jsr:@std/http/file-server rust/toddstack_renderer/web   # then open /index.html
 ```
 
-The wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,278,206 bytes
-raw, 705,859 bytes brotli (689,062 before images, paths and kernel textures). `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
-`demo`, `resize`, `render`; demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend.
+The wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,337,350 bytes
+raw, 724,768 bytes brotli (712,281 before the canvas target). `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
+`demo`, `resize`, `render` (presents to the canvas; `{ readback: true }` reads back and `putImageData`s instead); demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend, `?readback=1` times the readback path.

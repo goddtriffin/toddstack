@@ -1,5 +1,6 @@
 /**
  * Thin wrapper over the wasm renderer: build a scene with calls, `render()` it onto a canvas.
+ * The GPU backends draw straight to the canvas; there is no readback unless you ask for it.
  * Works from plain TypeScript and Deno projects; the wasm glue is `./pkg` (see `build.sh`).
  * @module
  */
@@ -17,25 +18,43 @@ export interface Options {
   backend?: string;
   /** Where the `.wasm` is, when it is not next to the glue. */
   wasm?: URL | string;
+  /**
+   * Draw offscreen, read the pixels back and `putImageData` them: the old path, for timing the
+   * readback. The default draws straight to the canvas with no readback.
+   */
+  readback?: boolean;
 }
 
-/** One renderer bound to a 2D canvas. */
 /** The built-in demos. */
 export type Demo = "board" | "chart" | "grid" | "images" | "paths" | "texture";
 
+/** One renderer bound to a canvas (or an `OffscreenCanvas` in a worker). */
 export class Renderer {
   private constructor(
     private readonly core: WebRenderer,
-    private readonly ctx: CanvasRenderingContext2D,
+    private readonly canvas: HTMLCanvasElement | OffscreenCanvas,
+    private readonly ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null,
   ) {}
 
-  /** Picks the best backend (WebGPU, WebGL2, CPU) and sizes the canvas. */
-  static async create(canvas: HTMLCanvasElement, options: Options): Promise<Renderer> {
+  /**
+   * Picks the best backend (WebGPU, WebGL2, CPU) and draws to `canvas` at its current
+   * `width` x `height`. The renderer takes the canvas's context, so nothing else may draw on it.
+   */
+  static async create(
+    canvas: HTMLCanvasElement | OffscreenCanvas,
+    options: Options,
+  ): Promise<Renderer> {
     await init(options.wasm);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("the canvas has no 2D context");
-    const core = await WebRenderer.create(canvas.width, canvas.height, options.font, options.backend);
-    return new Renderer(core, ctx);
+    if (options.readback) {
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("the canvas has no 2D context");
+      const core = await WebRenderer.createReadback(canvas.width, canvas.height, options.font, options.backend);
+      return new Renderer(core, canvas, ctx);
+    }
+    const core = canvas instanceof HTMLCanvasElement
+      ? await WebRenderer.create(canvas, options.font, options.backend)
+      : await WebRenderer.createOffscreen(canvas, options.font, options.backend);
+    return new Renderer(core, canvas, null);
   }
 
   /** The backend in use: `webgpu`, `webgl2` or `cpu`. */
@@ -60,11 +79,11 @@ export class Renderer {
     if (this.rendering) throw new Error("a render is still in flight; await it first");
   }
 
-  /** Resizes the canvas and the render target. */
+  /** Resizes the canvas (in device pixels) and the render target. */
   resize(width: number, height: number): void {
     this.idle();
-    this.ctx.canvas.width = width;
-    this.ctx.canvas.height = height;
+    this.canvas.width = width;
+    this.canvas.height = height;
     this.core.resize(width, height);
   }
 
@@ -94,9 +113,13 @@ export class Renderer {
     this.core.demo(name);
   }
 
-  /** Draws the scene and puts it on the canvas. */
+  /** Draws the scene onto the canvas. Without `readback` this is one synchronous GPU submit. */
   async render(): Promise<void> {
     this.idle();
+    if (!this.ctx) {
+      this.core.present();
+      return;
+    }
     this.rendering = true;
     let px: Uint8Array;
     try {
@@ -104,7 +127,7 @@ export class Renderer {
     } finally {
       this.rendering = false;
     }
-    const { width, height } = this.ctx.canvas;
+    const { width, height } = this.canvas;
     this.ctx.putImageData(new ImageData(new Uint8ClampedArray(px), width, height), 0, 0);
   }
 }
