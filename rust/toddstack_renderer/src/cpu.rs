@@ -342,7 +342,7 @@ fn draw(
         match run {
             Run::Batch(id) => {
                 if let Some(b) = batches.get(id.0) {
-                    b.cpu.draw(&b.data, b.params, pm);
+                    b.cpu.draw(&b.data, b.instances, b.params, pm);
                 }
             }
             Run::Image { id, insts } => {

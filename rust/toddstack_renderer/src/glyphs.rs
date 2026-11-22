@@ -122,7 +122,8 @@ fn push_sprite(
     };
     let (sx, sy): (u32, u32) = (sx.min(iw), sy.min(ih));
     let (sw, sh): (u32, u32) = (sw.min(iw - sx), sh.min(ih - sy));
-    if sw == 0 || sh == 0 {
+    // An empty, inverted or NaN destination draws nothing, on every backend.
+    if sw == 0 || sh == 0 || !(dst[2] > 0.0 && dst[3] > 0.0) {
         return;
     }
     flush(runs, start, insts.len());

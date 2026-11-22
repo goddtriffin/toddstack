@@ -22,6 +22,19 @@ pub(crate) enum Kind {
     Offscreen(web_sys::OffscreenCanvas),
 }
 
+impl Kind {
+    /// Whether both are the same browser canvas.
+    fn is_same_canvas(&self, other: &Self) -> bool {
+        match (self, other) {
+            #[cfg(target_arch = "wasm32")]
+            (Self::Html(a), Self::Html(b)) => a == b,
+            #[cfg(target_arch = "wasm32")]
+            (Self::Offscreen(a), Self::Offscreen(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// What to render into: an offscreen RGBA8 image (readback), nothing yet (a device-only renderer
 /// for [`Renderer::attach`]), or on wasm32 a canvas that [`Renderer::present`] draws to directly.
 #[derive(Clone, Debug)]
@@ -183,6 +196,8 @@ pub struct Renderer {
     primary: bool,
     /// Size of each attached canvas, by `SurfaceId`; `None` once detached.
     surfaces: Vec<Option<(u32, u32)>>,
+    /// The primary canvas and each attached one, to refuse a canvas that is already in use.
+    kinds: Vec<Option<Kind>>,
 }
 
 /// A canvas attached to a renderer with [`Renderer::attach`].
@@ -246,6 +261,7 @@ impl Renderer {
             canvas,
             primary,
             surfaces: Vec::new(),
+            kinds: vec![Some(target.kind.clone())],
         })
     }
 
@@ -305,6 +321,8 @@ impl Renderer {
     /// to it with [`Renderer::present_to`]. Make the renderer with [`Target::device_only`] (or an
     /// offscreen target) so the backend is chosen before any canvas is touched.
     ///
+    /// A canvas that is already this renderer's target or attached (and not detached) is refused.
+    ///
     /// - WebGPU: one device, one surface per canvas.
     /// - WebGL2: one GL context cannot drive many canvases, so frames are drawn on one internal
     ///   sheet and each is copied into its canvas with a 2D `drawImage` (alpha kept). A WebGL2
@@ -314,10 +332,6 @@ impl Renderer {
     /// # Errors
     /// `BadInput` for an image target, an empty or oversized canvas, or off the web; `Surface` if
     /// the canvas cannot be used (another context type took it).
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "the canvas handle is given to the renderer, as with Renderer::new"
-    )]
     pub fn attach(&mut self, target: Target) -> Result<SurfaceId> {
         if !target.is_canvas() {
             return Err(Error::BadInput(
@@ -330,12 +344,23 @@ impl Renderer {
             target.height,
             self.caps.max_texture_dimension_2d,
         )?;
+        if self
+            .kinds
+            .iter()
+            .flatten()
+            .any(|k| k.is_same_canvas(&target.kind))
+        {
+            return Err(Error::BadInput(
+                "this canvas is already the target or attached: detach it first".to_owned(),
+            ));
+        }
         let slot: usize = match &mut self.inner {
             Inner::Gpu(g) => g.attach(&target)?,
             Inner::Cpu(c) => c.attach(&target)?,
         };
         debug_assert_eq!(slot, self.surfaces.len(), "slots and sizes stay in step");
         self.surfaces.push(Some((target.width, target.height)));
+        self.kinds.push(Some(target.kind));
         Ok(SurfaceId(slot))
     }
 
@@ -378,6 +403,7 @@ impl Renderer {
             Inner::Cpu(c) => c.detach(id.0),
         }
         self.surfaces[id.0] = None;
+        self.kinds[id.0 + 1] = None;
         Ok(())
     }
 

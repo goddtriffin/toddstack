@@ -29,6 +29,7 @@ pub enum Sampling {
 
 /// One thing to draw. Coordinates are pixels, origin top-left, y down.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Prim {
     /// Rounded rectangle (`r` of 0 is a plain rectangle).
     RRect {
@@ -206,7 +207,8 @@ impl Scene {
     /// into `dst` (left, top, width, height in target pixels), rotated `rotation_radians`
     /// clockwise about the centre of `dst`, and multiplied by `tint` (straight RGBA; white and
     /// opaque draws the image as it is). Keep `src` on whole pixels inside the image. Thousands
-    /// per frame are fine: consecutive sprites of one image are one instanced draw.
+    /// per frame are fine: consecutive sprites of one image are one instanced draw. A `dst` with a
+    /// zero or negative width or height draws nothing (no flipping).
     pub fn image_rect(
         &mut self,
         image: ImageId,

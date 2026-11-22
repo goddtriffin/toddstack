@@ -111,9 +111,10 @@ pub struct Gpu {
     batches: Vec<GpuBatch>,
     image_pipes: ImagePipes,
     images: Vec<Option<GpuImage>>,
-    /// Made on the first path; its composite bind group and size; dropped when the size changes.
+    /// Made on the first path; the layer and its composite bind group. The layer only grows, to
+    /// the largest frame drawn, and each frame uses its top-left.
     path_pipes: Option<PathPipes>,
-    layer: Option<(Layer, GpuImage, (u32, u32))>,
+    layer: Option<(Layer, GpuImage)>,
     path_buf: wgpu::Buffer,
     path_cap: u64,
 }
@@ -965,11 +966,13 @@ impl Gpu {
         size: (u32, u32),
     ) -> wgpu::RenderPass<'static> {
         let load: wgpu::LoadOp<wgpu::Color> = clear.map_or(wgpu::LoadOp::Load, |c| {
+            // Premultiplied, as the CPU's pixmap holds it (the target is premultiplied everywhere).
+            let a: f64 = f64::from(c[3]) / 255.0;
             wgpu::LoadOp::Clear(wgpu::Color {
-                r: f64::from(c[0]) / 255.0,
-                g: f64::from(c[1]) / 255.0,
-                b: f64::from(c[2]) / 255.0,
-                a: f64::from(c[3]) / 255.0,
+                r: f64::from(c[0]) / 255.0 * a,
+                g: f64::from(c[1]) / 255.0 * a,
+                b: f64::from(c[2]) / 255.0 * a,
+                a,
             })
         });
         let mut pass: wgpu::RenderPass<'static> = enc
@@ -1137,7 +1140,7 @@ impl Gpu {
         let canvas: web_sys::OffscreenCanvas = sheet.canvas.clone();
         self.sheet = Some(sheet);
         if shown? {
-            ctx.copy_from(&canvas, size.0, size.1)?;
+            ctx.copy_from(&canvas, size.0, size.1, !self.transparent)?;
         }
         Ok(())
     }
@@ -1185,17 +1188,6 @@ impl Gpu {
             self.queue
                 .write_buffer(&self.insts, 0, bytemuck::cast_slice(&flat.insts));
         }
-        let quad: Inst = Inst {
-            a: [0.0, 0.0, width as f32, height as f32],
-            uv: [0.0, 0.0, 1.0, 1.0],
-            p: [0.0; 4],
-            color: [1.0; 4],
-        };
-        self.queue.write_buffer(
-            &self.insts,
-            u64::from(composite) * size_of::<Inst>() as u64,
-            bytemuck::bytes_of(&quad),
-        );
         let (pverts, pranges): (Vec<PVert>, Vec<gpu_path::PathRange>) =
             gpu_path::build(&flat.paths);
         if !pverts.is_empty() {
@@ -1211,13 +1203,16 @@ impl Gpu {
             if self.path_pipes.is_none() {
                 self.path_pipes = Some(PathPipes::new(&self.device, &self.view_buf));
             }
-            if self.layer.as_ref().is_none_or(|l| l.2 != size) {
-                let layer: Layer = Layer::new(
-                    &self.device,
-                    width,
-                    height,
-                    self.caps.max_texture_dimension_2d,
-                );
+            if self
+                .layer
+                .as_ref()
+                .is_none_or(|l| l.0.size.0 < width || l.0.size.1 < height)
+            {
+                let (lw, lh): (u32, u32) = self.layer.as_ref().map_or((width, height), |l| {
+                    (l.0.size.0.max(width), l.0.size.1.max(height))
+                });
+                let layer: Layer =
+                    Layer::new(&self.device, lw, lh, self.caps.max_texture_dimension_2d);
                 let comp: GpuImage = self.image_pipes.image(
                     &self.device,
                     &self.view_buf,
@@ -1225,7 +1220,21 @@ impl Gpu {
                     Sampling::Linear,
                     false,
                 );
-                self.layer = Some((layer, comp, size));
+                self.layer = Some((layer, comp));
+            }
+            if let Some((layer, _)) = &self.layer {
+                // The quad that composites the path layer, after the scene's records.
+                let quad: Inst = Inst {
+                    a: [0.0, 0.0, width as f32, height as f32],
+                    uv: layer.uv(size),
+                    p: [0.0; 4],
+                    color: [1.0; 4],
+                };
+                self.queue.write_buffer(
+                    &self.insts,
+                    u64::from(composite) * size_of::<Inst>() as u64,
+                    bytemuck::bytes_of(&quad),
+                );
             }
         }
         let mut enc: wgpu::CommandEncoder = self
@@ -1237,9 +1246,10 @@ impl Gpu {
             if let Run::Paths(r) = run {
                 // The layer draws between two target passes, then lands as one quad.
                 pass = None;
-                if let (Some(pipes), Some((layer, comp, _))) = (&self.path_pipes, &self.layer) {
+                if let (Some(pipes), Some((layer, comp))) = (&self.path_pipes, &self.layer) {
                     layer.draw(
                         &mut enc,
+                        size,
                         pipes,
                         &self.path_buf,
                         &pranges[r.start as usize..r.end as usize],
@@ -1661,6 +1671,8 @@ fn surface_config(
 #[cfg(target_arch = "wasm32")]
 impl Sheet {
     /// Configures the sheet at least `size` big (it only grows) and returns its configuration.
+    /// The sheet is as wide as the widest frame drawn and as tall as the tallest, so one wide frame
+    /// and one tall frame make it a near-maximum square (up to the device's texture limit squared).
     fn fit(
         &mut self,
         device: &wgpu::Device,
