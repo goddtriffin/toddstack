@@ -546,7 +546,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         let migrated = keep_baseline(&dir, &records, &pictures, opts.rebase)?;
         if migrated > 0 {
             outcome.notes.push(format!(
-                "note: moved {migrated} baseline picture(s) from baseline/ to baseline/{}/ (baselines are per operating system now; on macOS the old path is still read when the new one is missing)",
+                "note: moved {migrated} baseline picture(s) from baseline/ to baseline/{}/ (baselines are per operating system now; on macOS the old path is read only until the picture has moved)",
                 os_key()
             ));
         }
@@ -623,7 +623,8 @@ fn judge_shot(dir: &Path, shot: &Shot) -> Result<Judged, Error> {
 }
 
 /// Writes `baseline/<os>/`: the pictures that have no baseline yet, or every picture on `rebase`. A picture that
-/// only has the old macOS path is moved over unchanged, so it keeps being the thing later runs compare with.
+/// only has the old macOS path is moved over unchanged (the old file is removed), so it keeps being the thing later runs
+/// compare with.
 /// Returns how many were moved.
 fn keep_baseline(
     dir: &Path,
@@ -640,18 +641,35 @@ fn keep_baseline(
             continue;
         };
         let path = baseline.join(format!("{id}.png"));
-        if rebase || path.exists() {
-            if rebase {
-                std::fs::write(&path, png).map_err(|e| io(&e))?;
-            }
-        } else if let Some(old) = legacy_baseline(dir, &id) {
-            std::fs::copy(old, &path).map_err(|e| io(&e))?;
+        let old = legacy_baseline(dir, &id);
+        if rebase {
+            std::fs::write(&path, png).map_err(|e| io(&e))?;
+            remove_old(old.as_deref())?;
+        } else if path.exists() {
+            // A per-OS picture wins; a leftover old one must not come back later.
+            remove_old(old.as_deref())?;
+        } else if let Some(old) = old {
+            move_file(&old, &path)?;
             migrated += 1;
         } else {
             std::fs::write(&path, png).map_err(|e| io(&e))?;
         }
     }
     Ok(migrated)
+}
+
+/// Moves a file: rename, or copy then remove when rename cannot.
+fn move_file(from: &Path, to: &Path) -> Result<(), Error> {
+    if std::fs::rename(from, to).is_err() {
+        std::fs::copy(from, to).map_err(|e| io(&e))?;
+        std::fs::remove_file(from).map_err(|e| io(&e))?;
+    }
+    Ok(())
+}
+
+/// Removes the old macOS picture once the per-OS one exists.
+fn remove_old(old: Option<&Path>) -> Result<(), Error> {
+    old.map_or(Ok(()), |p| std::fs::remove_file(p).map_err(|e| io(&e)))
 }
 
 /// The judged shots as sorted records and the pictures by id.
@@ -966,6 +984,21 @@ mod tests {
                 "moved unchanged, not replaced by this run"
             );
             assert_eq!(baseline_png(&d, id), Some(own.clone()));
+            assert!(
+                !d.join("baseline").join(format!("{id}.png")).exists(),
+                "the old file is removed after the move"
+            );
+            // Deleting baseline/macos/ must not bring the old picture back.
+            std::fs::remove_file(&own).unwrap();
+            assert_eq!(baseline_png(&d, id), None);
+            // --rebase while only the old picture exists: new picture written, old removed.
+            std::fs::write(d.join("baseline").join(format!("{id}.png")), b"old").unwrap();
+            keep_baseline(&d, std::slice::from_ref(&rec), &pictures, true).unwrap();
+            assert_eq!(std::fs::read(&own).unwrap(), b"new");
+            assert!(!d.join("baseline").join(format!("{id}.png")).exists());
+            std::fs::remove_file(&own).unwrap();
+            std::fs::write(d.join("baseline").join(format!("{id}.png")), b"old").unwrap();
+            keep_baseline(&d, std::slice::from_ref(&rec), &pictures, false).unwrap();
         } else {
             assert_eq!(
                 baseline_png(&d, id),

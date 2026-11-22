@@ -411,6 +411,7 @@ pub struct Step {
 
 /// `[budgets]`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Budgets {
     /// Exact byte ceilings per artifact, keyed by label.
     #[serde(default)]
@@ -451,11 +452,12 @@ pub struct SharedFile {
 }
 
 /// One entry of the shared file's `"sizes"`.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 enum SharedSize {
     Ceiling(u64),
     Full(SizeBudget),
+    /// Anything else (a float, a negative, another tool's object): not ours.
+    Other,
 }
 
 /// One artifact's ceilings. `file` may hold one `*` in its last component (hashed names).
@@ -540,12 +542,33 @@ impl Config {
         let text = std::fs::read_to_string(&path).map_err(|e| bad(e.to_string()))?;
         let json: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
-        let sizes: BTreeMap<String, SharedSize> = match json.get("sizes") {
-            Some(v) => {
-                serde_json::from_value(v.clone()).map_err(|e| bad(format!("\"sizes\": {e}")))?
-            }
-            None => return Err(bad("has no \"sizes\" object".into())),
+        let Some(serde_json::Value::Object(raw)) = json.get("sizes") else {
+            return Err(bad("has no \"sizes\" object".into()));
         };
+        let mut sizes: BTreeMap<String, SharedSize> = BTreeMap::new();
+        for (label, v) in raw {
+            let mapped = self.budgets.files.contains_key(label);
+            let size = match v {
+                serde_json::Value::Number(n) if n.is_u64() => {
+                    SharedSize::Ceiling(n.as_u64().unwrap_or(0))
+                }
+                serde_json::Value::Object(_) => {
+                    match serde_json::from_value::<SizeBudget>(v.clone()) {
+                        Ok(b) => SharedSize::Full(b),
+                        // A table that is not ours is ignored unless the config maps it.
+                        Err(e) if mapped => return Err(bad(format!("{label:?}: {e}"))),
+                        Err(_) => SharedSize::Other,
+                    }
+                }
+                _ if mapped => {
+                    return Err(bad(format!(
+                        "{label:?} is mapped in [budgets.files] but is not a whole number of bytes"
+                    )));
+                }
+                _ => SharedSize::Other,
+            };
+            sizes.insert(label.clone(), size);
+        }
         for label in self.budgets.files.keys() {
             if !sizes.contains_key(label) {
                 return Err(bad(format!(
@@ -555,6 +578,7 @@ impl Config {
         }
         for (label, size) in sizes {
             let budget = match size {
+                SharedSize::Other => continue,
                 SharedSize::Full(b) => b,
                 SharedSize::Ceiling(bytes) => {
                     // A bare number with no `[budgets.files]` entry is another tool's budget: not measured here.
@@ -1052,6 +1076,31 @@ skip_unbuilt = true
         assert!(Config::parse_in(&missing, "0.4.3", &dir).is_err());
         let no_file = "shakedown = \"0.4.3\"\nproject = \"p\"\n[budgets.files]\n\"a\" = \"b\"\n";
         assert!(Config::parse_in(no_file, "0.4.3", &dir).is_err());
+        // Finding 2: a typo in [budgets] fails loudly.
+        let typo = toml.replace("skip_unbuilt", "skip_unbuild");
+        assert!(Config::parse_in(&typo, "0.4.3", &dir).is_err());
+        // Finding 3: unmapped values that are not ours are ignored.
+        std::fs::write(
+            dir.join("budgets.json"),
+            r#"{"sizes":{"web wasm gzip":405000,"web wasm raw":1050000,"iOS stripped per arch":3350000,"f":1.5,"neg":-3,"obj":{"x":1},"s":"a"}}"#,
+        )
+        .unwrap();
+        let ok = Config::parse_in(toml, "0.4.3", &dir).unwrap();
+        assert_eq!(ok.budgets.sizes.len(), 3);
+        // A mapped label with an invalid value names the label.
+        for bad in ["1.5", "-3", "\"x\"", "{\"x\":1}"] {
+            std::fs::write(
+                dir.join("budgets.json"),
+                format!(
+                    r#"{{"sizes":{{"web wasm gzip":{bad},"web wasm raw":1,"iOS stripped per arch":2}}}}"#
+                ),
+            )
+            .unwrap();
+            let e = Config::parse_in(toml, "0.4.3", &dir)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("web wasm gzip"), "{bad}: {e}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

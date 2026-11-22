@@ -288,4 +288,5 @@ text_tolerance_px = 2   # default 0 (off)
 
 Fonts measure differently per OS. With a tolerance, `clipped-text` ignores text that overflows its box by no more than
 this many px, and `layout-shift` ignores a shift in which no element moves more than this. A shift the browser gave no
-element positions for is never forgiven. Applies to `ui`, `sweep` and `devices serve`.
+element positions for is never forgiven. The browser reports at most 5 source elements per layout shift, so the
+tolerance applies to the largest move among those 5. Applies to `ui`, `sweep` and `devices serve`.
