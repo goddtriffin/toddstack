@@ -152,11 +152,17 @@ pub fn defaults_with(
     let same_repo = |e: &Entry| repo.is_some() && e.repo.as_deref() == repo;
     let pick =
         |tier: &dyn Fn(&Entry) -> bool| ok.iter().copied().filter(|e| tier(e)).collect::<Vec<_>>();
+    let every = |tier: &dyn Fn(&Entry) -> bool| {
+        entries
+            .iter()
+            .filter(|e| e.v >= min_v && tier(e))
+            .collect::<Vec<_>>()
+    };
     if let Some(d) = aggregate(&pick(&|e| e.cwd == cwd && e.cmd == cmd), median) {
-        return Some(d);
+        return Some(lane_check(d, &every(&|e| e.cwd == cwd && e.cmd == cmd)));
     }
     if let Some(d) = aggregate(&pick(&|e| same_repo(e) && e.cmd == cmd), median) {
-        return Some(d);
+        return Some(lane_check(d, &every(&|e| same_repo(e) && e.cmd == cmd)));
     }
     // Other commands' run times say nothing about this one's: the pooled tier never reaches the fast lane.
     // Third tier pools different commands, so it takes the largest peak, never the median, and only for a real
@@ -173,6 +179,29 @@ pub fn defaults_with(
         slowest_run_ms: None,
         ..d
     })
+}
+
+/// The fast lane looks at every recent run of the command, not only the counted ones: any run over `FAST_RUN_MS`
+/// (failed or killed too, which `counts` ignores for sizing under `FAILED_RUN_COUNTS_MS`) or where machine-wide VRAM
+/// rose by `VRAM_NOISE` or more while it ran takes the command out of the lane.
+fn lane_check(d: Defaults, all: &[&Entry]) -> Defaults {
+    let recent = &all[all.len().saturating_sub(KEEP)..];
+    let slowest = recent.iter().map(|e| e.measured.run_ms).max().unwrap_or(0);
+    let gpu = recent.iter().any(|e| {
+        e.measured
+            .vram_rise
+            .is_some_and(|r| r >= crate::run::VRAM_NOISE)
+    });
+    Defaults {
+        slowest_run_ms: d.slowest_run_ms.map(|ms| {
+            if gpu {
+                ms.max(crate::admit::FAST_RUN_MS + 1)
+            } else {
+                ms.max(slowest)
+            }
+        }),
+        ..d
+    }
 }
 
 /// A failed run counts once it ran this long: it did its real work before it failed.
@@ -649,6 +678,16 @@ mod tests {
             run("make lint", 900),
         ];
         assert_eq!(d(&long, &lint).slowest_run_ms, Some(40_000));
+        // A failed run over 10 s (under the 30 s sizing floor) still disqualifies.
+        let mut failed = run("make lint", 12_000);
+        failed.exit_code = 1;
+        let with_fail = [run("make lint", 1_285), run("make lint", 900), failed];
+        assert_eq!(d(&with_fail, &lint).slowest_run_ms, Some(12_000));
+        // A run during which machine VRAM rose 256M or more disqualifies too.
+        let mut gpu = run("make lint", 900);
+        gpu.measured.vram_rise = Some(crate::run::VRAM_NOISE);
+        let with_gpu = [run("make lint", 1_285), gpu, run("make lint", 800)];
+        assert!(d(&with_gpu, &lint).slowest_run_ms.unwrap() > crate::admit::FAST_RUN_MS);
         // The pooled program tier never gives a run time: other commands' times say nothing about this one's.
         let pooled: Vec<String> = ["make", "lint", "fix"].map(String::from).to_vec();
         assert_eq!(d(&two, &pooled).slowest_run_ms, None);
