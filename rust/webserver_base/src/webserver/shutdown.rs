@@ -100,7 +100,7 @@ impl Shutdown {
     }
 
     /// A handle wired to this platform's termination signals: `SIGTERM`,
-    /// `SIGINT` and `SIGQUIT` on unix, ctrl-c elsewhere.
+    /// `SIGINT`, `SIGQUIT` and `SIGHUP` on unix, ctrl-c elsewhere.
     ///
     /// The first signal starts the drain; a second exits immediately. Must be
     /// called from inside a Tokio runtime.
@@ -157,11 +157,14 @@ async fn wait_for_signal() {
     let mut interrupt: Signal =
         signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     let mut quit: Signal = signal(SignalKind::quit()).expect("failed to install SIGQUIT handler");
+    let mut hangup: Signal =
+        signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
 
     tokio::select! {
         _ = terminate.recv() => {}
         _ = interrupt.recv() => {}
         _ = quit.recv() => {}
+        _ = hangup.recv() => {}
     }
 }
 
@@ -221,6 +224,25 @@ mod tests {
         timeout(Duration::from_millis(50), shutdown.clone().recv())
             .await
             .expect("a handle created before the trigger still resolves after it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_starts_the_drain() {
+        let shutdown: Shutdown = Shutdown::listen();
+        // Let the spawned listener install its handlers before the signal.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // `unsafe` is forbidden here, so raise the signal through kill(1).
+        let status = std::process::Command::new("kill")
+            .args(["-HUP", &std::process::id().to_string()])
+            .status()
+            .expect("kill ran");
+        assert!(status.success());
+
+        timeout(Duration::from_secs(2), shutdown.recv())
+            .await
+            .expect("SIGHUP started the drain");
     }
 
     #[tokio::test]
