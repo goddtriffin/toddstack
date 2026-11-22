@@ -53,10 +53,7 @@ fn the_diff_of_an_image_with_itself_is_zero_and_a_flipped_image_fails_the_budget
 fn the_cpu_backend_is_always_selected_when_forced_and_reports_no_compute() {
     let r: Renderer = pollster::block_on(Renderer::with_options(
         Target::offscreen(8, 8),
-        Options {
-            force: Some(Backend::Cpu),
-            data_texture: None,
-        },
+        Options::new().with_force(Backend::Cpu),
     ))
     .expect("cpu renderer");
     assert_eq!(Backend::Cpu, r.backend());
@@ -99,14 +96,16 @@ fn a_grid_batch_renders_the_same_on_gpu_storage_gpu_data_texture_and_cpu() {
         pollster::block_on(async {
             let mut r: Renderer = Renderer::with_options(
                 Target::offscreen(cols, rows),
-                Options {
-                    force: Some(force),
-                    data_texture,
-                },
+                Options::new()
+                    .with_force(force)
+                    .with_data_texture(data_texture),
             )
             .await
             .ok()?;
-            let id = r.add_batch(demo::grid_batch(cols, rows)).expect("batch");
+            let id = r
+                .add_batch(demo::grid_batch(cols, rows))
+                .await
+                .expect("batch");
             r.set_batch_params(id, [64.0, 1.0, 0.0, 0.0])
                 .expect("params");
             let mut s = toddstack_renderer::Scene::new([255, 255, 255, 255]);
@@ -136,14 +135,16 @@ fn a_partial_batch_update_changes_only_those_tiles_and_matches_the_cpu() {
         pollster::block_on(async {
             let mut r: Renderer = Renderer::with_options(
                 Target::offscreen(cols, rows),
-                Options {
-                    force: Some(force),
-                    data_texture,
-                },
+                Options::new()
+                    .with_force(force)
+                    .with_data_texture(data_texture),
             )
             .await
             .ok()?;
-            let id = r.add_batch(demo::grid_batch(cols, rows)).expect("batch");
+            let id = r
+                .add_batch(demo::grid_batch(cols, rows))
+                .await
+                .expect("batch");
             r.set_batch_params(id, [64.0, 1.0, 0.0, 0.0])
                 .expect("params");
             let mut s = toddstack_renderer::Scene::new([255, 255, 255, 255]);
@@ -176,15 +177,9 @@ where
     F: Fn(&mut Renderer) -> Scene,
 {
     pollster::block_on(async {
-        let mut r: Renderer = Renderer::with_options(
-            target,
-            Options {
-                force: Some(force),
-                data_texture: None,
-            },
-        )
-        .await
-        .ok()?;
+        let mut r: Renderer = Renderer::with_options(target, Options::new().with_force(force))
+            .await
+            .ok()?;
         let scene: Scene = build(&mut r);
         Some(r.render(&scene).await.expect("render"))
     })
@@ -199,7 +194,7 @@ fn gpu_backends() -> impl Iterator<Item = Backend> {
 
 fn scene_parity<F>(name: &str, target: &Target, budget: &Budget, build: F)
 where
-    F: Fn(&mut Renderer) -> toddstack_renderer::Result<Scene> + Copy,
+    F: AsyncFn(&mut Renderer) -> toddstack_renderer::Result<Scene> + Copy,
 {
     for b in gpu_backends() {
         let Some((caps, diff)) =
@@ -223,7 +218,7 @@ fn image_quads_scaled_nearest_and_linear_with_opacity_match_the_cpu_within_the_a
         "images",
         &Target::offscreen(640, 260),
         &Budget::ARENA,
-        |r| {
+        async |r| {
             let font = r.add_font(FONT)?;
             demo::images_scene(r, font)
         },
@@ -232,9 +227,12 @@ fn image_quads_scaled_nearest_and_linear_with_opacity_match_the_cpu_within_the_a
 
 #[test]
 fn paths_with_curves_dashes_joins_holes_and_text_between_runs_match_the_cpu() {
-    scene_parity("paths", &Target::offscreen(640, 400), &Budget::PATHS, |r| {
-        Ok(demo::paths_scene(r.add_font(FONT)?))
-    });
+    scene_parity(
+        "paths",
+        &Target::offscreen(640, 400),
+        &Budget::PATHS,
+        async |r| Ok(demo::paths_scene(r.add_font(FONT)?)),
+    );
 }
 
 #[test]
@@ -243,9 +241,9 @@ fn a_kernel_output_drawn_as_a_scene_image_matches_the_cpu_form() {
         "texture",
         &Target::offscreen(640, 270),
         &Budget::KERNEL,
-        |r| {
+        async |r| {
             let font = r.add_font(FONT)?;
-            demo::texture_scene(r, font)
+            demo::texture_scene(r, font).await
         },
     );
 }
@@ -257,15 +255,14 @@ fn a_kernel_image_drawn_one_to_one_equals_the_kernel_readback_on_every_gpu_form(
     for b in gpu_backends() {
         let Ok(mut r) = pollster::block_on(Renderer::with_options(
             Target::offscreen(width, height),
-            Options {
-                force: Some(b),
-                data_texture: None,
-            },
+            Options::new().with_force(b),
         )) else {
             continue;
         };
         for path in [KernelPath::Compute, KernelPath::Fragment] {
-            let Ok((id, ran)) = r.kernel_image_with(&kernel, path, Sampling::Nearest) else {
+            let Ok((id, ran)) =
+                pollster::block_on(r.kernel_image_with(&kernel, path, Sampling::Nearest))
+            else {
                 println!("{} {path:?}: not available", b.name());
                 continue;
             };
@@ -318,10 +315,7 @@ fn a_nearest_upscale_is_exact_and_a_removed_or_unknown_image_is_refused() {
     }
     let mut r: Renderer = pollster::block_on(Renderer::with_options(
         Target::offscreen(8, 8),
-        Options {
-            force: Some(Backend::Cpu),
-            data_texture: None,
-        },
+        Options::new().with_force(Backend::Cpu),
     ))
     .expect("cpu renderer");
     assert!(r.add_image(2, 2, &[0; 3], Sampling::Linear).is_err());
@@ -401,5 +395,61 @@ fn paths_fill_non_zero_winding_keep_holes_and_respect_paint_order_on_every_backe
             "{} path over the rect",
             b.name()
         );
+    }
+}
+
+#[test]
+fn batch_input_is_checked_on_the_cpu_backend() {
+    pollster::block_on(async {
+        let mut r: Renderer = Renderer::with_options(
+            Target::offscreen(8, 8),
+            Options::new().with_force(Backend::Cpu),
+        )
+        .await
+        .expect("cpu renderer");
+        let id = r.add_batch(demo::grid_batch(4, 4)).await.expect("batch");
+        // An offset that overflows usize is an error, not a panic.
+        assert!(r.update_batch(id, usize::MAX, &[1, 2]).is_err());
+        assert!(r.update_batch(id, 15, &[1, 2]).is_err());
+        r.update_batch(id, 14, &[1, 2]).expect("in range");
+        // More instances than data words is refused; the batch has 16.
+        assert!(r.set_batch_instances(id, 17).is_err());
+        r.set_batch_instances(id, 16).expect("16 fits");
+    });
+}
+
+#[test]
+fn bad_wgsl_in_a_batch_or_a_kernel_is_an_error_not_a_panic_on_every_gpu_backend() {
+    for b in gpu_backends() {
+        pollster::block_on(async {
+            let Ok(mut r) =
+                Renderer::with_options(Target::offscreen(16, 16), Options::new().with_force(b))
+                    .await
+            else {
+                println!("bad wgsl {}: skipped, no adapter", b.name());
+                return;
+            };
+            let mut batch = demo::grid_batch(4, 4);
+            batch.wgsl = "this is not wgsl".to_owned();
+            let err = r.add_batch(batch).await.expect_err("bad batch wgsl");
+            assert!(
+                matches!(err, toddstack_renderer::Error::Shader(_)),
+                "{}: {err}",
+                b.name()
+            );
+            let mut kernel: Kernel = demo::quantize_kernel(16, 16);
+            kernel.fragment = Some("this is not wgsl".to_owned());
+            kernel.compute = Some("this is not wgsl".to_owned());
+            for path in [KernelPath::Compute, KernelPath::Fragment] {
+                if let Err(e) = r.run_kernel_with(&kernel, path).await {
+                    println!("{} {path:?}: {e}", b.name());
+                } else {
+                    panic!("{} {path:?}: bad WGSL ran", b.name());
+                }
+            }
+            // The renderer still works after the rejected shaders.
+            let good = r.add_batch(demo::grid_batch(4, 4)).await;
+            assert!(good.is_ok(), "{}: {good:?}", b.name());
+        });
     }
 }

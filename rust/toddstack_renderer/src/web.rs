@@ -145,7 +145,7 @@ impl WebRenderer {
     }
 
     /// Replaces the scene with a built-in demo: `board`, `chart`, `grid` (a 1000x1000 batch), `images`, `paths` or `texture` (a kernel's output as an image).
-    pub fn demo(&mut self, name: &str) -> Result<(), JsError> {
+    pub async fn demo(&mut self, name: &str) -> Result<(), JsError> {
         self.scene = match name {
             "board" => demo::board_scene(self.font),
             "chart" => demo::chart_scene(self.font),
@@ -157,6 +157,7 @@ impl WebRenderer {
                         let id: BatchId = self
                             .inner
                             .add_batch(demo::grid_batch(1000, 1000))
+                            .await
                             .map_err(|e| js(&e))?;
                         self.inner
                             .set_batch_params(id, [1000.0, 1.0, 0.0, 0.0])
@@ -177,7 +178,7 @@ impl WebRenderer {
                     let s: Scene = if name == "images" {
                         demo::images_scene(&mut self.inner, self.font)
                     } else {
-                        demo::texture_scene(&mut self.inner, self.font)
+                        demo::texture_scene(&mut self.inner, self.font).await
                     }
                     .map_err(|e| js(&e))?;
                     self.built.insert(name.to_owned(), s.clone());

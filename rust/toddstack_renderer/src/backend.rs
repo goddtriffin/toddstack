@@ -6,6 +6,7 @@ use wgpu::Backends;
 
 /// A way to draw. The CPU backend is always available and is the pixel reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Backend {
     /// Browser WebGPU.
     WebGpu,
@@ -85,6 +86,7 @@ impl Backend {
 
 /// What the chosen backend reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// The backend in use.
     pub backend: Backend,

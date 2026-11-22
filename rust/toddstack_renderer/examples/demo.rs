@@ -76,8 +76,7 @@ fn p50_max(mut ms: Vec<f64>) -> (f64, f64) {
 }
 
 async fn renderer(a: &Args, t: &Target, force: Option<Backend>) -> Renderer {
-    let mut opts: Options = Options::from_env();
-    opts.force = force.or(a.backend);
+    let opts: Options = Options::from_env().with_force(force.or(a.backend));
     let r: Renderer = match Renderer::with_options(t.clone(), opts).await {
         Ok(r) => r,
         Err(e) => {
@@ -101,11 +100,11 @@ async fn renderer(a: &Args, t: &Target, force: Option<Backend>) -> Renderer {
 /// whether the diff is within it.
 async fn scene_demo<F>(a: &Args, name: &str, t: Target, budget: Option<&Budget>, build: F) -> bool
 where
-    F: Fn(&mut Renderer) -> Scene,
+    F: AsyncFn(&mut Renderer) -> Scene,
 {
     println!("{name} ({}x{})", t.width, t.height);
     let mut gpu: Renderer = renderer(a, &t, None).await;
-    let scene: Scene = build(&mut gpu);
+    let scene: Scene = build(&mut gpu).await;
     let mut ms: Vec<f64> = Vec::new();
     let mut px: Vec<u8> = Vec::new();
     for _ in 0..a.frames.max(1) {
@@ -125,7 +124,7 @@ where
         &px,
     );
     let mut cpu: Renderer = renderer(a, &t, Some(Backend::Cpu)).await;
-    let scene: Scene = build(&mut cpu);
+    let scene: Scene = build(&mut cpu).await;
     let s: Instant = Instant::now();
     let reference: Vec<u8> = cpu.render(&scene).await.expect("cpu render");
     println!("  cpu frame ms: {:.3}", s.elapsed().as_secs_f64() * 1e3);
@@ -250,22 +249,25 @@ fn main() {
             let mut known: bool = all;
             if is("board") {
                 known = true;
-                scene_demo(&a, "board", Target::offscreen(520, 520), None, |r| {
+                scene_demo(&a, "board", Target::offscreen(520, 520), None, async |r| {
                     demo::board_scene(r.add_font(FONT).expect("font"))
                 })
                 .await;
             }
             if is("chart") {
                 known = true;
-                scene_demo(&a, "chart", Target::offscreen(640, 400), None, |r| {
+                scene_demo(&a, "chart", Target::offscreen(640, 400), None, async |r| {
                     demo::chart_scene(r.add_font(FONT).expect("font"))
                 })
                 .await;
             }
             if is("grid") {
                 known = true;
-                scene_demo(&a, "grid", Target::offscreen(1000, 1000), None, |r| {
-                    let id = r.add_batch(demo::grid_batch(1000, 1000)).expect("batch");
+                scene_demo(&a, "grid", Target::offscreen(1000, 1000), None, async |r| {
+                    let id = r
+                        .add_batch(demo::grid_batch(1000, 1000))
+                        .await
+                        .expect("batch");
                     r.set_batch_params(id, [1000.0, 1.0, 0.0, 0.0])
                         .expect("params");
                     let mut s: Scene = Scene::new([255, 255, 255, 255]);
@@ -281,7 +283,7 @@ fn main() {
                     "images",
                     Target::offscreen(640, 260),
                     Some(&Budget::ARENA),
-                    |r| {
+                    async |r| {
                         let font = r.add_font(FONT).expect("font");
                         demo::images_scene(r, font).expect("images scene")
                     },
@@ -295,7 +297,7 @@ fn main() {
                     "paths",
                     Target::offscreen(640, 400),
                     Some(&Budget::PATHS),
-                    |r| demo::paths_scene(r.add_font(FONT).expect("font")),
+                    async |r| demo::paths_scene(r.add_font(FONT).expect("font")),
                 )
                 .await;
             }
@@ -306,9 +308,9 @@ fn main() {
                     "texture",
                     Target::offscreen(640, 270),
                     Some(&Budget::KERNEL),
-                    |r| {
+                    async |r| {
                         let font = r.add_font(FONT).expect("font");
-                        demo::texture_scene(r, font).expect("texture scene")
+                        demo::texture_scene(r, font).await.expect("texture scene")
                     },
                 )
                 .await;

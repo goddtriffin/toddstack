@@ -28,7 +28,7 @@ async function show(name: Demo, size: readonly [number, number]): Promise<void> 
   r.resize(...size);
   // One canvas pixel per device pixel, so it stays crisp at any zoom or screen density.
   canvas.style.width = `${size[0] / devicePixelRatio}px`;
-  r.demo(name);
+  await r.demo(name);
   const t0 = performance.now();
   await r.render();
   const ms = performance.now() - t0;

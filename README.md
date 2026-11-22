@@ -16,6 +16,7 @@ published on its own and documented in its own README.
 | `toddstack-frontend-engine` | Rust | [crates.io](https://crates.io/crates/toddstack-frontend-engine) | [`rust/toddstack_frontend_engine/README.md`](rust/toddstack_frontend_engine/README.md) |
 | `shakedown` | Rust | [crates.io](https://crates.io/crates/shakedown) | [`rust/shakedown/README.md`](rust/shakedown/README.md) |
 | `stokehold` | Rust | not yet published | [`rust/stokehold/README.md`](rust/stokehold/README.md) |
+| `toddstack-renderer` | Rust | not yet published (0.1.0 is ready; Todd publishes) | [`rust/toddstack_renderer/README.md`](rust/toddstack_renderer/README.md) |
 | `template-web-server` | Rust | not published; Docker image for several sites | [`rust/template_web_server/`](rust/template_web_server/) |
 
 ## Layout
@@ -27,6 +28,7 @@ rust/              Cargo workspace: every Rust crate
   flyball/               keyed rate limiting: one trait, in-memory and mock implementations
   toddstack_accounts_server_sdk/  client for the shared accounts: sign-in, tokens, webhooks, friends
   shakedown/             the shared local testing tool (binary): check runner, budgets, pixel compare, doctor
+  toddstack_renderer/    one GPU renderer on wgpu (2D scenes, instanced batches, compute kernels) with a tiny-skia CPU fallback; web, Apple, Android, Windows
   toddstack_frontend_engine/      app-agnostic Elm-style frontend core: NDJSON bridge, effects, dirty-key views, headless harness, wasm and UniFFI glue (+ js/ worker runner)
 typescript/        JSR packages (deno.jsonc is the package config); FROZEN, see below
   webserver-base/        the browser/build-side half of webserver-base

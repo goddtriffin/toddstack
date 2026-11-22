@@ -11,6 +11,7 @@
 mod backend;
 mod batch;
 mod cpu;
+#[cfg(feature = "web-demo")]
 pub mod demo;
 mod diff;
 mod error;
@@ -22,7 +23,12 @@ mod kernel;
 mod paths;
 mod renderer;
 mod scene;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "web-demo"))]
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate,
+    reason = "a JS-facing demo surface: errors cross as JsError, the docs are in web/renderer.ts"
+)]
 mod web;
 
 pub use backend::{Backend, Capabilities};
@@ -35,4 +41,5 @@ pub use renderer::{Options, Renderer, Target};
 pub use scene::{BatchId, FontId, ImageId, Prim, Rgba, Sampling, Scene};
 // Part of the public API (the CPU form of a batch draws into a `Pixmap`).
 pub use tiny_skia;
-pub use wgpu;
+#[cfg(all(target_arch = "wasm32", feature = "web-demo"))]
+pub use web::WebRenderer;
