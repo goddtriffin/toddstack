@@ -171,18 +171,57 @@ fn padded(bytes: &[u8]) -> Vec<u8> {
     v
 }
 
+/// A GPU backend that passed every rejection rule, found before the real canvas was touched.
+pub struct Probe {
+    backend: Backend,
+    instance: wgpu::Instance,
+    /// The adapter and device to keep. `None` for a WebGL2 canvas: its adapter is bound to the
+    /// GL context of the surface it was requested with, so it is requested again on the canvas.
+    acquired: Option<Acquired>,
+}
+
+struct Acquired {
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+/// An adapter and device, or `None` if the backend has none worth using: no adapter, a software
+/// one, or a failed device request.
+async fn acquire(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'static>>,
+) -> Option<Acquired> {
+    let adapter: wgpu::Adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: surface,
+            ..Default::default()
+        })
+        .await
+        .ok()?;
+    if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+        return None;
+    }
+    let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..Default::default()
+        })
+        .await
+        .ok()?;
+    Some(Acquired {
+        adapter,
+        device,
+        queue,
+    })
+}
+
 impl Gpu {
-    /// `None` when this backend has no usable (non-CPU) adapter here.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one linear device and pipeline setup"
-    )]
-    pub async fn create(
-        backend: Backend,
-        target: &Target,
-        data_texture: Option<bool>,
-    ) -> Result<Option<Self>> {
-        let (width, height): (u32, u32) = (target.width, target.height);
+    /// Decides whether `backend` can be used, without touching a canvas target's real canvas (it
+    /// keeps one context type for life, so a GPU context taken and then rejected would leave the
+    /// CPU fallback with none). A WebGL2 canvas target is probed on a 1x1 `OffscreenCanvas`.
+    /// `None` when the backend has no usable (non-CPU) adapter here.
+    pub async fn probe(backend: Backend, target: &Target) -> Result<Option<Probe>> {
         let Some(backends) = backend.wgpu_backends() else {
             return Ok(None);
         };
@@ -190,37 +229,79 @@ impl Gpu {
             wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = backends;
         let instance: wgpu::Instance = wgpu::Instance::new(desc);
-        // wgpu's web GL backend only finds an adapter for a given surface: a canvas target
-        // brings its own; an offscreen target probes with a 1x1 one. WebGPU asks for the adapter
-        // first, so a browser without one leaves the canvas free for the next backend.
+        // wgpu's web GL backend only finds an adapter for a given surface: an offscreen target
+        // brings its own; a canvas target probes with a 1x1 one. WebGPU needs no surface.
         #[cfg(target_arch = "wasm32")]
-        let mut surface: Option<wgpu::Surface<'static>> = if backend == Backend::WebGl2 {
-            Some(web_surface(&instance, &target.kind)?)
+        let surface: Option<wgpu::Surface<'static>> = if backend == Backend::WebGl2 {
+            let Ok(probe_surface) = web_surface(&instance, &target.kind, target.is_canvas()) else {
+                return Ok(None);
+            };
+            Some(probe_surface)
         } else {
             None
         };
         #[cfg(not(target_arch = "wasm32"))]
         let surface: Option<wgpu::Surface<'static>> = None;
-        let Ok(adapter) = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: surface.as_ref(),
-                ..Default::default()
-            })
-            .await
-        else {
+        let Some(acquired) = acquire(&instance, surface.as_ref()).await else {
             return Ok(None);
         };
-        let info: wgpu::AdapterInfo = adapter.get_info();
-        if info.device_type == wgpu::DeviceType::Cpu {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(probe_surface) = &surface
+            && !surface_takes_format(probe_surface, &acquired.adapter)
+        {
             return Ok(None);
         }
-        let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                required_limits: adapter.limits(),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| Error::Device(e.to_string()))?;
+        let keep: bool = !(cfg!(target_arch = "wasm32")
+            && backend == Backend::WebGl2
+            && target.is_canvas());
+        Ok(Some(Probe {
+            backend,
+            instance,
+            acquired: keep.then_some(acquired),
+        }))
+    }
+
+    /// Builds the GPU renderer on an accepted probe, creating the surface on the real canvas.
+    ///
+    /// # Errors
+    /// `Surface` or `Device` if the real canvas still fails after acceptance: the one case the
+    /// fallback chain cannot recover from.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear device and pipeline setup"
+    )]
+    pub async fn create(probe: Probe, target: &Target, data_texture: Option<bool>) -> Result<Self> {
+        let (width, height): (u32, u32) = (target.width, target.height);
+        let Probe {
+            backend,
+            instance,
+            acquired,
+        } = probe;
+        #[cfg(target_arch = "wasm32")]
+        let mut surface: Option<wgpu::Surface<'static>> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        let surface: Option<wgpu::Surface<'static>> = None;
+        let acquired: Acquired = if let Some(a) = acquired {
+            a
+        } else {
+            #[cfg(target_arch = "wasm32")]
+            let real: wgpu::Surface<'static> = web_surface(&instance, &target.kind, false)?;
+            #[cfg(target_arch = "wasm32")]
+            let a: Option<Acquired> = acquire(&instance, Some(&real)).await;
+            #[cfg(not(target_arch = "wasm32"))]
+            let a: Option<Acquired> = acquire(&instance, None).await;
+            #[cfg(target_arch = "wasm32")]
+            {
+                surface = Some(real);
+            }
+            a.ok_or_else(|| Error::Device("no usable adapter or device".to_owned()))?
+        };
+        let Acquired {
+            adapter,
+            device,
+            queue,
+        } = acquired;
+        let info: wgpu::AdapterInfo = adapter.get_info();
         let flags: wgpu::DownlevelFlags = adapter.get_downlevel_capabilities().flags;
         let limits: wgpu::Limits = adapter.limits();
         let compute: bool = flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
@@ -244,14 +325,16 @@ impl Gpu {
         };
         #[cfg(target_arch = "wasm32")]
         if surface.is_none() && target.is_canvas() {
-            surface = Some(web_surface(&instance, &target.kind)?);
+            surface = Some(web_surface(&instance, &target.kind, false)?);
         }
         let surf: Option<Surf> = match surface {
             Some(surface) if target.is_canvas() => {
                 let Some(config) =
                     surface_config(&surface, &adapter, width, height, caps.max_texture_dimension_2d)?
                 else {
-                    return Ok(None);
+                    return Err(Error::Surface(format!(
+                        "the canvas surface cannot take {FORMAT:?}"
+                    )));
                 };
                 surface.configure(&device, &config);
                 #[cfg(target_arch = "wasm32")]
@@ -374,7 +457,7 @@ impl Gpu {
         } else {
             Some(target_texture(&device, width, height, false))
         };
-        Ok(Some(Self {
+        Ok(Self {
             device,
             queue,
             data_texture: data_texture.unwrap_or(!caps.storage_buffers),
@@ -396,7 +479,7 @@ impl Gpu {
             layer: None,
             path_buf,
             path_cap,
-        }))
+        })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -1230,19 +1313,34 @@ impl Gpu {
     }
 }
 
-/// The wgpu surface for a canvas target (an offscreen target gets a 1x1 probe canvas).
+/// The wgpu surface for a canvas target; with `probe`, a throwaway 1x1 canvas instead (an image
+/// target always gets one).
 #[cfg(target_arch = "wasm32")]
-fn web_surface(instance: &wgpu::Instance, kind: &Kind) -> Result<wgpu::Surface<'static>> {
+fn web_surface(
+    instance: &wgpu::Instance,
+    kind: &Kind,
+    probe: bool,
+) -> Result<wgpu::Surface<'static>> {
+    let throwaway = || {
+        web_sys::OffscreenCanvas::new(1, 1)
+            .map(wgpu::SurfaceTarget::OffscreenCanvas)
+            .map_err(|e| Error::Surface(format!("{e:?}")))
+    };
     let target: wgpu::SurfaceTarget<'static> = match kind {
+        Kind::Image => throwaway()?,
+        _ if probe => throwaway()?,
         Kind::Html(c) => wgpu::SurfaceTarget::Canvas(c.clone()),
         Kind::Offscreen(c) => wgpu::SurfaceTarget::OffscreenCanvas(c.clone()),
-        Kind::Image => wgpu::SurfaceTarget::OffscreenCanvas(
-            web_sys::OffscreenCanvas::new(1, 1).map_err(|e| Error::Device(format!("{e:?}")))?,
-        ),
     };
     instance
         .create_surface(target)
-        .map_err(|e| Error::Device(e.to_string()))
+        .map_err(|e| Error::Surface(e.to_string()))
+}
+
+/// Whether the surface can take our one render format.
+#[cfg(target_arch = "wasm32")]
+fn surface_takes_format(surface: &wgpu::Surface<'static>, adapter: &wgpu::Adapter) -> bool {
+    surface.get_capabilities(adapter).formats.contains(&FORMAT)
 }
 
 #[cfg(target_arch = "wasm32")]
