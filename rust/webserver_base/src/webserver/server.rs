@@ -355,21 +355,9 @@ where
         #[cfg(feature = "templates")]
         #[cfg_attr(
             not(feature = "pages"),
-            expect(unused_mut, reason = "only a frontend assigns it")
+            expect(unused_mut, reason = "only a frontend assigns them")
         )]
-        let mut frontend_runtime: Option<crate::templates::FrontendRuntime> = None;
-        #[cfg(feature = "templates")]
-        #[cfg_attr(
-            not(feature = "pages"),
-            expect(unused_mut, reason = "only a frontend assigns it")
-        )]
-        let mut base: Option<crate::templates::BaseTemplateData> = None;
-        #[cfg(feature = "templates")]
-        #[cfg_attr(
-            not(feature = "pages"),
-            expect(unused_mut, reason = "only a frontend assigns it")
-        )]
-        let mut templates: Option<crate::templates::TemplateRegistry<'static>> = None;
+        let mut slots: FrontendSlots = FrontendSlots::default();
         #[cfg(feature = "pages")]
         let mut not_found: Option<super::not_found::NotFound<S>> = None;
         #[cfg(feature = "pages")]
@@ -391,9 +379,7 @@ where
             proxy_scripts = Some(assembled.proxy_scripts);
             feed_router = assembled.feeds;
             not_found = Some(assembled.not_found);
-            frontend_runtime = Some(assembled.runtime);
-            base = Some(assembled.base);
-            templates = Some(assembled.templates);
+            slots = assembled.slots;
         }
 
         let no_cache: Router<WebServerState<S>> = no_cache.nest(API_PREFIX, built_in);
@@ -424,12 +410,12 @@ where
             environment,
             shutdown,
             #[cfg(feature = "templates")]
-            base,
+            base: slots.base,
             #[cfg(feature = "templates")]
-            templates,
+            templates: slots.templates,
             cache_buster: Some(cache_buster),
             #[cfg(feature = "templates")]
-            frontend: frontend_runtime,
+            frontend: slots.runtime,
             app,
         });
 
@@ -542,6 +528,15 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
                 .and(NotForContentType::const_new("application/x-ndjson"))
                 .and(NotForContentType::const_new("application/jsonl")),
         )
+}
+
+/// The frontend-only state parts, empty until a frontend assigns them.
+#[cfg(feature = "templates")]
+#[derive(Default)]
+struct FrontendSlots {
+    runtime: Option<crate::templates::FrontendRuntime>,
+    base: Option<crate::templates::BaseTemplateData>,
+    templates: Option<crate::templates::TemplateRegistry<'static>>,
 }
 
 /// A server ready to bind: what [`WebServer::run`] serves and what it cleans
@@ -1010,9 +1005,7 @@ struct AssembledFrontend<S> {
     proxy_scripts: Router<WebServerState<S>>,
     /// Feed documents, which carry theirs.
     feeds: Option<Router<WebServerState<S>>>,
-    runtime: crate::templates::FrontendRuntime,
-    base: crate::templates::BaseTemplateData,
-    templates: crate::templates::TemplateRegistry<'static>,
+    slots: FrontendSlots,
     not_found: super::not_found::NotFound<S>,
     /// Every route the library itself serves, which is never traced.
     untraced: Vec<String>,
@@ -1066,9 +1059,11 @@ where
         api,
         proxy_scripts,
         feeds,
-        runtime: built.runtime,
-        base: built.base,
-        templates,
+        slots: FrontendSlots {
+            runtime: Some(built.runtime),
+            base: Some(built.base),
+            templates: Some(templates),
+        },
         not_found: built.not_found,
         untraced,
         redirects,
