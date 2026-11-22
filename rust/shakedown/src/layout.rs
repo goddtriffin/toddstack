@@ -102,6 +102,9 @@ pub struct Node {
     /// The text is cut off.
     #[serde(default)]
     pub clipped: bool,
+    /// How far the text overflows its box, in px (the larger of the sideways and the vertical overflow).
+    #[serde(default)]
+    pub clip_px: f64,
     /// Inside a marked horizontal scroller.
     #[serde(default)]
     pub scroll_x: bool,
@@ -130,6 +133,9 @@ pub struct Ignored {
 pub struct Shift {
     /// The shift score.
     pub value: f64,
+    /// The largest edge move of any element in this shift, in px (`None` from a page that does not report it).
+    #[serde(default)]
+    pub max_px: Option<f64>,
     /// Which elements moved, as `name before -> after`.
     #[serde(default)]
     pub sources: Vec<String>,
@@ -152,6 +158,10 @@ pub struct Tree {
     /// Opt-outs that gave no reason.
     #[serde(default)]
     pub bad_ignores: Vec<String>,
+    /// `[layout].text_tolerance_px`, set by the caller (not by the page): clipped text that overflows by no more,
+    /// and a layout shift whose elements move by no more, are not findings. 0 is off.
+    #[serde(default)]
+    pub text_tolerance: f64,
 }
 
 /// One thing wrong.
@@ -228,7 +238,10 @@ pub fn check(tree: &Tree) -> Vec<Finding> {
     }
     off_screen(tree, &mut out);
     for n in &tree.nodes {
-        if n.clipped && !skip(n, "clipped-text") {
+        if n.clipped
+            && (tree.text_tolerance <= 0.0 || n.clip_px > tree.text_tolerance)
+            && !skip(n, "clipped-text")
+        {
             out.push(
                 Finding::new("clipped-text", format!("text is cut off: {}", show(n))).at(&[n.rect]),
             );
@@ -272,7 +285,10 @@ pub fn check(tree: &Tree) -> Vec<Finding> {
         }
     }
     overlaps(tree, &mut out);
-    for s in tree.shifts.iter().filter(|s| s.value >= SHIFT_EPS) {
+    for s in tree.shifts.iter().filter(|s| {
+        s.value >= SHIFT_EPS
+            && !(tree.text_tolerance > 0.0 && s.max_px.is_some_and(|m| m <= tree.text_tolerance))
+    }) {
         out.push(Finding::new(
             "layout-shift",
             format!("layout shift {:.4}: {}", s.value, s.sources.join("; ")),
@@ -368,6 +384,7 @@ mod tests {
             top_lines: Vec::new(),
             font_size: 16.0,
             clipped: false,
+            clip_px: 0.0,
             scroll_x: false,
             inline: false,
             decor: false,
@@ -391,6 +408,7 @@ mod tests {
             nodes,
             shifts: Vec::new(),
             bad_ignores: Vec::new(),
+            text_tolerance: 0.0,
         }
     }
 
@@ -492,14 +510,58 @@ mod tests {
         let mut t = tree(vec![]);
         t.shifts = vec![Shift {
             value: 0.0004,
+            max_px: None,
             sources: vec![],
         }];
         assert_eq!(rules(&t), NONE);
         t.shifts = vec![Shift {
             value: 0.0005,
+            max_px: None,
             sources: vec!["div 0,0 1x1 -> 0,5 1x1".into()],
         }];
         assert_eq!(rules(&t), ["layout-shift"]);
+    }
+
+    #[test]
+    fn text_tolerance_is_off_by_default_and_covers_clipped_text_and_shifts() {
+        let mut n = node(
+            "0",
+            Kind::Text,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 50.0,
+                h: 20.0,
+            },
+        );
+        n.text = "hello".into();
+        n.clipped = true;
+        n.clip_px = 3.0;
+        let mut t = tree(vec![n]);
+        t.shifts = vec![Shift {
+            value: 0.01,
+            max_px: Some(2.0),
+            sources: vec!["div 0,0 1x1 -> 0,2 1x1".into()],
+        }];
+        assert_eq!(
+            rules(&t),
+            ["clipped-text", "layout-shift"],
+            "off by default"
+        );
+        t.text_tolerance = 4.0;
+        assert_eq!(rules(&t), NONE, "within the tolerance");
+        t.text_tolerance = 2.0;
+        assert_eq!(
+            rules(&t),
+            ["clipped-text"],
+            "3px clip over 2px, 2px shift within"
+        );
+        t.shifts[0].max_px = None;
+        assert_eq!(
+            rules(&t),
+            ["clipped-text", "layout-shift"],
+            "a shift with no measured move is never forgiven"
+        );
     }
 
     #[test]

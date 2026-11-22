@@ -104,6 +104,8 @@ pub struct Env {
     pub signin: Option<String>,
     /// `[layout].ignore` as JSON for the collector.
     pub ignores: String,
+    /// `[layout].text_tolerance_px`.
+    pub text_tolerance: f64,
     /// `[players].parallel`.
     pub player_limit: usize,
 }
@@ -945,6 +947,7 @@ async fn draw(
     if !job.plan.act.is_empty() {
         tree.shifts = before_acts;
     }
+    tree.text_tolerance = env.text_tolerance;
     let mut findings = layout::check(&tree);
     if let Ok(f) = collected.findings.lock() {
         findings.extend(f.iter().cloned());
@@ -1714,6 +1717,7 @@ mod frame_tests {
             config_routes: Vec::new(),
             players: None,
             ignores: "[]".into(),
+            text_tolerance: 0.0,
         };
         std::thread::spawn(move || {
             let _ = crate::viewer::serve(&settings);
@@ -1798,6 +1802,7 @@ mod frame_tests {
             config_routes: Vec::new(),
             players: None,
             ignores: "[]".into(),
+            text_tolerance: 0.0,
         };
         std::thread::spawn(move || {
             let _ = crate::viewer::serve(&settings);
@@ -1881,6 +1886,7 @@ mod frame_tests {
             config_routes: Vec::new(),
             players: None,
             ignores: "[]".into(),
+            text_tolerance: 0.0,
         };
         std::thread::spawn(move || {
             let _ = crate::viewer::serve(&settings);

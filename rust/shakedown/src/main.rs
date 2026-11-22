@@ -24,7 +24,6 @@ use std::process::ExitCode;
 
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 
-use crate::budgets::Verdict;
 use crate::config::Config;
 use crate::error::Error;
 use crate::report::PixelFailure;
@@ -44,13 +43,18 @@ fn cli() -> Command {
             Command::new("check")
                 .about("Run the whole local gate: configured steps plus built-in ones, in parallel")
                 .arg(Arg::new("only").long("only").value_delimiter(',').help("Run only these steps (comma separated); manual steps run only when named here"))
+                .arg(Arg::new("skip-unbuilt").long("skip-unbuilt").action(ArgAction::SetTrue).help("The budgets.sizes step skips artifacts that are not built instead of failing (see [budgets].skip_unbuilt)"))
                 .arg(Arg::new("json").long("json").action(ArgAction::SetTrue).help("Also write target/shakedown/summary.json")),
         )
         .subcommand(
             Command::new("budgets")
                 .about("Size and speed budgets")
                 .subcommand_required(true)
-                .subcommand(Command::new("sizes").about("Exact byte ceilings from [budgets.sizes]")),
+                .subcommand(
+                    Command::new("sizes")
+                        .about("Exact byte ceilings from [budgets.sizes] and [budgets].file")
+                        .arg(Arg::new("skip-unbuilt").long("skip-unbuilt").action(ArgAction::SetTrue).help("Skip a budget whose artifact is not built (a \"skipped (not built)\" line) instead of failing; same as [budgets].skip_unbuilt = true")),
+                ),
         )
         .subcommand(
             Command::new("pixels")
@@ -177,15 +181,24 @@ fn run(m: &ArgMatches) -> Result<(), Error> {
             let only: Vec<String> = sub
                 .get_many::<String>("only")
                 .map_or_else(Vec::new, |v| v.cloned().collect());
-            check(&config, &root, &only, sub.get_flag("json"))
+            check(
+                &config,
+                &root,
+                &only,
+                sub.get_flag("json"),
+                config.budgets.skip_unbuilt || sub.get_flag("skip-unbuilt"),
+            )
         }
         Some(("smoke", sub)) => {
             let (config, root) = load(explicit)?;
             smoke::command(&config, &root, sub.get_flag("json"))
         }
-        Some(("budgets", _)) => {
+        Some(("budgets", b)) => {
             let (config, root) = load(explicit)?;
-            sizes_cmd(&config, &root)
+            let skip = config.budgets.skip_unbuilt
+                || b.subcommand_matches("sizes")
+                    .is_some_and(|s| s.get_flag("skip-unbuilt"));
+            sizes_cmd(&config, &root, skip)
         }
         _ => Err(Error::Config("unknown command".into())),
     }
@@ -207,6 +220,7 @@ fn devices_cmd(explicit: Option<&Path>, m: &ArgMatches) -> Result<(), Error> {
                 config_routes: Vec::new(),
                 players: None,
                 ignores: "[]".into(),
+                text_tolerance: 0.0,
             };
             // A shakedown.toml adds its sweep pages, players and layout ignores; the viewer works without one.
             let settings = match load(explicit) {
@@ -271,34 +285,24 @@ fn out_dir(root: &Path) -> PathBuf {
     root.join("target/shakedown")
 }
 
-fn sizes_status(config: &Config, root: &Path) -> (Status, String, String) {
+fn sizes_status(config: &Config, root: &Path, skip_unbuilt: bool) -> (Status, String, String) {
     let rows = budgets::check(&config.budgets.sizes, root);
     let output = rows
         .iter()
         .map(budgets::Row::line)
         .collect::<Vec<_>>()
         .join("\n");
-    let over = rows
-        .iter()
-        .filter(|r| matches!(r.verdict, Verdict::Over { .. }))
-        .count();
-    let skipped = rows
-        .iter()
-        .filter(|r| matches!(r.verdict, Verdict::Skipped(_)))
-        .count();
-    let status = if over > 0 {
-        Status::Fail(format!("{over} over budget"))
-    } else if skipped > 0 {
-        Status::Fail(format!(
-            "{skipped} not built (a skipped artifact is never a pass)"
-        ))
-    } else {
-        Status::Ok
-    };
+    let status = budgets::failure(&rows, skip_unbuilt).map_or(Status::Ok, Status::Fail);
     (status, format!("{} sizes", rows.len()), output)
 }
 
-fn check(config: &Config, root: &Path, only: &[String], json: bool) -> Result<(), Error> {
+fn check(
+    config: &Config,
+    root: &Path,
+    only: &[String],
+    json: bool,
+    skip_unbuilt: bool,
+) -> Result<(), Error> {
     let unused = config.unused_sections();
     if !unused.is_empty() {
         eprintln!(
@@ -368,7 +372,7 @@ fn check(config: &Config, root: &Path, only: &[String], json: bool) -> Result<()
         if name == UI_WEB {
             ui::step(config, root)
         } else {
-            sizes_status(config, root)
+            sizes_status(config, root, skip_unbuilt)
         }
     });
     print_results(&results);
@@ -477,7 +481,7 @@ fn ui_cmd(config: &Config, root: &Path, m: &ArgMatches, mode: ui::Mode) -> Resul
     }
 }
 
-fn sizes_cmd(config: &Config, root: &Path) -> Result<(), Error> {
+fn sizes_cmd(config: &Config, root: &Path, skip_unbuilt: bool) -> Result<(), Error> {
     if config.budgets.sizes.is_empty() {
         println!("no [budgets.sizes] configured");
         return Ok(());
@@ -486,23 +490,7 @@ fn sizes_cmd(config: &Config, root: &Path) -> Result<(), Error> {
     for r in &rows {
         println!("{}", r.line());
     }
-    let over = rows
-        .iter()
-        .filter(|r| matches!(r.verdict, Verdict::Over { .. }))
-        .count();
-    let skipped = rows
-        .iter()
-        .filter(|r| matches!(r.verdict, Verdict::Skipped(_)))
-        .count();
-    if over > 0 {
-        return Err(Error::Failed(format!("{over} over budget")));
-    }
-    if skipped > 0 {
-        return Err(Error::Failed(format!(
-            "{skipped} not built (a skipped artifact is never a pass)"
-        )));
-    }
-    Ok(())
+    budgets::failure(&rows, skip_unbuilt).map_or(Ok(()), |why| Err(Error::Failed(why)))
 }
 
 fn pixels_cmd(matches: &ArgMatches) -> Result<(), Error> {

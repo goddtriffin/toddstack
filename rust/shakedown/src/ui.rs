@@ -376,6 +376,7 @@ pub fn draw_all(
             now_ms: ms,
             signin: config.players.as_ref().map(|p| p.signin.clone()),
             ignores,
+            text_tolerance: config.layout.text_tolerance_px,
             player_limit: config.players.as_ref().map_or(3, |p| p.parallel),
         });
         let work = async {
