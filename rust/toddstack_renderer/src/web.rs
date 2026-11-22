@@ -1,7 +1,10 @@
 //! wasm-bindgen surface for the TypeScript wrapper in `web/renderer.ts`: build a scene with calls,
 //! present it to a canvas (or read RGBA bytes back from an offscreen target).
 
-use crate::{Backend, BatchId, Error, FontId, Options, Renderer, Scene, Target, demo};
+use crate::{
+    Backend, BatchId, Error, FontId, ImageId, Options, Renderer, Sampling, Scene, SurfaceId,
+    Target, demo,
+};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::{JsError, wasm_bindgen};
 
@@ -58,10 +61,8 @@ impl WebRenderer {
         font: Vec<u8>,
         backend: Option<String>,
     ) -> Result<WebRenderer, JsError> {
-        let options: Options = Options {
-            force: backend.as_deref().and_then(Backend::parse),
-            data_texture: None,
-        };
+        let options: Options =
+            Options::new().with_force(backend.as_deref().and_then(Backend::parse));
         let mut inner: Renderer = Renderer::with_options(target, options)
             .await
             .map_err(|e| js(&e))?;
@@ -202,5 +203,92 @@ impl WebRenderer {
     /// Readback targets only: draws the scene and returns `width * height * 4` RGBA bytes.
     pub async fn render(&mut self) -> Result<Vec<u8>, JsError> {
         self.inner.render(&self.scene).await.map_err(|e| js(&e))
+    }
+}
+
+/// Many transparent canvases on one renderer: the `?boards=N` page.
+#[wasm_bindgen]
+pub struct WebBoards {
+    inner: Renderer,
+    font: FontId,
+    sprites: ImageId,
+    surfaces: Vec<Option<SurfaceId>>,
+}
+
+#[wasm_bindgen]
+impl WebBoards {
+    /// A device-only transparent renderer; `backend` is an optional override (webgpu, webgl2, cpu).
+    pub async fn create(font: Vec<u8>, backend: Option<String>) -> Result<WebBoards, JsError> {
+        let options: Options = Options::new()
+            .with_force(backend.as_deref().and_then(Backend::parse))
+            .with_transparent(true);
+        let mut inner: Renderer = Renderer::with_options(Target::device_only(), options)
+            .await
+            .map_err(|e| js(&e))?;
+        let font: FontId = inner.add_font(&font).map_err(|e| js(&e))?;
+        let (w, h): (u32, u32) = demo::SPRITE_SHEET;
+        let sprites: ImageId = inner
+            .add_image(w, h, &demo::sprite_sheet(), Sampling::Linear)
+            .map_err(|e| js(&e))?;
+        Ok(Self {
+            inner,
+            font,
+            sprites,
+            surfaces: Vec::new(),
+        })
+    }
+
+    pub fn backend(&self) -> String {
+        self.inner.backend().name().to_owned()
+    }
+
+    pub fn adapter(&self) -> String {
+        self.inner.capabilities().adapter.clone()
+    }
+
+    /// Attaches a canvas (its current `width` and `height`); returns its index.
+    pub fn attach(&mut self, canvas: web_sys::HtmlCanvasElement) -> Result<u32, JsError> {
+        let id: SurfaceId = self
+            .inner
+            .attach(Target::canvas(canvas))
+            .map_err(|e| js(&e))?;
+        self.surfaces.push(Some(id));
+        Ok(u32::try_from(self.surfaces.len() - 1).unwrap_or(u32::MAX))
+    }
+
+    fn id(&self, index: u32) -> Result<SurfaceId, JsError> {
+        self.surfaces
+            .get(index as usize)
+            .copied()
+            .flatten()
+            .ok_or_else(|| JsError::new("unknown canvas index"))
+    }
+
+    pub fn resize(&mut self, index: u32, width: u32, height: u32) -> Result<(), JsError> {
+        let id: SurfaceId = self.id(index)?;
+        self.inner
+            .resize_surface(id, width, height)
+            .map_err(|e| js(&e))
+    }
+
+    pub fn detach(&mut self, index: u32) -> Result<(), JsError> {
+        let id: SurfaceId = self.id(index)?;
+        self.inner.detach(id).map_err(|e| js(&e))?;
+        self.surfaces[index as usize] = None;
+        Ok(())
+    }
+
+    /// Draws tile `index` (square, its canvas's width) at time `t` seconds.
+    pub fn frame(&mut self, index: u32, t: f32) -> Result<(), JsError> {
+        let id: SurfaceId = self.id(index)?;
+        let (w, _): (u32, u32) = self.inner.surface_size(id).map_err(|e| js(&e))?;
+        let scene: Scene = demo::board_tile_scene(
+            self.font,
+            self.sprites,
+            index,
+            t,
+            f32::from(u16::try_from(w).unwrap_or(u16::MAX)),
+        );
+        self.inner.present_to(id, &scene).map_err(|e| js(&e))
     }
 }

@@ -2,11 +2,11 @@
 
 One GPU renderer on [wgpu](https://wgpu.rs) for Todd's apps, with a [tiny-skia](https://crates.io/crates/tiny-skia)
 CPU backend that is both the last fallback and the pixel reference. Part of
-[toddstack](https://github.com/goddtriffin/toddstack). Version 0.1.0, not yet published.
+[toddstack](https://github.com/goddtriffin/toddstack). Version 0.2.0 (0.1.0 is on crates.io).
 
 Two layers share one `Renderer`:
 
-- **High:** a `Scene` of rounded rects, lines, text (one shared glyph atlas), image quads and filled or stroked paths.
+- **High:** a `Scene` of rounded rects, lines, text (one shared glyph atlas), images and sprites (sub-rects, rotated, tinted) and filled or stroked paths, to one target or many canvases, opaque or transparent.
 - **Low:** custom instanced batches (your layout, WGSL and data) and compute `Kernel`s.
 
 ## Backend selection
@@ -40,6 +40,14 @@ let rgba: Vec<u8> = r.render(&scene).await?; // width * height * 4, readback inc
 // let mut r = Renderer::new(Target::canvas(html_canvas)).await?; r.present(&scene)?;
 ```
 
+**Sprites**: `scene.image_rect(image, src, dst, rotation_radians, tint)` draws `src` (`[x, y, w, h]` in image pixels,
+whole pixels inside the image; it is clipped to the image) into `dst` (`[x, y, w, h]` in target pixels), rotated clockwise
+(y is down) about the centre of `dst`, times `tint` (straight RGBA: colour into colour, alpha into alpha). Sampling never
+leaves `src` (no bleed from a neighbouring sprite on a sheet). Consecutive sprites of one image are one instanced draw, so
+thousands per frame are fine; `scene.image` is the whole-image shorthand (no rotation, tint white with the opacity as alpha).
+Rotated quad edges are not antialiased (tiny-skia's non-AA fill on the CPU, pixel-centre coverage on the GPU), so a few edge
+pixels differ between backends (`Budget::SPRITES`).
+
 **Images**: `r.add_image(w, h, rgba8, Sampling::Linear | Nearest)` takes straight RGBA8; `scene.image(id, x, y, w, h,
 opacity)` stretches it over a rect (bilinear for avatars and scaled icons, nearest for pixel art and exact-size icons;
 no mipmaps, so pre-size icons that shrink a lot). `r.remove_image(id)` frees it.
@@ -61,7 +69,7 @@ consecutive paths is one layer pass; text, shapes, images and batches drawn betw
 an instance count, and a `CpuBatch` (any `Fn(&[u32], [f32; 4], &mut Pixmap)`). The renderer prepends a
 prelude with `globals` (target size, four params), `to_clip(px)` and `data_at(i)`; `data_at` reads a storage
 buffer, or a data texture where storage buffers are missing (WebGL2), so one WGSL runs on both.
-`add_batch` is `async` (see below). `update_batch(id, offset, words)` uploads only that range (a data texture, whole rows holding it); `set_batch_params`, `set_batch_instances`.
+`add_batch` is `async` (see below). `update_batch(id, offset, words)` uploads only that range (a data texture, whole rows holding it); `set_batch_params`, `set_batch_instances` (the count is not checked against the data length: a batch may draw from `instance_index` and `params` alone).
 Draw it in order with `scene.batch(id)`.
 
 **Bad WGSL is an `Err`, not a panic.** `add_batch`, `kernel_image`, `kernel_image_with`, `run_kernel` and
@@ -77,6 +85,30 @@ fragment form (render-to-texture; `Binding::Storage` becomes a uniform there), a
 pixels, more than 8 on 0.6%, more than 32 on 0.05%, max 48 (from boggledygook's renderer arena, which measured
 0.909% / 0.258% / 0% / 31 for wgpu on Metal).
 
+**Transparent output**: `Options::new().with_transparent(true)`. Canvas surfaces are configured premultiplied (WebGPU),
+falling back to inherit, then to whatever the surface offers (WebGL2 offers only one mode and keeps its alpha anyway);
+scenes may clear to alpha 0; all GPU blends and the CPU glyph blit keep alpha correct. The CPU `putImageData` gets straight
+alpha (unpremultiplied); an opaque output ignores alpha, like an opaque surface. **Readback (`render`) is always
+premultiplied RGBA8** on every backend and on native; it equals straight RGBA wherever alpha is 255, and
+`unpremultiply_rgba8` converts. `Diff::between_rgba` compares all four channels.
+
+**Many canvases on one renderer**: a page with dozens of boards cannot have a device each.
+
+```rust
+let mut r = Renderer::with_options(Target::device_only(), Options::new().with_transparent(true)).await?;
+let id: SurfaceId = r.attach(Target::canvas(html_canvas))?;   // or Target::offscreen_canvas
+r.present_to(id, &scene)?;
+r.resize_surface(id, w, h)?;
+r.detach(id)?;
+```
+
+`Target::device_only()` (or an offscreen target) picks the backend on a probe before any real canvas is touched; fonts,
+images, batches and the glyph atlas are shared by every canvas. WebGPU: one device, one surface per canvas. CPU: each
+canvas gets a 2D context and `putImageData`. **WebGL2**: one GL context cannot drive many canvases, so the renderer owns one
+internal `OffscreenCanvas` sheet (the probe's surface), draws each frame at its top-left (grown to the largest frame, never
+shrunk) and copies it into the canvas with a 2D `drawImage` (composite `copy`, alpha kept). A WebGL2 renderer whose primary
+target is a canvas draws to that canvas only and refuses `attach`. The single-target API is unchanged. Ids are never reused.
+
 **Presenting**: `r.present(&scene)` draws with no readback. `Target::canvas(HtmlCanvasElement)` and
 `Target::offscreen_canvas(OffscreenCanvas)` (wasm32 only) make a canvas target: the GPU backends draw into the
 canvas surface and present it; the CPU backend `putImageData`s into its 2D context. `resize` reconfigures the
@@ -89,8 +121,8 @@ remaining failure is an accepted backend whose surface (or WebGL2 adapter and de
 then fails on the real canvas: `Error::Surface` or `Error::Device`. Native surfaces from a raw window
 handle are left to the iOS and Android integrations.
 
-Not in v0: resizing a batch's
-data, image sub-rects (sprite sheets), even-odd fills, gradients, clipping.
+Not yet: resizing a batch's
+data, even-odd fills, gradients, clipping.
 
 ## Demos and the parity check
 
@@ -129,6 +161,26 @@ The `WebRenderer` wasm-bindgen class and the `demo` scenes sit behind the cargo 
 consumers compile neither (the crate is `rlib` only, and `wgpu` is not re-exported). The example, tests and `demo`
 example get the feature through a self dev-dependency; `build.sh` builds `examples/web.rs` as a cdylib.
 
-The wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,205,571 bytes
-raw, 683,190 bytes brotli. `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
-`demo` (async), `resize`, `render` (presents to the canvas; `{ readback: true }` reads back and `putImageData`s instead); demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend, `?readback=1` times the readback path.
+Sizes: the wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,223,609 bytes
+raw, 690,547 bytes brotli (0.1.0: 2,205,571 and 683,190). `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
+`demo` (async), `resize`, `render` (presents to the canvas; `{ readback: true }` reads back and `putImageData`s instead); demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend, `?readback=1` times the readback path. `?boards=24` draws 24 transparent board-like tiles with rotated, tinted sprites onto 24 canvases over a CSS gradient on one renderer (`Boards` in `web/renderer.ts`) and prints the median frame time; on an Apple M3 Max in Chrome: WebGPU 1.9 ms, WebGL2 (sheet copy) 2.2 ms, CPU 282 ms per frame of 24 tiles (381 px).
+
+## Changelog
+
+### 0.2.0
+
+Added: `Options::with_transparent`; `Target::device_only`, `Renderer::attach`, `present_to`, `resize_surface`,
+`surface_size`, `detach`, `SurfaceId`, `Error::UnknownSurface`; `Scene::image_rect` and `Prim::Sprite`;
+`unpremultiply_rgba8`; `Diff::between_rgba`, `Budget::SPRITES`; the `?boards=N` demo.
+
+Breaking:
+
+- `Prim` gained a variant (`Sprite`): exhaustive matches need an arm.
+- `Renderer::set_batch_instances` no longer rejects a count above the data length (it returned `BadInput`); it now only
+  fails for an unknown batch.
+- `Run`/`Inst` internals changed: an image draw's `Inst.p.x` is now rotation, not opacity (batches never see it).
+- GPU alpha now accumulates (premultiplied "over"): a target cleared to alpha below 255 is no longer left at the clear
+  alpha, and readback is documented premultiplied. Opaque scenes are byte-for-byte unchanged in alpha (255).
+- The CPU canvas `present` unpremultiplies (transparent) or forces alpha 255 (opaque) before `putImageData`.
+- `Renderer::resize`, `render` and `present` on a `Target::device_only()` renderer return `BadInput`.
+- Wasm grew by 7,357 bytes brotli.

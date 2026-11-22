@@ -26,6 +26,9 @@ pub enum Error {
     /// An `ImageId` that this renderer never issued, or one already removed.
     #[error("unknown image: add it with Renderer::add_image first")]
     UnknownImage,
+    /// A `SurfaceId` that this renderer never issued, or one already detached.
+    #[error("unknown surface: attach a canvas first, and do not use it after detach")]
+    UnknownSurface,
     /// The font bytes did not parse.
     #[error("the font did not parse: {0}")]
     Font(String),

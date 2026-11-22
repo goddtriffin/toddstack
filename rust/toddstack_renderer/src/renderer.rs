@@ -14,14 +14,16 @@ use crate::scene::{BatchId, FontId, ImageId, Sampling, Scene};
 pub(crate) enum Kind {
     /// An RGBA8 image; [`Renderer::render`] reads it back.
     Image,
+    /// No target of its own: canvases are attached later.
+    None,
     #[cfg(target_arch = "wasm32")]
     Html(web_sys::HtmlCanvasElement),
     #[cfg(target_arch = "wasm32")]
     Offscreen(web_sys::OffscreenCanvas),
 }
 
-/// What to render into: an offscreen RGBA8 image (readback), or on wasm32 a canvas that
-/// [`Renderer::present`] draws to directly.
+/// What to render into: an offscreen RGBA8 image (readback), nothing yet (a device-only renderer
+/// for [`Renderer::attach`]), or on wasm32 a canvas that [`Renderer::present`] draws to directly.
 #[derive(Clone, Debug)]
 pub struct Target {
     /// Width in pixels.
@@ -39,6 +41,18 @@ impl Target {
             width,
             height,
             kind: Kind::Image,
+        }
+    }
+
+    /// No target: a renderer that owns the device and fonts, images and batches, and draws only to
+    /// canvases added with [`Renderer::attach`] (see [`Renderer::present_to`]). Its width and
+    /// height are 0; [`Renderer::present`], [`Renderer::render`] and [`Renderer::resize`] refuse.
+    #[must_use]
+    pub const fn device_only() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            kind: Kind::None,
         }
     }
 
@@ -66,7 +80,7 @@ impl Target {
     }
 
     pub(crate) const fn is_canvas(&self) -> bool {
-        !matches!(self.kind, Kind::Image)
+        !matches!(self.kind, Kind::Image | Kind::None)
     }
 }
 
@@ -90,6 +104,9 @@ pub struct Options {
     /// Force batches onto data textures (`Some(true)`) or storage buffers (`Some(false)`);
     /// `None` picks by capability. Mostly for testing the WebGL2 path on a desktop GPU.
     pub data_texture: Option<bool>,
+    /// The output keeps its alpha: a canvas lets the page show through where the scene is
+    /// transparent, and readback is premultiplied. `false` (the default) is an opaque output.
+    pub transparent: bool,
 }
 
 impl Options {
@@ -99,6 +116,7 @@ impl Options {
         Self {
             force: None,
             data_texture: None,
+            transparent: false,
         }
     }
 
@@ -113,6 +131,17 @@ impl Options {
     #[must_use]
     pub fn with_data_texture(mut self, data_texture: impl Into<Option<bool>>) -> Self {
         self.data_texture = data_texture.into();
+        self
+    }
+
+    /// A transparent output (`true`) or an opaque one (`false`, the default). Transparent: canvas
+    /// surfaces are configured premultiplied (falling back to inherit, then to whatever the
+    /// surface offers: a WebGL2 canvas has only one mode and keeps its alpha anyway), the CPU
+    /// backend unpremultiplies for `putImageData`, scenes may clear to alpha 0, and readback is
+    /// premultiplied RGBA8. Opaque: alpha is ignored when a canvas shows the frame.
+    #[must_use]
+    pub const fn with_transparent(mut self, transparent: bool) -> Self {
+        self.transparent = transparent;
         self
     }
 
@@ -150,7 +179,15 @@ pub struct Renderer {
     height: u32,
     /// A canvas target: `present` draws it, `render` (readback) is refused.
     canvas: bool,
+    /// The target has pixels of its own (not device-only).
+    primary: bool,
+    /// Size of each attached canvas, by `SurfaceId`; `None` once detached.
+    surfaces: Vec<Option<(u32, u32)>>,
 }
+
+/// A canvas attached to a renderer with [`Renderer::attach`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SurfaceId(pub(crate) usize);
 
 impl Renderer {
     /// Picks the most capable backend and falls back down the chain, ending at the CPU.
@@ -168,17 +205,21 @@ impl Renderer {
     pub async fn with_options(target: Target, options: Options) -> Result<Self> {
         let (width, height): (u32, u32) = (target.width, target.height);
         let canvas: bool = target.is_canvas();
+        let primary: bool = !matches!(target.kind, Kind::None);
         // The upper bound is the chosen backend's texture limit, checked once it is known.
-        check_size(width, height, u32::MAX)?;
+        if primary {
+            check_size(width, height, u32::MAX)?;
+        }
         let chain: Vec<Backend> = options
             .force
             .map_or_else(|| Backend::chain().to_vec(), |b| vec![b]);
         // Choose before touching a canvas: each GPU candidate is probed off the real canvas.
         let picked = backend::select(&chain, |b| Gpu::probe(b, &target)).await?;
+        let transparent: bool = options.transparent;
         let inner: Inner = match picked {
-            Some((Backend::Cpu, _)) => Inner::Cpu(Cpu::new(&target)?),
+            Some((Backend::Cpu, _)) => Inner::Cpu(Cpu::new(&target, transparent)?),
             Some((_, Some(probe))) => Inner::Gpu(Box::new(
-                Gpu::create(probe, &target, options.data_texture).await?,
+                Gpu::create(probe, &target, options.data_texture, transparent).await?,
             )),
             _ => {
                 return Err(Error::NoBackend {
@@ -203,6 +244,8 @@ impl Renderer {
             width,
             height,
             canvas,
+            primary,
+            surfaces: Vec::new(),
         })
     }
 
@@ -235,6 +278,7 @@ impl Renderer {
     /// # Errors
     /// `BadInput` for an empty or oversized target.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        self.need_primary()?;
         check_size(width, height, self.caps.max_texture_dimension_2d)?;
         match &mut self.inner {
             Inner::Gpu(g) => g.resize(width, height)?,
@@ -243,6 +287,123 @@ impl Renderer {
         self.width = width;
         self.height = height;
         Ok(())
+    }
+
+    fn need_primary(&self) -> Result<()> {
+        if self.primary {
+            Ok(())
+        } else {
+            Err(Error::BadInput(
+                "this renderer has no primary target: attach a canvas and use present_to"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    /// Attaches a canvas (`Target::canvas` or `Target::offscreen_canvas`, wasm32 only) to this
+    /// renderer's device: any number of canvases share one set of fonts, images and batches. Draw
+    /// to it with [`Renderer::present_to`]. Make the renderer with [`Target::device_only`] (or an
+    /// offscreen target) so the backend is chosen before any canvas is touched.
+    ///
+    /// - WebGPU: one device, one surface per canvas.
+    /// - WebGL2: one GL context cannot drive many canvases, so frames are drawn on one internal
+    ///   sheet and each is copied into its canvas with a 2D `drawImage` (alpha kept). A WebGL2
+    ///   renderer whose primary target is a canvas has no sheet: attach is refused there.
+    /// - CPU: each canvas gets its own 2D context and `putImageData`.
+    ///
+    /// # Errors
+    /// `BadInput` for an image target, an empty or oversized canvas, or off the web; `Surface` if
+    /// the canvas cannot be used (another context type took it).
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the canvas handle is given to the renderer, as with Renderer::new"
+    )]
+    pub fn attach(&mut self, target: Target) -> Result<SurfaceId> {
+        if !target.is_canvas() {
+            return Err(Error::BadInput(
+                "attach takes a canvas: Target::canvas or Target::offscreen_canvas (wasm32)"
+                    .to_owned(),
+            ));
+        }
+        check_size(
+            target.width,
+            target.height,
+            self.caps.max_texture_dimension_2d,
+        )?;
+        let slot: usize = match &mut self.inner {
+            Inner::Gpu(g) => g.attach(&target)?,
+            Inner::Cpu(c) => c.attach(&target)?,
+        };
+        debug_assert_eq!(slot, self.surfaces.len(), "slots and sizes stay in step");
+        self.surfaces.push(Some((target.width, target.height)));
+        Ok(SurfaceId(slot))
+    }
+
+    /// Resizes an attached canvas (device pixels; its `width` and `height` are set).
+    ///
+    /// # Errors
+    /// `UnknownSurface`; `BadInput` for an empty or oversized size.
+    pub fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32) -> Result<()> {
+        self.surface_size(id)?;
+        check_size(width, height, self.caps.max_texture_dimension_2d)?;
+        match &mut self.inner {
+            Inner::Gpu(g) => g.resize_slot(id.0, width, height)?,
+            Inner::Cpu(c) => c.resize_slot(id.0, width, height)?,
+        }
+        self.surfaces[id.0] = Some((width, height));
+        Ok(())
+    }
+
+    /// The size of an attached canvas, if it is still attached.
+    ///
+    /// # Errors
+    /// `UnknownSurface`.
+    pub fn surface_size(&self, id: SurfaceId) -> Result<(u32, u32)> {
+        self.surfaces
+            .get(id.0)
+            .copied()
+            .flatten()
+            .ok_or(Error::UnknownSurface)
+    }
+
+    /// Frees an attached canvas's surface or context (the canvas itself is the caller's). The id
+    /// is never reused.
+    ///
+    /// # Errors
+    /// `UnknownSurface`.
+    pub fn detach(&mut self, id: SurfaceId) -> Result<()> {
+        self.surface_size(id)?;
+        match &mut self.inner {
+            Inner::Gpu(g) => g.detach(id.0),
+            Inner::Cpu(c) => c.detach(id.0),
+        }
+        self.surfaces[id.0] = None;
+        Ok(())
+    }
+
+    /// Draws the scene to an attached canvas with no readback. Synchronous. Backends: see
+    /// [`Renderer::attach`].
+    ///
+    /// # Errors
+    /// `UnknownSurface`, `AtlasFull`, `UnknownFont`, or `Surface` if the canvas cannot be recovered.
+    pub fn present_to(&mut self, id: SurfaceId, scene: &Scene) -> Result<()> {
+        self.surface_size(id)?;
+        let flat = self.atlas.flatten(scene, &self.images)?;
+        match &mut self.inner {
+            Inner::Cpu(c) => {
+                c.present_to(id.0, &flat, &self.atlas.pixels, scene.clear, &self.batches)
+            }
+            Inner::Gpu(g) => {
+                let upload: Option<&[u8]> = if self.atlas.dirty {
+                    Some(&self.atlas.pixels)
+                } else {
+                    None
+                };
+                g.present(Some(id.0), &flat, upload, scene.clear, &self.batches)?;
+                self.atlas.dirty = false;
+                Ok(())
+            }
+        }
     }
 
     /// Adds a font (TTF or OTF bytes) for text.
@@ -306,19 +467,18 @@ impl Renderer {
 
     /// Sets how many instances the batch draws.
     ///
+    /// The count is not checked against the batch's data length: the renderer cannot know how many
+    /// words an instance reads, and a batch may draw from `instance_index` and `params` alone. A
+    /// shader that reads past the data gets what its backend's bounds checks give (clamped or
+    /// zero), and the CPU form is the caller's own function, so it must bound itself.
+    ///
     /// # Errors
-    /// `UnknownBatch`; `BadInput` if `instances` is more than the batch has data words.
+    /// `UnknownBatch`.
     pub fn set_batch_instances(&mut self, id: BatchId, instances: u32) -> Result<()> {
-        let b: &mut BatchState = self.batches.get_mut(id.0).ok_or(Error::UnknownBatch)?;
-        // Every instance reads at least one data word, so more instances than words is a mistake.
-        if instances as usize > b.data.len() {
-            return Err(Error::BadInput(format!(
-                "batch `{}` has {} words, so it cannot draw {instances} instances",
-                b.name,
-                b.data.len()
-            )));
-        }
-        b.instances = instances;
+        self.batches
+            .get_mut(id.0)
+            .ok_or(Error::UnknownBatch)?
+            .instances = instances;
         Ok(())
     }
 
@@ -326,17 +486,23 @@ impl Renderer {
     /// for tests and for callers that want pixels. Offscreen targets only; use
     /// [`Renderer::present`] for a canvas.
     ///
+    /// The pixels are **premultiplied** (colour already multiplied by alpha), whatever the
+    /// backend. With an opaque scene (alpha 255 everywhere) premultiplied and straight are the
+    /// same bytes; for a transparent one use [`unpremultiply_rgba8`] to get straight RGBA.
+    ///
     /// # Errors
-    /// `BadInput` on a canvas target; `AtlasFull`, `UnknownFont`, or a readback failure.
+    /// `BadInput` on a canvas or device-only target; `AtlasFull`, `UnknownFont`, or a readback
+    /// failure.
     pub async fn render(&mut self, scene: &Scene) -> Result<Vec<u8>> {
+        self.need_primary()?;
         if self.canvas {
             return Err(Error::BadInput(
                 "a canvas target has no readback: use present, or an offscreen target".to_owned(),
             ));
         }
-        let flat = self.atlas.flatten(scene)?;
+        let flat = self.atlas.flatten(scene, &self.images)?;
         match &mut self.inner {
-            Inner::Cpu(c) => Ok(c.render(&flat, &self.atlas.pixels, scene.clear, &self.batches)),
+            Inner::Cpu(c) => c.render(&flat, &self.atlas.pixels, scene.clear, &self.batches),
             Inner::Gpu(g) => {
                 let upload: Option<&[u8]> = if self.atlas.dirty {
                     Some(&self.atlas.pixels)
@@ -357,7 +523,8 @@ impl Renderer {
     /// # Errors
     /// `AtlasFull`, `UnknownFont`, or `Surface` if the canvas surface cannot be recovered.
     pub fn present(&mut self, scene: &Scene) -> Result<()> {
-        let flat = self.atlas.flatten(scene)?;
+        self.need_primary()?;
+        let flat = self.atlas.flatten(scene, &self.images)?;
         match &mut self.inner {
             Inner::Cpu(c) => c.present(&flat, &self.atlas.pixels, scene.clear, &self.batches),
             Inner::Gpu(g) => {
@@ -366,7 +533,7 @@ impl Renderer {
                 } else {
                     None
                 };
-                g.present(&flat, upload, scene.clear, &self.batches)?;
+                g.present(None, &flat, upload, scene.clear, &self.batches)?;
                 self.atlas.dirty = false;
                 Ok(())
             }
@@ -536,6 +703,22 @@ fn premultiply(rgba8: &[u8]) -> Vec<u8> {
         let a: u32 = u32::from(px[3]);
         for c in &mut px[..3] {
             *c = ((u32::from(*c) * a + 127) / 255) as u8;
+        }
+    }
+    out
+}
+
+/// Premultiplied RGBA8 to straight, rounded (what a canvas `putImageData` wants, and what a PNG
+/// holds). Opaque pixels are unchanged.
+#[must_use]
+pub fn unpremultiply_rgba8(rgba8: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = rgba8.to_vec();
+    for px in out.as_chunks_mut::<4>().0 {
+        let a: u32 = u32::from(px[3]);
+        if a != 0 && a != 255 {
+            for c in &mut px[..3] {
+                *c = ((u32::from(*c) * 255 + a / 2) / a).min(255) as u8;
+            }
         }
     }
     out

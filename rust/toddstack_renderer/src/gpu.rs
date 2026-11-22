@@ -7,14 +7,14 @@
 
 use crate::backend::{Backend, Capabilities};
 use crate::batch::{BatchState, DATA_TEXTURE_WIDTH, prelude};
+#[cfg(target_arch = "wasm32")]
+use crate::canvas::Ctx2d;
 use crate::error::{Error, Result};
 use crate::glyphs::{ATLAS_SIZE, Flat, Inst, Run};
 use crate::gpu_image::{GpuImage, ImagePipes};
 use crate::gpu_path::{self, Layer, PVert, PathPipes};
 use crate::kernel::{Binding, FULLSCREEN_VS, Kernel, KernelPath};
-#[cfg(target_arch = "wasm32")]
-use crate::renderer::Kind;
-use crate::renderer::Target;
+use crate::renderer::{Kind, Target};
 use crate::scene::{ImageId, Rgba, Sampling};
 use wgpu::util::DeviceExt;
 
@@ -32,6 +32,42 @@ struct Surf {
     kind: Kind,
 }
 
+/// Where a frame ends up.
+enum Out {
+    /// An offscreen image, readable back.
+    Texture(wgpu::Texture),
+    /// A canvas surface, presented directly (WebGPU, or the one canvas of a WebGL2 renderer).
+    Surface(Surf),
+    /// WebGL2 with many canvases: drawn on the sheet, then copied into this canvas's 2D context.
+    #[cfg(target_arch = "wasm32")]
+    Copy(Ctx2d),
+}
+
+/// A target and its size.
+struct Slot {
+    w: u32,
+    h: u32,
+    out: Out,
+}
+
+/// WebGL2's one internal canvas. A GL context drives one canvas, so every attached canvas is drawn
+/// here (at the top-left, sized to the frame) and copied out with `drawImage`.
+#[cfg(target_arch = "wasm32")]
+struct Sheet {
+    surface: wgpu::Surface<'static>,
+    canvas: web_sys::OffscreenCanvas,
+    /// `None` until the first frame; grown, never shrunk.
+    config: Option<wgpu::SurfaceConfiguration>,
+}
+
+/// One frame's scene data.
+struct Frame<'a> {
+    flat: &'a Flat,
+    atlas: Option<&'a [u8]>,
+    clear: Rgba,
+    batches: &'a [BatchState],
+}
+
 struct GpuBatch {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
@@ -43,13 +79,29 @@ struct GpuBatch {
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    #[cfg(target_arch = "wasm32")]
+    instance: wgpu::Instance,
+    #[cfg(target_arch = "wasm32")]
+    adapter: wgpu::Adapter,
     pub caps: Capabilities,
     data_texture: bool,
-    width: u32,
-    height: u32,
-    /// The offscreen image; `None` for a canvas, which draws into the surface's texture.
-    target: Option<wgpu::Texture>,
-    surface: Option<Surf>,
+    /// Canvas surfaces keep their alpha (premultiplied).
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(
+            dead_code,
+            reason = "only canvases, which are wasm32, are configured with it"
+        )
+    )]
+    transparent: bool,
+    /// The target size the view uniforms (here and in every batch's globals) currently hold.
+    view: (u32, u32),
+    /// The target given to `Renderer::new`; `None` for a device-only renderer.
+    primary: Option<Slot>,
+    /// Attached canvases, by `SurfaceId`.
+    slots: Vec<Option<Slot>>,
+    #[cfg(target_arch = "wasm32")]
+    sheet: Option<Sheet>,
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
     view_buf: wgpu::Buffer,
@@ -59,13 +111,20 @@ pub struct Gpu {
     batches: Vec<GpuBatch>,
     image_pipes: ImagePipes,
     images: Vec<Option<GpuImage>>,
-    /// Made on the first path; its composite bind group; dropped on resize.
+    /// Made on the first path; its composite bind group and size; dropped when the size changes.
     path_pipes: Option<PathPipes>,
-    layer: Option<(Layer, GpuImage)>,
+    layer: Option<(Layer, GpuImage, (u32, u32))>,
     path_buf: wgpu::Buffer,
     path_cap: u64,
 }
 
+fn no_primary() -> Error {
+    Error::BadInput(
+        "this renderer has no primary target: attach a canvas and use present_to".to_owned(),
+    )
+}
+
+/// Straight source colour over a premultiplied target (shapes, glyphs and custom batches).
 fn blend() -> wgpu::BlendState {
     wgpu::BlendState {
         color: wgpu::BlendComponent {
@@ -73,9 +132,11 @@ fn blend() -> wgpu::BlendState {
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         },
+        // Premultiplied "over" for alpha, so a transparent target accumulates coverage (over an
+        // opaque one it stays 1).
         alpha: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::Zero,
-            dst_factor: wgpu::BlendFactor::One,
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         },
     }
@@ -178,6 +239,10 @@ pub struct Probe {
     /// The adapter and device to keep. `None` for a WebGL2 canvas: its adapter is bound to the
     /// GL context of the surface it was requested with, so it is requested again on the canvas.
     acquired: Option<Acquired>,
+    /// WebGL2 without a canvas target: the probe's surface becomes the sheet that frames for
+    /// attached canvases are drawn on.
+    #[cfg(target_arch = "wasm32")]
+    sheet: Option<(wgpu::Surface<'static>, web_sys::OffscreenCanvas)>,
 }
 
 struct Acquired {
@@ -232,21 +297,24 @@ impl Gpu {
         // wgpu's web GL backend only finds an adapter for a given surface: an offscreen target
         // brings its own; a canvas target probes with a 1x1 one. WebGPU needs no surface.
         #[cfg(target_arch = "wasm32")]
-        let surface: Option<wgpu::Surface<'static>> = if backend == Backend::WebGl2 {
-            let Ok(probe_surface) = web_surface(&instance, &target.kind, target.is_canvas()) else {
-                return Ok(None);
+        let probe_canvas: Option<(wgpu::Surface<'static>, web_sys::OffscreenCanvas)> =
+            if backend == Backend::WebGl2 {
+                let Ok(throwaway) = throwaway_surface(&instance) else {
+                    return Ok(None);
+                };
+                Some(throwaway)
+            } else {
+                None
             };
-            Some(probe_surface)
-        } else {
-            None
-        };
+        #[cfg(target_arch = "wasm32")]
+        let surface: Option<&wgpu::Surface<'static>> = probe_canvas.as_ref().map(|(s, _)| s);
         #[cfg(not(target_arch = "wasm32"))]
-        let surface: Option<wgpu::Surface<'static>> = None;
-        let Some(acquired) = acquire(&instance, surface.as_ref()).await else {
+        let surface: Option<&wgpu::Surface<'static>> = None;
+        let Some(acquired) = acquire(&instance, surface).await else {
             return Ok(None);
         };
         #[cfg(target_arch = "wasm32")]
-        if let Some(probe_surface) = &surface
+        if let Some(probe_surface) = surface
             && !surface_takes_format(probe_surface, &acquired.adapter)
         {
             return Ok(None);
@@ -257,6 +325,8 @@ impl Gpu {
             backend,
             instance,
             acquired: keep.then_some(acquired),
+            #[cfg(target_arch = "wasm32")]
+            sheet: probe_canvas.filter(|_| !target.is_canvas()),
         }))
     }
 
@@ -269,12 +339,19 @@ impl Gpu {
         clippy::too_many_lines,
         reason = "one linear device and pipeline setup"
     )]
-    pub async fn create(probe: Probe, target: &Target, data_texture: Option<bool>) -> Result<Self> {
+    pub async fn create(
+        probe: Probe,
+        target: &Target,
+        data_texture: Option<bool>,
+        transparent: bool,
+    ) -> Result<Self> {
         let (width, height): (u32, u32) = (target.width, target.height);
         let Probe {
             backend,
             instance,
             acquired,
+            #[cfg(target_arch = "wasm32")]
+            sheet,
         } = probe;
         #[cfg(target_arch = "wasm32")]
         let mut surface: Option<wgpu::Surface<'static>> = None;
@@ -284,7 +361,7 @@ impl Gpu {
             a
         } else {
             #[cfg(target_arch = "wasm32")]
-            let real: wgpu::Surface<'static> = web_surface(&instance, &target.kind, false)?;
+            let real: wgpu::Surface<'static> = web_surface(&instance, &target.kind)?;
             #[cfg(target_arch = "wasm32")]
             let a: Option<Acquired> = acquire(&instance, Some(&real)).await;
             #[cfg(not(target_arch = "wasm32"))]
@@ -322,19 +399,22 @@ impl Gpu {
             max_buffer_size: limits.max_buffer_size,
             max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
         };
-        crate::renderer::check_size(width, height, caps.max_texture_dimension_2d)?;
+        let has_target: bool = !matches!(target.kind, Kind::None);
+        if has_target {
+            crate::renderer::check_size(width, height, caps.max_texture_dimension_2d)?;
+        }
         #[cfg(target_arch = "wasm32")]
         if surface.is_none() && target.is_canvas() {
-            surface = Some(web_surface(&instance, &target.kind, false)?);
+            surface = Some(web_surface(&instance, &target.kind)?);
         }
-        let surf: Option<Surf> = match surface {
+        let primary: Option<Slot> = match surface {
             Some(surface) if target.is_canvas() => {
                 let Some(config) = surface_config(
                     &surface,
                     &adapter,
-                    width,
-                    height,
+                    (width, height),
                     caps.max_texture_dimension_2d,
+                    transparent,
                 )?
                 else {
                     return Err(Error::Surface(format!(
@@ -343,15 +423,23 @@ impl Gpu {
                 };
                 surface.configure(&device, &config);
                 #[cfg(target_arch = "wasm32")]
-                set_canvas_size(&target.kind, width, height);
-                Some(Surf {
-                    surface,
-                    config,
-                    #[cfg(target_arch = "wasm32")]
-                    kind: target.kind.clone(),
+                crate::canvas::set_kind_size(&target.kind, width, height);
+                Some(Slot {
+                    w: width,
+                    h: height,
+                    out: Out::Surface(Surf {
+                        surface,
+                        config,
+                        #[cfg(target_arch = "wasm32")]
+                        kind: target.kind.clone(),
+                    }),
                 })
             }
-            // The WebGL2 probe for an offscreen target has done its job.
+            _ if has_target => Some(Slot {
+                w: width,
+                h: height,
+                out: Out::Texture(target_texture(&device, width, height, false)),
+            }),
             _ => None,
         };
         let shader: wgpu::ShaderModule =
@@ -457,20 +545,25 @@ impl Gpu {
             mapped_at_creation: false,
         });
         let image_pipes: ImagePipes = ImagePipes::new(&device);
-        let target: Option<wgpu::Texture> = if surf.is_some() {
-            None
-        } else {
-            Some(target_texture(&device, width, height, false))
-        };
         Ok(Self {
             device,
             queue,
+            #[cfg(target_arch = "wasm32")]
+            instance,
+            #[cfg(target_arch = "wasm32")]
+            adapter,
             data_texture: data_texture.unwrap_or(!caps.storage_buffers),
             caps,
-            width,
-            height,
-            target,
-            surface: surf,
+            transparent,
+            view: (width, height),
+            primary,
+            slots: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            sheet: sheet.map(|(surface, canvas)| Sheet {
+                surface,
+                canvas,
+                config: None,
+            }),
             pipeline,
             bind,
             view_buf,
@@ -489,31 +582,108 @@ impl Gpu {
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         crate::renderer::check_size(width, height, self.caps.max_texture_dimension_2d)?;
-        if let Some(s) = &mut self.surface {
-            s.config.width = width;
-            s.config.height = height;
-            #[cfg(target_arch = "wasm32")]
-            set_canvas_size(&s.kind, width, height);
-            s.surface.configure(&self.device, &s.config);
-        } else {
-            self.target = Some(target_texture(&self.device, width, height, false));
-        }
-        self.width = width;
-        self.height = height;
-        self.layer = None;
-        self.queue.write_buffer(
-            &self.view_buf,
-            0,
-            bytemuck::cast_slice(&[width as f32, height as f32, 0.0, 0.0]),
-        );
-        for b in &self.batches {
-            self.queue.write_buffer(
-                &b.globals,
-                0,
-                bytemuck::cast_slice(&[width as f32, height as f32, 0.0, 0.0]),
-            );
-        }
+        let slot: &mut Slot = self.primary.as_mut().ok_or_else(no_primary)?;
+        Self::resize_out(&self.device, slot, width, height);
         Ok(())
+    }
+
+    pub fn resize_slot(&mut self, i: usize, width: u32, height: u32) -> Result<()> {
+        crate::renderer::check_size(width, height, self.caps.max_texture_dimension_2d)?;
+        let slot: &mut Slot = self
+            .slots
+            .get_mut(i)
+            .and_then(Option::as_mut)
+            .ok_or(Error::UnknownSurface)?;
+        Self::resize_out(&self.device, slot, width, height);
+        Ok(())
+    }
+
+    fn resize_out(device: &wgpu::Device, slot: &mut Slot, width: u32, height: u32) {
+        match &mut slot.out {
+            Out::Texture(t) => *t = target_texture(device, width, height, false),
+            Out::Surface(s) => {
+                s.config.width = width;
+                s.config.height = height;
+                #[cfg(target_arch = "wasm32")]
+                crate::canvas::set_kind_size(&s.kind, width, height);
+                s.surface.configure(device, &s.config);
+            }
+            #[cfg(target_arch = "wasm32")]
+            Out::Copy(ctx) => ctx.set_size(width, height),
+        }
+        slot.w = width;
+        slot.h = height;
+    }
+
+    pub fn detach(&mut self, i: usize) {
+        if let Some(s) = self.slots.get_mut(i) {
+            *s = None;
+        }
+    }
+
+    /// Attaches a canvas: a surface of its own on WebGPU, a 2D context to copy into on WebGL2.
+    pub fn attach(&mut self, target: &Target) -> Result<usize> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (w, h): (u32, u32) = (target.width, target.height);
+            let out: Out = if self.caps.backend == Backend::WebGl2 {
+                if self.sheet.is_none() {
+                    return Err(Error::BadInput(
+                        "a WebGL2 renderer whose target is a canvas draws to that canvas only: \
+                         make the renderer with Target::device_only to attach many"
+                            .to_owned(),
+                    ));
+                }
+                Out::Copy(
+                    Ctx2d::new(&target.kind)?
+                        .ok_or_else(|| Error::BadInput("not a canvas".to_owned()))?,
+                )
+            } else {
+                let surface: wgpu::Surface<'static> = web_surface(&self.instance, &target.kind)?;
+                let config: wgpu::SurfaceConfiguration = surface_config(
+                    &surface,
+                    &self.adapter,
+                    (w, h),
+                    self.caps.max_texture_dimension_2d,
+                    self.transparent,
+                )?
+                .ok_or_else(|| {
+                    Error::Surface(format!("the canvas surface cannot take {FORMAT:?}"))
+                })?;
+                surface.configure(&self.device, &config);
+                crate::canvas::set_kind_size(&target.kind, w, h);
+                Out::Surface(Surf {
+                    surface,
+                    config,
+                    kind: target.kind.clone(),
+                })
+            };
+            self.slots.push(Some(Slot { w, h, out }));
+            Ok(self.slots.len() - 1)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = target;
+            Err(Error::BadInput(format!(
+                "attaching canvases is wasm32 only ({} attached)",
+                self.slots.len()
+            )))
+        }
+    }
+
+    /// Makes the view uniforms (here and in every batch's globals) hold this target size.
+    fn set_view(&mut self, w: u32, h: u32) {
+        if self.view == (w, h) {
+            return;
+        }
+        self.view = (w, h);
+        let size: [f32; 4] = [w as f32, h as f32, 0.0, 0.0];
+        self.queue
+            .write_buffer(&self.view_buf, 0, bytemuck::cast_slice(&size));
+        for b in &self.batches {
+            self.queue
+                .write_buffer(&b.globals, 0, bytemuck::cast_slice(&size));
+        }
     }
 
     #[expect(
@@ -557,8 +727,8 @@ impl Gpu {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("globals"),
                     contents: bytemuck::cast_slice(&[
-                        self.width as f32,
-                        self.height as f32,
+                        self.view.0 as f32,
+                        self.view.1 as f32,
                         0.0,
                         0.0,
                         state.params[0],
@@ -792,6 +962,7 @@ impl Gpu {
         enc: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         clear: Option<Rgba>,
+        size: (u32, u32),
     ) -> wgpu::RenderPass<'static> {
         let load: wgpu::LoadOp<wgpu::Color> = clear.map_or(wgpu::LoadOp::Load, |c| {
             wgpu::LoadOp::Clear(wgpu::Color {
@@ -801,26 +972,30 @@ impl Gpu {
                 a: f64::from(c[3]) / 255.0,
             })
         });
-        enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        })
-        .forget_lifetime()
+        let mut pass: wgpu::RenderPass<'static> = enc
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            })
+            .forget_lifetime();
+        // The frame fills the top-left of a view that may be larger (the WebGL2 sheet).
+        pass.set_viewport(0.0, 0.0, size.0 as f32, size.1 as f32, 0.0, 1.0);
+        pass
     }
 
-    /// Draws the frame and reads it back (offscreen targets).
+    /// Draws the frame and reads it back (offscreen targets): premultiplied RGBA8.
     pub async fn render(
         &mut self,
         flat: &Flat,
@@ -828,47 +1003,95 @@ impl Gpu {
         clear: Rgba,
         batches: &[BatchState],
     ) -> Result<Vec<u8>> {
-        let view: wgpu::TextureView = self
-            .target
-            .as_ref()
-            .ok_or_else(|| Error::BadInput("a canvas target has no readback".to_owned()))?
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw(flat, atlas, clear, batches, &view);
-        let target: &wgpu::Texture = self
-            .target
-            .as_ref()
-            .ok_or_else(|| Error::BadInput("a canvas target has no readback".to_owned()))?;
-        self.read_texture(target, self.width, self.height).await
+        let slot: Slot = self.primary.take().ok_or_else(no_primary)?;
+        let frame: Frame = Frame {
+            flat,
+            atlas,
+            clear,
+            batches,
+        };
+        let result: Result<Vec<u8>> = if let Out::Texture(t) = &slot.out {
+            let view: wgpu::TextureView = t.create_view(&wgpu::TextureViewDescriptor::default());
+            self.draw(&frame, &view, (slot.w, slot.h));
+            self.read_texture(t, slot.w, slot.h).await
+        } else {
+            Err(Error::BadInput(
+                "a canvas target has no readback".to_owned(),
+            ))
+        };
+        self.primary = Some(slot);
+        result
     }
 
     /// Draws the frame with no readback: into the canvas surface and presents it, or (offscreen)
-    /// just runs it.
+    /// just runs it. `slot` is an attached canvas; `None` is the primary target.
     pub fn present(
         &mut self,
+        slot: Option<usize>,
         flat: &Flat,
         atlas: Option<&[u8]>,
         clear: Rgba,
         batches: &[BatchState],
     ) -> Result<()> {
-        if self.surface.is_none() {
-            let view: wgpu::TextureView = self
-                .target
-                .as_ref()
-                .ok_or_else(|| Error::Surface("no target".to_owned()))?
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            self.draw(flat, atlas, clear, batches, &view);
-            return Ok(());
+        let taken: Option<Slot> = match slot {
+            None => self.primary.take(),
+            Some(i) => self.slots.get_mut(i).and_then(Option::take),
+        };
+        let Some(taken) = taken else {
+            return Err(if slot.is_some() {
+                Error::UnknownSurface
+            } else {
+                no_primary()
+            });
+        };
+        let frame: Frame = Frame {
+            flat,
+            atlas,
+            clear,
+            batches,
+        };
+        let result: Result<()> = self.present_slot(&taken, &frame);
+        match slot {
+            None => self.primary = Some(taken),
+            Some(i) => self.slots[i] = Some(taken),
         }
+        result
+    }
+
+    fn present_slot(&mut self, slot: &Slot, frame: &Frame) -> Result<()> {
+        let size: (u32, u32) = (slot.w, slot.h);
+        match &slot.out {
+            Out::Texture(t) => {
+                let view: wgpu::TextureView =
+                    t.create_view(&wgpu::TextureViewDescriptor::default());
+                self.draw(frame, &view, size);
+                Ok(())
+            }
+            Out::Surface(s) => self
+                .present_surface(&s.surface, &s.config, size, frame)
+                .map(drop),
+            #[cfg(target_arch = "wasm32")]
+            Out::Copy(ctx) => self.present_copy(ctx, size, frame),
+        }
+    }
+
+    /// Draws into the surface's current texture and presents it. `false` when there was no frame
+    /// to show (hidden, or slow), which is not an error.
+    fn present_surface(
+        &mut self,
+        surface: &wgpu::Surface<'static>,
+        config: &wgpu::SurfaceConfiguration,
+        size: (u32, u32),
+        frame: &Frame,
+    ) -> Result<bool> {
         // Lost or outdated: reconfigure and retry once, then give up.
         let mut last: &str = "";
         for attempt in 0..2 {
-            let Some(s) = &self.surface else { break };
-            let frame: wgpu::SurfaceTexture = match s.surface.get_current_texture() {
+            let texture: wgpu::SurfaceTexture = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(f)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-                // Nothing to show this frame (hidden, or slow): not an error.
                 wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                    return Ok(());
+                    return Ok(false);
                 }
                 other => {
                     last = match other {
@@ -877,35 +1100,61 @@ impl Gpu {
                         _ => "validation error",
                     };
                     if attempt == 0 {
-                        s.surface.configure(&self.device, &s.config);
+                        surface.configure(&self.device, config);
                     }
                     continue;
                 }
             };
-            let view: wgpu::TextureView = frame
+            let view: wgpu::TextureView = texture
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
-            self.draw(flat, atlas, clear, batches, &view);
-            self.queue.present(frame);
-            return Ok(());
+            self.draw(frame, &view, size);
+            self.queue.present(texture);
+            return Ok(true);
         }
         Err(Error::Surface(format!(
             "{last} after a reconfigure; recreate the renderer"
         )))
     }
 
+    /// WebGL2: draws on the sheet (grown to fit), then copies the frame into the canvas.
+    #[cfg(target_arch = "wasm32")]
+    fn present_copy(&mut self, ctx: &Ctx2d, size: (u32, u32), frame: &Frame) -> Result<()> {
+        let mut sheet: Sheet = self
+            .sheet
+            .take()
+            .ok_or_else(|| Error::BadInput("no WebGL2 sheet".to_owned()))?;
+        let shown: Result<bool> = match sheet.fit(
+            &self.device,
+            &self.adapter,
+            size,
+            self.caps.max_texture_dimension_2d,
+            self.transparent,
+        ) {
+            Ok(config) => self.present_surface(&sheet.surface, &config, size, frame),
+            Err(e) => Err(e),
+        };
+        let canvas: web_sys::OffscreenCanvas = sheet.canvas.clone();
+        self.sheet = Some(sheet);
+        if shown? {
+            ctx.copy_from(&canvas, size.0, size.1)?;
+        }
+        Ok(())
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one linear frame: uploads, then passes in paint order"
     )]
-    fn draw(
-        &mut self,
-        flat: &Flat,
-        atlas: Option<&[u8]>,
-        clear: Rgba,
-        batches: &[BatchState],
-        view: &wgpu::TextureView,
-    ) {
+    fn draw(&mut self, frame: &Frame, view: &wgpu::TextureView, size: (u32, u32)) {
+        let Frame {
+            flat,
+            atlas,
+            clear,
+            batches,
+        } = *frame;
+        let (width, height): (u32, u32) = size;
+        self.set_view(width, height);
         if let Some(px) = atlas {
             self.queue.write_texture(
                 self.atlas.as_image_copy(),
@@ -937,9 +1186,9 @@ impl Gpu {
                 .write_buffer(&self.insts, 0, bytemuck::cast_slice(&flat.insts));
         }
         let quad: Inst = Inst {
-            a: [0.0, 0.0, self.width as f32, self.height as f32],
-            uv: [0.0; 4],
-            p: [1.0, 0.0, 0.0, 0.0],
+            a: [0.0, 0.0, width as f32, height as f32],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            p: [0.0; 4],
             color: [1.0; 4],
         };
         self.queue.write_buffer(
@@ -962,11 +1211,11 @@ impl Gpu {
             if self.path_pipes.is_none() {
                 self.path_pipes = Some(PathPipes::new(&self.device, &self.view_buf));
             }
-            if self.layer.is_none() {
+            if self.layer.as_ref().is_none_or(|l| l.2 != size) {
                 let layer: Layer = Layer::new(
                     &self.device,
-                    self.width,
-                    self.height,
+                    width,
+                    height,
                     self.caps.max_texture_dimension_2d,
                 );
                 let comp: GpuImage = self.image_pipes.image(
@@ -976,26 +1225,26 @@ impl Gpu {
                     Sampling::Linear,
                     false,
                 );
-                self.layer = Some((layer, comp));
+                self.layer = Some((layer, comp, size));
             }
         }
         let mut enc: wgpu::CommandEncoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let mut pass: Option<wgpu::RenderPass<'static>> =
-            Some(Self::main_pass(&mut enc, view, Some(clear)));
+            Some(Self::main_pass(&mut enc, view, Some(clear), size));
         for run in &flat.runs {
             if let Run::Paths(r) = run {
                 // The layer draws between two target passes, then lands as one quad.
                 pass = None;
-                if let (Some(pipes), Some((layer, comp))) = (&self.path_pipes, &self.layer) {
+                if let (Some(pipes), Some((layer, comp, _))) = (&self.path_pipes, &self.layer) {
                     layer.draw(
                         &mut enc,
                         pipes,
                         &self.path_buf,
                         &pranges[r.start as usize..r.end as usize],
                     );
-                    let p = pass.insert(Self::main_pass(&mut enc, view, None));
+                    let p = pass.insert(Self::main_pass(&mut enc, view, None, size));
                     p.set_pipeline(&self.image_pipes.pipes[0]);
                     p.set_bind_group(0, &comp.bind, &[]);
                     p.set_vertex_buffer(0, self.insts.slice(..));
@@ -1004,7 +1253,7 @@ impl Gpu {
                 continue;
             }
             let p: &mut wgpu::RenderPass<'static> =
-                pass.get_or_insert_with(|| Self::main_pass(&mut enc, view, None));
+                pass.get_or_insert_with(|| Self::main_pass(&mut enc, view, None, size));
             match run {
                 Run::Insts(r) => {
                     p.set_pipeline(&self.pipeline);
@@ -1019,12 +1268,12 @@ impl Gpu {
                         p.draw(0..4, 0..s.instances);
                     }
                 }
-                Run::Image { id, inst } => {
+                Run::Image { id, insts } => {
                     if let Some(Some(img)) = self.images.get(id.0) {
                         p.set_pipeline(&self.image_pipes.pipes[usize::from(img.straight)]);
                         p.set_bind_group(0, &img.bind, &[]);
                         p.set_vertex_buffer(0, self.insts.slice(..));
-                        p.draw(0..4, *inst..*inst + 1);
+                        p.draw(0..4, insts.clone());
                     }
                 }
                 Run::Paths(_) => {}
@@ -1334,22 +1583,25 @@ async fn shader_result(scope: wgpu::ErrorScopeGuard) -> Result<()> {
     }
 }
 
-/// The wgpu surface for a canvas target; with `probe`, a throwaway 1x1 canvas instead (an image
-/// target always gets one).
+/// A throwaway 1x1 `OffscreenCanvas` and its wgpu surface: what a WebGL2 adapter is requested
+/// against when no real canvas may be touched yet (it becomes the sheet of a device-only renderer).
 #[cfg(target_arch = "wasm32")]
-fn web_surface(
+fn throwaway_surface(
     instance: &wgpu::Instance,
-    kind: &Kind,
-    probe: bool,
-) -> Result<wgpu::Surface<'static>> {
-    let throwaway = || {
-        web_sys::OffscreenCanvas::new(1, 1)
-            .map(wgpu::SurfaceTarget::OffscreenCanvas)
-            .map_err(|e| Error::Surface(format!("{e:?}")))
-    };
+) -> Result<(wgpu::Surface<'static>, web_sys::OffscreenCanvas)> {
+    let canvas: web_sys::OffscreenCanvas =
+        web_sys::OffscreenCanvas::new(1, 1).map_err(|e| Error::Surface(format!("{e:?}")))?;
+    let surface: wgpu::Surface<'static> = instance
+        .create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas.clone()))
+        .map_err(|e| Error::Surface(e.to_string()))?;
+    Ok((surface, canvas))
+}
+
+/// The wgpu surface for a canvas target (an image target gets a throwaway one).
+#[cfg(target_arch = "wasm32")]
+fn web_surface(instance: &wgpu::Instance, kind: &Kind) -> Result<wgpu::Surface<'static>> {
     let target: wgpu::SurfaceTarget<'static> = match kind {
-        Kind::Image => throwaway()?,
-        _ if probe => throwaway()?,
+        Kind::Image | Kind::None => return Ok(throwaway_surface(instance)?.0),
         Kind::Html(c) => wgpu::SurfaceTarget::Canvas(c.clone()),
         Kind::Offscreen(c) => wgpu::SurfaceTarget::OffscreenCanvas(c.clone()),
     };
@@ -1364,41 +1616,35 @@ fn surface_takes_format(surface: &wgpu::Surface<'static>, adapter: &wgpu::Adapte
     surface.get_capabilities(adapter).formats.contains(&FORMAT)
 }
 
-#[cfg(target_arch = "wasm32")]
-fn set_canvas_size(kind: &Kind, width: u32, height: u32) {
-    match kind {
-        Kind::Html(c) => {
-            c.set_width(width);
-            c.set_height(height);
-        }
-        Kind::Offscreen(c) => {
-            c.set_width(width);
-            c.set_height(height);
-        }
-        Kind::Image => {}
-    }
-}
-
-/// The surface configuration: our one render format, opaque alpha. `None` if the surface cannot
-/// take that format.
+/// The surface configuration: our one render format. Transparent: premultiplied alpha, else
+/// inherit, else whatever the surface offers (WebGL2 offers only `Opaque` and still keeps the
+/// canvas's alpha); opaque: `Opaque`. `None` if the surface cannot take the format.
 fn surface_config(
     surface: &wgpu::Surface<'static>,
     adapter: &wgpu::Adapter,
-    width: u32,
-    height: u32,
+    size: (u32, u32),
     max: u32,
+    transparent: bool,
 ) -> Result<Option<wgpu::SurfaceConfiguration>> {
+    let (width, height): (u32, u32) = size;
     crate::renderer::check_size(width, height, max)?;
     let caps: wgpu::SurfaceCapabilities = surface.get_capabilities(adapter);
     if !caps.formats.contains(&FORMAT) {
         return Ok(None);
     }
-    let alpha: wgpu::CompositeAlphaMode =
-        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-            wgpu::CompositeAlphaMode::Opaque
-        } else {
-            caps.alpha_modes.first().copied().unwrap_or_default()
-        };
+    let wanted: &[wgpu::CompositeAlphaMode] = if transparent {
+        &[
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Inherit,
+        ]
+    } else {
+        &[wgpu::CompositeAlphaMode::Opaque]
+    };
+    let alpha: wgpu::CompositeAlphaMode = wanted
+        .iter()
+        .copied()
+        .find(|m| caps.alpha_modes.contains(m))
+        .unwrap_or_else(|| caps.alpha_modes.first().copied().unwrap_or_default());
     Ok(Some(wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: FORMAT,
@@ -1410,6 +1656,38 @@ fn surface_config(
         alpha_mode: alpha,
         view_formats: vec![],
     }))
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Sheet {
+    /// Configures the sheet at least `size` big (it only grows) and returns its configuration.
+    fn fit(
+        &mut self,
+        device: &wgpu::Device,
+        adapter: &wgpu::Adapter,
+        size: (u32, u32),
+        max: u32,
+        transparent: bool,
+    ) -> Result<wgpu::SurfaceConfiguration> {
+        let (w, h): (u32, u32) = self
+            .config
+            .as_ref()
+            .map_or(size, |c| (c.width.max(size.0), c.height.max(size.1)));
+        if let Some(c) = &self.config
+            && (c.width, c.height) == (w, h)
+        {
+            return Ok(c.clone());
+        }
+        let config: wgpu::SurfaceConfiguration =
+            surface_config(&self.surface, adapter, (w, h), max, transparent)?.ok_or_else(|| {
+                Error::Surface(format!("the sheet surface cannot take {FORMAT:?}"))
+            })?;
+        self.canvas.set_width(w);
+        self.canvas.set_height(h);
+        self.surface.configure(device, &config);
+        self.config = Some(config.clone());
+        Ok(config)
+    }
 }
 
 /// Yields to the JS event loop with `setTimeout(0)`, in a window or a worker.

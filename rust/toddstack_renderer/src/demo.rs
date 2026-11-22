@@ -11,7 +11,7 @@ use crate::batch::BatchDesc;
 use crate::kernel::{Binding, Kernel};
 use crate::paths::rounded_rect;
 use crate::renderer::Renderer;
-use crate::scene::{FontId, Sampling, Scene};
+use crate::scene::{FontId, ImageId, Sampling, Scene};
 use std::sync::Arc;
 use tiny_skia::{LineCap, LineJoin, Path, PathBuilder, Pixmap, Stroke, StrokeDash};
 
@@ -663,21 +663,290 @@ pub async fn parity_scene<F>(
 where
     F: AsyncFn(&mut Renderer) -> crate::Result<Scene>,
 {
+    parity_with(backend, target, false, build).await
+}
+
+/// As [`parity_scene`] for a transparent output: the renderers are made transparent and the diff
+/// compares all four premultiplied channels, alpha included.
+///
+/// # Errors
+/// Anything the renderer or `build` fails with other than a missing backend.
+pub async fn parity_scene_transparent<F>(
+    backend: crate::Backend,
+    target: crate::Target,
+    build: F,
+) -> crate::Result<Option<(crate::Capabilities, crate::Diff)>>
+where
+    F: AsyncFn(&mut Renderer) -> crate::Result<Scene>,
+{
+    parity_with(backend, target, true, build).await
+}
+
+async fn parity_with<F>(
+    backend: crate::Backend,
+    target: crate::Target,
+    transparent: bool,
+    build: F,
+) -> crate::Result<Option<(crate::Capabilities, crate::Diff)>>
+where
+    F: AsyncFn(&mut Renderer) -> crate::Result<Scene>,
+{
     use crate::{Backend, Diff, Error, Options};
+    let options = Options::new().with_transparent(transparent);
     let mut cpu: Renderer =
-        Renderer::with_options(target.clone(), Options::new().with_force(Backend::Cpu)).await?;
+        Renderer::with_options(target.clone(), options.with_force(Backend::Cpu)).await?;
     let scene: Scene = build(&mut cpu).await?;
     let reference: Vec<u8> = cpu.render(&scene).await?;
-    let mut gpu: Renderer =
-        match Renderer::with_options(target, Options::new().with_force(backend)).await {
-            Ok(r) => r,
-            Err(Error::NoBackend { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        };
+    let mut gpu: Renderer = match Renderer::with_options(target, options.with_force(backend)).await
+    {
+        Ok(r) => r,
+        Err(Error::NoBackend { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let scene: Scene = build(&mut gpu).await?;
     let pixels: Vec<u8> = gpu.render(&scene).await?;
-    Ok(Some((
-        gpu.capabilities().clone(),
-        Diff::between(&reference, &pixels),
-    )))
+    let diff: Diff = if transparent {
+        Diff::between_rgba(&reference, &pixels)
+    } else {
+        Diff::between(&reference, &pixels)
+    };
+    Ok(Some((gpu.capabilities().clone(), diff)))
+}
+
+/// Width and height of [`sprite_sheet`].
+pub const SPRITE_SHEET: (u32, u32) = (128, 32);
+
+/// The sprite sheet: four 32x32 sprites side by side (disc, diamond, ring, opaque tile), light
+/// grey gradients with a dark notch at the top so rotation shows. The tile is opaque to its edge,
+/// so a sampler that leaks across sprites would show on it. Straight RGBA.
+#[must_use]
+pub fn sprite_sheet() -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::with_capacity((SPRITE_SHEET.0 * SPRITE_SHEET.1 * 4) as usize);
+    for y in 0..SPRITE_SHEET.1 {
+        for x in 0..SPRITE_SHEET.0 {
+            let (k, lx): (u32, u32) = (x / 32, x % 32);
+            let (dx, dy): (f32, f32) = (lx as f32 - 15.5, y as f32 - 15.5);
+            let cov: f32 = match k {
+                0 => 14.5 - dx.hypot(dy),
+                1 => (15.0 - (dx.abs() + dy.abs())) * 0.7,
+                2 => 3.5 - (dx.hypot(dy) - 11.0).abs(),
+                _ => 1.0,
+            }
+            .clamp(0.0, 1.0);
+            let shade: u8 = 255 - ((lx + y) * 2).min(120) as u8;
+            let notch: bool = dy < -8.0 && dy > -13.0 && dx.abs() < 3.0;
+            let rgb: [u8; 3] = if notch {
+                [50, 50, 70]
+            } else if k == 3 {
+                [
+                    shade,
+                    255 - (lx * 3).min(150) as u8,
+                    255 - (y * 3).min(150) as u8,
+                ]
+            } else {
+                [shade, shade, shade]
+            };
+            v.extend_from_slice(&[rgb[0], rgb[1], rgb[2], (cov * 255.0).round() as u8]);
+        }
+    }
+    v
+}
+
+/// The source rectangle of sprite `k` (0 to 3) in [`sprite_sheet`].
+#[must_use]
+pub const fn sprite_rect(k: u32) -> [u32; 4] {
+    [(k % 4) * 32, 0, 32, 32]
+}
+
+/// A tiny deterministic generator for the swarm.
+fn lcg(state: &mut u32) -> f32 {
+    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (*state >> 8) as f32 / 16_777_216.0
+}
+
+/// Sprites (640x400): the sheet whole, each sprite rotated, a row of tints, a nearest-sampled
+/// copy, and a swarm of 300 small ones in a single instanced run.
+///
+/// # Errors
+/// Anything adding the images or the font fails with.
+pub fn sprites_scene(r: &mut Renderer, font: FontId) -> crate::Result<Scene> {
+    let sheet = r.add_image(
+        SPRITE_SHEET.0,
+        SPRITE_SHEET.1,
+        &sprite_sheet(),
+        Sampling::Linear,
+    )?;
+    let blocky = r.add_image(
+        SPRITE_SHEET.0,
+        SPRITE_SHEET.1,
+        &sprite_sheet(),
+        Sampling::Nearest,
+    )?;
+    let mut v: Scene = Scene::new(BG);
+    v.rrect(8.0, 8.0, 624.0, 384.0, 14.0, [255, 250, 240, 255]);
+    v.image(sheet, 20.0, 20.0, 256.0, 64.0, 1.0);
+    v.text(font, "sheet", 148.0, 100.0, 12.0, [90, 80, 70, 255]);
+    for (k, angle) in [0.0_f32, 0.5, 1.2, 2.6].into_iter().enumerate() {
+        v.image_rect(
+            sheet,
+            sprite_rect(k as u32),
+            [296.0 + k as f32 * 80.0, 20.0, 64.0, 64.0],
+            angle,
+            [255, 255, 255, 255],
+        );
+    }
+    v.text(
+        font,
+        "rotation 0, 0.5, 1.2, 2.6 rad",
+        456.0,
+        100.0,
+        12.0,
+        [90, 80, 70, 255],
+    );
+    let tints: [[u8; 4]; 5] = [
+        [255, 255, 255, 255],
+        [235, 60, 50, 255],
+        [40, 190, 90, 255],
+        [60, 100, 255, 170],
+        [255, 255, 255, 80],
+    ];
+    for (i, tint) in tints.iter().enumerate() {
+        v.image_rect(
+            sheet,
+            sprite_rect(3),
+            [28.0 + i as f32 * 96.0, 116.0, 80.0, 80.0],
+            0.15 * i as f32,
+            *tint,
+        );
+        v.image_rect(
+            sheet,
+            sprite_rect(0),
+            [28.0 + i as f32 * 96.0, 204.0, 80.0, 80.0],
+            -0.4 * i as f32,
+            *tint,
+        );
+    }
+    v.text(font, "tints", 270.0, 300.0, 12.0, [90, 80, 70, 255]);
+    v.image_rect(
+        blocky,
+        sprite_rect(1),
+        [520.0, 116.0, 96.0, 96.0],
+        0.4,
+        [255, 210, 74, 255],
+    );
+    v.image_rect(
+        blocky,
+        sprite_rect(2),
+        [520.0, 216.0, 96.0, 96.0],
+        0.0,
+        [255, 255, 255, 255],
+    );
+    v.rrect(20.0, 314.0, 600.0, 4.0, 2.0, [63, 184, 196, 255]);
+    let mut seed: u32 = 7;
+    for _ in 0..300 {
+        let size: f32 = 10.0 + lcg(&mut seed) * 14.0;
+        let (x, y): (f32, f32) = (24.0 + lcg(&mut seed) * 580.0, 326.0 + lcg(&mut seed) * 40.0);
+        let angle: f32 = lcg(&mut seed) * std::f32::consts::TAU;
+        let tint: [u8; 4] = [
+            (80.0 + lcg(&mut seed) * 175.0) as u8,
+            (80.0 + lcg(&mut seed) * 175.0) as u8,
+            (80.0 + lcg(&mut seed) * 175.0) as u8,
+            (140.0 + lcg(&mut seed) * 115.0) as u8,
+        ];
+        let k: u32 = (lcg(&mut seed) * 4.0) as u32 % 4;
+        v.image_rect(sheet, sprite_rect(k), [x, y, size, size], angle, tint);
+    }
+    Ok(v)
+}
+
+/// Fills over a fully transparent clear (320x200): overlapping half-transparent shapes, a line,
+/// text, a path and a half-opaque image, so the output's alpha matters everywhere.
+///
+/// # Errors
+/// Anything adding the image fails with.
+pub fn transparent_scene(r: &mut Renderer, font: FontId) -> crate::Result<Scene> {
+    let avatar = r.add_image(64, 64, &avatar_image(), Sampling::Linear)?;
+    let mut v: Scene = Scene::new([0, 0, 0, 0]);
+    v.rrect(16.0, 16.0, 120.0, 90.0, 18.0, [214, 90, 60, 128]);
+    v.rrect(72.0, 48.0, 120.0, 90.0, 18.0, [40, 160, 200, 128]);
+    v.rect(10.0, 150.0, 60.0, 40.0, [60, 200, 90, 255]);
+    v.line(90.0, 170.0, 200.0, 150.0, 14.0, [255, 210, 74, 100]);
+    v.text(font, "alpha", 250.0, 40.0, 26.0, [255, 255, 255, 160]);
+    v.image(avatar, 216.0, 60.0, 72.0, 72.0, 0.5);
+    if let Some(tile) = rounded_rect(220.0, 144.0, 80.0, 40.0, 14.0) {
+        v.fill_path(&tile, [103, 58, 183, 120]);
+    }
+    Ok(v)
+}
+
+/// One tile of the `?boards=N` page: a board-like card on a fully transparent clear, so the page
+/// behind shows through its see-through body and its rounded corners, with rotated, tinted sprites
+/// from [`sprite_sheet`] on it. `size` is the tile's side in pixels; `index` picks the letters and
+/// the tints; `t` (seconds) turns the sprites.
+#[must_use]
+pub fn board_tile_scene(font: FontId, sprites: ImageId, index: u32, t: f32, size: f32) -> Scene {
+    let u: f32 = size / 256.0;
+    let mut v: Scene = Scene::new([0, 0, 0, 0]);
+    v.rrect(0.0, 0.0, size, size, 28.0 * u, [24, 20, 44, 120]);
+    v.rrect(
+        6.0 * u,
+        6.0 * u,
+        size - 12.0 * u,
+        size - 12.0 * u,
+        22.0 * u,
+        [255, 255, 255, 36],
+    );
+    let (cell, gap, origin): (f32, f32, f32) = (48.0 * u, 6.0 * u, 20.0 * u);
+    for i in 0..16_u32 {
+        let (x, y): (f32, f32) = (
+            origin + (i % 4) as f32 * (cell + gap),
+            origin + (i / 4) as f32 * (cell + gap),
+        );
+        let lit: bool = (i + index).is_multiple_of(5);
+        let body: [u8; 4] = if lit {
+            [255, 210, 74, 215]
+        } else {
+            [250, 246, 236, 150]
+        };
+        v.rrect(x, y, cell, cell, 9.0 * u, body);
+        let letter: &str = LETTERS[((i + index * 3) % 25) as usize];
+        v.text(
+            font,
+            letter,
+            x + cell / 2.0,
+            y + cell * 0.68,
+            26.0 * u,
+            [42, 33, 24, 235],
+        );
+    }
+    v.line(
+        origin + cell / 2.0,
+        origin + cell / 2.0,
+        origin + 3.0 * (cell + gap) + cell / 2.0,
+        origin + 3.0 * (cell + gap) + cell / 2.0,
+        10.0 * u,
+        [40, 200, 220, 110],
+    );
+    let hue: f32 = index as f32 * 0.61;
+    let tint = |phase: f32| -> [u8; 4] {
+        let c = |p: f32| (140.0 + 115.0 * (hue + phase + p).sin()) as u8;
+        [c(0.0), c(2.1), c(4.2), 235]
+    };
+    let spin: f32 = t * 0.9 + index as f32 * 0.37;
+    let spots: [(f32, f32, f32, u32); 3] = [
+        (size - 52.0 * u, size - 52.0 * u, 56.0 * u, 1),
+        (44.0 * u, size - 44.0 * u, 44.0 * u, 0),
+        (size - 36.0 * u, 36.0 * u, 36.0 * u, 2),
+    ];
+    for (n, (cx, cy, s, k)) in spots.into_iter().enumerate() {
+        let dir: f32 = if n % 2 == 0 { 1.0 } else { -1.3 };
+        v.image_rect(
+            sprites,
+            sprite_rect(k),
+            [cx - s / 2.0, cy - s / 2.0, s, s],
+            spin * dir + n as f32,
+            tint(n as f32),
+        );
+    }
+    v
 }
