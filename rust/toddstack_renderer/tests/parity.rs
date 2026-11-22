@@ -197,13 +197,13 @@ fn gpu_backends() -> impl Iterator<Item = Backend> {
         .filter(|b| *b != Backend::Cpu)
 }
 
-fn scene_parity<F>(name: &str, target: Target, budget: &Budget, build: F)
+fn scene_parity<F>(name: &str, target: &Target, budget: &Budget, build: F)
 where
     F: Fn(&mut Renderer) -> toddstack_renderer::Result<Scene> + Copy,
 {
     for b in gpu_backends() {
         let Some((caps, diff)) =
-            pollster::block_on(demo::parity_scene(b, target, build)).expect("parity run")
+            pollster::block_on(demo::parity_scene(b, target.clone(), build)).expect("parity run")
         else {
             println!("{name} {}: skipped, no adapter", b.name());
             continue;
@@ -219,7 +219,7 @@ where
 
 #[test]
 fn image_quads_scaled_nearest_and_linear_with_opacity_match_the_cpu_within_the_arena_budget() {
-    scene_parity("images", Target::offscreen(640, 260), &Budget::ARENA, |r| {
+    scene_parity("images", &Target::offscreen(640, 260), &Budget::ARENA, |r| {
         let font = r.add_font(FONT)?;
         demo::images_scene(r, font)
     });
@@ -227,7 +227,7 @@ fn image_quads_scaled_nearest_and_linear_with_opacity_match_the_cpu_within_the_a
 
 #[test]
 fn paths_with_curves_dashes_joins_holes_and_text_between_runs_match_the_cpu() {
-    scene_parity("paths", Target::offscreen(640, 400), &Budget::PATHS, |r| {
+    scene_parity("paths", &Target::offscreen(640, 400), &Budget::PATHS, |r| {
         Ok(demo::paths_scene(r.add_font(FONT)?))
     });
 }
@@ -236,7 +236,7 @@ fn paths_with_curves_dashes_joins_holes_and_text_between_runs_match_the_cpu() {
 fn a_kernel_output_drawn_as_a_scene_image_matches_the_cpu_form() {
     scene_parity(
         "texture",
-        Target::offscreen(640, 270),
+        &Target::offscreen(640, 270),
         &Budget::KERNEL,
         |r| {
             let font = r.add_font(FONT)?;
@@ -377,7 +377,7 @@ fn paths_fill_non_zero_winding_keep_holes_and_respect_paint_order_on_every_backe
     let mut all: Vec<Backend> = vec![Backend::Cpu];
     all.extend(gpu_backends());
     for b in all {
-        let Some(px) = render_on(b, target, build) else {
+        let Some(px) = render_on(b, target.clone(), build) else {
             continue;
         };
         assert_eq!(

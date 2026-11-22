@@ -6,19 +6,26 @@ const info = document.querySelector<HTMLElement>("#info")!;
 const params = new URLSearchParams(location.search);
 const font = new Uint8Array(await (await fetch("./dist/Arimo-Bold.ttf")).arrayBuffer());
 
-async function show(name: Demo, size: [number, number]): Promise<void> {
+const readback = params.get("readback") === "1";
+let current: Demo = "board";
+
+async function show(name: Demo, size: readonly [number, number]): Promise<void> {
+  current = name;
   r.resize(...size);
+  // One canvas pixel per device pixel, so it stays crisp at any zoom or screen density.
+  canvas.style.width = `${size[0] / devicePixelRatio}px`;
   r.demo(name);
   const t0 = performance.now();
   await r.render();
-  info.textContent = `${name}: ${r.backend} | ${r.adapter} | compute ${r.compute} | ${
-    (performance.now() - t0).toFixed(1)
-  } ms`;
+  const ms = performance.now() - t0;
+  const how = readback ? "render + readback" : "present (submit)";
+  info.textContent = `${name}: ${r.backend} | ${r.adapter} | compute ${r.compute} | ${how} ${ms.toFixed(1)} ms`;
+  Object.assign(globalThis, { lastFrame: { name, backend: r.backend, ms, readback } });
 }
 
 canvas.width = 520;
 canvas.height = 520;
-const r = await Renderer.create(canvas, { font, backend: params.get("backend") ?? undefined });
+const r = await Renderer.create(canvas, { font, backend: params.get("backend") ?? undefined, readback });
 const sizes = {
   board: [520, 520],
   chart: [640, 400],
@@ -29,10 +36,16 @@ const sizes = {
 } as const;
 for (const name of Object.keys(sizes) as Demo[]) {
   document.querySelector(`#${name}`)!.addEventListener("click", () => {
-    show(name, [...sizes[name]]).catch((e) => {
+    show(name, sizes[name]).catch((e) => {
       info.textContent = `${name}: ${e instanceof Error ? e.message : String(e)}`;
     });
   });
 }
+// A window resize or zoom changes the device pixel ratio: redraw at the new density.
+addEventListener("resize", () => {
+  show(current, sizes[current]).catch((e) => {
+    info.textContent = `${current}: ${e instanceof Error ? e.message : String(e)}`;
+  });
+});
 const first = (params.get("demo") as Demo | null) ?? "board";
-await show(first, [...sizes[first]]);
+await show(first, sizes[first]);

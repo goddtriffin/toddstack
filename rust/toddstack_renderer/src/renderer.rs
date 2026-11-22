@@ -9,20 +9,64 @@ use crate::gpu::Gpu;
 use crate::kernel::{Kernel, KernelOutput, KernelPath};
 use crate::scene::{BatchId, FontId, ImageId, Sampling, Scene};
 
-/// What to render into: an offscreen RGBA8 image of this size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a target draws.
+#[derive(Clone, Debug)]
+pub(crate) enum Kind {
+    /// An RGBA8 image; [`Renderer::render`] reads it back.
+    Image,
+    #[cfg(target_arch = "wasm32")]
+    Html(web_sys::HtmlCanvasElement),
+    #[cfg(target_arch = "wasm32")]
+    Offscreen(web_sys::OffscreenCanvas),
+}
+
+/// What to render into: an offscreen RGBA8 image (readback), or on wasm32 a canvas that
+/// [`Renderer::present`] draws to directly.
+#[derive(Clone, Debug)]
 pub struct Target {
     /// Width in pixels.
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
+    pub(crate) kind: Kind,
 }
 
 impl Target {
-    /// An offscreen target.
+    /// An offscreen target: the only one whose pixels [`Renderer::render`] can read back.
     #[must_use]
     pub const fn offscreen(width: u32, height: u32) -> Self {
-        Self { width, height }
+        Self {
+            width,
+            height,
+            kind: Kind::Image,
+        }
+    }
+
+    /// A canvas element, sized to its current `width` and `height` attributes. The renderer takes
+    /// the canvas's context (WebGPU, WebGL2 or 2D), so give it a canvas nothing else draws on.
+    #[cfg(target_arch = "wasm32")]
+    #[must_use]
+    pub fn canvas(canvas: web_sys::HtmlCanvasElement) -> Self {
+        Self {
+            width: canvas.width(),
+            height: canvas.height(),
+            kind: Kind::Html(canvas),
+        }
+    }
+
+    /// An `OffscreenCanvas` (for a worker), sized as [`Target::canvas`].
+    #[cfg(target_arch = "wasm32")]
+    #[must_use]
+    pub fn offscreen_canvas(canvas: web_sys::OffscreenCanvas) -> Self {
+        Self {
+            width: canvas.width(),
+            height: canvas.height(),
+            kind: Kind::Offscreen(canvas),
+        }
+    }
+
+    pub(crate) const fn is_canvas(&self) -> bool {
+        !matches!(self.kind, Kind::Image)
     }
 }
 
@@ -73,6 +117,8 @@ pub struct Renderer {
     images: Vec<Option<(u32, u32)>>,
     width: u32,
     height: u32,
+    /// A canvas target: `present` draws it, `render` (readback) is refused.
+    canvas: bool,
 }
 
 impl Renderer {
@@ -90,6 +136,7 @@ impl Renderer {
     /// `NoBackend` if a forced GPU backend is unavailable; `BadInput` for a bad target.
     pub async fn with_options(target: Target, options: Options) -> Result<Self> {
         let (width, height): (u32, u32) = (target.width, target.height);
+        let canvas: bool = target.is_canvas();
         let chain: Vec<Backend> = options
             .force
             .map_or_else(|| Backend::chain().to_vec(), |b| vec![b]);
@@ -98,16 +145,17 @@ impl Renderer {
             tried.push(b.name());
             if b == Backend::Cpu {
                 return Ok(Self {
-                    inner: Inner::Cpu(Cpu::new(width, height)?),
+                    inner: Inner::Cpu(Cpu::new(&target)?),
                     caps: Capabilities::cpu(),
                     atlas: Atlas::new(),
                     batches: Vec::new(),
                     images: Vec::new(),
                     width,
                     height,
+                    canvas,
                 });
             }
-            if let Some(gpu) = Gpu::create(b, width, height, options.data_texture).await? {
+            if let Some(gpu) = Gpu::create(b, &target, options.data_texture).await? {
                 let caps: Capabilities = gpu.caps.clone();
                 return Ok(Self {
                     inner: Inner::Gpu(Box::new(gpu)),
@@ -117,6 +165,7 @@ impl Renderer {
                     images: Vec::new(),
                     width,
                     height,
+                    canvas,
                 });
             }
         }
@@ -155,7 +204,7 @@ impl Renderer {
     /// `BadInput` for an empty or oversized target.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         match &mut self.inner {
-            Inner::Gpu(g) => g.resize(width, height),
+            Inner::Gpu(g) => g.resize(width, height)?,
             Inner::Cpu(c) => c.resize(width, height)?,
         }
         self.width = width;
@@ -232,11 +281,18 @@ impl Renderer {
         Ok(())
     }
 
-    /// Draws the scene and returns the image as RGBA8 (`width * height * 4` bytes).
+    /// Draws the scene and returns the image as RGBA8 (`width * height * 4` bytes): a readback,
+    /// for tests and for callers that want pixels. Offscreen targets only; use
+    /// [`Renderer::present`] for a canvas.
     ///
     /// # Errors
-    /// `AtlasFull`, `UnknownFont`, or a readback failure.
+    /// `BadInput` on a canvas target; `AtlasFull`, `UnknownFont`, or a readback failure.
     pub async fn render(&mut self, scene: &Scene) -> Result<Vec<u8>> {
+        if self.canvas {
+            return Err(Error::BadInput(
+                "a canvas target has no readback: use present, or an offscreen target".to_owned(),
+            ));
+        }
         let flat = self.atlas.flatten(scene)?;
         match &mut self.inner {
             Inner::Cpu(c) => Ok(c.render(&flat, &self.atlas.pixels, scene.clear, &self.batches)),
@@ -249,6 +305,29 @@ impl Renderer {
                 let px: Vec<u8> = g.render(&flat, upload, scene.clear, &self.batches).await?;
                 self.atlas.dirty = false;
                 Ok(px)
+            }
+        }
+    }
+
+    /// Draws the scene to the target with no readback: a canvas target shows the frame (GPU
+    /// backends present the surface; the CPU backend `putImageData`s into the canvas's 2D
+    /// context); an offscreen target just runs the frame. Synchronous.
+    ///
+    /// # Errors
+    /// `AtlasFull`, `UnknownFont`, or `Surface` if the canvas surface cannot be recovered.
+    pub fn present(&mut self, scene: &Scene) -> Result<()> {
+        let flat = self.atlas.flatten(scene)?;
+        match &mut self.inner {
+            Inner::Cpu(c) => c.present(&flat, &self.atlas.pixels, scene.clear, &self.batches),
+            Inner::Gpu(g) => {
+                let upload: Option<&[u8]> = if self.atlas.dirty {
+                    Some(&self.atlas.pixels)
+                } else {
+                    None
+                };
+                g.present(&flat, upload, scene.clear, &self.batches)?;
+                self.atlas.dirty = false;
+                Ok(())
             }
         }
     }

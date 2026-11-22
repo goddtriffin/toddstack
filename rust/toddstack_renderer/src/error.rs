@@ -39,6 +39,9 @@ pub enum Error {
         /// The kernel's name.
         kernel: String,
     },
+    /// The canvas surface could not be recovered after being lost or outdated.
+    #[error("the canvas surface is unusable: {0}")]
+    Surface(String),
     /// Reading a GPU buffer back failed.
     #[error("GPU readback failed: {0}")]
     Readback(String),

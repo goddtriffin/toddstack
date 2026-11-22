@@ -1,5 +1,5 @@
 //! wasm-bindgen surface for the TypeScript wrapper in `web/renderer.ts`: build a scene with calls,
-//! render, get RGBA bytes back.
+//! present it to a canvas (or read RGBA bytes back from an offscreen target).
 
 use crate::{Backend, BatchId, Error, FontId, Options, Renderer, Scene, Target, demo};
 use std::collections::HashMap;
@@ -22,10 +22,39 @@ pub struct WebRenderer {
 
 #[wasm_bindgen]
 impl WebRenderer {
-    /// `backend` is an optional override: webgpu, webgl2 or cpu.
+    /// Draws straight to `canvas` (its current `width` and `height`; the renderer takes its
+    /// context). `backend` is an optional override: webgpu, webgl2 or cpu.
     pub async fn create(
+        canvas: web_sys::HtmlCanvasElement,
+        font: Vec<u8>,
+        backend: Option<String>,
+    ) -> Result<WebRenderer, JsError> {
+        Self::make(Target::canvas(canvas), font, backend).await
+    }
+
+    /// As `create`, for an `OffscreenCanvas` (a worker).
+    #[wasm_bindgen(js_name = createOffscreen)]
+    pub async fn create_offscreen(
+        canvas: web_sys::OffscreenCanvas,
+        font: Vec<u8>,
+        backend: Option<String>,
+    ) -> Result<WebRenderer, JsError> {
+        Self::make(Target::offscreen_canvas(canvas), font, backend).await
+    }
+
+    /// An offscreen target of this size, for `render()` (readback) instead of `present()`.
+    #[wasm_bindgen(js_name = createReadback)]
+    pub async fn create_readback(
         width: u32,
         height: u32,
+        font: Vec<u8>,
+        backend: Option<String>,
+    ) -> Result<WebRenderer, JsError> {
+        Self::make(Target::offscreen(width, height), font, backend).await
+    }
+
+    async fn make(
+        target: Target,
         font: Vec<u8>,
         backend: Option<String>,
     ) -> Result<WebRenderer, JsError> {
@@ -33,7 +62,7 @@ impl WebRenderer {
             force: backend.as_deref().and_then(Backend::parse),
             data_texture: None,
         };
-        let mut inner: Renderer = Renderer::with_options(Target::offscreen(width, height), options)
+        let mut inner: Renderer = Renderer::with_options(target, options)
             .await
             .map_err(|e| js(&e))?;
         let font: FontId = inner.add_font(&font).map_err(|e| js(&e))?;
@@ -164,7 +193,12 @@ impl WebRenderer {
         Ok(())
     }
 
-    /// Draws the scene; returns `width * height * 4` RGBA bytes.
+    /// Draws the scene to the canvas: no readback, nothing to await.
+    pub fn present(&mut self) -> Result<(), JsError> {
+        self.inner.present(&self.scene).map_err(|e| js(&e))
+    }
+
+    /// Readback targets only: draws the scene and returns `width * height * 4` RGBA bytes.
     pub async fn render(&mut self) -> Result<Vec<u8>, JsError> {
         self.inner.render(&self.scene).await.map_err(|e| js(&e))
     }

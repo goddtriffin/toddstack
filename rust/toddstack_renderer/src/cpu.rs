@@ -18,8 +18,17 @@ use tiny_skia::{
     Stroke, Transform,
 };
 
+/// The canvas's 2D context, when the target is a canvas.
+#[cfg(target_arch = "wasm32")]
+enum Ctx2d {
+    Html(web_sys::CanvasRenderingContext2d),
+    Offscreen(web_sys::OffscreenCanvasRenderingContext2d),
+}
+
 pub struct Cpu {
     pm: Pixmap,
+    #[cfg(target_arch = "wasm32")]
+    ctx: Option<Ctx2d>,
     /// Premultiplied pixels and how to sample them, by image id.
     images: Vec<Option<(Pixmap, FilterQuality)>>,
 }
@@ -80,18 +89,106 @@ fn fill_paths(pm: &mut Pixmap, paths: &[crate::glyphs::PathDraw]) {
 }
 
 impl Cpu {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(target: &crate::renderer::Target) -> Result<Self> {
+        let (width, height): (u32, u32) = (target.width, target.height);
         let pm: Pixmap = Pixmap::new(width, height).ok_or_else(|| {
             Error::BadInput(format!("target {width}x{height} is empty or too large"))
         })?;
         Ok(Self {
             pm,
+            #[cfg(target_arch = "wasm32")]
+            ctx: Self::context(&target.kind)?,
             images: Vec::new(),
         })
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn context(kind: &crate::renderer::Kind) -> Result<Option<Ctx2d>> {
+        use crate::renderer::Kind;
+        use wasm_bindgen::JsCast as _;
+        let none = || {
+            Error::Surface(
+                "the canvas has no 2D context (a GPU context already took it)".to_owned(),
+            )
+        };
+        Ok(match kind {
+            Kind::Image => None,
+            Kind::Html(c) => Some(Ctx2d::Html(
+                c.get_context("2d")
+                    .ok()
+                    .flatten()
+                    .and_then(|o| o.dyn_into().ok())
+                    .ok_or_else(none)?,
+            )),
+            Kind::Offscreen(c) => Some(Ctx2d::Offscreen(
+                c.get_context("2d")
+                    .ok()
+                    .flatten()
+                    .and_then(|o| o.dyn_into().ok())
+                    .ok_or_else(none)?,
+            )),
+        })
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
-        self.pm = Self::new(width, height)?.pm;
+        self.pm = Pixmap::new(width, height).ok_or_else(|| {
+            Error::BadInput(format!("target {width}x{height} is empty or too large"))
+        })?;
+        #[cfg(target_arch = "wasm32")]
+        self.set_canvas_size(width, height);
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn set_canvas_size(&self, width: u32, height: u32) {
+        match &self.ctx {
+            Some(Ctx2d::Html(c)) => {
+                if let Some(cv) = c.canvas() {
+                    cv.set_width(width);
+                    cv.set_height(height);
+                }
+            }
+            Some(Ctx2d::Offscreen(c)) => {
+                let cv = c.canvas();
+                cv.set_width(width);
+                cv.set_height(height);
+            }
+            None => {}
+        }
+    }
+
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "fallible on wasm32, where it writes to a canvas"
+        )
+    )]
+    /// Draws the frame, then `putImageData`s it into the canvas (a no-op for an offscreen target).
+    pub fn present(
+        &mut self,
+        flat: &Flat,
+        atlas: &[u8],
+        clear: Rgba,
+        batches: &[BatchState],
+    ) -> Result<()> {
+        self.draw(flat, atlas, clear, batches);
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::Clamped;
+            let img: web_sys::ImageData = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
+                Clamped(self.pm.data()),
+                self.pm.width(),
+                self.pm.height(),
+            )
+            .map_err(|e| Error::Surface(format!("{e:?}")))?;
+            let put = match &self.ctx {
+                Some(Ctx2d::Html(c)) => c.put_image_data(&img, 0.0, 0.0),
+                Some(Ctx2d::Offscreen(c)) => c.put_image_data(&img, 0.0, 0.0),
+                None => Ok(()),
+            };
+            put.map_err(|e| Error::Surface(format!("{e:?}")))?;
+        }
         Ok(())
     }
 
@@ -126,6 +223,11 @@ impl Cpu {
         clear: Rgba,
         batches: &[BatchState],
     ) -> Vec<u8> {
+        self.draw(flat, atlas, clear, batches);
+        self.pm.data().to_vec()
+    }
+
+    fn draw(&mut self, flat: &Flat, atlas: &[u8], clear: Rgba, batches: &[BatchState]) {
         let (w, h): (i32, i32) = (self.pm.width() as i32, self.pm.height() as i32);
         self.pm
             .fill(Color::from_rgba8(clear[0], clear[1], clear[2], clear[3]));
@@ -219,6 +321,5 @@ impl Cpu {
                 }
             }
         }
-        self.pm.data().to_vec()
     }
 }

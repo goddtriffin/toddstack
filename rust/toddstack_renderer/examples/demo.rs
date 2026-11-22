@@ -75,10 +75,10 @@ fn p50_max(mut ms: Vec<f64>) -> (f64, f64) {
     (ms[ms.len() / 2], ms[ms.len() - 1])
 }
 
-async fn renderer(a: &Args, t: Target, force: Option<Backend>) -> Renderer {
+async fn renderer(a: &Args, t: &Target, force: Option<Backend>) -> Renderer {
     let mut opts: Options = Options::from_env();
     opts.force = force.or(a.backend);
-    let r: Renderer = match Renderer::with_options(t, opts).await {
+    let r: Renderer = match Renderer::with_options(t.clone(), opts).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("no renderer: {e}");
@@ -104,7 +104,7 @@ where
     F: Fn(&mut Renderer) -> Scene,
 {
     println!("{name} ({}x{})", t.width, t.height);
-    let mut gpu: Renderer = renderer(a, t, None).await;
+    let mut gpu: Renderer = renderer(a, &t, None).await;
     let scene: Scene = build(&mut gpu);
     let mut ms: Vec<f64> = Vec::new();
     let mut px: Vec<u8> = Vec::new();
@@ -124,7 +124,7 @@ where
         t.height,
         &px,
     );
-    let mut cpu: Renderer = renderer(a, t, Some(Backend::Cpu)).await;
+    let mut cpu: Renderer = renderer(a, &t, Some(Backend::Cpu)).await;
     let scene: Scene = build(&mut cpu);
     let s: Instant = Instant::now();
     let reference: Vec<u8> = cpu.render(&scene).await.expect("cpu render");
@@ -147,7 +147,7 @@ where
 async fn quantize(a: &Args) {
     let (width, height): (u32, u32) = (640, 480);
     println!("quantize ({width}x{height})");
-    let rend: Renderer = renderer(a, Target::offscreen(width, height), None).await;
+    let rend: Renderer = renderer(a, &Target::offscreen(width, height), None).await;
     let kernel: Kernel = demo::quantize_kernel(width, height);
     let cpu_out = rend
         .run_kernel_with(&kernel, KernelPath::Cpu)

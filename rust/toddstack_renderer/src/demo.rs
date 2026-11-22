@@ -663,7 +663,7 @@ where
 {
     use crate::{Backend, Diff, Error, Options};
     let mut cpu: Renderer = Renderer::with_options(
-        target,
+        target.clone(),
         Options {
             force: Some(Backend::Cpu),
             data_texture: None,
