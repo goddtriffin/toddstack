@@ -158,7 +158,10 @@ mod tests {
     #[test]
     fn first_accepted_wins() {
         let c = [Backend::WebGpu, Backend::WebGl2, Backend::Cpu];
-        assert_eq!(run(&c, &[Backend::WebGpu, Backend::WebGl2]), Some((Backend::WebGpu, true)));
+        assert_eq!(
+            run(&c, &[Backend::WebGpu, Backend::WebGl2]),
+            Some((Backend::WebGpu, true))
+        );
         assert_eq!(run(&c, &[Backend::WebGl2]), Some((Backend::WebGl2, true)));
     }
 

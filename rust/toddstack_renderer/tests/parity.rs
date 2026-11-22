@@ -219,10 +219,15 @@ where
 
 #[test]
 fn image_quads_scaled_nearest_and_linear_with_opacity_match_the_cpu_within_the_arena_budget() {
-    scene_parity("images", &Target::offscreen(640, 260), &Budget::ARENA, |r| {
-        let font = r.add_font(FONT)?;
-        demo::images_scene(r, font)
-    });
+    scene_parity(
+        "images",
+        &Target::offscreen(640, 260),
+        &Budget::ARENA,
+        |r| {
+            let font = r.add_font(FONT)?;
+            demo::images_scene(r, font)
+        },
+    );
 }
 
 #[test]

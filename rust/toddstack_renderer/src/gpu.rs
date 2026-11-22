@@ -12,10 +12,10 @@ use crate::glyphs::{ATLAS_SIZE, Flat, Inst, Run};
 use crate::gpu_image::{GpuImage, ImagePipes};
 use crate::gpu_path::{self, Layer, PVert, PathPipes};
 use crate::kernel::{Binding, FULLSCREEN_VS, Kernel, KernelPath};
-use crate::renderer::Target;
-use crate::scene::{ImageId, Rgba, Sampling};
 #[cfg(target_arch = "wasm32")]
 use crate::renderer::Kind;
+use crate::renderer::Target;
+use crate::scene::{ImageId, Rgba, Sampling};
 use wgpu::util::DeviceExt;
 
 /// The attributes of one [`Inst`], shared by the shape and image pipelines.
@@ -251,9 +251,8 @@ impl Gpu {
         {
             return Ok(None);
         }
-        let keep: bool = !(cfg!(target_arch = "wasm32")
-            && backend == Backend::WebGl2
-            && target.is_canvas());
+        let keep: bool =
+            !(cfg!(target_arch = "wasm32") && backend == Backend::WebGl2 && target.is_canvas());
         Ok(Some(Probe {
             backend,
             instance,
@@ -329,8 +328,13 @@ impl Gpu {
         }
         let surf: Option<Surf> = match surface {
             Some(surface) if target.is_canvas() => {
-                let Some(config) =
-                    surface_config(&surface, &adapter, width, height, caps.max_texture_dimension_2d)?
+                let Some(config) = surface_config(
+                    &surface,
+                    &adapter,
+                    width,
+                    height,
+                    caps.max_texture_dimension_2d,
+                )?
                 else {
                     return Err(Error::Surface(format!(
                         "the canvas surface cannot take {FORMAT:?}"
@@ -826,9 +830,10 @@ impl Gpu {
             .ok_or_else(|| Error::BadInput("a canvas target has no readback".to_owned()))?
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.draw(flat, atlas, clear, batches, &view);
-        let target: &wgpu::Texture = self.target.as_ref().ok_or_else(|| {
-            Error::BadInput("a canvas target has no readback".to_owned())
-        })?;
+        let target: &wgpu::Texture = self
+            .target
+            .as_ref()
+            .ok_or_else(|| Error::BadInput("a canvas target has no readback".to_owned()))?;
         self.read_texture(target, self.width, self.height).await
     }
 
@@ -1376,12 +1381,12 @@ fn surface_config(
     if !caps.formats.contains(&FORMAT) {
         return Ok(None);
     }
-    let alpha: wgpu::CompositeAlphaMode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque)
-    {
-        wgpu::CompositeAlphaMode::Opaque
-    } else {
-        caps.alpha_modes.first().copied().unwrap_or_default()
-    };
+    let alpha: wgpu::CompositeAlphaMode =
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes.first().copied().unwrap_or_default()
+        };
     Ok(Some(wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: FORMAT,
