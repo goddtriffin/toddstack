@@ -456,13 +456,6 @@ mod tests {
             blocked_by: None,
             mem_declared: false,
             mem_peak_at_ms: None,
-            cpu_hold_ms: None,
-            cpu_settled: false,
-            non_heavy_cpu_at_start: 0,
-            fast: false,
-            cpu_sustained: None,
-            run_p90_ms: None,
-            cold: false,
             vram_declared: false,
         }
     }

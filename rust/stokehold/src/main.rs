@@ -7,6 +7,8 @@ mod history;
 mod job;
 mod log;
 mod machine;
+#[cfg(test)]
+mod replay;
 mod report;
 mod run;
 mod sample;

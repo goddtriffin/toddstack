@@ -1,6 +1,6 @@
 //! End-to-end tests of the `heavy` binary with a temp state dir and overridden capacity numbers.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -230,10 +230,13 @@ fn small_jobs_run_together_with_no_job_cap() {
     let start = Instant::now();
     for k in kids {
         let o = k.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        // Racing waiters let the oldest one go first ("which can start now"); nothing else may hold them.
         assert!(
-            !String::from_utf8_lossy(&o.stderr).contains("waiting"),
-            "{}",
-            String::from_utf8_lossy(&o.stderr)
+            err.lines()
+                .filter(|l| l.contains("waiting"))
+                .all(|l| l.contains("which can start now")),
+            "{err}"
         );
     }
     assert!(start.elapsed() < Duration::from_secs(4), "ran in parallel");
@@ -499,11 +502,11 @@ fn runs_under_a_pty_and_passes_the_exit_code() {
 #[test]
 fn stopped_waiting_head_wakes_the_follower_at_once() {
     let t = TempDir::new().unwrap();
-    // Holder keeps 4G. The head needs 12G (does not fit next to it). The follower needs more cores than the head,
-    // so it waits behind the head although it would fit.
+    // Holder (5 of 8 cores) has just started and settles for 10 s. The head (2 cores) does not fit under the 80%
+    // line (6.4 cores) beside it until then; the follower (1 core) would, but waits behind the settle-blocked head.
     let (holder, _out) = start_ready(
         t.path(),
-        &["--cpu", "1", "--mem", "4G"],
+        &["--cpu", "5", "--mem", "1G"],
         "echo ready; sleep 60",
     );
     let spawn = |extra: &[&str]| {
@@ -514,12 +517,12 @@ fn stopped_waiting_head_wakes_the_follower_at_once() {
             .spawn()
             .unwrap()
     };
-    let mut head = spawn(&["--cpu", "1", "--mem", "12G"]);
+    let mut head = spawn(&["--cpu", "2", "--mem", "1G"]);
     let mut head_err = BufReader::new(head.stderr.take().unwrap());
     let mut line = String::new();
     head_err.read_line(&mut line).unwrap();
     assert!(line.contains("waiting"), "{line}");
-    let mut follower = spawn(&["--cpu", "2", "--mem", "1G"]);
+    let mut follower = spawn(&["--cpu", "1", "--mem", "1G"]);
     let mut follower_err = BufReader::new(follower.stderr.take().unwrap());
     line.clear();
     follower_err.read_line(&mut line).unwrap();
@@ -527,13 +530,15 @@ fn stopped_waiting_head_wakes_the_follower_at_once() {
     let start = Instant::now();
     kill(&head, "-TSTP");
     let status = follower.wait().unwrap();
-    assert!(status.success());
+    let elapsed = start.elapsed();
+    let mut rest = String::new();
+    let _ = follower_err.read_to_string(&mut rest);
+    assert!(status.success(), "{line}{rest}");
     assert!(
-        start.elapsed() < Duration::from_secs(10),
-        "follower stalled for {:?}",
-        start.elapsed()
+        elapsed < Duration::from_secs(10),
+        "follower stalled for {elapsed:?}: {line}{rest}"
     );
-    // The head resumes and is queued again (it still cannot fit), then is torn down.
+    // The head resumes and is queued again, then is torn down.
     kill(&head, "-CONT");
     kill(&head, "-TERM");
     let _ = head.wait();
