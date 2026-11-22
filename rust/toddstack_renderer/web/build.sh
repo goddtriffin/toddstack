@@ -5,9 +5,9 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 export CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_OPT_LEVEL=z CARGO_PROFILE_RELEASE_PANIC=abort \
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols
-stokehold cargo build --release --package toddstack-renderer --target wasm32-unknown-unknown --lib
+stokehold cargo build --release --package toddstack-renderer --target wasm32-unknown-unknown --example web
 rm -rf toddstack_renderer/web/pkg toddstack_renderer/web/dist
-wasm-bindgen --target web --out-dir toddstack_renderer/web/pkg target/wasm32-unknown-unknown/release/toddstack_renderer.wasm
+wasm-bindgen --target web --out-dir toddstack_renderer/web/pkg --out-name toddstack_renderer target/wasm32-unknown-unknown/release/examples/web.wasm
 wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-reference-types \
   --enable-mutable-globals -o toddstack_renderer/web/pkg/toddstack_renderer_bg.wasm toddstack_renderer/web/pkg/toddstack_renderer_bg.wasm
 deno bundle --config toddstack_renderer/web/deno.jsonc --output toddstack_renderer/web/dist/example.js toddstack_renderer/web/example.ts

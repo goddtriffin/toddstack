@@ -70,8 +70,19 @@ impl Target {
     }
 }
 
+/// `BadInput` unless both sides are 1 to `max`.
+pub(crate) fn check_size(width: u32, height: u32, max: u32) -> Result<()> {
+    if width == 0 || height == 0 || width > max || height > max {
+        return Err(Error::BadInput(format!(
+            "target {width}x{height} is empty or larger than {max}"
+        )));
+    }
+    Ok(())
+}
+
 /// Overrides for backend selection.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct Options {
     /// Use only this backend (fails with `NoBackend` if it is missing, except `Cpu`).
     /// `None` walks [`Backend::chain`].
@@ -82,6 +93,29 @@ pub struct Options {
 }
 
 impl Options {
+    /// No overrides: the platform's fallback chain, capability-picked batch data.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            force: None,
+            data_texture: None,
+        }
+    }
+
+    /// Use only this backend (or the chain again with `None`).
+    #[must_use]
+    pub fn with_force(mut self, force: impl Into<Option<Backend>>) -> Self {
+        self.force = force.into();
+        self
+    }
+
+    /// Force batches onto data textures (`true`) or storage buffers (`false`), or `None` to pick.
+    #[must_use]
+    pub fn with_data_texture(mut self, data_texture: impl Into<Option<bool>>) -> Self {
+        self.data_texture = data_texture.into();
+        self
+    }
+
     /// `WGPU_BACKEND=vulkan|dx12|metal|gl|cpu` (native only; unset or unknown means no override).
     #[must_use]
     pub fn from_env() -> Self {
@@ -90,14 +124,11 @@ impl Options {
             let force: Option<Backend> = std::env::var("WGPU_BACKEND")
                 .ok()
                 .and_then(|s| Backend::parse(&s));
-            Self {
-                force,
-                data_texture: None,
-            }
+            Self::new().with_force(force)
         }
         #[cfg(target_arch = "wasm32")]
         {
-            Self::default()
+            Self::new()
         }
     }
 }
@@ -137,6 +168,8 @@ impl Renderer {
     pub async fn with_options(target: Target, options: Options) -> Result<Self> {
         let (width, height): (u32, u32) = (target.width, target.height);
         let canvas: bool = target.is_canvas();
+        // The upper bound is the chosen backend's texture limit, checked once it is known.
+        check_size(width, height, u32::MAX)?;
         let chain: Vec<Backend> = options
             .force
             .map_or_else(|| Backend::chain().to_vec(), |b| vec![b]);
@@ -202,6 +235,7 @@ impl Renderer {
     /// # Errors
     /// `BadInput` for an empty or oversized target.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        check_size(width, height, self.caps.max_texture_dimension_2d)?;
         match &mut self.inner {
             Inner::Gpu(g) => g.resize(width, height)?,
             Inner::Cpu(c) => c.resize(width, height)?,
@@ -222,11 +256,11 @@ impl Renderer {
     /// Adds a custom batch; draw it with `Scene::batch`.
     ///
     /// # Errors
-    /// Shader or pipeline problems on the GPU.
-    pub fn add_batch(&mut self, desc: BatchDesc) -> Result<BatchId> {
+    /// `Shader` if the GPU rejects the WGSL or the pipeline (async: the GPU reports it later).
+    pub async fn add_batch(&mut self, desc: BatchDesc) -> Result<BatchId> {
         let state: BatchState = desc.into();
         if let Inner::Gpu(g) = &mut self.inner {
-            g.add_batch(&state)?;
+            g.add_batch(&state).await?;
         }
         self.batches.push(state);
         Ok(BatchId(self.batches.len() - 1))
@@ -238,7 +272,9 @@ impl Renderer {
     /// `UnknownBatch`, or `BadInput` if the range is past the batch's data.
     pub fn update_batch(&mut self, id: BatchId, offset: usize, words: &[u32]) -> Result<()> {
         let b: &mut BatchState = self.batches.get_mut(id.0).ok_or(Error::UnknownBatch)?;
-        let end: usize = offset + words.len();
+        let end: usize = offset.checked_add(words.len()).ok_or_else(|| {
+            Error::BadInput(format!("batch `{}`: offset {offset} overflows", b.name))
+        })?;
         if end > b.data.len() {
             return Err(Error::BadInput(format!(
                 "batch `{}` has {} words, update ends at {end}",
@@ -248,7 +284,7 @@ impl Renderer {
         }
         b.data[offset..end].copy_from_slice(words);
         if let Inner::Gpu(g) = &self.inner {
-            g.write_batch_data(id.0, &self.batches[id.0].data, offset);
+            g.write_batch_data(id.0, &self.batches[id.0].data, offset, end);
         }
         Ok(())
     }
@@ -271,12 +307,18 @@ impl Renderer {
     /// Sets how many instances the batch draws.
     ///
     /// # Errors
-    /// `UnknownBatch`.
+    /// `UnknownBatch`; `BadInput` if `instances` is more than the batch has data words.
     pub fn set_batch_instances(&mut self, id: BatchId, instances: u32) -> Result<()> {
-        self.batches
-            .get_mut(id.0)
-            .ok_or(Error::UnknownBatch)?
-            .instances = instances;
+        let b: &mut BatchState = self.batches.get_mut(id.0).ok_or(Error::UnknownBatch)?;
+        // Every instance reads at least one data word, so more instances than words is a mistake.
+        if instances as usize > b.data.len() {
+            return Err(Error::BadInput(format!(
+                "batch `{}` has {} words, so it cannot draw {instances} instances",
+                b.name,
+                b.data.len()
+            )));
+        }
+        b.instances = instances;
         Ok(())
     }
 
@@ -383,20 +425,20 @@ impl Renderer {
     ///
     /// # Errors
     /// `KernelUnavailable` if no form can run here.
-    pub fn kernel_image(
+    pub async fn kernel_image(
         &mut self,
         kernel: &Kernel,
         sampling: Sampling,
     ) -> Result<(ImageId, KernelPath)> {
         let path: KernelPath = self.best_path(kernel)?;
-        self.kernel_image_with(kernel, path, sampling)
+        self.kernel_image_with(kernel, path, sampling).await
     }
 
     /// As [`Renderer::kernel_image`], on one named form.
     ///
     /// # Errors
     /// `KernelUnavailable` if the kernel lacks that form, or the backend cannot run it.
-    pub fn kernel_image_with(
+    pub async fn kernel_image_with(
         &mut self,
         kernel: &Kernel,
         path: KernelPath,
@@ -410,7 +452,7 @@ impl Renderer {
                 return Err(unavailable());
             }
             let id: ImageId = ImageId(self.images.len());
-            g.kernel_image(kernel, path, id, sampling)?;
+            g.kernel_image(kernel, path, id, sampling).await?;
             self.images.push(Some((kernel.width, kernel.height)));
             return Ok((id, path));
         }

@@ -614,8 +614,10 @@ fn stroke(width: f32, line_cap: LineCap, line_join: LineJoin) -> Stroke {
 ///
 /// # Errors
 /// Anything the kernel, the image or the font fails with.
-pub fn texture_scene(r: &mut Renderer, font: FontId) -> crate::Result<Scene> {
-    let (id, _path) = r.kernel_image(&quantize_kernel(320, 240), Sampling::Linear)?;
+pub async fn texture_scene(r: &mut Renderer, font: FontId) -> crate::Result<Scene> {
+    let (id, _path) = r
+        .kernel_image(&quantize_kernel(320, 240), Sampling::Linear)
+        .await?;
     let mut v: Scene = Scene::new(BG);
     v.rrect(8.0, 8.0, 328.0, 248.0, 12.0, [91, 74, 58, 255]);
     v.image(id, 12.0, 12.0, 320.0, 240.0, 1.0);
@@ -642,7 +644,7 @@ pub async fn parity(
     backend: crate::Backend,
     font: &[u8],
 ) -> crate::Result<Option<(crate::Capabilities, crate::Diff)>> {
-    parity_scene(backend, crate::Target::offscreen(800, 520), |r| {
+    parity_scene(backend, crate::Target::offscreen(800, 520), async |r| {
         Ok(arena_scene(r.add_font(font)?))
     })
     .await
@@ -659,33 +661,20 @@ pub async fn parity_scene<F>(
     build: F,
 ) -> crate::Result<Option<(crate::Capabilities, crate::Diff)>>
 where
-    F: Fn(&mut Renderer) -> crate::Result<Scene>,
+    F: AsyncFn(&mut Renderer) -> crate::Result<Scene>,
 {
     use crate::{Backend, Diff, Error, Options};
-    let mut cpu: Renderer = Renderer::with_options(
-        target.clone(),
-        Options {
-            force: Some(Backend::Cpu),
-            data_texture: None,
-        },
-    )
-    .await?;
-    let scene: Scene = build(&mut cpu)?;
+    let mut cpu: Renderer =
+        Renderer::with_options(target.clone(), Options::new().with_force(Backend::Cpu)).await?;
+    let scene: Scene = build(&mut cpu).await?;
     let reference: Vec<u8> = cpu.render(&scene).await?;
-    let mut gpu: Renderer = match Renderer::with_options(
-        target,
-        Options {
-            force: Some(backend),
-            data_texture: None,
-        },
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(Error::NoBackend { .. }) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let scene: Scene = build(&mut gpu)?;
+    let mut gpu: Renderer =
+        match Renderer::with_options(target, Options::new().with_force(backend)).await {
+            Ok(r) => r,
+            Err(Error::NoBackend { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+    let scene: Scene = build(&mut gpu).await?;
     let pixels: Vec<u8> = gpu.render(&scene).await?;
     Ok(Some((
         gpu.capabilities().clone(),

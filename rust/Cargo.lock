@@ -4382,6 +4382,7 @@ dependencies = [
  "pollster",
  "thiserror",
  "tiny-skia",
+ "toddstack-renderer",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

@@ -12,13 +12,24 @@ description = "One GPU renderer on wgpu for 2D scenes, custom instanced batches 
 license-file.workspace = true
 keywords = ["wgpu", "renderer", "2d", "compute", "toddstack"]
 categories = ["rendering", "graphics", "wasm"]
-include = ["**/*.rs", "assets/**", "web/**", "Cargo.toml", "LICENSE", "README.md"]
+include = ["**/*.rs", "src/**/*.wgsl", "assets/**", "Cargo.toml", "LICENSE", "README.md"]
 
 [lints]
 workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
+
+[features]
+# The wasm-bindgen `WebRenderer` and the demo scenes behind the example page; off for consumers.
+web-demo = []
+
+# The example page's wasm, built as a cdylib by `web/build.sh` (empty off wasm32). Examples get
+# `web-demo` from the self dev-dependency below.
+[[example]]
+name = "web"
+path = "examples/web.rs"
+crate-type = ["cdylib"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -39,15 +50,16 @@ wgpu = { version = "30.0.2", default-features = false, features = ["std", "wgsl"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "30.0.2", default-features = false, features = ["std", "wgsl", "webgpu", "webgl"] }
-web-sys = { version = "=0.3.107", features = [
+web-sys = { version = "0.3.107", features = [
   "OffscreenCanvas", "OffscreenCanvasRenderingContext2d", "HtmlCanvasElement", "CanvasRenderingContext2d",
   "ImageData", "Window", "WorkerGlobalScope",
 ] }
-# Exact: must equal the installed `wasm-bindgen` CLI that builds the bundle.
-wasm-bindgen = "=0.2.130"
-wasm-bindgen-futures = "=0.4.80"
-js-sys = "=0.3.107"
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+js-sys = "0.3.107"
 
 [dev-dependencies]
+# Self-dependency: tests and examples get the `web-demo` demo scenes.
+toddstack-renderer = { path = ".", features = ["web-demo"] }
 png = "0.18.1"
 pollster = "1.0.3"

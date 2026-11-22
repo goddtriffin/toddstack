@@ -2,7 +2,7 @@
 
 One GPU renderer on [wgpu](https://wgpu.rs) for Todd's apps, with a [tiny-skia](https://crates.io/crates/tiny-skia)
 CPU backend that is both the last fallback and the pixel reference. Part of
-[toddstack](https://github.com/goddtriffin/toddstack). v0, not published.
+[toddstack](https://github.com/goddtriffin/toddstack). Version 0.1.0, not yet published.
 
 Two layers share one `Renderer`:
 
@@ -23,7 +23,7 @@ buffers, limits) report what you got.
 | Windows | Vulkan, DX12, GLES, CPU |
 
 A CPU-type adapter (a software Vulkan) is skipped: the tiny-skia path is the one CPU renderer.
-`Options { force, data_texture }` pins a backend; `Options::from_env()` reads `WGPU_BACKEND`
+`Options::new().with_force(backend).with_data_texture(bool)` pins a backend (`Options`, `Error`, `Backend` and `Capabilities` are `#[non_exhaustive]`); `Options::from_env()` reads `WGPU_BACKEND`
 (`vulkan|dx12|metal|gl|cpu`). Tested: Metal and CPU (Apple M3 Max), WebGPU and WebGL2 in Chrome, Vulkan, DX12 and GLES (RTX 3080). `x86_64-pc-windows-gnu` is clippy-checked, not linked or run.
 
 ## API
@@ -61,8 +61,13 @@ consecutive paths is one layer pass; text, shapes, images and batches drawn betw
 an instance count, and a `CpuBatch` (any `Fn(&[u32], [f32; 4], &mut Pixmap)`). The renderer prepends a
 prelude with `globals` (target size, four params), `to_clip(px)` and `data_at(i)`; `data_at` reads a storage
 buffer, or a data texture where storage buffers are missing (WebGL2), so one WGSL runs on both.
-`update_batch(id, offset, words)` uploads only that range; `set_batch_params`, `set_batch_instances`.
+`add_batch` is `async` (see below). `update_batch(id, offset, words)` uploads only that range (a data texture, whole rows holding it); `set_batch_params`, `set_batch_instances`.
 Draw it in order with `scene.batch(id)`.
+
+**Bad WGSL is an `Err`, not a panic.** `add_batch`, `kernel_image`, `kernel_image_with`, `run_kernel` and
+`run_kernel_with` compile user WGSL inside a wgpu validation error scope, so a rejected shader or pipeline comes back
+as `Error::Shader(message)`. The GPU reports it later, so these are `async` on every platform (native callers
+block with `pollster::block_on`).
 
 **Kernel**: WGSL compute form (inputs at `@binding(0..n)`, output storage texture at `n`), an optional
 fragment form (render-to-texture; `Binding::Storage` becomes a uniform there), an optional CPU function.
@@ -116,10 +121,14 @@ stokehold cargo test --release -p toddstack-renderer -- --nocapture             
 ## Web
 
 ```sh
-rust/toddstack_renderer/web/build.sh        # wasm + glue (web/pkg) + example bundle (web/dist), prints sizes
+rust/toddstack_renderer/web/build.sh        # wasm (the `web` example, a cdylib) + glue (web/pkg) + example bundle (web/dist), prints sizes
 deno run -A jsr:@std/http/file-server rust/toddstack_renderer/web   # then open /index.html
 ```
 
-The wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,337,350 bytes
-raw, 724,768 bytes brotli (712,281 before the canvas target). `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
-`demo`, `resize`, `render` (presents to the canvas; `{ readback: true }` reads back and `putImageData`s instead); demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend, `?readback=1` times the readback path.
+The `WebRenderer` wasm-bindgen class and the `demo` scenes sit behind the cargo feature `web-demo`, off by default, so
+consumers compile neither (the crate is `rlib` only, and `wgpu` is not re-exported). The example, tests and `demo`
+example get the feature through a self dev-dependency; `build.sh` builds `examples/web.rs` as a cdylib.
+
+The wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,205,571 bytes
+raw, 683,190 bytes brotli. `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
+`demo` (async), `resize`, `render` (presents to the canvas; `{ readback: true }` reads back and `putImageData`s instead); demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend, `?readback=1` times the readback path.

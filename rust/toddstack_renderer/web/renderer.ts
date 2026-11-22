@@ -108,9 +108,9 @@ export class Renderer {
   }
 
   /** Replaces the scene with a built-in demo. */
-  demo(name: Demo): void {
+  async demo(name: Demo): Promise<void> {
     this.idle();
-    this.core.demo(name);
+    await this.core.demo(name);
   }
 
   /** Draws the scene onto the canvas. Without `readback` this is one synchronous GPU submit. */

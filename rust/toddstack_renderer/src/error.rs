@@ -2,6 +2,7 @@
 
 /// Everything the renderer can refuse to do.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// No backend in the chain produced a usable adapter; the CPU backend is always last, so this
     /// only happens when the caller forced a GPU backend that is not there.
@@ -42,6 +43,9 @@ pub enum Error {
     /// The canvas surface could not be recovered after being lost or outdated.
     #[error("the canvas surface is unusable: {0}")]
     Surface(String),
+    /// The GPU rejected WGSL or a pipeline built from it (the validation message).
+    #[error("shader or pipeline rejected: {0}")]
+    Shader(String),
     /// Reading a GPU buffer back failed.
     #[error("GPU readback failed: {0}")]
     Readback(String),

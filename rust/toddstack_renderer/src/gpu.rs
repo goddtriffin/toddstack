@@ -322,6 +322,7 @@ impl Gpu {
             max_buffer_size: limits.max_buffer_size,
             max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
         };
+        crate::renderer::check_size(width, height, caps.max_texture_dimension_2d)?;
         #[cfg(target_arch = "wasm32")]
         if surface.is_none() && target.is_canvas() {
             surface = Some(web_surface(&instance, &target.kind, false)?);
@@ -487,13 +488,8 @@ impl Gpu {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        crate::renderer::check_size(width, height, self.caps.max_texture_dimension_2d)?;
         if let Some(s) = &mut self.surface {
-            let max: u32 = self.caps.max_texture_dimension_2d;
-            if width == 0 || height == 0 || width > max || height > max {
-                return Err(Error::BadInput(format!(
-                    "canvas {width}x{height} is empty or larger than {max}"
-                )));
-            }
             s.config.width = width;
             s.config.height = height;
             #[cfg(target_arch = "wasm32")]
@@ -524,7 +520,9 @@ impl Gpu {
         clippy::too_many_lines,
         reason = "one linear layout, buffer and pipeline setup"
     )]
-    pub fn add_batch(&mut self, state: &BatchState) -> Result<()> {
+    pub async fn add_batch(&mut self, state: &BatchState) -> Result<()> {
+        let scope: wgpu::ErrorScopeGuard =
+            self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let dt: bool = self.data_texture;
         let wgsl: String = format!("{}{}", prelude(dt), state.wgsl);
         let module: wgpu::ShaderModule =
@@ -657,6 +655,7 @@ impl Gpu {
                     multiview_mask: None,
                     cache: None,
                 });
+        shader_result(scope).await?;
         self.batches.push(GpuBatch {
             pipeline,
             bind,
@@ -665,12 +664,12 @@ impl Gpu {
             data_tex,
         });
         let idx: usize = self.batches.len() - 1;
-        self.write_batch_data(idx, &state.data, 0);
+        self.write_batch_data(idx, &state.data, 0, state.data.len());
         Ok(())
     }
 
-    /// Uploads `state_data[offset..]`'s changed words; `data` is the whole mirror, `offset` the first changed word.
-    pub fn write_batch_data(&self, idx: usize, data: &[u32], offset: usize) {
+    /// Uploads the changed words `data[offset..end]`; `data` is the whole mirror.
+    pub fn write_batch_data(&self, idx: usize, data: &[u32], offset: usize, end: usize) {
         let Some(b) = self.batches.get(idx) else {
             return;
         };
@@ -678,13 +677,18 @@ impl Gpu {
             self.queue.write_buffer(
                 buf,
                 (offset * 4) as u64,
-                bytemuck::cast_slice(&data[offset..]),
+                bytemuck::cast_slice(&data[offset..end]),
             );
         } else if let Some(tex) = &b.data_tex {
             let w: usize = DATA_TEXTURE_WIDTH as usize;
+            if end <= offset {
+                return;
+            }
+            // A texture upload is whole rows: those holding `offset..end`, re-sent from the
+            // mirror, nothing past the last of them.
             let first: usize = offset / w;
-            let rows: usize = data.len().div_ceil(w);
-            let mut words: Vec<u32> = data[first * w..].to_vec();
+            let rows: usize = end.div_ceil(w);
+            let mut words: Vec<u32> = data[first * w..(rows * w).min(data.len())].to_vec();
             words.resize((rows - first) * w, 0);
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -760,14 +764,14 @@ impl Gpu {
     }
 
     /// Runs the kernel into a texture and keeps it as image `id`: no readback.
-    pub fn kernel_image(
+    pub async fn kernel_image(
         &mut self,
         k: &Kernel,
         path: KernelPath,
         id: ImageId,
         sampling: Sampling,
     ) -> Result<()> {
-        let tex: wgpu::Texture = self.dispatch_kernel(k, path)?;
+        let tex: wgpu::Texture = self.dispatch_kernel(k, path).await?;
         self.put_image(id, tex, sampling, true);
         Ok(())
     }
@@ -1098,7 +1102,7 @@ impl Gpu {
     }
 
     pub async fn run_kernel(&self, k: &Kernel, path: KernelPath) -> Result<Vec<u8>> {
-        let tex: wgpu::Texture = self.dispatch_kernel(k, path)?;
+        let tex: wgpu::Texture = self.dispatch_kernel(k, path).await?;
         self.read_texture(&tex, k.width, k.height).await
     }
 
@@ -1107,7 +1111,9 @@ impl Gpu {
         clippy::too_many_lines,
         reason = "one linear bind-group and pipeline setup for two forms"
     )]
-    fn dispatch_kernel(&self, k: &Kernel, path: KernelPath) -> Result<wgpu::Texture> {
+    async fn dispatch_kernel(&self, k: &Kernel, path: KernelPath) -> Result<wgpu::Texture> {
+        let scope: wgpu::ErrorScopeGuard =
+            self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let compute: bool = path == KernelPath::Compute;
         let stage: wgpu::ShaderStages = if compute {
             wgpu::ShaderStages::COMPUTE
@@ -1314,7 +1320,17 @@ impl Gpu {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([enc.finish()]);
+        shader_result(scope).await?;
         Ok(out_tex)
+    }
+}
+
+/// Ends a validation error scope: a captured error (bad WGSL, a pipeline that does not link)
+/// becomes `Error::Shader` with wgpu's message.
+async fn shader_result(scope: wgpu::ErrorScopeGuard) -> Result<()> {
+    match scope.pop().await {
+        None => Ok(()),
+        Some(e) => Err(Error::Shader(e.to_string())),
     }
 }
 
@@ -1372,11 +1388,7 @@ fn surface_config(
     height: u32,
     max: u32,
 ) -> Result<Option<wgpu::SurfaceConfiguration>> {
-    if width == 0 || height == 0 || width > max || height > max {
-        return Err(Error::BadInput(format!(
-            "canvas {width}x{height} is empty or larger than {max}"
-        )));
-    }
+    crate::renderer::check_size(width, height, max)?;
     let caps: wgpu::SurfaceCapabilities = surface.get_capabilities(adapter);
     if !caps.formats.contains(&FORMAT) {
         return Ok(None);
