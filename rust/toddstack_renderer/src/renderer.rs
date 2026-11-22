@@ -43,8 +43,13 @@ impl Options {
     pub fn from_env() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let force: Option<Backend> = std::env::var("WGPU_BACKEND").ok().and_then(|s| Backend::parse(&s));
-            Self { force, data_texture: None }
+            let force: Option<Backend> = std::env::var("WGPU_BACKEND")
+                .ok()
+                .and_then(|s| Backend::parse(&s));
+            Self {
+                force,
+                data_texture: None,
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -83,19 +88,37 @@ impl Renderer {
     /// `NoBackend` if a forced GPU backend is unavailable; `BadInput` for a bad target.
     pub async fn with_options(target: Target, options: Options) -> Result<Self> {
         let (width, height): (u32, u32) = (target.width, target.height);
-        let chain: Vec<Backend> = options.force.map_or_else(|| Backend::chain().to_vec(), |b| vec![b]);
+        let chain: Vec<Backend> = options
+            .force
+            .map_or_else(|| Backend::chain().to_vec(), |b| vec![b]);
         let mut tried: Vec<&str> = Vec::new();
         for b in chain {
             tried.push(b.name());
             if b == Backend::Cpu {
-                return Ok(Self { inner: Inner::Cpu(Cpu::new(width, height)?), caps: Capabilities::cpu(), atlas: Atlas::new(), batches: Vec::new(), width, height });
+                return Ok(Self {
+                    inner: Inner::Cpu(Cpu::new(width, height)?),
+                    caps: Capabilities::cpu(),
+                    atlas: Atlas::new(),
+                    batches: Vec::new(),
+                    width,
+                    height,
+                });
             }
             if let Some(gpu) = Gpu::create(b, width, height, options.data_texture).await? {
                 let caps: Capabilities = gpu.caps.clone();
-                return Ok(Self { inner: Inner::Gpu(Box::new(gpu)), caps, atlas: Atlas::new(), batches: Vec::new(), width, height });
+                return Ok(Self {
+                    inner: Inner::Gpu(Box::new(gpu)),
+                    caps,
+                    atlas: Atlas::new(),
+                    batches: Vec::new(),
+                    width,
+                    height,
+                });
             }
         }
-        Err(Error::NoBackend { tried: tried.join(", ") })
+        Err(Error::NoBackend {
+            tried: tried.join(", "),
+        })
     }
 
     /// The backend in use.
@@ -165,7 +188,11 @@ impl Renderer {
         let b: &mut BatchState = self.batches.get_mut(id.0).ok_or(Error::UnknownBatch)?;
         let end: usize = offset + words.len();
         if end > b.data.len() {
-            return Err(Error::BadInput(format!("batch `{}` has {} words, update ends at {end}", b.name, b.data.len())));
+            return Err(Error::BadInput(format!(
+                "batch `{}` has {} words, update ends at {end}",
+                b.name,
+                b.data.len()
+            )));
         }
         b.data[offset..end].copy_from_slice(words);
         if let Inner::Gpu(g) = &self.inner {
@@ -179,7 +206,10 @@ impl Renderer {
     /// # Errors
     /// `UnknownBatch`.
     pub fn set_batch_params(&mut self, id: BatchId, params: [f32; 4]) -> Result<()> {
-        self.batches.get_mut(id.0).ok_or(Error::UnknownBatch)?.params = params;
+        self.batches
+            .get_mut(id.0)
+            .ok_or(Error::UnknownBatch)?
+            .params = params;
         if let Inner::Gpu(g) = &self.inner {
             g.write_batch_params(id.0, params);
         }
@@ -191,7 +221,10 @@ impl Renderer {
     /// # Errors
     /// `UnknownBatch`.
     pub fn set_batch_instances(&mut self, id: BatchId, instances: u32) -> Result<()> {
-        self.batches.get_mut(id.0).ok_or(Error::UnknownBatch)?.instances = instances;
+        self.batches
+            .get_mut(id.0)
+            .ok_or(Error::UnknownBatch)?
+            .instances = instances;
         Ok(())
     }
 
@@ -204,7 +237,11 @@ impl Renderer {
         match &mut self.inner {
             Inner::Cpu(c) => Ok(c.render(&flat, &self.atlas.pixels, scene.clear, &self.batches)),
             Inner::Gpu(g) => {
-                let upload: Option<&[u8]> = if self.atlas.dirty { Some(&self.atlas.pixels) } else { None };
+                let upload: Option<&[u8]> = if self.atlas.dirty {
+                    Some(&self.atlas.pixels)
+                } else {
+                    None
+                };
                 let px: Vec<u8> = g.render(&flat, upload, scene.clear, &self.batches).await?;
                 self.atlas.dirty = false;
                 Ok(px)
@@ -221,7 +258,11 @@ impl Renderer {
             Inner::Gpu(g) if g.caps.compute && kernel.compute.is_some() => KernelPath::Compute,
             Inner::Gpu(_) if kernel.fragment.is_some() => KernelPath::Fragment,
             _ if kernel.cpu.is_some() => KernelPath::Cpu,
-            _ => return Err(Error::KernelUnavailable { kernel: kernel.name.clone() }),
+            _ => {
+                return Err(Error::KernelUnavailable {
+                    kernel: kernel.name.clone(),
+                });
+            }
         };
         self.run_kernel_with(kernel, path).await
     }
@@ -233,13 +274,31 @@ impl Renderer {
     pub async fn run_kernel_with(&self, kernel: &Kernel, path: KernelPath) -> Result<KernelOutput> {
         let rgba8: Vec<u8> = match (path, &self.inner) {
             (KernelPath::Cpu, _) => {
-                let f = kernel.cpu.as_ref().ok_or_else(|| Error::KernelUnavailable { kernel: kernel.name.clone() })?;
+                let f = kernel
+                    .cpu
+                    .as_ref()
+                    .ok_or_else(|| Error::KernelUnavailable {
+                        kernel: kernel.name.clone(),
+                    })?;
                 f(&kernel.inputs, kernel.width, kernel.height)
             }
-            (KernelPath::Compute, Inner::Gpu(g)) if !g.caps.compute => return Err(Error::KernelUnavailable { kernel: kernel.name.clone() }),
+            (KernelPath::Compute, Inner::Gpu(g)) if !g.caps.compute => {
+                return Err(Error::KernelUnavailable {
+                    kernel: kernel.name.clone(),
+                });
+            }
             (p, Inner::Gpu(g)) => g.run_kernel(kernel, p).await?,
-            (_, Inner::Cpu(_)) => return Err(Error::KernelUnavailable { kernel: kernel.name.clone() }),
+            (_, Inner::Cpu(_)) => {
+                return Err(Error::KernelUnavailable {
+                    kernel: kernel.name.clone(),
+                });
+            }
         };
-        Ok(KernelOutput { path, width: kernel.width, height: kernel.height, rgba8 })
+        Ok(KernelOutput {
+            path,
+            width: kernel.width,
+            height: kernel.height,
+            rgba8,
+        })
     }
 }

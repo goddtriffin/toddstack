@@ -29,7 +29,9 @@ pub enum Error {
     #[error("bad input: {0}")]
     BadInput(String),
     /// No path of the kernel can run on this backend.
-    #[error("kernel `{kernel}` has no form this backend can run: add a fragment form or a CPU function")]
+    #[error(
+        "kernel `{kernel}` has no form this backend can run: add a fragment form or a CPU function"
+    )]
     KernelUnavailable {
         /// The kernel's name.
         kernel: String,

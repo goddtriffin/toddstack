@@ -38,7 +38,11 @@ impl Binding {
     /// An RGBA8 texture binding; `rgba8` must hold `width * height * 4` bytes.
     #[must_use]
     pub const fn texture(width: u32, height: u32, rgba8: Vec<u8>) -> Self {
-        Self::Texture { width, height, rgba8 }
+        Self::Texture {
+            width,
+            height,
+            rgba8,
+        }
     }
 }
 

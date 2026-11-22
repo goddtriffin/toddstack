@@ -56,7 +56,14 @@ pub struct BatchState {
 
 impl From<BatchDesc> for BatchState {
     fn from(d: BatchDesc) -> Self {
-        Self { name: d.name, wgsl: d.wgsl, data: d.data, params: [0.0; 4], instances: d.instances, cpu: d.cpu }
+        Self {
+            name: d.name,
+            wgsl: d.wgsl,
+            data: d.data,
+            params: [0.0; 4],
+            instances: d.instances,
+            cpu: d.cpu,
+        }
     }
 }
 
@@ -66,8 +73,12 @@ pub const DATA_TEXTURE_WIDTH: u32 = 2048;
 pub fn prelude(data_texture: bool) -> String {
     let head: &str = "struct Globals { view: vec4f, params: vec4f };\n@group(0) @binding(0) var<uniform> globals: Globals;\nfn to_clip(px: vec2f) -> vec4f { return vec4f(px.x / globals.view.x * 2.0 - 1.0, 1.0 - px.y / globals.view.y * 2.0, 0.0, 1.0); }\n";
     if data_texture {
-        format!("{head}const DATA_W: u32 = {DATA_TEXTURE_WIDTH}u;\n@group(0) @binding(1) var data_tex: texture_2d<u32>;\nfn data_at(i: u32) -> u32 {{ return textureLoad(data_tex, vec2u(i % DATA_W, i / DATA_W), 0).r; }}\n")
+        format!(
+            "{head}const DATA_W: u32 = {DATA_TEXTURE_WIDTH}u;\n@group(0) @binding(1) var data_tex: texture_2d<u32>;\nfn data_at(i: u32) -> u32 {{ return textureLoad(data_tex, vec2u(i % DATA_W, i / DATA_W), 0).r; }}\n"
+        )
     } else {
-        format!("{head}@group(0) @binding(1) var<storage, read> data_buf: array<u32>;\nfn data_at(i: u32) -> u32 {{ return data_buf[i]; }}\n")
+        format!(
+            "{head}@group(0) @binding(1) var<storage, read> data_buf: array<u32>;\nfn data_at(i: u32) -> u32 {{ return data_buf[i]; }}\n"
+        )
     }
 }

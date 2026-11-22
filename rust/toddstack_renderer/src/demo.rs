@@ -1,5 +1,11 @@
 //! The demo scenes, batch and kernel the examples and the parity test share.
-#![expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss, clippy::many_single_char_names, reason = "demo geometry and colours: small values, letters for coordinates")]
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    reason = "demo geometry and colours: small values, letters for coordinates"
+)]
 
 use crate::batch::BatchDesc;
 use crate::kernel::{Binding, Kernel};
@@ -11,19 +17,29 @@ use tiny_skia::Pixmap;
 pub const BG: [u8; 4] = [239, 233, 221, 255];
 
 const LETTERS: [&str; 25] = [
-    "T", "N", "E", "A", "R", "I", "S", "O", "L", "D", "C", "Qu", "H", "U", "G", "P", "B", "W", "K", "F", "Y", "V", "X", "Z", "M",
+    "T", "N", "E", "A", "R", "I", "S", "O", "L", "D", "C", "Qu", "H", "U", "G", "P", "B", "W", "K",
+    "F", "Y", "V", "X", "Z", "M",
 ];
 
 fn board_into(v: &mut Scene, font: FontId) {
     v.rrect(16.0, 16.0, 488.0, 488.0, 24.0, [91, 74, 58, 255]);
     let (cell, gap, ox, oy): (f32, f32, f32, f32) = (84.0, 10.0, 30.0, 30.0);
     let lit: [usize; 3] = [6, 7, 12];
-    let pos = |i: usize| (ox + (i % 5) as f32 * (cell + gap), oy + (i / 5) as f32 * (cell + gap));
+    let pos = |i: usize| {
+        (
+            ox + (i % 5) as f32 * (cell + gap),
+            oy + (i / 5) as f32 * (cell + gap),
+        )
+    };
     for i in 0..25 {
         let (x, y): (f32, f32) = pos(i);
         v.rrect(x, y, cell, cell, 14.0, [61, 49, 38, 255]);
         v.rrect(x + 4.0, y + 6.0, 76.0, 76.0, 12.0, [0, 0, 0, 90]);
-        let body: [u8; 4] = if lit.contains(&i) { [255, 210, 74, 255] } else { [246, 241, 230, 255] };
+        let body: [u8; 4] = if lit.contains(&i) {
+            [255, 210, 74, 255]
+        } else {
+            [246, 241, 230, 255]
+        };
         v.rrect(x + 4.0, y + 2.0, 76.0, 76.0, 12.0, body);
     }
     let centre = |i: usize| {
@@ -43,7 +59,14 @@ fn board_into(v: &mut Scene, font: FontId) {
 
 fn arena_chart_into(v: &mut Scene, font: FontId) {
     v.rrect(528.0, 16.0, 256.0, 300.0, 16.0, [255, 250, 240, 255]);
-    v.text(font, "Words by length", 656.0, 46.0, 16.0, [42, 33, 24, 255]);
+    v.text(
+        font,
+        "Words by length",
+        656.0,
+        46.0,
+        16.0,
+        [42, 33, 24, 255],
+    );
     for (g, lab) in ["100", "50", "0"].iter().enumerate() {
         let y: f32 = 90.0 + g as f32 * 95.0;
         v.rect(546.0, y, 222.0, 1.0, [0, 0, 0, 40]);
@@ -53,7 +76,14 @@ fn arena_chart_into(v: &mut Scene, font: FontId) {
         let x: f32 = 566.0 + i as f32 * 34.0;
         let h: f32 = val * 190.0;
         v.rrect(x, 280.0 - h, 26.0, h, 4.0, [63, 184, 196, 255]);
-        v.text(font, &format!("{}", i + 3), x + 13.0, 298.0, 14.0, [42, 33, 24, 255]);
+        v.text(
+            font,
+            &format!("{}", i + 3),
+            x + 13.0,
+            298.0,
+            14.0,
+            [42, 33, 24, 255],
+        );
     }
     v.rect(556.0, 280.0, 212.0, 2.0, [68, 68, 68, 255]);
     v.rect(556.0, 90.0, 2.0, 192.0, [68, 68, 68, 255]);
@@ -81,7 +111,14 @@ pub fn board_scene(font: FontId) -> Scene {
 pub fn chart_scene(font: FontId) -> Scene {
     let mut v: Scene = Scene::new(BG);
     v.rrect(12.0, 12.0, 616.0, 376.0, 16.0, [255, 250, 240, 255]);
-    v.text(font, "Words found per day", 320.0, 46.0, 20.0, [42, 33, 24, 255]);
+    v.text(
+        font,
+        "Words found per day",
+        320.0,
+        46.0,
+        20.0,
+        [42, 33, 24, 255],
+    );
     for (g, lab) in ["200", "150", "100", "50", "0"].iter().enumerate() {
         let y: f32 = 80.0 + g as f32 * 66.0;
         v.rect(70.0, y, 540.0, 1.0, [0, 0, 0, 40]);
@@ -106,7 +143,15 @@ pub fn chart_scene(font: FontId) -> Scene {
 }
 
 const GRID_PALETTE: [[u8; 3]; 9] = [
-    [226, 226, 226], [66, 133, 244], [52, 168, 83], [234, 67, 53], [103, 58, 183], [191, 54, 12], [0, 150, 136], [33, 33, 33], [120, 120, 120],
+    [226, 226, 226],
+    [66, 133, 244],
+    [52, 168, 83],
+    [234, 67, 53],
+    [103, 58, 183],
+    [191, 54, 12],
+    [0, 150, 136],
+    [33, 33, 33],
+    [120, 120, 120],
 ];
 
 /// Packed tile: bits 0-7 neighbour count (0-8), bit 8 revealed, bit 9 flagged, bit 10 mine.
@@ -156,7 +201,11 @@ fn grid_color(tile: u32, x: u32, y: u32) -> [u8; 3] {
     if tile & 512 != 0 {
         [214, 58, 58]
     } else if tile & 256 == 0 {
-        if (x + y) & 1 == 0 { [150, 160, 180] } else { [140, 150, 170] }
+        if (x + y) & 1 == 0 {
+            [150, 160, 180]
+        } else {
+            [140, 150, 170]
+        }
     } else if tile & 1024 != 0 {
         [20, 20, 20]
     } else {
@@ -196,8 +245,22 @@ pub fn grid_batch(cols: u32, rows: u32) -> BatchDesc {
 
 /// 16 colours (a cross-stitch floss subset), as RGB bytes.
 pub const PALETTE: [[u8; 3]; 16] = [
-    [0, 0, 0], [255, 255, 255], [200, 30, 40], [240, 120, 40], [250, 210, 50], [120, 190, 60], [30, 130, 70], [60, 190, 200],
-    [40, 90, 190], [90, 60, 160], [200, 90, 170], [120, 70, 40], [230, 190, 160], [150, 150, 150], [80, 80, 90], [250, 160, 170],
+    [0, 0, 0],
+    [255, 255, 255],
+    [200, 30, 40],
+    [240, 120, 40],
+    [250, 210, 50],
+    [120, 190, 60],
+    [30, 130, 70],
+    [60, 190, 200],
+    [40, 90, 190],
+    [90, 60, 160],
+    [200, 90, 170],
+    [120, 70, 40],
+    [230, 190, 160],
+    [150, 150, 150],
+    [80, 80, 90],
+    [250, 160, 170],
 ];
 
 /// A deterministic test image: gradients, rings and a checker.
@@ -208,7 +271,11 @@ pub fn test_image(w: u32, h: u32) -> Vec<u8> {
         for x in 0..w {
             let (dx, dy): (f32, f32) = (x as f32 - w as f32 * 0.5, y as f32 - h as f32 * 0.5);
             let ring: f32 = ((dx * dx + dy * dy).sqrt() * 0.12).sin() * 0.5 + 0.5;
-            let checker: f32 = if ((x / 24) + (y / 24)) % 2 == 0 { 0.15 } else { 0.0 };
+            let checker: f32 = if ((x / 24) + (y / 24)) % 2 == 0 {
+                0.15
+            } else {
+                0.0
+            };
             let r: f32 = x as f32 / w as f32;
             let g: f32 = y as f32 / h as f32;
             let b: f32 = (ring * 0.8 + checker).min(1.0);
@@ -258,20 +325,41 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 /// Nearest-palette quantize (the core of image-to-cross-stitch) with all three forms.
 #[must_use]
 pub fn quantize_kernel(width: u32, height: u32) -> Kernel {
-    let pal: Vec<[f32; 4]> = PALETTE.iter().map(|c| [f32::from(c[0]) / 255.0, f32::from(c[1]) / 255.0, f32::from(c[2]) / 255.0, 1.0]).collect();
+    let pal: Vec<[f32; 4]> = PALETTE
+        .iter()
+        .map(|c| {
+            [
+                f32::from(c[0]) / 255.0,
+                f32::from(c[1]) / 255.0,
+                f32::from(c[2]) / 255.0,
+                1.0,
+            ]
+        })
+        .collect();
     Kernel {
         name: "quantize".to_owned(),
         compute: Some(QUANT_COMPUTE.to_owned()),
         fragment: Some(QUANT_FRAGMENT.to_owned()),
         cpu: Some(Arc::new(|inputs: &[Binding], w: u32, h: u32| {
-            let (Binding::Texture { rgba8, .. }, Binding::Storage(p)) = (&inputs[0], &inputs[1]) else { return Vec::new() };
+            let (Binding::Texture { rgba8, .. }, Binding::Storage(p)) = (&inputs[0], &inputs[1])
+            else {
+                return Vec::new();
+            };
             let pal: &[f32] = bytemuck::cast_slice(p);
             let mut out: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
             for px in rgba8.as_chunks::<4>().0 {
-                let c: [f32; 3] = [f32::from(px[0]) / 255.0, f32::from(px[1]) / 255.0, f32::from(px[2]) / 255.0];
+                let c: [f32; 3] = [
+                    f32::from(px[0]) / 255.0,
+                    f32::from(px[1]) / 255.0,
+                    f32::from(px[2]) / 255.0,
+                ];
                 let (mut best, mut bd): (usize, f32) = (0, 1e9);
                 for i in 0..16 {
-                    let d: [f32; 3] = [c[0] - pal[i * 4], c[1] - pal[i * 4 + 1], c[2] - pal[i * 4 + 2]];
+                    let d: [f32; 3] = [
+                        c[0] - pal[i * 4],
+                        c[1] - pal[i * 4 + 1],
+                        c[2] - pal[i * 4 + 2],
+                    ];
                     let e: f32 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if e < bd {
                         bd = e;
@@ -284,7 +372,10 @@ pub fn quantize_kernel(width: u32, height: u32) -> Kernel {
             out
         })),
         workgroup: [8, 8],
-        inputs: vec![Binding::texture(width, height, test_image(width, height)), Binding::storage(&pal)],
+        inputs: vec![
+            Binding::texture(width, height, test_image(width, height)),
+            Binding::storage(&pal),
+        ],
         width,
         height,
     }
@@ -295,18 +386,39 @@ pub fn quantize_kernel(width: u32, height: u32) -> Kernel {
 ///
 /// # Errors
 /// Anything the renderer fails with other than a missing backend.
-pub async fn parity(backend: crate::Backend, font: &[u8]) -> crate::Result<Option<(crate::Capabilities, crate::Diff)>> {
+pub async fn parity(
+    backend: crate::Backend,
+    font: &[u8],
+) -> crate::Result<Option<(crate::Capabilities, crate::Diff)>> {
     use crate::{Backend, Diff, Error, Options, Renderer, Target};
     let target: Target = Target::offscreen(800, 520);
-    let mut cpu: Renderer = Renderer::with_options(target, Options { force: Some(Backend::Cpu), data_texture: None }).await?;
+    let mut cpu: Renderer = Renderer::with_options(
+        target,
+        Options {
+            force: Some(Backend::Cpu),
+            data_texture: None,
+        },
+    )
+    .await?;
     let cpu_font: FontId = cpu.add_font(font)?;
     let reference: Vec<u8> = cpu.render(&arena_scene(cpu_font)).await?;
-    let mut gpu: Renderer = match Renderer::with_options(target, Options { force: Some(backend), data_texture: None }).await {
+    let mut gpu: Renderer = match Renderer::with_options(
+        target,
+        Options {
+            force: Some(backend),
+            data_texture: None,
+        },
+    )
+    .await
+    {
         Ok(r) => r,
         Err(Error::NoBackend { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
     let gpu_font: FontId = gpu.add_font(font)?;
     let pixels: Vec<u8> = gpu.render(&arena_scene(gpu_font)).await?;
-    Ok(Some((gpu.capabilities().clone(), Diff::between(&reference, &pixels))))
+    Ok(Some((
+        gpu.capabilities().clone(),
+        Diff::between(&reference, &pixels),
+    )))
 }

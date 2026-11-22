@@ -59,7 +59,11 @@ impl Backend {
             "metal" => Some(Self::Metal),
             "vulkan" | "vk" => Some(Self::Vulkan),
             "dx12" | "d3d12" => Some(Self::Dx12),
-            "gl" | "gles" | "opengl" => Some(if cfg!(target_arch = "wasm32") { Self::WebGl2 } else { Self::Gles }),
+            "gl" | "gles" | "opengl" => Some(if cfg!(target_arch = "wasm32") {
+                Self::WebGl2
+            } else {
+                Self::Gles
+            }),
             "cpu" => Some(Self::Cpu),
             _ => None,
         }

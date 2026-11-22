@@ -76,13 +76,26 @@ impl Scene {
     /// An empty scene.
     #[must_use]
     pub const fn new(clear: Rgba) -> Self {
-        Self { clear, prims: Vec::new() }
+        Self {
+            clear,
+            prims: Vec::new(),
+        }
     }
 
     /// Adds a rounded rectangle.
-    #[expect(clippy::many_single_char_names, reason = "x, y, w, h, r are the geometry")]
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "x, y, w, h, r are the geometry"
+    )]
     pub fn rrect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, color: Rgba) {
-        self.prims.push(Prim::RRect { x, y, w, h, r, color });
+        self.prims.push(Prim::RRect {
+            x,
+            y,
+            w,
+            h,
+            r,
+            color,
+        });
     }
 
     /// Adds a plain rectangle.
@@ -92,12 +105,26 @@ impl Scene {
 
     /// Adds a line of the given width with round caps.
     pub fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Rgba) {
-        self.prims.push(Prim::Capsule { x0, y0, x1, y1, r: width / 2.0, color });
+        self.prims.push(Prim::Capsule {
+            x0,
+            y0,
+            x1,
+            y1,
+            r: width / 2.0,
+            color,
+        });
     }
 
     /// Adds centred text on a baseline.
     pub fn text(&mut self, font: FontId, text: &str, x: f32, y: f32, size: f32, color: Rgba) {
-        self.prims.push(Prim::Text { font, text: text.to_owned(), x, y, size, color });
+        self.prims.push(Prim::Text {
+            font,
+            text: text.to_owned(),
+            x,
+            y,
+            size,
+            color,
+        });
     }
 
     /// Draws a custom batch here in paint order.

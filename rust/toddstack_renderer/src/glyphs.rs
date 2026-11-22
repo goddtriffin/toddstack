@@ -1,5 +1,9 @@
 //! The shared glyph atlas and the flattening of a scene into instance records.
-#![expect(clippy::cast_possible_truncation, clippy::cast_precision_loss, reason = "pixel and atlas coordinates are small non-negative values")]
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "pixel and atlas coordinates are small non-negative values"
+)]
 
 use crate::error::{Error, Result};
 use crate::scene::{BatchId, FontId, Prim, Rgba, Scene};
@@ -72,8 +76,9 @@ impl Atlas {
     }
 
     pub fn add_font(&mut self, bytes: &[u8]) -> Result<FontId> {
-        let font: fontdue::Font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
-            .map_err(|e| Error::Font(e.to_owned()))?;
+        let font: fontdue::Font =
+            fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
+                .map_err(|e| Error::Font(e.to_owned()))?;
         self.fonts.push(font);
         Ok(FontId(self.fonts.len() - 1))
     }
@@ -99,7 +104,15 @@ impl Atlas {
             let src: usize = (row * w) as usize;
             self.pixels[dst..dst + w as usize].copy_from_slice(&bitmap[src..src + w as usize]);
         }
-        let g: Glyph = Glyph { x: self.cx, y: self.cy, xmin: m.xmin, ymin: m.ymin, w, h, advance: m.advance_width };
+        let g: Glyph = Glyph {
+            x: self.cx,
+            y: self.cy,
+            xmin: m.xmin,
+            ymin: m.ymin,
+            w,
+            h,
+            advance: m.advance_width,
+        };
         self.cx += w + 1;
         self.row_h = self.row_h.max(h);
         self.dirty = true;
@@ -114,19 +127,40 @@ impl Atlas {
         let mut start: u32 = 0;
         for p in &scene.prims {
             match p {
-                Prim::RRect { x, y, w, h, r, color } => insts.push(Inst {
+                Prim::RRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    r,
+                    color,
+                } => insts.push(Inst {
                     a: [*x, *y, *w, *h],
                     uv: [0.0; 4],
                     p: [*r, 0.0, 0.0, 0.0],
                     color: col(*color),
                 }),
-                Prim::Capsule { x0, y0, x1, y1, r, color } => insts.push(Inst {
+                Prim::Capsule {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    r,
+                    color,
+                } => insts.push(Inst {
                     a: [*x0, *y0, *x1, *y1],
                     uv: [0.0; 4],
                     p: [*r, 1.0, 0.0, 0.0],
                     color: col(*color),
                 }),
-                Prim::Text { font, text, x, y, size, color } => {
+                Prim::Text {
+                    font,
+                    text,
+                    x,
+                    y,
+                    size,
+                    color,
+                } => {
                     let mut glyphs: Vec<Glyph> = Vec::with_capacity(text.len());
                     for ch in text.chars() {
                         glyphs.push(self.glyph(*font, ch, *size)?);
