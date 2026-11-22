@@ -5,10 +5,20 @@
 <style>
   body { font: 14px system-ui; margin: 16px; background: #fff; color: #222; }
   canvas { max-width: 100%; height: auto; display: block; margin-top: 12px; border: 1px solid #ccc; }
+  /* ?boards=N: N transparent canvases over this gradient, so it shows through the tiles. */
+  #boards { display: none; }
+  body.boards .demo { display: none; }
+  body.boards #boards {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 12px;
+    padding: 16px; border-radius: 12px;
+    background: linear-gradient(135deg, #ff7a59 0%, #ffd166 28%, #06d6a0 56%, #118ab2 78%, #7b2cbf 100%);
+  }
+  #boards canvas { margin: 0; border: 0; width: 100%; aspect-ratio: 1; }
   @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } }
 </style>
-<button id="board">board</button> <button id="chart">chart</button> <button id="grid">grid (1M tiles)</button>
-<button id="images">images</button> <button id="paths">paths</button> <button id="texture">kernel texture</button>
+<span class="demo"><button id="board">board</button> <button id="chart">chart</button> <button id="grid">grid (1M tiles)</button>
+<button id="images">images</button> <button id="paths">paths</button> <button id="texture">kernel texture</button></span>
 <p id="info">loading</p>
-<canvas id="canvas"></canvas>
+<canvas id="canvas" class="demo"></canvas>
+<div id="boards"></div>
 <script type="module" src="./dist/example.js"></script>

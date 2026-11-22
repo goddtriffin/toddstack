@@ -1,4 +1,4 @@
-//! The example page's wasm: re-exports `WebRenderer`, built as a cdylib by `web/build.sh`.
+//! The example page's wasm: re-exports `WebRenderer` and `WebBoards`, built as a cdylib by `web/build.sh`.
 #![cfg(target_arch = "wasm32")]
 
-pub use toddstack_renderer::WebRenderer;
+pub use toddstack_renderer::{WebBoards, WebRenderer};

@@ -90,6 +90,21 @@ pub enum Prim {
         /// 0 to 1.
         opacity: f32,
     },
+    /// A sub-rectangle of an image, rotated about the centre of its destination rectangle and
+    /// multiplied by a tint. Consecutive sprites of one image are one instanced draw.
+    Sprite {
+        /// Image from `Renderer::add_image` or `Renderer::kernel_image`.
+        image: ImageId,
+        /// The part of the image to draw: left, top, width, height, in image pixels. Clipped to the
+        /// image; the destination is not rescaled to follow.
+        src: [u32; 4],
+        /// Where it lands before rotation: left, top, width, height, in target pixels.
+        dst: [f32; 4],
+        /// Clockwise (y is down), about the centre of `dst`.
+        rotation: f32,
+        /// Straight RGBA multiplied into the image: colour into colour, alpha into alpha.
+        tint: Rgba,
+    },
     /// A filled path (non-zero winding), antialiased.
     Fill {
         /// The outline; open subpaths close implicitly.
@@ -174,7 +189,8 @@ impl Scene {
         });
     }
 
-    /// Adds an image stretched over a rectangle (`opacity` 0 to 1).
+    /// Adds a whole image stretched over a rectangle (`opacity` 0 to 1): the shorthand for
+    /// [`Scene::image_rect`] with the full image, no rotation and a white tint of that alpha.
     pub fn image(&mut self, image: ImageId, x: f32, y: f32, w: f32, h: f32, opacity: f32) {
         self.prims.push(Prim::Image {
             image,
@@ -183,6 +199,28 @@ impl Scene {
             w,
             h,
             opacity,
+        });
+    }
+
+    /// Adds a sub-rectangle of an image (`src`: left, top, width, height in image pixels), drawn
+    /// into `dst` (left, top, width, height in target pixels), rotated `rotation_radians`
+    /// clockwise about the centre of `dst`, and multiplied by `tint` (straight RGBA; white and
+    /// opaque draws the image as it is). Keep `src` on whole pixels inside the image. Thousands
+    /// per frame are fine: consecutive sprites of one image are one instanced draw.
+    pub fn image_rect(
+        &mut self,
+        image: ImageId,
+        src: [u32; 4],
+        dst: [f32; 4],
+        rotation_radians: f32,
+        tint: Rgba,
+    ) {
+        self.prims.push(Prim::Sprite {
+            image,
+            src,
+            dst,
+            rotation: rotation_radians,
+            tint,
         });
     }
 

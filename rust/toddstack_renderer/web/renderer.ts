@@ -5,7 +5,7 @@
  * @module
  */
 
-import init, { WebRenderer } from "./pkg/toddstack_renderer.js";
+import init, { WebBoards, WebRenderer } from "./pkg/toddstack_renderer.js";
 
 /** R, G, B and an optional alpha, 0-255. */
 export type Color = readonly [number, number, number, number?];
@@ -129,5 +129,60 @@ export class Renderer {
     }
     const { width, height } = this.canvas;
     this.ctx.putImageData(new ImageData(new Uint8ClampedArray(px), width, height), 0, 0);
+  }
+}
+
+/** Options for {@link Boards.create}. */
+export interface BoardsOptions {
+  /** TTF or OTF bytes for text. */
+  font: Uint8Array;
+  /** Force `webgpu`, `webgl2` or `cpu`; default is the fallback chain. */
+  backend?: string;
+  /** Where the `.wasm` is, when it is not next to the glue. */
+  wasm?: URL | string;
+}
+
+/**
+ * Many transparent canvases on one renderer (one device, one set of images and glyphs). Each
+ * canvas is drawn with the demo board tile. The demo scene stands in for your own: the point is
+ * `attach`, `resize` and `frame` (`present_to` in Rust), which work for any scene.
+ */
+export class Boards {
+  private constructor(private readonly core: WebBoards) {}
+
+  /** Picks the backend on a probe (no canvas touched), then draws to attached canvases. */
+  static async create(options: BoardsOptions): Promise<Boards> {
+    await init(options.wasm);
+    return new Boards(await WebBoards.create(options.font, options.backend));
+  }
+
+  /** The backend in use: `webgpu`, `webgl2` or `cpu`. */
+  get backend(): string {
+    return this.core.backend();
+  }
+
+  /** Adapter name and driver. */
+  get adapter(): string {
+    return this.core.adapter();
+  }
+
+  /** Attaches a canvas at its current `width` x `height`; returns its index. */
+  attach(canvas: HTMLCanvasElement): number {
+    return this.core.attach(canvas);
+  }
+
+  /** Resizes an attached canvas (device pixels; the canvas's size is set too). */
+  resize(index: number, width: number, height: number): void {
+    this.core.resize(index, width, height);
+  }
+
+  /** Frees the canvas's surface or context. */
+  detach(index: number): void {
+    this.core.detach(index);
+  }
+
+  /** Draws tile `index` at time `t` seconds, with no readback. */
+  frame(index: number, t: number): void {
+    this.core.frame(index, t);
   }
 }

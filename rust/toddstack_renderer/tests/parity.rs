@@ -412,8 +412,9 @@ fn batch_input_is_checked_on_the_cpu_backend() {
         assert!(r.update_batch(id, usize::MAX, &[1, 2]).is_err());
         assert!(r.update_batch(id, 15, &[1, 2]).is_err());
         r.update_batch(id, 14, &[1, 2]).expect("in range");
-        // More instances than data words is refused; the batch has 16.
-        assert!(r.set_batch_instances(id, 17).is_err());
+        // The count is not checked against the data: a batch may draw from instance_index and
+        // params alone.
+        r.set_batch_instances(id, 17).expect("not checked");
         r.set_batch_instances(id, 16).expect("16 fits");
     });
 }
@@ -452,4 +453,201 @@ fn bad_wgsl_in_a_batch_or_a_kernel_is_an_error_not_a_panic_on_every_gpu_backend(
             assert!(good.is_ok(), "{}: {good:?}", b.name());
         });
     }
+}
+
+#[test]
+fn a_half_transparent_fill_over_a_clear_of_zero_matches_across_backends() {
+    // Premultiplied, all four channels: the GPU's blend and the CPU's pixmap must agree.
+    scene_parity_transparent(
+        "transparent",
+        &Target::offscreen(320, 200),
+        &Budget::ARENA,
+        async |r| {
+            let font = r.add_font(FONT)?;
+            demo::transparent_scene(r, font)
+        },
+    );
+    let build = |_: &mut Renderer| {
+        let mut s: Scene = Scene::new([0, 0, 0, 0]);
+        s.rect(0.0, 0.0, 8.0, 8.0, [255, 0, 0, 128]);
+        s
+    };
+    let mut all: Vec<Backend> = vec![Backend::Cpu];
+    all.extend(gpu_backends());
+    for b in all {
+        let Some(px) = render_transparent_on(b, Target::offscreen(16, 16), build) else {
+            continue;
+        };
+        let inside: [u8; 4] = [px[4 * 4], px[4 * 4 + 1], px[4 * 4 + 2], px[4 * 4 + 3]];
+        let outside: &[u8] = &px[(12 * 16 + 12) * 4..(12 * 16 + 12) * 4 + 4];
+        assert_eq!([0, 0, 0, 0], outside, "{} outside is clear", b.name());
+        for (got, want) in inside.iter().zip([128_u8, 0, 0, 128]) {
+            assert!(
+                got.abs_diff(want) <= 1,
+                "{} premultiplied pixel {inside:?}",
+                b.name()
+            );
+        }
+        let straight: Vec<u8> = toddstack_renderer::unpremultiply_rgba8(&px);
+        assert!(
+            straight[4 * 4].abs_diff(255) <= 1 && straight[4 * 4 + 3].abs_diff(128) <= 1,
+            "{} unpremultiplied {:?}",
+            b.name(),
+            &straight[4 * 4..4 * 4 + 4]
+        );
+    }
+}
+
+fn render_transparent_on<F>(force: Backend, target: Target, build: F) -> Option<Vec<u8>>
+where
+    F: Fn(&mut Renderer) -> Scene,
+{
+    pollster::block_on(async {
+        let mut r: Renderer = Renderer::with_options(
+            target,
+            Options::new().with_force(force).with_transparent(true),
+        )
+        .await
+        .ok()?;
+        let scene: Scene = build(&mut r);
+        Some(r.render(&scene).await.expect("render"))
+    })
+}
+
+fn scene_parity_transparent<F>(name: &str, target: &Target, budget: &Budget, build: F)
+where
+    F: AsyncFn(&mut Renderer) -> toddstack_renderer::Result<Scene> + Copy,
+{
+    for b in gpu_backends() {
+        let Some((caps, diff)) =
+            pollster::block_on(demo::parity_scene_transparent(b, target.clone(), build))
+                .expect("parity run")
+        else {
+            println!("{name} {}: skipped, no adapter", b.name());
+            continue;
+        };
+        println!("{name} {}: {diff} ({})", b.name(), caps.adapter);
+        assert!(
+            diff.within(budget),
+            "{name} on {} is outside the budget: {diff}",
+            b.name()
+        );
+    }
+}
+
+#[test]
+fn sprites_rotated_tinted_and_cut_from_a_sheet_match_the_cpu() {
+    scene_parity(
+        "sprites",
+        &Target::offscreen(640, 400),
+        &Budget::SPRITES,
+        async |r| {
+            let font = r.add_font(FONT)?;
+            demo::sprites_scene(r, font)
+        },
+    );
+}
+
+#[test]
+fn a_quarter_turn_moves_the_source_corner_and_a_tint_multiplies_on_every_backend() {
+    let texels: Vec<u8> = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 0, 255],
+    ]
+    .concat();
+    // Clockwise a quarter turn about the centre: the top-left texel (red) goes to the top-right.
+    let turned = |r: &mut Renderer| {
+        let id = r
+            .add_image(2, 2, &texels, Sampling::Nearest)
+            .expect("image");
+        let mut s: Scene = Scene::new([255, 255, 255, 255]);
+        s.image_rect(
+            id,
+            [0, 0, 2, 2],
+            [0.0, 0.0, 8.0, 8.0],
+            std::f32::consts::FRAC_PI_2,
+            [255, 255, 255, 255],
+        );
+        s
+    };
+    // Only the right texel column, doubled, tinted half-transparent red over white.
+    let tinted = |r: &mut Renderer| {
+        let id = r
+            .add_image(2, 2, &texels, Sampling::Nearest)
+            .expect("image");
+        let mut s: Scene = Scene::new([255, 255, 255, 255]);
+        s.image_rect(
+            id,
+            [1, 1, 1, 1],
+            [0.0, 0.0, 8.0, 8.0],
+            0.0,
+            [255, 0, 0, 128],
+        );
+        s
+    };
+    let mut all: Vec<Backend> = vec![Backend::Cpu];
+    all.extend(gpu_backends());
+    for b in all {
+        let Some(px) = render_on(b, Target::offscreen(8, 8), turned) else {
+            continue;
+        };
+        let at = |x: usize, y: usize| -> [u8; 3] {
+            let o: usize = (y * 8 + x) * 4;
+            [px[o], px[o + 1], px[o + 2]]
+        };
+        assert_eq!([255, 0, 0], at(6, 1), "{} red went top-right", b.name());
+        assert_eq!(
+            [0, 255, 0],
+            at(6, 6),
+            "{} green went bottom-right",
+            b.name()
+        );
+        assert_eq!([0, 0, 255], at(1, 1), "{} blue went top-left", b.name());
+        assert_eq!(
+            [255, 255, 0],
+            at(1, 6),
+            "{} yellow went bottom-left",
+            b.name()
+        );
+        let Some(px) = render_on(b, Target::offscreen(8, 8), tinted) else {
+            continue;
+        };
+        // Yellow (255,255,0) times a straight (255,0,0) tint is (255,0,0), at half alpha over white.
+        for (got, want) in px[3 * 4..3 * 4 + 3].iter().zip([255_u8, 127, 127]) {
+            assert!(
+                got.abs_diff(want) <= 2,
+                "{} tinted {:?}",
+                b.name(),
+                &px[12..15]
+            );
+        }
+    }
+}
+
+#[test]
+fn surfaces_need_a_canvas_and_a_device_only_renderer_has_no_target_of_its_own() {
+    pollster::block_on(async {
+        let mut r: Renderer = Renderer::with_options(
+            Target::device_only(),
+            Options::new().with_force(Backend::Cpu),
+        )
+        .await
+        .expect("device-only renderer");
+        assert_eq!((0, 0), (r.width(), r.height()));
+        let scene: Scene = Scene::new([0, 0, 0, 0]);
+        assert!(r.render(&scene).await.is_err());
+        assert!(r.present(&scene).is_err());
+        assert!(r.resize(8, 8).is_err());
+        // Off the web an offscreen target is not a canvas.
+        assert!(r.attach(Target::offscreen(8, 8)).is_err());
+        let mut other: Renderer = Renderer::with_options(
+            Target::offscreen(8, 8),
+            Options::new().with_force(Backend::Cpu),
+        )
+        .await
+        .expect("offscreen renderer");
+        assert!(other.attach(Target::offscreen(8, 8)).is_err());
+    });
 }

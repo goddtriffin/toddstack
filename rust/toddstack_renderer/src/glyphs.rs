@@ -15,6 +15,8 @@ pub const ATLAS_SIZE: u32 = 512;
 
 /// One draw record, 64 bytes, four float4 attributes. `p.y` is the kind: 0 rounded rect
 /// (`a` = x, y, w, h), 1 capsule (`a` = x0, y0, x1, y1), 2 glyph (`a` = quad, `uv` = atlas x, y).
+/// A sprite (its own run, so `p.y` is unused): `a` = destination rect, `uv` = source rect as
+/// fractions of the image, `p` = rotation, half a texel in u, half a texel in v, `color` = tint.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Inst {
@@ -29,10 +31,10 @@ pub struct Inst {
 pub enum Run {
     Insts(Range<u32>),
     Batch(BatchId),
-    /// One image quad: its record is `insts[inst]` (`a` = quad, `p.x` = opacity).
+    /// Sprite quads of one image, in order: their records are `insts[insts]`.
     Image {
         id: ImageId,
-        inst: u32,
+        insts: Range<u32>,
     },
     /// A range of `Flat::paths`, filled in order.
     Paths(Range<u32>),
@@ -92,6 +94,59 @@ fn push_path(runs: &mut Vec<Run>, paths: &mut Vec<PathDraw>, outline: tiny_skia:
         Some(Run::Paths(r)) if r.end == at => r.end = at + 1,
         _ => runs.push(Run::Paths(at..at + 1)),
     }
+}
+
+fn size_of_image(images: &[Option<(u32, u32)>], id: ImageId) -> Option<(u32, u32)> {
+    images.get(id.0).copied().flatten()
+}
+
+/// Adds one sprite record, extending the previous run when it is the same image drawn straight
+/// after. A removed or unknown image, or an empty source, draws nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the flattening state plus the sprite's own fields"
+)]
+fn push_sprite(
+    runs: &mut Vec<Run>,
+    insts: &mut Vec<Inst>,
+    start: &mut u32,
+    images: &[Option<(u32, u32)>],
+    image: ImageId,
+    src: Option<[u32; 4]>,
+    dst: [f32; 4],
+    rotation: f32,
+    tint: [f32; 4],
+) {
+    let (Some((iw, ih)), Some([sx, sy, sw, sh])) = (size_of_image(images, image), src) else {
+        return;
+    };
+    let (sx, sy): (u32, u32) = (sx.min(iw), sy.min(ih));
+    let (sw, sh): (u32, u32) = (sw.min(iw - sx), sh.min(ih - sy));
+    if sw == 0 || sh == 0 {
+        return;
+    }
+    flush(runs, start, insts.len());
+    let at: u32 = insts.len() as u32;
+    let (fw, fh): (f32, f32) = (iw as f32, ih as f32);
+    insts.push(Inst {
+        a: dst,
+        uv: [
+            sx as f32 / fw,
+            sy as f32 / fh,
+            sw as f32 / fw,
+            sh as f32 / fh,
+        ],
+        p: [rotation, 0.5 / fw, 0.5 / fh, 0.0],
+        color: tint,
+    });
+    match runs.last_mut() {
+        Some(Run::Image { id, insts: r }) if *id == image && r.end == at => r.end = at + 1,
+        _ => runs.push(Run::Image {
+            id: image,
+            insts: at..at + 1,
+        }),
+    }
+    *start = insts.len() as u32;
 }
 
 fn col(c: Rgba) -> [f32; 4] {
@@ -158,7 +213,7 @@ impl Atlas {
 
     /// Lays text out into the atlas and flattens the scene to instances, in paint order.
     #[expect(clippy::too_many_lines, reason = "one match over every primitive kind")]
-    pub fn flatten(&mut self, scene: &Scene) -> Result<Flat> {
+    pub fn flatten(&mut self, scene: &Scene, images: &[Option<(u32, u32)>]) -> Result<Flat> {
         let mut insts: Vec<Inst> = Vec::new();
         let mut runs: Vec<Run> = Vec::new();
         let mut paths: Vec<PathDraw> = Vec::new();
@@ -231,19 +286,38 @@ impl Atlas {
                     h,
                     opacity,
                 } => {
-                    flush(&mut runs, &mut start, insts.len());
-                    runs.push(Run::Image {
-                        id: *image,
-                        inst: insts.len() as u32,
-                    });
-                    insts.push(Inst {
-                        a: [*x, *y, *w, *h],
-                        uv: [0.0; 4],
-                        p: [opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
-                        color: [1.0; 4],
-                    });
-                    start = insts.len() as u32;
+                    let tint: [f32; 4] = [1.0, 1.0, 1.0, opacity.clamp(0.0, 1.0)];
+                    let whole: Option<[u32; 4]> =
+                        size_of_image(images, *image).map(|(iw, ih)| [0, 0, iw, ih]);
+                    push_sprite(
+                        &mut runs,
+                        &mut insts,
+                        &mut start,
+                        images,
+                        *image,
+                        whole,
+                        [*x, *y, *w, *h],
+                        0.0,
+                        tint,
+                    );
                 }
+                Prim::Sprite {
+                    image,
+                    src,
+                    dst,
+                    rotation,
+                    tint,
+                } => push_sprite(
+                    &mut runs,
+                    &mut insts,
+                    &mut start,
+                    images,
+                    *image,
+                    Some(*src),
+                    *dst,
+                    *rotation,
+                    col(*tint),
+                ),
                 Prim::Fill { path, color } => {
                     flush(&mut runs, &mut start, insts.len());
                     push_path(&mut runs, &mut paths, path.clone(), *color);

@@ -45,6 +45,17 @@ impl Budget {
         max: 48,
     };
 
+    /// For rotated, tinted sprites: a rotated quad's edge pixels are decided by pixel-centre
+    /// coverage on the GPU and by tiny-skia's non-antialiased fill on the CPU, so a handful of
+    /// edge pixels differ by a whole step (measured 0.053% / 0.020% / 0.014% / 227 on Metal;
+    /// everything else is within a level or two).
+    pub const SPRITES: Self = Self {
+        over_1: 0.2,
+        over_8: 0.1,
+        over_32: 0.05,
+        max: 255,
+    };
+
     /// For a kernel's output drawn in a scene: float rounding in the GPU kernel can flip a
     /// nearest-palette pick on a few pixels (measured 0.08% / 0.04% / 0.005% / 120).
     pub const KERNEL: Self = Self {
@@ -59,6 +70,17 @@ impl Diff {
     /// Compares two RGBA8 images (alpha ignored). Images of different length compare as total failure.
     #[must_use]
     pub fn between(a: &[u8], b: &[u8]) -> Self {
+        Self::compare(a, b, 3)
+    }
+
+    /// As [`Diff::between`], with alpha compared too: for transparent output, where both images
+    /// are premultiplied.
+    #[must_use]
+    pub fn between_rgba(a: &[u8], b: &[u8]) -> Self {
+        Self::compare(a, b, 4)
+    }
+
+    fn compare(a: &[u8], b: &[u8], channels: usize) -> Self {
         if a.len() != b.len() || a.is_empty() {
             return Self {
                 over_1: 100.0,
@@ -69,7 +91,10 @@ impl Diff {
         }
         let (mut n1, mut n8, mut n32, mut max): (u64, u64, u64, u8) = (0, 0, 0, 0);
         for (p, q) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
-            let d: u8 = (0..3).map(|i| p[i].abs_diff(q[i])).max().unwrap_or(0);
+            let d: u8 = (0..channels)
+                .map(|i| p[i].abs_diff(q[i]))
+                .max()
+                .unwrap_or(0);
             n1 += u64::from(d > 1);
             n8 += u64::from(d > 8);
             n32 += u64::from(d > 32);
