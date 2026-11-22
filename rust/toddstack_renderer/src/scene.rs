@@ -1,5 +1,7 @@
 //! The backend-neutral scene: plain data, drawn in order.
 
+use tiny_skia::{Path, Stroke};
+
 /// Straight (non-premultiplied) RGBA, 8 bits per channel.
 pub type Rgba = [u8; 4];
 
@@ -10,6 +12,20 @@ pub struct FontId(pub(crate) usize);
 /// A custom batch added to a renderer with `Renderer::add_batch`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BatchId(pub(crate) usize);
+
+/// An image added to a renderer with `Renderer::add_image` or `Renderer::kernel_image`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageId(pub(crate) usize);
+
+/// How an image is sampled when drawn at a size other than its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Sampling {
+    /// Bilinear: smooth, for avatars and scaled icons.
+    #[default]
+    Linear,
+    /// Nearest texel: hard pixels, for pixel art and exact-size icons.
+    Nearest,
+}
 
 /// One thing to draw. Coordinates are pixels, origin top-left, y down.
 #[derive(Clone, Debug)]
@@ -56,6 +72,37 @@ pub enum Prim {
         y: f32,
         /// Pixel size.
         size: f32,
+        /// Fill.
+        color: Rgba,
+    },
+    /// An image stretched over a rectangle; `opacity` multiplies its alpha.
+    Image {
+        /// Image from `Renderer::add_image` or `Renderer::kernel_image`.
+        image: ImageId,
+        /// Left edge.
+        x: f32,
+        /// Top edge.
+        y: f32,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// 0 to 1.
+        opacity: f32,
+    },
+    /// A filled path (non-zero winding), antialiased.
+    Fill {
+        /// The outline; open subpaths close implicitly.
+        path: Path,
+        /// Fill.
+        color: Rgba,
+    },
+    /// A stroked path, antialiased: the stroker's outline, filled.
+    Stroke {
+        /// The centre line.
+        path: Path,
+        /// Width, caps, joins and dashes.
+        stroke: Stroke,
         /// Fill.
         color: Rgba,
     },
@@ -123,6 +170,35 @@ impl Scene {
             x,
             y,
             size,
+            color,
+        });
+    }
+
+    /// Adds an image stretched over a rectangle (`opacity` 0 to 1).
+    pub fn image(&mut self, image: ImageId, x: f32, y: f32, w: f32, h: f32, opacity: f32) {
+        self.prims.push(Prim::Image {
+            image,
+            x,
+            y,
+            w,
+            h,
+            opacity,
+        });
+    }
+
+    /// Fills a path (non-zero winding).
+    pub fn fill_path(&mut self, path: &Path, color: Rgba) {
+        self.prims.push(Prim::Fill {
+            path: path.clone(),
+            color,
+        });
+    }
+
+    /// Strokes a path with the given width, caps, joins and dashes.
+    pub fn stroke_path(&mut self, path: &Path, stroke: &Stroke, color: Rgba) {
+        self.prims.push(Prim::Stroke {
+            path: path.clone(),
+            stroke: stroke.clone(),
             color,
         });
     }

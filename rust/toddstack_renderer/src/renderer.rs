@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::glyphs::Atlas;
 use crate::gpu::Gpu;
 use crate::kernel::{Kernel, KernelOutput, KernelPath};
-use crate::scene::{BatchId, FontId, Scene};
+use crate::scene::{BatchId, FontId, ImageId, Sampling, Scene};
 
 /// What to render into: an offscreen RGBA8 image of this size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +69,8 @@ pub struct Renderer {
     caps: Capabilities,
     atlas: Atlas,
     batches: Vec<BatchState>,
+    /// Size of each live image, by id.
+    images: Vec<Option<(u32, u32)>>,
     width: u32,
     height: u32,
 }
@@ -100,6 +102,7 @@ impl Renderer {
                     caps: Capabilities::cpu(),
                     atlas: Atlas::new(),
                     batches: Vec::new(),
+                    images: Vec::new(),
                     width,
                     height,
                 });
@@ -111,6 +114,7 @@ impl Renderer {
                     caps,
                     atlas: Atlas::new(),
                     batches: Vec::new(),
+                    images: Vec::new(),
                     width,
                     height,
                 });
@@ -254,17 +258,118 @@ impl Renderer {
     /// # Errors
     /// `KernelUnavailable` if no form can run here.
     pub async fn run_kernel(&self, kernel: &Kernel) -> Result<KernelOutput> {
-        let path: KernelPath = match &self.inner {
-            Inner::Gpu(g) if g.caps.compute && kernel.compute.is_some() => KernelPath::Compute,
-            Inner::Gpu(_) if kernel.fragment.is_some() => KernelPath::Fragment,
-            _ if kernel.cpu.is_some() => KernelPath::Cpu,
-            _ => {
-                return Err(Error::KernelUnavailable {
-                    kernel: kernel.name.clone(),
-                });
-            }
-        };
+        let path: KernelPath = self.best_path(kernel)?;
         self.run_kernel_with(kernel, path).await
+    }
+
+    fn best_path(&self, kernel: &Kernel) -> Result<KernelPath> {
+        match &self.inner {
+            Inner::Gpu(g) if g.caps.compute && kernel.compute.is_some() => Ok(KernelPath::Compute),
+            Inner::Gpu(_) if kernel.fragment.is_some() => Ok(KernelPath::Fragment),
+            _ if kernel.cpu.is_some() => Ok(KernelPath::Cpu),
+            _ => Err(Error::KernelUnavailable {
+                kernel: kernel.name.clone(),
+            }),
+        }
+    }
+
+    /// Adds an image from straight RGBA8 (`width * height * 4` bytes); draw it with `Scene::image`.
+    ///
+    /// # Errors
+    /// `BadInput` for an empty image or the wrong byte length.
+    pub fn add_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba8: &[u8],
+        sampling: Sampling,
+    ) -> Result<ImageId> {
+        if width == 0 || height == 0 || rgba8.len() != (width as usize) * (height as usize) * 4 {
+            return Err(Error::BadInput(format!(
+                "image {width}x{height} needs {} bytes, got {}",
+                (width as usize) * (height as usize) * 4,
+                rgba8.len()
+            )));
+        }
+        let id: ImageId = self.next_image(width, height);
+        let premul: Vec<u8> = premultiply(rgba8);
+        match &mut self.inner {
+            Inner::Gpu(g) => g.set_image(id, width, height, &premul, sampling),
+            Inner::Cpu(c) => c.set_image(id, width, height, premul, sampling),
+        }
+        Ok(id)
+    }
+
+    /// Runs a kernel and keeps its output as an image for `Scene::image`. On a GPU form the output
+    /// stays on the GPU (no readback); the CPU form uploads its bytes. Returns the form that ran.
+    ///
+    /// # Errors
+    /// `KernelUnavailable` if no form can run here.
+    pub fn kernel_image(
+        &mut self,
+        kernel: &Kernel,
+        sampling: Sampling,
+    ) -> Result<(ImageId, KernelPath)> {
+        let path: KernelPath = self.best_path(kernel)?;
+        self.kernel_image_with(kernel, path, sampling)
+    }
+
+    /// As [`Renderer::kernel_image`], on one named form.
+    ///
+    /// # Errors
+    /// `KernelUnavailable` if the kernel lacks that form, or the backend cannot run it.
+    pub fn kernel_image_with(
+        &mut self,
+        kernel: &Kernel,
+        path: KernelPath,
+        sampling: Sampling,
+    ) -> Result<(ImageId, KernelPath)> {
+        let unavailable = || Error::KernelUnavailable {
+            kernel: kernel.name.clone(),
+        };
+        if let (Inner::Gpu(g), true) = (&mut self.inner, path != KernelPath::Cpu) {
+            if path == KernelPath::Compute && !g.caps.compute {
+                return Err(unavailable());
+            }
+            let id: ImageId = ImageId(self.images.len());
+            g.kernel_image(kernel, path, id, sampling)?;
+            self.images.push(Some((kernel.width, kernel.height)));
+            return Ok((id, path));
+        }
+        if path != KernelPath::Cpu {
+            return Err(unavailable());
+        }
+        let f = kernel.cpu.as_ref().ok_or_else(unavailable)?;
+        let rgba8: Vec<u8> = f(&kernel.inputs, kernel.width, kernel.height);
+        let id: ImageId = self.add_image(kernel.width, kernel.height, &rgba8, sampling)?;
+        Ok((id, KernelPath::Cpu))
+    }
+
+    /// Frees an image; scenes that still draw it draw nothing for it.
+    ///
+    /// # Errors
+    /// `UnknownImage`.
+    pub fn remove_image(&mut self, id: ImageId) -> Result<()> {
+        self.images
+            .get_mut(id.0)
+            .and_then(Option::take)
+            .ok_or(Error::UnknownImage)?;
+        match &mut self.inner {
+            Inner::Gpu(g) => g.remove_image(id),
+            Inner::Cpu(c) => c.remove_image(id),
+        }
+        Ok(())
+    }
+
+    /// The size of an image, if it is live.
+    #[must_use]
+    pub fn image_size(&self, id: ImageId) -> Option<(u32, u32)> {
+        self.images.get(id.0).copied().flatten()
+    }
+
+    fn next_image(&mut self, width: u32, height: u32) -> ImageId {
+        self.images.push(Some((width, height)));
+        ImageId(self.images.len() - 1)
     }
 
     /// Runs one named form, for comparing forms against each other.
@@ -301,4 +406,17 @@ impl Renderer {
             rgba8,
         })
     }
+}
+
+/// Straight RGBA8 to premultiplied, rounded.
+#[expect(clippy::cast_possible_truncation, reason = "the result is at most 255")]
+fn premultiply(rgba8: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = rgba8.to_vec();
+    for px in out.as_chunks_mut::<4>().0 {
+        let a: u32 = u32::from(px[3]);
+        for c in &mut px[..3] {
+            *c = ((u32::from(*c) * a + 127) / 255) as u8;
+        }
+    }
+    out
 }

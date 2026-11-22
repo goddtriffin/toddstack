@@ -20,6 +20,9 @@ export interface Options {
 }
 
 /** One renderer bound to a 2D canvas. */
+/** The built-in demos. */
+export type Demo = "board" | "chart" | "grid" | "images" | "paths" | "texture";
+
 export class Renderer {
   private constructor(
     private readonly core: WebRenderer,
@@ -77,8 +80,8 @@ export class Renderer {
     this.core.text(text, x, y, size, c[0], c[1], c[2], c[3] ?? 255);
   }
 
-  /** Replaces the scene with a built-in demo: `board`, `chart` or `grid`. */
-  demo(name: "board" | "chart" | "grid"): void {
+  /** Replaces the scene with a built-in demo. */
+  demo(name: Demo): void {
     this.core.demo(name);
   }
 

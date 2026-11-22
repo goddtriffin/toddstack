@@ -9,9 +9,11 @@
 
 use crate::batch::BatchDesc;
 use crate::kernel::{Binding, Kernel};
-use crate::scene::{FontId, Scene};
+use crate::paths::rounded_rect;
+use crate::renderer::Renderer;
+use crate::scene::{FontId, Sampling, Scene};
 use std::sync::Arc;
-use tiny_skia::Pixmap;
+use tiny_skia::{LineCap, LineJoin, Path, PathBuilder, Pixmap, Stroke, StrokeDash};
 
 /// Background of the board and chart scenes.
 pub const BG: [u8; 4] = [239, 233, 221, 255];
@@ -381,6 +383,256 @@ pub fn quantize_kernel(width: u32, height: u32) -> Kernel {
     }
 }
 
+/// A 64x64 avatar-like RGBA image: a gradient disc with a soft edge, two eyes, transparent corners.
+#[must_use]
+pub fn avatar_image() -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::with_capacity(64 * 64 * 4);
+    for y in 0..64_u32 {
+        for x in 0..64_u32 {
+            let (dx, dy): (f32, f32) = (x as f32 - 31.5, y as f32 - 31.5);
+            let alpha: f32 = (32.0 - dx.hypot(dy)).clamp(0.0, 1.0);
+            let eye: bool = [(-10.0_f32, -6.0_f32), (10.0, -6.0)]
+                .iter()
+                .any(|(ex, ey)| (dx - ex).hypot(dy - ey) < 5.0);
+            let rgb: [u8; 3] = if eye {
+                [42, 33, 24]
+            } else {
+                [(x * 4).min(255) as u8, (y * 3 + 60).min(255) as u8, 190]
+            };
+            v.extend_from_slice(&[rgb[0], rgb[1], rgb[2], (alpha * 255.0).round() as u8]);
+        }
+    }
+    v
+}
+
+/// An 8x8 pixel-art heart, opaque red on transparent.
+#[must_use]
+pub fn heart_image() -> Vec<u8> {
+    const ROWS: [&str; 8] = [
+        "..XX.XX.", ".XXXXXXX", ".XXXXXXX", ".XXXXXXX", "..XXXXX.", "...XXX..", "....X...",
+        "........",
+    ];
+    let mut v: Vec<u8> = Vec::with_capacity(8 * 8 * 4);
+    for row in ROWS {
+        for ch in row.bytes() {
+            v.extend_from_slice(if ch == b'X' {
+                &[214, 60, 80, 255]
+            } else {
+                &[0, 0, 0, 0]
+            });
+        }
+    }
+    v
+}
+
+/// Image quads (640x260): an avatar at 0.5x, 1x and 2x, the 2x one nearest-sampled; a pixel icon
+/// nearest and linear; the avatar at half opacity over a bar.
+///
+/// # Errors
+/// Anything adding the images or the font fails with.
+pub fn images_scene(r: &mut Renderer, font: FontId) -> crate::Result<Scene> {
+    let avatar = r.add_image(64, 64, &avatar_image(), Sampling::Linear)?;
+    let blocky = r.add_image(64, 64, &avatar_image(), Sampling::Nearest)?;
+    let heart = r.add_image(8, 8, &heart_image(), Sampling::Nearest)?;
+    let soft = r.add_image(8, 8, &heart_image(), Sampling::Linear)?;
+    let mut v: Scene = Scene::new(BG);
+    v.rrect(12.0, 12.0, 616.0, 236.0, 16.0, [255, 250, 240, 255]);
+    v.image(avatar, 28.0, 28.0, 32.0, 32.0, 1.0);
+    v.image(avatar, 72.0, 28.0, 64.0, 64.0, 1.0);
+    v.image(avatar, 28.0, 104.0, 128.0, 128.0, 1.0);
+    v.image(blocky, 172.0, 104.0, 128.0, 128.0, 1.0);
+    v.text(
+        font,
+        "0.5x 1x 2x linear | 2x nearest",
+        164.0,
+        100.0,
+        11.0,
+        [90, 80, 70, 255],
+    );
+    v.image(heart, 332.0, 28.0, 96.0, 96.0, 1.0);
+    v.image(soft, 444.0, 28.0, 96.0, 96.0, 1.0);
+    v.image(heart, 560.0, 28.0, 24.0, 24.0, 1.0);
+    v.rect(332.0, 160.0, 280.0, 40.0, [63, 184, 196, 255]);
+    v.image(avatar, 440.0, 136.0, 88.0, 88.0, 0.5);
+    v.image(avatar, 340.0, 136.0, 88.0, 88.0, 1.0);
+    Ok(v)
+}
+
+/// A Catmull-Rom spline through `pts`, as cubics.
+fn spline(pts: &[(f32, f32)]) -> Option<Path> {
+    let mut b: PathBuilder = PathBuilder::new();
+    b.move_to(pts.first()?.0, pts.first()?.1);
+    for i in 0..pts.len() - 1 {
+        let p0: (f32, f32) = pts[i.saturating_sub(1)];
+        let (p1, p2): ((f32, f32), (f32, f32)) = (pts[i], pts[i + 1]);
+        let p3: (f32, f32) = pts[(i + 2).min(pts.len() - 1)];
+        b.cubic_to(
+            p1.0 + (p2.0 - p0.0) / 6.0,
+            p1.1 + (p2.1 - p0.1) / 6.0,
+            p2.0 - (p3.0 - p1.0) / 6.0,
+            p2.1 - (p3.1 - p1.1) / 6.0,
+            p2.0,
+            p2.1,
+        );
+    }
+    b.finish()
+}
+
+/// Paths (640x400): a smooth line chart with a translucent area, dots, a dashed guide, a pentagram,
+/// a frame with a hole, a zig-zag with miter and bevel joins, rounded tiles; text between runs.
+#[must_use]
+pub fn paths_scene(font: FontId) -> Scene {
+    let ink: [u8; 4] = [42, 33, 24, 255];
+    let mut v: Scene = Scene::new(BG);
+    if let Some(card) = rounded_rect(12.0, 12.0, 616.0, 376.0, 16.0) {
+        v.fill_path(&card, [255, 250, 240, 255]);
+        v.stroke_path(
+            &card,
+            &stroke(2.0, LineCap::Butt, LineJoin::Miter),
+            [0, 0, 0, 40],
+        );
+    }
+    v.text(font, "Words found per day", 190.0, 44.0, 18.0, ink);
+    let pts: Vec<(f32, f32)> = [88.0_f32, 132.0, 110.0, 176.0, 150.0, 198.0, 121.0]
+        .iter()
+        .enumerate()
+        .map(|(i, val)| (40.0 + i as f32 * 50.0, 330.0 - val * 1.3))
+        .collect();
+    if let Some(line) = spline(&pts) {
+        let mut area: PathBuilder = PathBuilder::new();
+        area.move_to(pts[0].0, 330.0);
+        area.line_to(pts[0].0, pts[0].1);
+        for seg in line.segments().skip(1) {
+            if let tiny_skia::PathSegment::CubicTo(a, b, c) = seg {
+                area.cubic_to(a.x, a.y, b.x, b.y, c.x, c.y);
+            }
+        }
+        area.line_to(pts[6].0, 330.0);
+        area.close();
+        if let Some(area) = area.finish() {
+            v.fill_path(&area, [63, 184, 196, 110]);
+        }
+        v.stroke_path(
+            &line,
+            &stroke(4.0, LineCap::Round, LineJoin::Round),
+            [214, 90, 60, 255],
+        );
+    }
+    for (x, y) in &pts {
+        if let Some(dot) = rounded_rect(x - 6.0, y - 6.0, 12.0, 12.0, 6.0) {
+            v.fill_path(&dot, [255, 250, 240, 255]);
+            v.stroke_path(&dot, &stroke(3.0, LineCap::Butt, LineJoin::Round), ink);
+        }
+    }
+    v.text(font, "Mon to Sun", 190.0, 356.0, 13.0, [90, 80, 70, 255]);
+    let mut guide: PathBuilder = PathBuilder::new();
+    guide.move_to(40.0, 330.0 - 150.0 * 1.3);
+    guide.line_to(340.0, 330.0 - 150.0 * 1.3);
+    if let Some(g) = guide.finish() {
+        let mut st: Stroke = stroke(2.0, LineCap::Butt, LineJoin::Miter);
+        st.dash = StrokeDash::new(vec![10.0, 6.0], 0.0);
+        v.stroke_path(&g, &st, [90, 80, 70, 200]);
+    }
+    shapes_into(&mut v);
+    v
+}
+
+fn shapes_into(v: &mut Scene) {
+    let ink: [u8; 4] = [42, 33, 24, 255];
+    let mut star: PathBuilder = PathBuilder::new();
+    for k in 0..5_u32 {
+        let a: f32 = (k * 2) as f32 * std::f32::consts::TAU / 5.0 - std::f32::consts::FRAC_PI_2;
+        let (x, y): (f32, f32) = (500.0 + 64.0 * a.cos(), 110.0 + 64.0 * a.sin());
+        if k == 0 {
+            star.move_to(x, y);
+        } else {
+            star.line_to(x, y);
+        }
+    }
+    star.close();
+    if let Some(star) = star.finish() {
+        v.fill_path(&star, [255, 210, 74, 255]);
+        v.stroke_path(&star, &stroke(3.0, LineCap::Butt, LineJoin::Miter), ink);
+    }
+    let mut frame: PathBuilder = PathBuilder::new();
+    frame.move_to(380.0, 210.0);
+    frame.line_to(470.0, 210.0);
+    frame.line_to(470.0, 290.0);
+    frame.line_to(380.0, 290.0);
+    frame.close();
+    frame.move_to(398.0, 226.0);
+    frame.line_to(398.0, 274.0);
+    frame.line_to(452.0, 274.0);
+    frame.line_to(452.0, 226.0);
+    frame.close();
+    if let Some(frame) = frame.finish() {
+        v.fill_path(&frame, [91, 74, 58, 255]);
+    }
+    let mut zig: PathBuilder = PathBuilder::new();
+    zig.move_to(496.0, 250.0);
+    zig.line_to(520.0, 190.0);
+    zig.line_to(544.0, 250.0);
+    zig.line_to(568.0, 190.0);
+    zig.line_to(592.0, 250.0);
+    if let Some(zig) = zig.finish() {
+        v.stroke_path(
+            &zig,
+            &stroke(8.0, LineCap::Square, LineJoin::Miter),
+            [40, 160, 200, 255],
+        );
+        let moved: Path = zig
+            .clone()
+            .transform(tiny_skia::Transform::from_translate(0.0, 60.0))
+            .unwrap_or_else(|| zig.clone());
+        v.stroke_path(
+            &moved,
+            &stroke(8.0, LineCap::Butt, LineJoin::Bevel),
+            [103, 58, 183, 255],
+        );
+    }
+    for (i, color) in [[63, 184, 196, 255], [255, 210, 74, 255], [214, 90, 60, 255]]
+        .iter()
+        .enumerate()
+    {
+        if let Some(tile) = rounded_rect(380.0 + i as f32 * 72.0, 326.0, 60.0, 44.0, 12.0) {
+            v.fill_path(&tile, *color);
+        }
+    }
+}
+
+fn stroke(width: f32, line_cap: LineCap, line_join: LineJoin) -> Stroke {
+    Stroke {
+        width,
+        line_cap,
+        line_join,
+        ..Stroke::default()
+    }
+}
+
+/// A kernel's output as a scene image (640x300): the quantize kernel runs on the GPU and is drawn
+/// at full size and half size with no readback, with a frame and text drawn around it.
+///
+/// # Errors
+/// Anything the kernel, the image or the font fails with.
+pub fn texture_scene(r: &mut Renderer, font: FontId) -> crate::Result<Scene> {
+    let (id, _path) = r.kernel_image(&quantize_kernel(320, 240), Sampling::Linear)?;
+    let mut v: Scene = Scene::new(BG);
+    v.rrect(8.0, 8.0, 328.0, 248.0, 12.0, [91, 74, 58, 255]);
+    v.image(id, 12.0, 12.0, 320.0, 240.0, 1.0);
+    v.text(
+        font,
+        "kernel output, no readback",
+        480.0,
+        40.0,
+        16.0,
+        [42, 33, 24, 255],
+    );
+    v.image(id, 352.0, 56.0, 160.0, 120.0, 1.0);
+    v.image(id, 524.0, 56.0, 96.0, 72.0, 0.6);
+    v.rrect(352.0, 190.0, 268.0, 40.0, 10.0, [63, 184, 196, 255]);
+    Ok(v)
+}
+
 /// Renders [`arena_scene`] on `backend` and on the CPU and diffs them. `Ok(None)` when `backend`
 /// is not available on this machine.
 ///
@@ -390,8 +642,26 @@ pub async fn parity(
     backend: crate::Backend,
     font: &[u8],
 ) -> crate::Result<Option<(crate::Capabilities, crate::Diff)>> {
-    use crate::{Backend, Diff, Error, Options, Renderer, Target};
-    let target: Target = Target::offscreen(800, 520);
+    parity_scene(backend, crate::Target::offscreen(800, 520), |r| {
+        Ok(arena_scene(r.add_font(font)?))
+    })
+    .await
+}
+
+/// Renders the scene `build` makes on `backend` and on the CPU and diffs them. `Ok(None)` when
+/// `backend` is not available on this machine.
+///
+/// # Errors
+/// Anything the renderer or `build` fails with other than a missing backend.
+pub async fn parity_scene<F>(
+    backend: crate::Backend,
+    target: crate::Target,
+    build: F,
+) -> crate::Result<Option<(crate::Capabilities, crate::Diff)>>
+where
+    F: Fn(&mut Renderer) -> crate::Result<Scene>,
+{
+    use crate::{Backend, Diff, Error, Options};
     let mut cpu: Renderer = Renderer::with_options(
         target,
         Options {
@@ -400,8 +670,8 @@ pub async fn parity(
         },
     )
     .await?;
-    let cpu_font: FontId = cpu.add_font(font)?;
-    let reference: Vec<u8> = cpu.render(&arena_scene(cpu_font)).await?;
+    let scene: Scene = build(&mut cpu)?;
+    let reference: Vec<u8> = cpu.render(&scene).await?;
     let mut gpu: Renderer = match Renderer::with_options(
         target,
         Options {
@@ -415,8 +685,8 @@ pub async fn parity(
         Err(Error::NoBackend { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
-    let gpu_font: FontId = gpu.add_font(font)?;
-    let pixels: Vec<u8> = gpu.render(&arena_scene(gpu_font)).await?;
+    let scene: Scene = build(&mut gpu)?;
+    let pixels: Vec<u8> = gpu.render(&scene).await?;
     Ok(Some((
         gpu.capabilities().clone(),
         Diff::between(&reference, &pixels),
