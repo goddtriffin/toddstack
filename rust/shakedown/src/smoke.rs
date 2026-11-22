@@ -6,7 +6,8 @@
 //! (the run ends through `interrupted()`) all reach it.
 
 use std::collections::BTreeMap;
-use std::io::{Read as _, Write as _};
+use std::fmt::Write as _;
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -105,8 +106,9 @@ impl Smoke {
     ///
     /// # Errors
     ///
-    /// A path without a leading `/`, or an empty command.
-    pub fn validate(&self) -> Result<(), Error> {
+    /// A path without a leading `/` (or with a space or control character), an empty command, or `sweep = true`
+    /// with no `[sweep]` section (`has_sweep` says whether there is one).
+    pub fn validate(&self, has_sweep: bool) -> Result<(), Error> {
         let bad = |m: String| Err(Error::Config(format!("[smoke] {m}")));
         if self.up.trim().is_empty() || self.down.trim().is_empty() {
             return bad("needs up and down (the repo's Makefile targets)".into());
@@ -120,9 +122,17 @@ impl Smoke {
             if !p.starts_with('/') {
                 return bad(format!("path {p:?} must start with /"));
             }
+            if p.chars().any(|c| c == ' ' || c.is_control()) {
+                return bad(format!(
+                    "path {p:?} must not hold spaces or control characters"
+                ));
+            }
         }
         if self.timeout == 0 {
             return bad("timeout must be at least 1".into());
+        }
+        if self.sweep && !has_sweep {
+            return bad("sweep = true needs a [sweep] section in shakedown.toml".into());
         }
         Ok(())
     }
@@ -182,26 +192,82 @@ fn dechunk(mut body: &[u8]) -> Vec<u8> {
     }
 }
 
-/// `GET path` on `127.0.0.1:port`.
+/// How long one request may take in all, and how much of the answer is kept.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Total time from connecting to the last byte.
+    pub total: Duration,
+    /// The most bytes read (headers and body).
+    pub max_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            total: Duration::from_secs(30),
+            max_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+/// `GET path` on `127.0.0.1:port`, within the default [`Limits`].
 ///
 /// # Errors
 ///
-/// Nothing answers, or the answer is not HTTP.
+/// Nothing answers, or the answer is not HTTP, or too slow, or too big.
 pub fn get(port: u16, path: &str) -> Result<Response, String> {
+    get_with(port, path, Limits::default(), &|| false)
+}
+
+/// `GET path` with one total deadline and a byte cap, giving up the moment `stop` turns true. Reads wake every
+/// 100 ms, so neither a dribbling route nor a signal can hold it.
+///
+/// # Errors
+///
+/// Nothing answers, the answer is not HTTP, it is too slow or too big, or `stop` turned true.
+pub fn get_with(
+    port: u16,
+    path: &str,
+    limits: Limits,
+    stop: &dyn Fn() -> bool,
+) -> Result<Response, String> {
+    let started = Instant::now();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2).min(limits.total))
         .map_err(|e| format!("cannot connect: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(10)))
+    s.set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|e| e.to_string())?;
-    write!(
-        s,
+    let request = format!(
         "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAccept: */*\r\nAccept-Encoding: identity\r\n\
          User-Agent: shakedown-smoke\r\nConnection: close\r\n\r\n"
-    )
-    .map_err(|e| format!("cannot send: {e}"))?;
+    );
+    s.write_all(request.as_bytes())
+        .map_err(|e| format!("cannot send: {e}"))?;
     let mut raw = Vec::new();
-    s.read_to_end(&mut raw)
-        .map_err(|e| format!("cannot read: {e}"))?;
+    let mut buf = [0_u8; 16 * 1024];
+    loop {
+        if stop() {
+            return Err("interrupted".into());
+        }
+        if started.elapsed() > limits.total {
+            return Err(format!("took over {}s", limits.total.as_secs_f64()));
+        }
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > limits.max_bytes {
+                    return Err(format!("answer is over {} bytes", limits.max_bytes));
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(format!("cannot read: {e}")),
+        }
+    }
     parse(&raw)
 }
 
@@ -424,10 +490,31 @@ fn dev_urls(text: &str) -> Vec<String> {
     out
 }
 
+/// Dev URLs in a response's headers and, for text (HTML, JSON, XML, JavaScript, CSS), its body.
+fn scan_dev_urls(path: &str, r: &Response, problems: &mut Vec<String>) {
+    let mut head = String::new();
+    for (k, v) in &r.headers {
+        let _ = writeln!(head, "{k}: {v}");
+    }
+    for found in dev_urls(&head) {
+        problems.push(format!("{path}: header {found}"));
+    }
+    if is_text(r) {
+        for found in dev_urls(&r.text()) {
+            problems.push(format!("{path}: {found}"));
+        }
+    }
+}
+
 fn is_text(r: &Response) -> bool {
     r.header("content-type").is_some_and(|c| {
         let c = c.to_ascii_lowercase();
-        c.contains("text/html") || c.contains("json") || c.contains("xml")
+        c.contains("text/html")
+            || c.contains("json")
+            || c.contains("xml")
+            || c.contains("javascript")
+            || c.contains("ecmascript")
+            || c.contains("css")
     })
 }
 
@@ -491,11 +578,7 @@ pub fn builtin(
             http.problems
                 .push(format!("{route}: missing headers {}", missing.join(", ")));
         }
-        if is_text(&r) {
-            for found in dev_urls(&r.text()) {
-                http.problems.push(format!("{route}: {found}"));
-            }
-        }
+        scan_dev_urls(route, &r, &mut http.problems);
         if r.status == 200 && r.is_html() {
             for url in asset_refs(&r.text()) {
                 if let Some(p) = local_path(&url, route)
@@ -518,6 +601,7 @@ pub fn builtin(
                 r.status
             )),
             Ok(r) => {
+                scan_dev_urls(&asset, &r, &mut http.problems);
                 let age = cache_age(r.header("cache-control"));
                 if age < smoke.min_cache {
                     http.problems.push(format!(
@@ -535,10 +619,15 @@ pub fn builtin(
 /// The project's checks.
 pub fn project_checks(
     checks: &[Check],
+    host: &str,
     fetch: &mut impl FnMut(&str) -> Result<Response, String>,
+    stop: &dyn Fn() -> bool,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     for c in checks {
+        if stop() {
+            break;
+        }
         let p = &c.path;
         let r = match fetch(p) {
             Ok(r) => r,
@@ -557,10 +646,11 @@ pub fn project_checks(
         }
         if let Some(want) = &c.location {
             let got = r.header("location").unwrap_or("(none)");
-            // A full URL to this server counts as its path.
+            // A full URL to this server (`host`, nothing else) counts as its path; another host never does.
             let path = got
                 .strip_prefix("http://")
-                .and_then(|u| u.find('/').map(|i| &u[i..]))
+                .and_then(|u| u.strip_prefix(host))
+                .filter(|rest| rest.starts_with('/'))
                 .unwrap_or(got);
             if got != want && path != want {
                 problems.push(format!("{p}: redirects to {got}, expected {want}"));
@@ -584,19 +674,44 @@ pub fn project_checks(
     problems
 }
 
-/// Panics and error lines in the container's logs. A line counts when it has the word `error`, `panic`,
-/// `panicked` or `fatal` as a whole word (letters, digits and `_` make a word, so `errors` and `no_errors` do
-/// not), unless it holds one of `ignore`.
+/// Panics and error lines in the container's logs. A line counts when it has a level-style token: the word
+/// `ERROR`, `FATAL` or `PANIC` in capitals, `panicked at`, a line starting `Error:`, or a level field set to error, fatal or panic
+/// (`level=error`, `"level":"error"`). Words in ordinary text (`error=none`, `/error-page`, `no errors`) do not
+/// count. A line holding one of `ignore` is skipped.
 pub fn scan_logs(text: &str, ignore: &[String]) -> Vec<String> {
     text.lines()
         .filter(|l| !ignore.iter().any(|i| l.contains(i.as_str())))
-        .filter(|l| {
-            l.to_ascii_lowercase()
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .any(|w| matches!(w, "error" | "panic" | "panicked" | "fatal"))
-        })
+        .filter(|l| is_error_line(l))
         .map(|l| l.trim().chars().take(300).collect())
         .collect()
+}
+
+fn is_error_line(line: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    if line
+        .split(|c: char| !word(c))
+        .any(|w| matches!(w, "ERROR" | "FATAL" | "PANIC"))
+    {
+        return true;
+    }
+    // What a Rust `main` prints when it returns an error.
+    if line.trim_start().starts_with("Error:") {
+        return true;
+    }
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("panicked at") {
+        return true;
+    }
+    let squeezed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    ["error", "fatal", "panic"].iter().any(|lv| {
+        [
+            format!("level={lv}"),
+            format!("level=\"{lv}\""),
+            format!("\"level\":\"{lv}\""),
+        ]
+        .iter()
+        .any(|pat| squeezed.contains(pat.as_str()))
+    })
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -634,6 +749,8 @@ struct Down {
     root: PathBuf,
     log: PathBuf,
     done: bool,
+    /// How long `down` may take before its whole process group is killed.
+    limit: Duration,
 }
 
 impl Down {
@@ -655,7 +772,7 @@ impl Down {
             .process_group(0)
             .spawn()
             .map_err(|e| format!("cannot run smoke.down: {e}"))?;
-        let deadline = Instant::now() + Duration::from_secs(180);
+        let deadline = Instant::now() + self.limit;
         loop {
             match child.try_wait() {
                 Ok(Some(s)) if s.success() => return Ok(()),
@@ -664,8 +781,14 @@ impl Down {
                     return Err(format!("smoke.down exited {s}: {}", tail(&text, 10)));
                 }
                 Ok(None) if Instant::now() > deadline => {
+                    // The whole group (the shell and what it started), not just `sh`.
+                    let _ = Command::new("kill")
+                        .args(["-KILL", "--", &format!("-{}", child.id())])
+                        .stderr(Stdio::null())
+                        .status();
                     let _ = child.kill();
-                    return Err("smoke.down took over 180s".into());
+                    let _ = child.wait();
+                    return Err(format!("smoke.down took over {}s", self.limit.as_secs()));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 Err(e) => return Err(e.to_string()),
@@ -743,7 +866,8 @@ fn skipped(name: &str, why: &str) -> StepResult {
 pub type Sweeper<'a> = &'a dyn Fn(u16) -> Result<Vec<String>, String>;
 
 /// The real sweeper: the project's `[sweep]` pages drawn against `http://127.0.0.1:{port}` with no world of its own.
-/// Pixel changes against the baseline of the dev-server sweep are reported by `shakedown sweep`, not failed here.
+/// It works in its own directory (`target/shakedown/smoke/sweep`) and writes no baseline: the dev sweep's
+/// baselines, pictures and reports are never touched, and pixel changes are not judged here.
 fn sweep_container(config: &Config, root: &Path, port: u16) -> Result<Vec<String>, String> {
     if config.sweep.is_none() {
         return Err("no [sweep] section in shakedown.toml".into());
@@ -753,6 +877,7 @@ fn sweep_container(config: &Config, root: &Path, port: u16) -> Result<Vec<String
         routes: Vec::new(),
         pack: false,
         rebase: false,
+        out: Some(root.join("target/shakedown/smoke/sweep")),
     };
     Ok(match crate::sweep::run(config, root, &opts) {
         Ok(o) => o
@@ -799,6 +924,7 @@ pub fn run_on(
         root: root.to_path_buf(),
         log: out.join("down.log"),
         done: false,
+        limit: Duration::from_secs(180),
     };
     let mut digest = None;
     body(
@@ -840,7 +966,8 @@ fn interrupted(results: &mut Vec<StepResult>, from: &[&str]) {
     ));
 }
 
-/// Steps 1 to 6. Returns early when a step leaves nothing to check; the caller still runs down.
+/// Steps 1 to 6. Returns early when a step leaves nothing to check, and straight away (no checks, no logs) once
+/// a signal has arrived; the caller still runs down.
 fn body(
     smoke: &Smoke,
     root: &Path,
@@ -851,27 +978,39 @@ fn body(
     digest: &mut Option<String>,
 ) {
     if !step_up(smoke, root, out, port, signals, results, digest) {
-        logs_step(smoke, root, out, port, results, true);
+        if !signals.interrupted() {
+            logs_step(smoke, root, out, port, results, true);
+        }
+        return;
+    }
+    if signals.interrupted() {
+        interrupted(results, &AFTER_UP);
         return;
     }
     if !step_ready(smoke, port, signals, results) {
-        logs_step(smoke, root, out, port, results, true);
+        if !signals.interrupted() {
+            logs_step(smoke, root, out, port, results, true);
+        }
         return;
     }
     let stopped = || signals.interrupted();
     // Each path is requested once, however many checks look at it.
     let mut cache: BTreeMap<String, Result<Response, String>> = BTreeMap::new();
     let mut fetch = |p: &str| {
-        cache
-            .entry(p.to_string())
-            .or_insert_with(|| get(port, p))
-            .clone()
+        if let Some(hit) = cache.get(p) {
+            return hit.clone();
+        }
+        let got = get_with(port, p, Limits::default(), &stopped);
+        // An interrupted request says nothing about the route: do not keep it.
+        if !stopped() {
+            cache.insert(p.to_string(), got.clone());
+        }
+        got
     };
     let started = Instant::now();
     let http = builtin(smoke, &mut fetch, &stopped);
     if stopped() {
         interrupted(results, &AFTER_UP[1..]);
-        logs_step(smoke, root, out, port, results, true);
         return;
     }
     results.push(problems_result(
@@ -881,7 +1020,12 @@ fn body(
         &http.problems,
     ));
     let started = Instant::now();
-    let problems = project_checks(&smoke.checks, &mut fetch);
+    let host = format!("127.0.0.1:{port}");
+    let problems = project_checks(&smoke.checks, &host, &mut fetch, &stopped);
+    if stopped() {
+        interrupted(results, &AFTER_UP[2..]);
+        return;
+    }
     results.push(problems_result(
         "smoke.checks",
         &format!("{} checks", smoke.checks.len()),
@@ -894,6 +1038,10 @@ fn body(
             Ok(findings) => problems_result("smoke.sweep", "", started, &findings),
             Err(why) => skipped("smoke.sweep", &why),
         });
+        if stopped() {
+            interrupted(results, &[]);
+            return;
+        }
     }
     logs_step(smoke, root, out, port, results, false);
 }
@@ -1043,8 +1191,14 @@ fn logs_step(
         .env("SHAKEDOWN", "1")
         .stdin(Stdio::null())
         .output();
+    let mut exit_failure = None;
     let text = match o {
-        Ok(o) => String::from_utf8_lossy(&[o.stdout, o.stderr].concat()).into_owned(),
+        Ok(o) => {
+            if !o.status.success() {
+                exit_failure = Some(o.status);
+            }
+            String::from_utf8_lossy(&[o.stdout, o.stderr].concat()).into_owned()
+        }
         Err(e) => {
             results.push(result(
                 "smoke.logs",
@@ -1067,6 +1221,16 @@ fn logs_step(
                 "end of target/shakedown/smoke/container.log:\n{}",
                 tail(&text, 20)
             ),
+        ));
+        return;
+    }
+    if let Some(status) = exit_failure {
+        results.push(result(
+            "smoke.logs",
+            Status::Fail(format!("the logs command exited {status}")),
+            "",
+            started,
+            tail(&text, 20),
         ));
         return;
     }
@@ -1137,7 +1301,8 @@ pub fn command(config: &Config, root: &Path, json: bool) -> Result<(), Error> {
         .ok_or_else(|| Error::Config("no [smoke] section in shakedown.toml".into()))?;
     let out = root.join("target/shakedown/smoke");
     let port = world::free_port()?;
-    let signals = world::watch_signals();
+    // Shielded: Ctrl-C any number of times still lets `down` run.
+    let signals = world::watch_signals_shielded();
     let outcome = run_on(smoke, root, &out, port, &signals, &|p| {
         sweep_container(config, root, p)
     })?;
@@ -1194,7 +1359,6 @@ pub fn command(config: &Config, root: &Path, json: bool) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fmt::Write as _;
     use std::io::BufRead as _;
     use std::net::TcpListener;
     use std::process::Child;
@@ -1388,7 +1552,12 @@ mod tests {
         };
         let run = |t: &str| {
             let mut fetch = |p: &str| get(port, p);
-            project_checks(&checks(t), &mut fetch)
+            project_checks(
+                &checks(t),
+                &format!("127.0.0.1:{port}"),
+                &mut fetch,
+                &|| false,
+            )
         };
         assert_eq!(
             run(
@@ -1464,6 +1633,311 @@ mod tests {
         assert_eq!(hits.len(), 4, "{hits:?}");
         let hits = scan_logs(log, &["sentry".to_string()]);
         assert_eq!(hits.len(), 3, "{hits:?}");
+    }
+
+    #[test]
+    fn info_lines_that_mention_errors_are_not_flagged() {
+        let log =
+            "INFO error=none\nINFO GET /error-page 200\nlevel=info msg=\"no error\"\nerror_count=0";
+        assert_eq!(scan_logs(log, &[]), none());
+        assert_eq!(
+            scan_logs("ts level=error msg=x\nts level=info", &[]).len(),
+            1
+        );
+        assert_eq!(scan_logs("{\"level\": \"fatal\"}", &[]).len(), 1);
+    }
+
+    #[test]
+    fn a_location_on_another_host_is_not_the_local_path() {
+        let port = serve(vec![
+            ("/abs", 301, vec![("location", "http://other.test/x")], ""),
+            ("/self", 301, vec![("location", "http://HOST/x")], ""),
+        ]);
+        let host = format!("127.0.0.1:{port}");
+        let mut fetch = |p: &str| {
+            get(port, p).map(|mut r| {
+                for (_, v) in &mut r.headers {
+                    *v = v.replace("HOST", &host);
+                }
+                r
+            })
+        };
+        let checks: Vec<Check> = toml::from_str::<toml::Table>(
+            r#"c = [{ path = "/abs", status = 301, location = "/x" }, { path = "/self", status = 301, location = "/x" }]"#,
+        )
+        .unwrap()["c"]
+            .clone()
+            .try_into()
+            .unwrap();
+        let p = project_checks(&checks, &host, &mut fetch, &|| false);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].starts_with("/abs: redirects to http://other.test/x"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn the_dev_url_scan_covers_scripts_styles_and_headers() {
+        let port = serve(vec![
+            (
+                "/",
+                200,
+                vec![HTML],
+                "<script src=/a.js></script><link rel=stylesheet href=/a.css>",
+            ),
+            (
+                "/a.js",
+                200,
+                vec![
+                    ("content-type", "text/javascript"),
+                    ("cache-control", "max-age=31536000"),
+                ],
+                "fetch('http://localhost:3000/api')",
+            ),
+            (
+                "/a.css",
+                200,
+                vec![
+                    ("content-type", "text/css"),
+                    ("cache-control", "max-age=31536000"),
+                ],
+                "a{background:url(http://127.0.0.1/x.png)}",
+            ),
+        ]);
+        let p = problems(&smoke("headers = []"), port);
+        assert!(
+            p.iter()
+                .any(|l| l.starts_with("/a.js:") && l.contains("localhost")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|l| l.starts_with("/a.css:") && l.contains("127.0.0.1")),
+            "{p:?}"
+        );
+        let port = serve(vec![(
+            "/",
+            200,
+            vec![HTML, ("link", "<http://localhost:5173/x>; rel=preload")],
+            "hi",
+        )]);
+        let p = problems(&smoke("headers = []"), port);
+        assert!(
+            p.iter()
+                .any(|l| l.contains("header") && l.contains("localhost")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn paths_with_spaces_or_control_characters_are_rejected() {
+        for bad in ["/a b", "/a\tb", "/a\nb"] {
+            let s: Smoke =
+                toml::from_str(&format!("up = \"u\"\ndown = \"d\"\nroutes = [{bad:?}]\n")).unwrap();
+            assert!(s.validate(true).is_err(), "{bad:?}");
+        }
+        let ok: Smoke =
+            toml::from_str("up = \"u\"\ndown = \"d\"\nroutes = [\"/a?b=c\"]\n").unwrap();
+        assert!(ok.validate(true).is_ok());
+    }
+
+    #[test]
+    fn sweep_true_without_a_sweep_section_is_rejected() {
+        let s: Smoke = toml::from_str("up = \"u\"\ndown = \"d\"\nsweep = true\n").unwrap();
+        assert!(s.validate(false).is_err());
+        assert!(s.validate(true).is_ok());
+    }
+
+    #[test]
+    fn a_dribbling_route_times_out_and_a_stop_ends_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut s = stream;
+                    let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n");
+                    for _ in 0..600 {
+                        if s.write_all(b"x").is_err() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+            }
+        });
+        let started = Instant::now();
+        let limits = Limits {
+            total: Duration::from_millis(600),
+            max_bytes: 1 << 20,
+        };
+        let e = get_with(port, "/", limits, &|| false).unwrap_err();
+        assert!(e.contains("took over"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let e = get_with(port, "/", Limits::default(), &|| true).unwrap_err();
+        assert_eq!(e, "interrupted");
+    }
+
+    #[test]
+    fn a_huge_answer_is_cut_off_at_the_byte_cap() {
+        let body: &'static str = Box::leak("y".repeat(200_000).into_boxed_str());
+        let port = serve(vec![("/big", 200, vec![HTML], body)]);
+        let limits = Limits {
+            total: Duration::from_secs(10),
+            max_bytes: 50_000,
+        };
+        let e = get_with(port, "/big", limits, &|| false).unwrap_err();
+        assert!(e.contains("over 50000 bytes"), "{e}");
+    }
+
+    #[test]
+    fn a_failing_logs_command_fails_the_run() {
+        let port = serve(vec![("/", 200, vec![HTML], "hi")]);
+        let (o, marker) = run_marked(
+            "logsfail",
+            &up_ok(),
+            "routes = [\"/\"]\nlogs = \"echo all fine; exit 5\"",
+            port,
+        );
+        assert!(!o.passed(), "{:?}", lines(&o));
+        assert!(
+            names(&o).contains(&"smoke.logs FAIL".to_string()),
+            "{:?}",
+            names(&o)
+        );
+        assert!(marker.exists());
+        let (o, _) = run_marked(
+            "logsok",
+            &up_ok(),
+            "routes = [\"/\"]\nlogs = \"echo all fine\"",
+            port,
+        );
+        assert!(o.passed(), "{:?}", lines(&o));
+    }
+
+    /// Down that hangs: the whole group dies at the limit, including what the shell started.
+    #[test]
+    fn a_hung_down_is_killed_with_its_whole_group() {
+        let dir = scratch("hungdown");
+        let pidfile = dir.join("pid");
+        let mut down = Down {
+            command: format!("sleep 300 & echo $! > {}; wait", pidfile.display()),
+            root: dir.clone(),
+            log: dir.join("down.log"),
+            done: false,
+            limit: Duration::from_millis(600),
+        };
+        let e = down.run().unwrap_err();
+        assert!(e.contains("took over"), "{e}");
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::thread::sleep(Duration::from_millis(300));
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the grandchild sleep {pid} survived");
+    }
+
+    /// A signal while the checks run: no later step runs (no logs), and down still does.
+    #[test]
+    fn a_smoke_child_for_the_mid_checks_test() {
+        let Ok(marker) = std::env::var("SHAKEDOWN_SMOKE_MID") else {
+            return;
+        };
+        let dir = PathBuf::from(&marker).parent().unwrap().to_path_buf();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut s = stream;
+                    let mut head = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    if String::from_utf8_lossy(&head).contains("GET /slow") {
+                        // Never answers.
+                        std::thread::sleep(Duration::from_secs(60));
+                    } else {
+                        let _ =
+                            s.write_all(b"HTTP/1.0 200 OK\r\ncontent-type: text/html\r\n\r\nhi");
+                    }
+                });
+            }
+        });
+        let s: Smoke = toml::from_str(&format!(
+            "up = {:?}\ndown = \"touch {marker}\"\nheaders = []\nroutes = [\"/\", \"/slow\"]\nlogs = \"touch {}\"\n",
+            up_ok(),
+            dir.join("logs-ran").display()
+        ))
+        .unwrap();
+        let signals = world::watch_signals_shielded();
+        println!("waiting");
+        let o = run_on(&s, &dir, &dir.join("out"), port, &signals, &no_sweep).unwrap();
+        println!("finished {}", names(&o).join(","));
+    }
+
+    #[test]
+    fn two_signals_during_the_checks_skip_to_down_and_do_not_kill_it() {
+        let dir = scratch("mid");
+        let marker = dir.join("down-ran");
+        let mut c: Child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "smoke::tests::a_smoke_child_for_the_mid_checks_test",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SHAKEDOWN_SMOKE_MID", &marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(c.stdout.take().unwrap()).lines();
+        loop {
+            if lines
+                .next()
+                .expect("the child ended early")
+                .unwrap()
+                .ends_with("waiting")
+            {
+                break;
+            }
+        }
+        // Let it get stuck on /slow, then Ctrl-C twice.
+        std::thread::sleep(Duration::from_millis(1500));
+        for _ in 0..2 {
+            let _ = Command::new("kill")
+                .args(["-INT", &c.id().to_string()])
+                .status();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let rest: Vec<String> = lines.map_while(Result::ok).collect();
+        assert!(
+            c.wait().unwrap().success(),
+            "the child died on the second Ctrl-C: {rest:?}"
+        );
+        assert!(marker.exists(), "down ran: {rest:?}");
+        assert!(
+            !dir.join("logs-ran").exists(),
+            "the logs step ran after the signal: {rest:?}"
+        );
+        let done = rest
+            .iter()
+            .find(|l| l.starts_with("finished"))
+            .expect("finished");
+        assert!(done.contains("smoke.interrupted FAIL"), "{done}");
+        assert!(!done.contains("smoke.logs"), "{done}");
     }
 
     #[test]
@@ -1648,6 +2122,7 @@ mod tests {
                 root: dir.clone(),
                 log: dir.join("down.log"),
                 done: false,
+                limit: Duration::from_secs(5),
             };
             panic!("a bug in a check");
         });
@@ -1664,6 +2139,7 @@ mod tests {
             root: dir.clone(),
             log: dir.join("down.log"),
             done: false,
+            limit: Duration::from_secs(5),
         };
         down.run().unwrap();
         drop(down);

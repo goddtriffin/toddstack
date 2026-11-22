@@ -230,6 +230,7 @@ fn sweep_cmd(config: &Config, root: &Path, m: &ArgMatches) -> Result<(), Error> 
             .map_or_else(Vec::new, |v| v.cloned().collect()),
         pack: m.get_flag("pack"),
         rebase: m.get_flag("rebase"),
+        out: None,
     };
     let outcome = sweep::run(config, root, &opts)?;
     for line in sweep::lines(&outcome) {
