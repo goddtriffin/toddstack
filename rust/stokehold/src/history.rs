@@ -98,6 +98,9 @@ pub struct Defaults {
     /// The slowest of the recent runs (ms), when they were this very command (not the pooled program tier) and there are
     /// at least `FAST_MIN_RUNS` of them: what decides the fast lane (`admit::fast_lane`). `None` otherwise.
     pub slowest_run_ms: Option<u64>,
+    /// The sustained CPU level (centi-cores) of the recent runs that recorded one (`Stats::sustained_centi_cores`),
+    /// picked like the peak; `None` when none did.
+    pub cpu_sustained: Option<u64>,
 }
 
 /// A command needs this many counted runs of its own before its run time can put it in the fast lane.
@@ -284,6 +287,12 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
         .collect();
     let cpu_peak_at_ms = ramps.iter().copied().max();
     let cpu_peak_median_ms = median(ramps);
+    let cpu_sustained = pick(
+        mine.iter()
+            .map(|e| e.measured.sustained_centi_cores)
+            .filter(|c| *c > 0)
+            .collect(),
+    );
     let slowest_run_ms = (mine.len() >= FAST_MIN_RUNS)
         .then(|| mine.iter().map(|e| e.measured.run_ms).max())
         .flatten();
@@ -295,6 +304,7 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
         cpu_peak_at_ms,
         cpu_peak_median_ms,
         slowest_run_ms,
+        cpu_sustained,
     })
 }
 
@@ -354,7 +364,8 @@ mod tests {
                 mem_peak_at_ms: None,
                 cpu_peak_at_ms: None,
                 cpu_peak_median_ms: None,
-                slowest_run_ms: Some(0)
+                slowest_run_ms: Some(0),
+                cpu_sustained: None
             }
         );
         assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
@@ -396,7 +407,8 @@ mod tests {
                 mem_peak_at_ms: None,
                 cpu_peak_at_ms: None,
                 cpu_peak_median_ms: None,
-                slowest_run_ms: None
+                slowest_run_ms: None,
+                cpu_sustained: None
             }
         );
     }

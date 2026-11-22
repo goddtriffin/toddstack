@@ -71,12 +71,19 @@ All of these must hold:
   band up to one free core. 0.4.5 cut it from half: over 575 runs peaking at 6+ cores, average / peak cores is p50 0.18,
   p75 0.32, p90 0.51, and half kept 13-core builds off a Mac under 59% busy. A third or a quarter overran the machine
   43-47% of the time in the bursty-builds test; 2/5 keeps it at 0%. In 0.4.3 any waiter started with one free core under the band, so 13-core builds started
-  at 83% busy and took the Mac to 100% with load1 34. A waiter held back by a hold sleeps until the first
+  at 83% busy and took the Mac to 100% with load1 34. With a learned sustained level (0.4.8, below) the projection is
+  that level when it is lower than 2/5 of the peak. A waiter held back by a hold sleeps until the first
   moment the holds leave room, and re-samples at least every 10 s, so a peak that shows sooner releases it. A job's recorded peak is the larger of its process tree's peak and the
   machine-wide CPU rise of other programs over the pre-start baseline, so work hosted in Docker's VM (outside the
   tree) also teaches a real peak. On Linux a process's threads are not counted as children (sysinfo lists each thread
   with its whole process's RSS and CPU; before 0.3.2 a 16-thread rustc counted 17 times, so learned memory peaks were
   inflated about 17x and their reservations blocked idle machines on "mem").
+- Sustained level (0.4.8): each run also records its tree's best 10 s mean CPU (`sustained_centi_cores` in history),
+  and a learned size carries one picked like the peak (same tiers). A running job holds its full learned peak for
+  its first 10 s, then at most that sustained level. Learned peaks are the highest 500 ms sample: `make lint
+  test-changed` learned 10-11 cores (a spike about 15 s in) and averaged 1.2 cores over a 23-minute run, so its hold
+  and its projected peak kept 6-core waiters out on a machine 20-40% busy. Cold, `--cpu` declared and Docker/VM sizes
+  (whose CPU shows outside the tree) have no sustained level and keep the full peak.
 - Memory headroom: `95% of RAM - non-heavy usage - live memory of running jobs - the unused part of each job's reservation` fits the
   request. The unused part (reservation minus live use) of a declared (`--mem`) size is held for the whole run. A learned
   size's is held until the job's learned time to peak (history records when memory peaked; 60 s when unknown, at least 10 s),
@@ -90,13 +97,17 @@ All of these must hold:
 - Known limit: the memory and pressure guards only veto new starts. A gate cannot stop jobs already running, and
   stokehold does not kill them: if running jobs all grow past their learned peaks, memory can still run out. The unused
   reservation holds above are what protect against this, not the guards.
-- Hard guards (veto only, they block even a job that would run alone): memory used at 95% or more (90% before 0.4.5, on Linux too), 1-minute load at or over 4 x cores blocks
-  whatever the CPU says (runaway load: 120 on 16 cores killed Docker on 2026-11-19), and so does critical memory
+- Hard guards (veto only, they block even a job that would run alone): memory used at 95% or more (90% before 0.4.5, on Linux too), 1-minute load at or over 4 x cores
+  once the CPU confirms it: at least 50% busy, or Linux `/proc/pressure/cpu` `some avg10` at least 25 (runaway load:
+  120 on 16 cores, CPU pinned, killed Docker on 2026-11-19; before 0.4.8 it blocked whatever the CPU said, and a load
+  of I/O-waiting threads at 8-15% CPU is no overload), 6 x cores whatever the CPU says, and critical memory
   pressure: macOS `kern.memorystatus_vm_pressure_level` 4, Linux `/proc/pressure/memory` (`some avg10` 25 or more, or
   `full avg10` 5 or more; the Windows rig's WSL Ubuntu). An unreadable pressure source never blocks.
 - Soft guards (veto only): from 2 x cores up, load blocks while it is still rising (load1 > 1.1 x load5)
   and the CPU is at least 75% busy, or while the CPU is at least 90% busy (the CPU here is the larger of the latest
-  and the sustained reading). Load without CPU is not CPU overload: on
+  and the sustained reading), or while Linux PSI cpu `some avg10` is at least 25 (tasks queue for a CPU; 0.4.8). On
+  the rig on 2026-11-21, load1 10-35 on 16 cores came with 8-15% CPU and PSI cpu `some` under 1: threads in I/O
+  wait. Load without CPU is not CPU overload: on
   macOS load also counts threads blocked in I/O (network, disk), so it can read 20-60 on an idle CPU (load1 58 at 26%
   CPU during a network outage on 2026-11-20). macOS
   pressure level 2 ("warn") blocks only with memory at least 85% used. Level 2 is common and sticky: on 2026-11-21 it
@@ -112,8 +123,13 @@ head has waited under 60 s. A tiny job (at most the backfill share of cores and 
 by memory, VRAM or a guard while the head has waited under 5 minutes, or by a ramp hold it does not make end later (0.4.5: in 24 h on the Mac, 393
 job-samples sat queued behind a head under 60% CPU). Behind a head blocked on CPU room (or a ramp hold), a job of at
 most the backfill share passes while the machine reads under 75% busy and the head has waited under 5 minutes (0.4.6:
-strict FIFO past 60 s kept 1-2 core jobs queued up to 30 minutes behind an 11-16 core head at 40-60% CPU); bigger
-jobs keep the 60 s rule, and the 5-minute bound keeps a stream of small jobs from starving a big one.
+strict FIFO past 60 s kept 1-2 core jobs queued up to 30 minutes behind an 11-16 core head at 40-60% CPU). 0.4.8
+lets any job no bigger than the head (cores, memory and VRAM) backfill there, not only small ones: with 0.4.7 on the
+Mac, 1-2 core jobs waited p50 42 s but 3-8 core jobs (`cargo clippy`, `cargo test` at 6 cores) p50 21 minutes, up to
+74, behind 11-core `make lint` heads, with the Mac idle 23% of the time jobs waited. Once the head has waited 5
+minutes it holds the queue (only tiny jobs pass a head blocked by memory, VRAM or a guard, and only before that), so
+no stream of backfills can starve it: only the jobs already running stand before it. (Aging its projected peak away
+instead overran the machine 16% of the time in the bursty-builds test.)
 
 Fast lane (0.4.7): a job whose own recent runs (at least 2 of this very command, never the pooled program tier) all
 finished within 10 s, and that reserves at most 2 cores, 1/32 of RAM and no VRAM (and is not Docker/VM work), skips

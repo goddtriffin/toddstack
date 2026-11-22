@@ -134,6 +134,8 @@ struct Resolved {
     cpu_settle_after_ms: Option<u64>,
     /// Learned short and small: may use the fast lane (`admit::fast_lane_eligible`).
     fast: bool,
+    /// A learned sustained CPU level (`Job::cpu_sustained`); `None` for cold, declared and Docker/VM sizes.
+    cpu_sustained: Option<u64>,
 }
 
 fn resolve_weights(
@@ -172,6 +174,9 @@ fn resolve_weights(
         cpu_settle_after_ms: hist
             .filter(|_| flags.cpu.is_none())
             .and_then(|d| d.cpu_peak_at_ms),
+        cpu_sustained: hist
+            .filter(|_| flags.cpu.is_none() && !hosts_vm_work(cmd))
+            .and_then(|d| d.cpu_sustained),
     }
 }
 
@@ -205,6 +210,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         cpu_hold_ms,
         cpu_settle_after_ms,
         fast,
+        cpu_sustained,
     } = resolve_weights(state, flags, cmd, &cwd_str, &cap);
 
     let (tx, rx) = channel();
@@ -234,6 +240,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         cpu_settled: false,
         non_heavy_cpu_at_start: 0,
         fast,
+        cpu_sustained,
     };
     let _guard = JobGuard {
         state,
@@ -466,6 +473,8 @@ struct TreePeak {
     usage: Usage,
     mem_at_ms: u64,
     cpu_at_ms: u64,
+    /// The best 10 s mean of the tree's CPU (`admit::sustained_level`).
+    cpu_sustained: u64,
 }
 
 /// When (ms) the CPU samples `(ms, centi-cores)` first reached 3/4 of their peak; 0 with no CPU at all.
@@ -529,6 +538,7 @@ fn tree_sampler(
                 Err(RecvTimeoutError::Timeout)
             ) {
                 peak.cpu_at_ms = cpu_peak_at(&cpu);
+                peak.cpu_sustained = crate::admit::sustained_level(&cpu);
                 return peak;
             }
         }
@@ -812,11 +822,14 @@ fn execute(
         stats.peak_centi_cores = peak.usage.cpu;
         stats.peak_mem_at_ms = peak.mem_at_ms;
         stats.peak_cpu_at_ms = peak.cpu_at_ms;
+        stats.sustained_centi_cores = peak.cpu_sustained;
     }
     if let Some(other) = other_peak {
         stats.peak_other_centi_cores = other.cpu;
         if other.cpu > stats.peak_centi_cores {
             stats.peak_cpu_at_ms = other.cpu_at_ms;
+            // The work ran outside the tree (Docker's VM): the tree's sustained level is not the job's.
+            stats.sustained_centi_cores = 0;
         }
         stats.peak_centi_cores = effective_peak(stats.peak_centi_cores, other.cpu, 0, cap.cpu);
         stats.peak_other_mem = other.mem;
@@ -863,6 +876,7 @@ mod tests {
             cpu_settled: false,
             non_heavy_cpu_at_start: 0,
             fast: false,
+            cpu_sustained: None,
         };
         dir.write_job(&mk("run", State::Running)).unwrap();
         dir.write_job(&mk("wait", State::Queued)).unwrap();
