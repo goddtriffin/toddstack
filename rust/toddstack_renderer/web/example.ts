@@ -11,7 +11,9 @@ async function show(name: "board" | "chart" | "grid", size: [number, number]): P
   r.demo(name);
   const t0 = performance.now();
   await r.render();
-  info.textContent = `${name}: ${r.backend} | ${r.adapter} | compute ${r.compute} | ${(performance.now() - t0).toFixed(1)} ms`;
+  info.textContent = `${name}: ${r.backend} | ${r.adapter} | compute ${r.compute} | ${
+    (performance.now() - t0).toFixed(1)
+  } ms`;
 }
 
 canvas.width = 520;
@@ -21,4 +23,6 @@ const sizes = { board: [520, 520], chart: [640, 400], grid: [1000, 1000] } as co
 for (const name of ["board", "chart", "grid"] as const) {
   document.querySelector(`#${name}`)!.addEventListener("click", () => show(name, [...sizes[name]]));
 }
-await show((params.get("demo") as "board" | "chart" | "grid" | null) ?? "board", [...sizes[(params.get("demo") as "board") ?? "board"]]);
+await show((params.get("demo") as "board" | "chart" | "grid" | null) ?? "board", [
+  ...sizes[(params.get("demo") as "board") ?? "board"],
+]);

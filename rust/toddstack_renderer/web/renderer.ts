@@ -86,6 +86,6 @@ export class Renderer {
   async render(): Promise<void> {
     const px = await this.core.render();
     const { width, height } = this.ctx.canvas;
-    this.ctx.putImageData(new ImageData(new Uint8ClampedArray(px.buffer, px.byteOffset, px.length), width, height), 0, 0);
+    this.ctx.putImageData(new ImageData(new Uint8ClampedArray(px), width, height), 0, 0);
   }
 }
