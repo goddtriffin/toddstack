@@ -2,9 +2,12 @@
 //!
 //! CPU is closed-loop (0.4.10): a job starts while the machine's measured CPU (`Live::cpu_sustained_pct`, the larger
 //! of the latest reading and the mean of the last `BUSY_WINDOW_MS`) is under `CPU_ADMIT_PCT`. A job's learned or
-//! declared CPU size counts only while it settles: for `SETTLE_MS` after a start the machine has not shown that job's
-//! CPU yet, so another job starts then only if the measured CPU, the settling jobs' sizes and its own size together
-//! stay under the admit line (`settle_fits`). After that only what is measured counts.
+//! declared CPU size counts only while it settles: for `settle_window_ms` after a start (10 s, or the learned time to
+//! its CPU peak, at most 60 s; 30 s for cold and Docker/VM jobs) the machine has not shown that job's CPU yet, so
+//! another job starts then only if the measured CPU, the settling jobs' sizes and its own size together stay under
+//! the admit line. After that only what is measured counts, with two backstops: the measured busy cores plus the new
+//! job's typical cores stay within `SIZE_PCT` of the machine, and the running jobs' expected peaks stay within
+//! `PEAK_SUM_CAP` x cores.
 //!
 //! Before 0.4.10 admission reserved each job's learned peak (and a sustained floor) for as long as the peak might
 //! come. Jobs here are very bursty: `make lint` learned a 13-core peak and averaged 1.4 cores over 15 minutes,
@@ -21,7 +24,8 @@
 //! against live use (`vram_reserved`), within 90% of capacity.
 //!
 //! The queue: a waiter never starts while an older waiter could start now or is settling-blocked (it goes first), nor
-//! while an older waiter has waited `QUEUE_PASS_MS` for memory or VRAM (younger jobs would keep taking it). Behind an
+//! while an older waiter has waited `QUEUE_PASS_MS` for memory, VRAM or the size check (younger jobs would keep taking
+//! it). A waiter from a release before 0.4.10 (`Job::v` 0) never holds the queue. Behind an
 //! older waiter blocked by the CPU line or a guard it may go: the same line and guards apply to it.
 //!
 //! Live guards (`guard_block`) veto: a CPU pinned within `PINNED_WINDOW_MS`, a 1-minute load of 2-6 x cores as
@@ -30,7 +34,7 @@
 
 use std::collections::VecDeque;
 
-use crate::job::{Capacity, Job, Live, State, Usage, Weights};
+use crate::job::{Capacity, JOB_VERSION, Job, Live, State, Usage, Weights};
 
 /// Memory target: jobs start while measured use plus holds stays within this % of RAM, and memory used at this % blocks.
 const MEM_PCT: u64 = 95;
@@ -68,8 +72,28 @@ const CPU_PSI_PCT: u64 = 25;
 /// higher) is under this %. Jobs here average a fraction of their peak and burst for seconds, so the machine then
 /// runs mostly in the 80-90% band while jobs wait, with the bursts of the running jobs on top.
 pub const CPU_ADMIT_PCT: u64 = 80;
-/// For this long after a start the machine has not shown the new job's CPU yet: it is settling (`Block::Ramp`).
+/// For at least this long after a start the machine has not shown the new job's CPU yet: it is settling
+/// (`Block::Ramp`). A job settles for `settle_window_ms`.
 pub const SETTLE_MS: i64 = 10_000;
+/// A cold job (no history) or a Docker/VM job settles at least this long. Cold `cargo build`s spend 30-60 s fetching
+/// crates or waiting on a build-dir lock, and `docker build`s pull images, before they compile: with a 10 s settle a
+/// herd of them started 10 s apart and then all compiled at once (load about 120 on 16 cores, 2026-11-19).
+pub const SETTLE_COLD_MS: i64 = 30_000;
+/// No job settles longer than this, however late its learned peak.
+pub const SETTLE_MAX_MS: i64 = 60_000;
+/// The expected peaks (`Job::weights.cpu`: learned peak, `--cpu`, or the whole machine when cold) of the running jobs
+/// still young (started under `SETTLE_MAX_MS` ago) plus the new one's add up to at most this many times the cores
+/// (5/2). A backstop behind the measured CPU line, not the main gate. It stops the herd the measurement cannot see yet:
+/// whole-machine jobs that idle on downloads or a build-dir lock for up to a minute and then compile together. On 16
+/// cores at most two cold jobs and 8 cores of learned peaks are young at once, so at worst 40 cores of work line up
+/// (load about 2.5 x cores, near the 2 x soft guard), not the 7.5 x of 2026-11-19. Older jobs do not count: their CPU
+/// shows in the measurement, and their peaks are seconds-long bursts at different times (`make lint test-changed`
+/// peaks at 10 cores and averages 1.2 for 30 minutes). Counting every running job's peak, as the review first asked,
+/// replayed the Mac's 2026-11-21 day at 12% in band and waits of hours: the 0.4.9 failure again.
+const PEAK_SUM_CAP: (u64, u64) = (5, 2);
+/// The size check: measured busy cores plus the new job's typical cores (`typical_centi`) stay within this % of the
+/// cores, whether or not a job is settling.
+const SIZE_PCT: u64 = 95;
 /// An older waiter that has waited this long for memory or VRAM holds back the younger ones, which would otherwise keep
 /// taking what it waits for.
 pub const QUEUE_PASS_MS: i64 = 5 * 60_000;
@@ -140,6 +164,9 @@ struct Blocked {
     live: bool,
     block: Block,
     ramp_end_ms: Option<i64>,
+    /// Blocked by the size check: like a memory wait, the queue holds for it once it has waited `QUEUE_PASS_MS`, or a
+    /// stream of small jobs would keep the machine too busy for it forever.
+    by_size: bool,
 }
 
 fn blocked(reason: impl Into<String>, live: bool, block: Block) -> Blocked {
@@ -148,6 +175,16 @@ fn blocked(reason: impl Into<String>, live: bool, block: Block) -> Blocked {
         live,
         block,
         ramp_end_ms: None,
+        by_size: false,
+    }
+}
+
+impl Blocked {
+    fn sized(self) -> Self {
+        Self {
+            by_size: true,
+            ..self
+        }
     }
 }
 
@@ -506,15 +543,70 @@ fn measured_pct(live: &Live) -> u64 {
     live.cpu_pct.max(live.cpu_sustained_pct)
 }
 
-/// The settling jobs (started under `SETTLE_MS` ago, or not yet stamped): the CPU (centi-cores) their sizes may still
-/// add beyond their live use, and the moment the first of them has settled.
+/// How long a job settles: `SETTLE_MS`, or `SETTLE_COLD_MS` for a cold (`peak_at_ms` unknown) or Docker/VM job, or
+/// the learned time to its CPU peak when that is later; at most `SETTLE_MAX_MS`.
+#[must_use]
+pub fn settle_window_ms(vm: bool, peak_at_ms: Option<u64>) -> i64 {
+    let base = if vm || peak_at_ms.is_none() {
+        SETTLE_COLD_MS
+    } else {
+        SETTLE_MS
+    };
+    let learned = peak_at_ms.map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX));
+    base.max(learned).min(SETTLE_MAX_MS)
+}
+
+fn settle_of(j: &Job) -> i64 {
+    j.settle_ms.unwrap_or(SETTLE_MS)
+}
+
+/// The cores (centi) `j` typically uses: its learned typical or `--cpu` (`Job::typical_cpu`), else a quarter of the
+/// machine (a cold job: 4 of 16 cores is above the 90th percentile of the Mac's recorded mean cores, 3.0; half the
+/// machine replayed at 12% in band, because a cold job then waited for the machine to fall to 45%). Never more than
+/// its size.
+#[must_use]
+pub fn typical_centi(j: &Job, cap: &Capacity) -> u64 {
+    centi(
+        j.typical_cpu
+            .unwrap_or_else(|| cap.cpu.div_ceil(4))
+            .min(j.weights.cpu)
+            .min(cap.cpu),
+    )
+}
+
+/// The young running jobs' (started under `SETTLE_MAX_MS` ago, or not yet stamped) expected peak cores (centi): each
+/// one's size, at most the machine.
+fn peak_sum(running: &[&Job], cap: &Capacity, now_ms: i64) -> u64 {
+    running
+        .iter()
+        .filter(|j| j.started_ms.is_none_or(|t| now_ms - t < SETTLE_MAX_MS))
+        .map(|j| centi(j.weights.cpu).min(centi(cap.cpu)))
+        .sum()
+}
+
+/// Whether `j` is settling: not yet stamped, or started under `SETTLE_MS` ago, or under its `settle_window_ms` ago
+/// while its process tree still uses less than its typical cores (at least 1): it is fetching, waiting on a lock, or
+/// its work runs in Docker's VM, so the measurement cannot see what is coming. A job that already works at its typical
+/// level shows in the measurement and settles at `SETTLE_MS`.
+fn is_settling(j: &Job, cap: &Capacity, live: &Live, now_ms: i64) -> bool {
+    j.started_ms.is_none_or(|t| {
+        let age = now_ms - t;
+        age < SETTLE_MS
+            || (age < settle_of(j) && live_use(j, live).cpu < typical_centi(j, cap).max(100))
+    })
+}
+
+/// The settling jobs (`is_settling`): the CPU (centi-cores) their sizes may still add beyond their live use, and the
+/// moment the first of them has settled.
 fn settling(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> (u64, Option<i64>) {
     running
         .iter()
-        .filter(|j| j.started_ms.is_none_or(|t| now_ms - t < SETTLE_MS))
+        .filter(|j| is_settling(j, cap, live, now_ms))
         .fold((0, None), |(cpu, first), j| {
             let size = centi(j.weights.cpu).min(centi(cap.cpu));
-            let end = j.started_ms.map_or(now_ms + SETTLE_MS, |t| t + SETTLE_MS);
+            let end = j
+                .started_ms
+                .map_or(now_ms + settle_of(j), |t| t + settle_of(j));
             (
                 cpu + size.saturating_sub(live_use(j, live).cpu),
                 Some(first.map_or(end, |f: i64| f.min(end))),
@@ -548,6 +640,20 @@ fn blocker(
                 Block::Mem,
             ));
         }
+        let total = centi(cap.cpu);
+        let peaks = peak_sum(running, cap, now_ms) + centi(w.cpu).min(total);
+        let peak_cap = total * PEAK_SUM_CAP.0 / PEAK_SUM_CAP.1;
+        if peaks > peak_cap {
+            return Some(blocked(
+                format!(
+                    "cpu: running jobs' peaks with this one's are {} cores, over {} (2.5 x cores)",
+                    cores(peaks),
+                    cores(peak_cap)
+                ),
+                true,
+                Block::Cpu,
+            ));
+        }
         let pct = measured_pct(live);
         if pct >= CPU_ADMIT_PCT {
             return Some(blocked(
@@ -555,6 +661,22 @@ fn blocker(
                 true,
                 Block::Cpu,
             ));
+        }
+        let busy = pct * total / 100;
+        let typical = typical_centi(want, cap);
+        let size_line = total * SIZE_PCT / 100;
+        if busy + typical > size_line {
+            return Some(blocked(
+                format!(
+                    "cpu: machine {} cores busy plus this job's typical {} is over {} ({SIZE_PCT}%)",
+                    cores(busy),
+                    cores(typical),
+                    cores(size_line)
+                ),
+                true,
+                Block::Cpu,
+            )
+            .sized());
         }
         let (unshown, settled_at) = settling(running, cap, live, now_ms);
         if let Some(at) = settled_at {
@@ -570,6 +692,7 @@ fn blocker(
                     live: true,
                     block: Block::Ramp,
                     ramp_end_ms: Some(at),
+                    by_size: false,
                 });
             }
         }
@@ -584,11 +707,14 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
         return Decision::Fail(why);
     }
     let running: Vec<&Job> = jobs.iter().filter(|j| j.state == State::Running).collect();
-    // A waiter that is stopped (Ctrl-Z) cannot start, so it never holds back the ones behind it.
+    // A waiter that is stopped (Ctrl-Z) cannot start, so it never holds back the ones behind it. Nor does one from a
+    // release before 0.4.10 (`Job::v`): it decides by the old rules, which may block it while these would start it, so
+    // waiting behind it would idle the machine until it starts by its own rules.
     let mut older: Vec<&Job> = jobs
         .iter()
         .filter(|j| {
             j.state == State::Queued
+                && j.v >= JOB_VERSION
                 && j.id != job.id
                 && !live.stopped.contains(&j.id)
                 && (j.enqueued_ms, &j.id) < (job.enqueued_ms, &job.id)
@@ -619,7 +745,7 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
                 };
             }
             Some(b)
-                if matches!(b.block, Block::Mem | Block::Vram)
+                if (b.by_size || matches!(b.block, Block::Mem | Block::Vram))
                     && now_ms - o.enqueued_ms >= QUEUE_PASS_MS =>
             {
                 return wait(
@@ -627,7 +753,11 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
                         "queued behind {} (waited over {} min for {})",
                         o.id,
                         QUEUE_PASS_MS / 60_000,
-                        b.block.name()
+                        if b.by_size {
+                            "room for its size"
+                        } else {
+                            b.block.name()
+                        }
                     ),
                     Block::Queue,
                 );
@@ -690,6 +820,9 @@ mod tests {
             mem_declared: false,
             mem_peak_at_ms: None,
             vram_declared: false,
+            v: JOB_VERSION,
+            settle_ms: None,
+            typical_cpu: Some(cpu),
         }
     }
     fn waits(d: &Decision) -> bool {
@@ -1986,9 +2119,13 @@ mod tests {
 
     #[test]
     fn jobs_start_while_the_machine_reads_under_the_cpu_line() {
-        // A long-running job whatever its learned peak: only the measured CPU counts once it has settled.
+        // A long-running job whatever its learned peak: only the measured CPU counts once it has settled. The waiter
+        // learned a 16-core peak but typically uses 2, so the size check passes too.
         let run = started("r", 16, 0);
-        let me = job("w", 16, 1, State::Queued, 1);
+        let me = Job {
+            typical_cpu: Some(2),
+            ..job("w", 16, 1, State::Queued, 1)
+        };
         let jobs = [run, me.clone()];
         let at = |pct| evaluate(&me, &jobs, &mac(), &on_mac(pct), 60_000);
         assert_eq!(at(CPU_ADMIT_PCT - 1), Decision::Start);
@@ -2161,5 +2298,191 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_settle_window_follows_the_learned_peak_and_covers_cold_and_docker_jobs() {
+        assert_eq!(settle_window_ms(false, Some(0)), SETTLE_MS);
+        assert_eq!(settle_window_ms(false, Some(45_000)), 45_000);
+        assert_eq!(settle_window_ms(false, Some(600_000)), SETTLE_MAX_MS);
+        assert_eq!(settle_window_ms(false, None), SETTLE_COLD_MS);
+        assert_eq!(settle_window_ms(true, Some(0)), SETTLE_COLD_MS);
+        assert_eq!(settle_window_ms(true, Some(50_000)), 50_000);
+    }
+
+    fn cold(id: &str, enq: i64) -> Job {
+        Job {
+            typical_cpu: None,
+            settle_ms: Some(settle_window_ms(false, None)),
+            ..job(id, 16, 1, State::Queued, enq)
+        }
+    }
+
+    #[test]
+    fn a_herd_of_cold_builds_starts_one_per_settle_window_within_the_peak_cap() {
+        // Six cold whole-machine `cargo build`s queue at once and spend minutes fetching crates: the machine reads 20%
+        // the whole time, so only the settle window and the peak cap stand between them and a herd.
+        let mut jobs: Vec<Job> = (0..6).map(|i| cold(&format!("c{i}"), i)).collect();
+        let mut starts = Vec::new();
+        for now in (0..600_000).step_by(1_000) {
+            for i in 0..jobs.len() {
+                if jobs[i].state != State::Queued {
+                    continue;
+                }
+                if evaluate(&jobs[i], &jobs, &mac(), &on_mac(20), now) == Decision::Start {
+                    jobs[i].state = State::Running;
+                    jobs[i].started_ms = Some(now);
+                    starts.push(now);
+                }
+            }
+            let running: Vec<&Job> = jobs.iter().filter(|j| j.state == State::Running).collect();
+            assert!(
+                peak_sum(&running, &mac(), now) * PEAK_SUM_CAP.1 <= centi(16) * PEAK_SUM_CAP.0,
+                "peak cap broken at {now}"
+            );
+        }
+        // One start per settle window, and never more than two young whole-machine jobs.
+        assert!(
+            starts.windows(2).all(|w| w[1] - w[0] >= SETTLE_COLD_MS),
+            "{starts:?}"
+        );
+        assert_eq!(&starts[..3], &[0, SETTLE_COLD_MS, 2 * SETTLE_COLD_MS]);
+        // The cap alone: two cold builds 40 s and 10 s old already compile at 4 cores each (settled), so a third
+        // cold one waits on the 40-core cap until the older one is a minute old; a 1-core job still fits.
+        let busy = |id: &str, at: i64| Job {
+            state: State::Running,
+            ..started(id, 16, at)
+        };
+        let shown = Live {
+            per_job: ["a", "b"]
+                .iter()
+                .map(|id| {
+                    (
+                        (*id).to_string(),
+                        Usage {
+                            cpu: 400,
+                            mem: G,
+                            vram: 0,
+                        },
+                    )
+                })
+                .collect(),
+            ..on_mac(50)
+        };
+        let third = cold("t", 11);
+        let small = job("s", 1, 1, State::Queued, 12);
+        let jobs = [
+            busy("a", 0),
+            busy("b", 30_000),
+            third.clone(),
+            small.clone(),
+        ];
+        let d = evaluate(&third, &jobs, &mac(), &shown, 40_000);
+        assert!(
+            matches!(d, Decision::Wait { block: Block::Cpu, live: true, ref reason, .. } if reason.contains("peaks")),
+            "{d:?}"
+        );
+        assert_eq!(
+            evaluate(&small, &jobs, &mac(), &shown, 40_000),
+            Decision::Start
+        );
+        assert_eq!(
+            evaluate(&third, &jobs, &mac(), &shown, SETTLE_MAX_MS),
+            Decision::Start
+        );
+    }
+
+    #[test]
+    fn a_docker_build_keeps_the_machine_settled_until_its_window_ends() {
+        // A `docker build` pulls images in the VM: its process tree reads 0 cores, the machine 10%. Another build
+        // waits for the 30 s window, not 10 s.
+        let docker = Job {
+            cmd: vec!["docker".into(), "build".into(), ".".into()],
+            settle_ms: Some(settle_window_ms(true, Some(0))),
+            ..started("d", 16, 0)
+        };
+        let me = job("w", 4, 1, State::Queued, 1);
+        let jobs = [docker, me.clone()];
+        let live = Live {
+            per_job: vec![("d".into(), Usage::default())],
+            ..on_mac(10)
+        };
+        for now in [SETTLE_MS, 20_000, SETTLE_COLD_MS - 1] {
+            let d = evaluate(&me, &jobs, &mac(), &live, now);
+            assert!(
+                matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(t), .. } if t == SETTLE_COLD_MS),
+                "{now}: {d:?}"
+            );
+        }
+        assert_eq!(
+            evaluate(&me, &jobs, &mac(), &live, SETTLE_COLD_MS),
+            Decision::Start
+        );
+    }
+
+    #[test]
+    fn the_size_check_holds_with_no_job_settling() {
+        // A settled job and the machine at 79%: under the CPU line, but a job that typically uses 16 cores would take
+        // it to 28.6 cores. It waits; a small one fits (12.64 + 2 <= 15.2).
+        let run = started("r", 16, 0);
+        let at =
+            |w: &Job, pct| evaluate(w, &[run.clone(), w.clone()], &mac(), &on_mac(pct), 60_000);
+        let big = job("b", 12, 1, State::Queued, 1);
+        assert!(matches!(
+            at(&big, 79),
+            Decision::Wait {
+                block: Block::Cpu,
+                live: true,
+                ..
+            }
+        ));
+        assert_eq!(at(&big, 10), Decision::Start);
+        // Small jobs pass it while it waits, but not for ever: after 5 minutes the queue holds for it.
+        let small = job("s", 1, 1, State::Queued, 2);
+        let jobs = [run.clone(), big, small.clone()];
+        assert_eq!(
+            evaluate(&small, &jobs, &mac(), &on_mac(79), 60_000),
+            Decision::Start
+        );
+        assert!(matches!(
+            evaluate(&small, &jobs, &mac(), &on_mac(79), 1 + QUEUE_PASS_MS),
+            Decision::Wait {
+                block: Block::Queue,
+                ..
+            }
+        ));
+        assert_eq!(at(&job("s", 2, 1, State::Queued, 1), 79), Decision::Start);
+        // It weighs the typical cores, not the peak: `cargo test` learned a 16-core peak and averages 2.4.
+        let bursty = Job {
+            typical_cpu: Some(2),
+            ..job("t", 16, 1, State::Queued, 1)
+        };
+        assert_eq!(at(&bursty, 79), Decision::Start);
+        // A cold job counts as a quarter of the machine.
+        let c = cold("c", 1);
+        assert!(waits(&at(&c, 79)));
+        assert_eq!(at(&c, 40), Decision::Start);
+    }
+
+    #[test]
+    fn a_waiter_from_an_older_release_never_holds_the_queue() {
+        // A 0.4.9 waiter decides by the old rules, which may hold it while these would start it: a 0.4.10 waiter that
+        // queued behind it would idle the machine.
+        let run = started("r", 1, 0);
+        let old = Job {
+            v: 0,
+            ..job("h", 4, 1, State::Queued, 1)
+        };
+        let next = job("n", 1, 1, State::Queued, 2);
+        assert_eq!(
+            evaluate(
+                &next,
+                &[run, old, next.clone()],
+                &mac(),
+                &on_mac(10),
+                60_000
+            ),
+            Decision::Start
+        );
     }
 }

@@ -95,6 +95,7 @@ fn make_job(id: String, e: &Entry, d: Option<Defaults>, cap: &Capacity, q_ms: i6
         vram: d.and_then(|d| d.vram).unwrap_or(0),
         disk: 0,
     });
+    let (settle_ms, typical_cpu) = crate::run::admit_shape(&e.cmd, d, None, cap);
     Job {
         id,
         pid: 0,
@@ -111,6 +112,9 @@ fn make_job(id: String, e: &Entry, d: Option<Defaults>, cap: &Capacity, q_ms: i6
             .and_then(|d| d.mem_peak_at_ms)
             .and_then(|m| i64::try_from(m).ok()),
         vram_declared: false,
+        v: crate::job::JOB_VERSION,
+        settle_ms: Some(settle_ms),
+        typical_cpu,
     }
 }
 

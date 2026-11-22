@@ -116,9 +116,8 @@ pub fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
 }
 
-/// The CPU ask of a job with no history: the whole machine. A whole-machine ramp hold is never released early, so cold
-/// jobs start at least 10 s apart; after one run, history gives the real peak. The full 10 s hold covers cold jobs,
-/// Docker/VM jobs (the work runs in Docker's VM, outside the process tree) and peaks of 75% of the machine or more.
+/// The CPU ask of a job with no history: the whole machine. A whole-machine settle is never released early, so cold
+/// jobs start at least `admit::SETTLE_COLD_MS` apart; after one run, history gives the real peak.
 fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
     cap.cpu
 }
@@ -128,6 +127,23 @@ fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
 struct Resolved {
     weights: Weights,
     mem_peak_at_ms: Option<i64>,
+    settle_ms: i64,
+    typical_cpu: Option<u32>,
+}
+
+/// How long a job settles (`admit::settle_window_ms`, from its learned time to CPU peak; cold and Docker/VM jobs at
+/// least 30 s) and the cores it typically uses (`--cpu`, else the learned typical; `None` when cold).
+pub(crate) fn admit_shape(
+    cmd: &[String],
+    hist: Option<history::Defaults>,
+    cpu_flag: Option<u32>,
+    cap: &Capacity,
+) -> (i64, Option<u32>) {
+    let settle = crate::admit::settle_window_ms(hosts_vm_work(cmd), hist.map(|d| d.cpu_peak_at_ms));
+    let typical = cpu_flag
+        .or(hist.map(|d| d.typical_cpu))
+        .map(|c| c.min(cap.cpu));
+    (settle, typical)
 }
 
 fn resolve_weights(
@@ -152,8 +168,11 @@ fn resolve_weights(
         vram: flags.vram.or(hist.and_then(|d| d.vram)).unwrap_or(0),
         disk: flags.disk.unwrap_or(0),
     });
+    let (settle_ms, typical_cpu) = admit_shape(cmd, hist, flags.cpu, cap);
     Resolved {
         weights,
+        settle_ms,
+        typical_cpu,
         mem_peak_at_ms: hist
             .and_then(|d| d.mem_peak_at_ms)
             .and_then(|ms| i64::try_from(ms).ok()),
@@ -172,11 +191,15 @@ fn nice_level() -> u8 {
 }
 
 /// The command, started through `nice` when a level is set and `/usr/bin/nice` exists (`nice` execs the command, so
-/// the pid, the process group and the tree stay the same).
+/// the pid, the process group and the tree stay the same). Docker/VM jobs run un-niced: their work runs in the VM,
+/// which nice cannot reach, so it would only slow the client.
 fn niced(first: &str, rest: &[String]) -> Command {
     let level = nice_level();
     let nice = Path::new("/usr/bin/nice");
-    if level == 0 || !nice.exists() {
+    let vm = std::iter::once(first)
+        .chain(rest.iter().map(String::as_str))
+        .any(|a| a.contains("docker"));
+    if level == 0 || vm || !nice.exists() {
         let mut c = Command::new(first);
         c.args(rest);
         return c;
@@ -237,6 +260,9 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         mem_declared: flags.mem.is_some(),
         mem_peak_at_ms: r.mem_peak_at_ms.filter(|_| flags.mem.is_none()),
         vram_declared: flags.vram.is_some(),
+        v: crate::job::JOB_VERSION,
+        settle_ms: Some(r.settle_ms),
+        typical_cpu: r.typical_cpu,
     };
     let _guard = JobGuard {
         state,
@@ -595,7 +621,8 @@ fn p90(samples: &mut [u64]) -> u64 {
     samples[(samples.len() * 9).div_ceil(10) - 1]
 }
 
-/// Only Docker-style jobs run their work outside the process tree (in a VM), so only they learn from the machine, and their ramp hold is always the full 10 s.
+/// Only Docker-style jobs run their work outside the process tree (in a VM), so only they learn from the machine, and they
+/// settle at least `admit::SETTLE_COLD_MS`.
 pub(crate) fn hosts_vm_work(cmd: &[String]) -> bool {
     cmd.iter().any(|a| a.contains("docker"))
 }
@@ -805,6 +832,45 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_and_docker_jobs_settle_longer_and_declared_cpu_is_the_typical_size() {
+        let cap = Capacity {
+            cpu: 16,
+            mem: 64 << 30,
+            vram: 0,
+            disk_total: 1 << 40,
+            vram_is_ram: true,
+        };
+        let c = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let learned = history::Defaults {
+            cpu: 12,
+            mem: 1 << 30,
+            vram: None,
+            mem_peak_at_ms: None,
+            cpu_peak_at_ms: 2_000,
+            typical_cpu: 3,
+        };
+        let build = c(&["cargo", "build"]);
+        assert_eq!(admit_shape(&build, None, None, &cap), (30_000, None));
+        assert_eq!(
+            admit_shape(&build, Some(learned), None, &cap),
+            (10_000, Some(3))
+        );
+        assert_eq!(
+            admit_shape(&build, Some(learned), Some(6), &cap),
+            (10_000, Some(6))
+        );
+        let late = history::Defaults {
+            cpu_peak_at_ms: 45_000,
+            ..learned
+        };
+        assert_eq!(admit_shape(&build, Some(late), None, &cap).0, 45_000);
+        let docker = c(&["docker", "build", "."]);
+        assert_eq!(admit_shape(&docker, Some(learned), None, &cap).0, 30_000);
+        // Docker jobs run un-niced: nice cannot reach the VM.
+        assert_eq!(niced("docker", &c(&["build"])).get_program(), "docker");
+    }
 
     #[test]
     fn cold_and_docker_jobs_ask_for_the_whole_machine() {
