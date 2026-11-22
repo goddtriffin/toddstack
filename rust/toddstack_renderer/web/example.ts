@@ -6,6 +6,20 @@ const info = document.querySelector<HTMLElement>("#info")!;
 const params = new URLSearchParams(location.search);
 const font = new Uint8Array(await (await fetch("./dist/Arimo-Bold.ttf")).arrayBuffer());
 
+// Test only, this page only: `?reject=webgpu,webgl2` makes those backends look unusable, to prove the
+// fallback still reaches the CPU on the same canvas. The library has no such hook.
+const reject = (params.get("reject") ?? "").split(",");
+if (reject.includes("webgpu")) {
+  Object.defineProperty(navigator, "gpu", { value: undefined, configurable: true });
+}
+if (reject.includes("webgl2")) {
+  const getParameter = WebGL2RenderingContext.prototype.getParameter;
+  WebGL2RenderingContext.prototype.getParameter = function (pname: number) {
+    // UNMASKED_RENDERER_WEBGL and RENDERER: look like a software rasterizer.
+    return pname === 0x9246 || pname === 0x1f01 ? "Google SwiftShader" : getParameter.call(this, pname);
+  } as typeof getParameter;
+}
+
 const readback = params.get("readback") === "1";
 let current: Demo = "board";
 
