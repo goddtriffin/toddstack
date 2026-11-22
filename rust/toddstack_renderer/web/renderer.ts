@@ -53,8 +53,16 @@ export class Renderer {
     return this.core.compute();
   }
 
+  /** True while `render()` is pending; the wasm object is borrowed then. */
+  private rendering = false;
+
+  private idle(): void {
+    if (this.rendering) throw new Error("a render is still in flight; await it first");
+  }
+
   /** Resizes the canvas and the render target. */
   resize(width: number, height: number): void {
+    this.idle();
     this.ctx.canvas.width = width;
     this.ctx.canvas.height = height;
     this.core.resize(width, height);
@@ -82,12 +90,20 @@ export class Renderer {
 
   /** Replaces the scene with a built-in demo. */
   demo(name: Demo): void {
+    this.idle();
     this.core.demo(name);
   }
 
   /** Draws the scene and puts it on the canvas. */
   async render(): Promise<void> {
-    const px = await this.core.render();
+    this.idle();
+    this.rendering = true;
+    let px: Uint8Array;
+    try {
+      px = await this.core.render();
+    } finally {
+      this.rendering = false;
+    }
     const { width, height } = this.ctx.canvas;
     this.ctx.putImageData(new ImageData(new Uint8ClampedArray(px), width, height), 0, 0);
   }

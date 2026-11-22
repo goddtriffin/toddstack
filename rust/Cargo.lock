@@ -4377,12 +4377,14 @@ dependencies = [
  "bytemuck",
  "fontdue",
  "futures-channel",
+ "js-sys",
  "png",
  "pollster",
  "thiserror",
  "tiny-skia",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
 ]
 

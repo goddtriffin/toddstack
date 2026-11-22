@@ -177,8 +177,26 @@ impl Gpu {
             wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = backends;
         let instance: wgpu::Instance = wgpu::Instance::new(desc);
+        // wgpu's web GL backend only finds an adapter for a given surface, so probe with a 1x1 one.
+        #[cfg(target_arch = "wasm32")]
+        let probe: Option<wgpu::Surface<'static>> = if backend == Backend::WebGl2 {
+            let canvas: web_sys::OffscreenCanvas = web_sys::OffscreenCanvas::new(1, 1)
+                .map_err(|e| Error::Device(format!("{e:?}")))?;
+            Some(
+                instance
+                    .create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas))
+                    .map_err(|e| Error::Device(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let probe: Option<wgpu::Surface<'static>> = None;
         let Ok(adapter) = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                compatible_surface: probe.as_ref(),
+                ..Default::default()
+            })
             .await
         else {
             return Ok(None);
@@ -837,9 +855,25 @@ impl Gpu {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| Error::Readback(e.to_string()))?;
-        rx.await
-            .map_err(|e| Error::Readback(e.to_string()))?
-            .map_err(|e| Error::Readback(e.to_string()))?;
+        // WebGPU fires the callback from the JS event loop. WebGL2 has no event for it: wgpu only
+        // runs the callback from `poll`, once the GL fence signals, so yield to the loop between polls.
+        #[cfg(target_arch = "wasm32")]
+        let mut rx = rx;
+        #[cfg(target_arch = "wasm32")]
+        let mapped = if self.caps.backend == Backend::WebGl2 {
+            loop {
+                drop(self.device.poll(wgpu::PollType::Poll));
+                if let Some(r) = rx.try_recv().map_err(|e| Error::Readback(e.to_string()))? {
+                    break r;
+                }
+                yield_to_event_loop().await;
+            }
+        } else {
+            rx.await.map_err(|e| Error::Readback(e.to_string()))?
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let mapped = rx.await.map_err(|e| Error::Readback(e.to_string()))?;
+        mapped.map_err(|e| Error::Readback(e.to_string()))?;
         let data = out
             .slice(..)
             .get_mapped_range()
@@ -1072,4 +1106,15 @@ impl Gpu {
         self.queue.submit([enc.finish()]);
         Ok(out_tex)
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = "export function tick() { return new Promise((r) => setTimeout(r, 0)); }")]
+extern "C" {
+    fn tick() -> js_sys::Promise;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn yield_to_event_loop() {
+    drop(wasm_bindgen_futures::JsFuture::from(tick()).await);
 }
