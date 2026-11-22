@@ -89,32 +89,7 @@ pub struct Defaults {
     pub vram: Option<u64>,
     /// Median time (ms after the start) of the memory peak; `None` when no run recorded it.
     pub mem_peak_at_ms: Option<u64>,
-    /// Median time (ms after the start) at which the CPU reached 3/4 of its peak; `None` when no run recorded it
-    /// (history from before 0.4.3).
-    pub cpu_peak_at_ms: Option<u64>,
-    /// Median time (ms after the start) at which the CPU reached 3/4 of its peak: from then on a run whose CPU has
-    /// stopped rising has shown its real use, and its hold is released (`admit::cpu_plateaued`).
-    pub cpu_peak_median_ms: Option<u64>,
-    /// The slowest of the recent runs (ms), when they were this very command (not the pooled program tier) and there are
-    /// at least `FAST_MIN_RUNS` of them: what decides the fast lane (`admit::fast_lane`). `None` otherwise.
-    pub slowest_run_ms: Option<u64>,
-    /// The sustained CPU level (centi-cores): the picked peak (`cpu`'s centi-cores) times the median sustained/peak
-    /// ratio of the recent runs that recorded a sustained level (`Stats::sustained_centi_cores`). `None` unless at
-    /// least `SUSTAINED_MIN_RUNS` did: no run before 0.4.8 recorded one, and a median over only the newest runs (say one
-    /// cached 1-core run among 19 old 14-core ones) set beside a peak picked over all of them would size a 14-core job
-    /// at 1 core.
-    pub cpu_sustained: Option<u64>,
-    /// The p90 run time (ms) of the recent runs, when they were this very command (not the pooled program tier): how
-    /// long a backfiller bigger than tiny keeps what the head waits for (`admit::evaluate`). `None` otherwise.
-    pub run_p90_ms: Option<u64>,
 }
-
-/// A command needs this many recent runs that recorded a sustained CPU level before it learns one
-/// (`Defaults::cpu_sustained`).
-pub const SUSTAINED_MIN_RUNS: usize = 3;
-
-/// A command needs this many counted runs of its own before its run time can put it in the fast lane.
-pub const FAST_MIN_RUNS: usize = 2;
 
 fn median(mut v: Vec<u64>) -> Option<u64> {
     if v.is_empty() {
@@ -123,18 +98,6 @@ fn median(mut v: Vec<u64>) -> Option<u64> {
     v.sort_unstable();
     v.get(v.len() / 2).copied()
 }
-
-/// The nearest-rank 90th percentile; `None` when empty.
-fn p90(mut v: Vec<u64>) -> Option<u64> {
-    if v.is_empty() {
-        return None;
-    }
-    v.sort_unstable();
-    v.get((v.len() * 9).div_ceil(10).saturating_sub(1)).copied()
-}
-
-/// Per-mille resolution of the sustained/peak ratio.
-const RATIO_SCALE: u64 = 1_000;
 
 #[must_use]
 pub fn defaults_from(
@@ -177,19 +140,12 @@ pub fn defaults_with(
     let same_repo = |e: &Entry| repo.is_some() && e.repo.as_deref() == repo;
     let pick =
         |tier: &dyn Fn(&Entry) -> bool| ok.iter().copied().filter(|e| tier(e)).collect::<Vec<_>>();
-    let every = |tier: &dyn Fn(&Entry) -> bool| {
-        entries
-            .iter()
-            .filter(|e| e.v >= min_v && tier(e))
-            .collect::<Vec<_>>()
-    };
     if let Some(d) = aggregate(&pick(&|e| e.cwd == cwd && e.cmd == cmd), median) {
-        return Some(lane_check(d, &every(&|e| e.cwd == cwd && e.cmd == cmd)));
+        return Some(d);
     }
     if let Some(d) = aggregate(&pick(&|e| same_repo(e) && e.cmd == cmd), median) {
-        return Some(lane_check(d, &every(&|e| same_repo(e) && e.cmd == cmd)));
+        return Some(d);
     }
-    // Other commands' run times say nothing about this one's: the pooled tier never reaches the fast lane.
     // Third tier pools different commands, so it takes the largest peak, never the median, and only for a real
     // program with a subcommand: not wrappers, not a bare program, not a flag first argument.
     if !program_pools(cmd) {
@@ -200,34 +156,6 @@ pub fn defaults_with(
         &pick(&|e| same_repo(e) && e.cmd.starts_with(program)),
         |v| v.into_iter().max(),
     )
-    .map(|d| Defaults {
-        slowest_run_ms: None,
-        run_p90_ms: None,
-        ..d
-    })
-}
-
-/// The fast lane looks at every recent run of the command, not only the counted ones: any run over `FAST_RUN_MS`
-/// (failed or killed too, which `counts` ignores for sizing under `FAILED_RUN_COUNTS_MS`) or where machine-wide VRAM
-/// rose by `VRAM_NOISE` or more while it ran takes the command out of the lane.
-fn lane_check(d: Defaults, all: &[&Entry]) -> Defaults {
-    let recent = &all[all.len().saturating_sub(KEEP)..];
-    let slowest = recent.iter().map(|e| e.measured.run_ms).max().unwrap_or(0);
-    let gpu = recent.iter().any(|e| {
-        e.measured
-            .vram_rise
-            .is_some_and(|r| r >= crate::run::VRAM_NOISE)
-    });
-    Defaults {
-        slowest_run_ms: d.slowest_run_ms.map(|ms| {
-            if gpu {
-                ms.max(crate::admit::FAST_RUN_MS + 1)
-            } else {
-                ms.max(slowest)
-            }
-        }),
-        ..d
-    }
 }
 
 /// A failed run counts once it ran this long: it did its real work before it failed.
@@ -298,40 +226,11 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
             .filter(|ms| *ms > 0)
             .collect(),
     );
-    // The slowest recent ramp, not the median: about half of all runs ramp later than their median, and a hold that
-    // ended there let the next build in before their CPU showed.
-    let ramps: Vec<u64> = mine
-        .iter()
-        .map(|e| e.measured.peak_cpu_at_ms)
-        .filter(|ms| *ms > 0)
-        .collect();
-    let cpu_peak_at_ms = ramps.iter().copied().max();
-    let cpu_peak_median_ms = median(ramps);
-    // Each run's sustained/peak ratio, the median of those over the runs that have one, applied to the picked peak: the
-    // two levels then come from the same runs' shape, never a sustained median of new runs beside a peak of old ones.
-    let ratios: Vec<u64> = mine
-        .iter()
-        .filter(|e| e.measured.sustained_centi_cores > 0 && peak_of(e) > 0)
-        .map(|e| (e.measured.sustained_centi_cores * RATIO_SCALE / peak_of(e)).min(RATIO_SCALE))
-        .collect();
-    let cpu_sustained = (ratios.len() >= SUSTAINED_MIN_RUNS)
-        .then(|| median(ratios))
-        .flatten()
-        .map(|r| (cores * r).div_ceil(RATIO_SCALE).max(1));
-    let run_p90_ms = p90(mine.iter().map(|e| e.measured.run_ms).collect());
-    let slowest_run_ms = (mine.len() >= FAST_MIN_RUNS)
-        .then(|| mine.iter().map(|e| e.measured.run_ms).max())
-        .flatten();
     Some(Defaults {
         cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX),
         mem,
         vram,
         mem_peak_at_ms,
-        cpu_peak_at_ms,
-        cpu_peak_median_ms,
-        slowest_run_ms,
-        cpu_sustained,
-        run_p90_ms,
     })
 }
 
@@ -388,36 +287,10 @@ mod tests {
                 cpu: 3,
                 mem: 200,
                 vram: None,
-                mem_peak_at_ms: None,
-                cpu_peak_at_ms: None,
-                cpu_peak_median_ms: None,
-                slowest_run_ms: Some(0),
-                cpu_sustained: None,
-                run_p90_ms: Some(0)
+                mem_peak_at_ms: None
             }
         );
         assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
-    }
-
-    #[test]
-    fn cpu_time_to_peak_is_the_slowest_of_the_runs_that_recorded_it() {
-        let runs: Vec<Entry> = [0, 20_000, 30_000, 40_000]
-            .into_iter()
-            .map(|ms| {
-                let mut e = entry("t", "/a", 100, 50, 0);
-                e.measured.peak_cpu_at_ms = ms;
-                e
-            })
-            .collect();
-        let d = defaults_from(&runs, &["t".to_string()], "/a", None).unwrap();
-        assert_eq!(d.cpu_peak_at_ms, Some(40_000), "0 (unknown) is left out");
-        assert_eq!(
-            d.cpu_peak_median_ms,
-            Some(30_000),
-            "the median of 20, 30 and 40 s"
-        );
-        let old = defaults_from(&runs[..1], &["t".to_string()], "/a", None).unwrap();
-        assert_eq!(old.cpu_peak_at_ms, None);
     }
 
     #[test]
@@ -432,12 +305,7 @@ mod tests {
                 cpu: 7,
                 mem: 900,
                 vram: None,
-                mem_peak_at_ms: None,
-                cpu_peak_at_ms: None,
-                cpu_peak_median_ms: None,
-                slowest_run_ms: None,
-                cpu_sustained: None,
-                run_p90_ms: Some(0)
+                mem_peak_at_ms: None
             }
         );
     }
@@ -692,94 +560,5 @@ mod tests {
             defaults_from(&gpu, &cmd, "/a", None).unwrap().vram,
             Some(3 << 30)
         );
-    }
-
-    #[test]
-    fn slowest_run_needs_two_runs_of_this_very_command() {
-        let run = |cmd: &str, run_ms: u64| {
-            let mut e = entry("x", "/a", 100, 50, 0);
-            e.cmd = cmd.split(' ').map(String::from).collect();
-            e.measured.run_ms = run_ms;
-            e.repo = Some("r".into());
-            e
-        };
-        let lint: Vec<String> = vec!["make".into(), "lint".into()];
-        let d = |all: &[Entry], cmd: &[String]| defaults_from(all, cmd, "/a", Some("r")).unwrap();
-        assert_eq!(
-            d(&[run("make lint", 1_285)], &lint).slowest_run_ms,
-            None,
-            "one run"
-        );
-        let two = [run("make lint", 1_285), run("make lint", 900)];
-        assert_eq!(d(&two, &lint).slowest_run_ms, Some(1_285));
-        // A run that turns out long takes the command out of the fast lane.
-        let long = [
-            run("make lint", 1_285),
-            run("make lint", 40_000),
-            run("make lint", 900),
-        ];
-        assert_eq!(d(&long, &lint).slowest_run_ms, Some(40_000));
-        // A failed run over 10 s (under the 30 s sizing floor) still disqualifies.
-        let mut failed = run("make lint", 12_000);
-        failed.exit_code = 1;
-        let with_fail = [run("make lint", 1_285), run("make lint", 900), failed];
-        assert_eq!(d(&with_fail, &lint).slowest_run_ms, Some(12_000));
-        // A run during which machine VRAM rose 256M or more disqualifies too.
-        let mut gpu = run("make lint", 900);
-        gpu.measured.vram_rise = Some(crate::run::VRAM_NOISE);
-        let with_gpu = [run("make lint", 1_285), gpu, run("make lint", 800)];
-        assert!(d(&with_gpu, &lint).slowest_run_ms.unwrap() > crate::admit::FAST_RUN_MS);
-        // The pooled program tier never gives a run time: other commands' times say nothing about this one's.
-        let pooled: Vec<String> = ["make", "lint", "fix"].map(String::from).to_vec();
-        assert_eq!(d(&two, &pooled).slowest_run_ms, None);
-    }
-
-    #[test]
-    fn the_sustained_level_is_a_learned_ratio_applied_to_the_picked_peak() {
-        let c = ["cargo".to_string()];
-        let run = |peak: u64, sustained: u64, run_ms: u64| {
-            let mut e = entry("cargo", "/a", 0, 50, 0);
-            e.measured.peak_centi_cores = peak;
-            e.measured.sustained_centi_cores = sustained;
-            e.measured.run_ms = run_ms;
-            e
-        };
-        // Right after the 0.4.8 upgrade: 19 old 14-core `cargo test` runs (no sustained level) and 1 new cached run on
-        // 1 core. A median of sustained levels over the one new run would say 1 core beside a 14-core peak, and
-        // `projected_peak` would admit a 14-core job as a 1-core one.
-        let mut all: Vec<Entry> = (0..19).map(|_| run(1_400, 0, 600_000)).collect();
-        all.push(run(100, 100, 5_000));
-        let d = defaults_from(&all, &c, "/a", None).unwrap();
-        assert_eq!(d.cpu, 14);
-        assert_eq!(d.cpu_sustained, None, "1 run with a level is too few");
-        // Two more new runs: still too few, then three with a level learn their median ratio (1/4) times the peak.
-        all.drain(..2);
-        all.push(run(1_400, 350, 600_000));
-        assert_eq!(
-            defaults_from(&all, &c, "/a", None).unwrap().cpu_sustained,
-            None
-        );
-        all.drain(..1);
-        all.push(run(1_200, 300, 600_000));
-        let d = defaults_from(&all, &c, "/a", None).unwrap();
-        assert_eq!(d.cpu, 14);
-        assert_eq!(
-            d.cpu_sustained,
-            Some(350),
-            "ratios 1/4, 1/4 and 1: the median 1/4 of the 14-core peak, not the cached run's 1 core"
-        );
-        assert_eq!(d.run_p90_ms, Some(600_000));
-    }
-
-    #[test]
-    fn run_p90_is_this_commands_own() {
-        let run = |ms: u64| {
-            let mut e = entry("t", "/a", 100, 50, 0);
-            e.measured.run_ms = ms;
-            e
-        };
-        let runs: Vec<Entry> = (1..=10).map(|i| run(i * 1_000)).collect();
-        let d = defaults_from(&runs, &["t".to_string()], "/a", None).unwrap();
-        assert_eq!(d.run_p90_ms, Some(9_000));
     }
 }

@@ -123,23 +123,11 @@ fn default_cpu(_cmd: &[String], cap: &Capacity) -> u32 {
     cap.cpu
 }
 
-/// What `resolve_weights` decided: the weights, for a learned memory size when (ms after the start) past runs peaked
-/// in memory, and for a learned or declared CPU size how long its peak is held until it shows (`None`: cold).
+/// What `resolve_weights` decided: the weights and, for a learned memory size, when (ms after the start) past runs
+/// peaked in memory.
 struct Resolved {
     weights: Weights,
     mem_peak_at_ms: Option<i64>,
-    cpu_hold_ms: Option<i64>,
-    /// A learned CPU size: when (ms after the start) its CPU may count as plateaued, the slowest time to peak. `None` for
-    /// cold, declared (`--cpu`) and no-ramp-history sizes, whose hold is never released by a plateau.
-    cpu_settle_after_ms: Option<u64>,
-    /// Learned short and small: may use the fast lane (`admit::fast_lane_eligible`).
-    fast: bool,
-    /// A learned sustained CPU level (`Job::cpu_sustained`); `None` for cold, declared and Docker/VM sizes.
-    cpu_sustained: Option<u64>,
-    /// The learned p90 run time (`Job::run_p90_ms`).
-    run_p90_ms: Option<u64>,
-    /// No history and no `--cpu` (`Job::cold`).
-    cold: bool,
 }
 
 fn resolve_weights(
@@ -166,24 +154,40 @@ fn resolve_weights(
     });
     Resolved {
         weights,
-        fast: !hosts_vm_work(cmd)
-            && crate::admit::fast_lane_eligible(weights, cap, hist.and_then(|d| d.slowest_run_ms)),
         mem_peak_at_ms: hist
             .and_then(|d| d.mem_peak_at_ms)
             .and_then(|ms| i64::try_from(ms).ok()),
-        // Cold jobs too: they hold the whole machine (`default_cpu`) until it shows or the fallback time passes.
-        cpu_hold_ms: Some(crate::admit::cpu_hold_ms(
-            hist.and_then(|d| d.cpu_peak_at_ms),
-        )),
-        cpu_settle_after_ms: hist
-            .filter(|_| flags.cpu.is_none())
-            .and_then(|d| d.cpu_peak_at_ms),
-        cpu_sustained: hist
-            .filter(|_| flags.cpu.is_none() && !hosts_vm_work(cmd))
-            .and_then(|d| d.cpu_sustained),
-        run_p90_ms: hist.and_then(|d| d.run_p90_ms),
-        cold: hist.is_none() && flags.cpu.is_none(),
     }
+}
+
+/// The niceness admitted jobs run at (`STOKEHOLD_NICE`, 0 to 19; 0 turns it off): the desktop, the shells and
+/// stokehold itself stay responsive while builds fill the CPU, so admission can run the machine fuller.
+pub const DEFAULT_NICE: u8 = 10;
+
+fn nice_level() -> u8 {
+    crate::state::env_var("STOKEHOLD_NICE")
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .map_or(DEFAULT_NICE, |n| n.min(19))
+}
+
+/// The command, started through `nice` when a level is set and `/usr/bin/nice` exists (`nice` execs the command, so
+/// the pid, the process group and the tree stay the same).
+fn niced(first: &str, rest: &[String]) -> Command {
+    let level = nice_level();
+    let nice = Path::new("/usr/bin/nice");
+    if level == 0 || !nice.exists() {
+        let mut c = Command::new(first);
+        c.args(rest);
+        return c;
+    }
+    let mut c = Command::new(nice);
+    c.arg("-n")
+        .arg(level.to_string())
+        .arg("--")
+        .arg(first)
+        .args(rest);
+    c
 }
 
 fn exec_nested(state: &StateDir, cmd: &[String]) -> Option<Error> {
@@ -211,7 +215,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
     let cwd_str = cwd.to_string_lossy().into_owned();
     let cap = machine::capacity(&cwd)?;
     let r = resolve_weights(state, flags, cmd, &cwd_str, &cap);
-    let (weights, cpu_settle_after_ms) = (r.weights, r.cpu_settle_after_ms);
+    let weights = r.weights;
 
     let (tx, rx) = channel();
     let sig = spawn_signal_thread(tx.clone())?;
@@ -232,13 +236,6 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         blocked_by: None,
         mem_declared: flags.mem.is_some(),
         mem_peak_at_ms: r.mem_peak_at_ms.filter(|_| flags.mem.is_none()),
-        cpu_hold_ms: r.cpu_hold_ms,
-        cpu_settled: false,
-        non_heavy_cpu_at_start: 0,
-        fast: r.fast,
-        cpu_sustained: r.cpu_sustained,
-        run_p90_ms: r.run_p90_ms,
-        cold: r.cold,
         vram_declared: flags.vram.is_some(),
     };
     let _guard = JobGuard {
@@ -286,16 +283,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
             reasons: tally.reasons(),
         },
     );
-    execute(
-        state,
-        &cap,
-        &job,
-        &info,
-        &sig,
-        flags.timeout(),
-        queued_ms,
-        cpu_settle_after_ms,
-    )
+    execute(state, &cap, &job, &info, &sig, flags.timeout(), queued_ms)
 }
 
 /// The process start time, retried; when it cannot be read, the marker that makes liveness check the pid only
@@ -372,7 +360,6 @@ fn acquire(
                 job.blocked_by = None;
                 job.state = State::Running;
                 job.started_ms = Some(now_ms());
-                job.non_heavy_cpu_at_start = live.non_heavy.cpu;
                 state.write_job(job)?;
             }
             d
@@ -395,11 +382,18 @@ fn acquire(
             eprintln!("stokehold: waiting ({reason})");
             said = reason;
         }
-        match rx.recv_timeout(wait_timeout(live_blocked, ramp_end_ms, now_ms())) {
+        let mut event = rx.recv_timeout(wait_timeout(live_blocked, ramp_end_ms, now_ms()));
+        // A burst of file events needs one re-check; drain it, but never drop a Stop or a signal behind it.
+        while matches!(event, Ok(WaitEvent::Fs)) {
+            match rx.try_recv() {
+                Ok(next) => event = Ok(next),
+                Err(_) => break,
+            }
+        }
+        match event {
             Ok(WaitEvent::Signal(s)) => return Err(Error::Interrupted(s)),
             Ok(WaitEvent::Stop) => park(state, job)?,
-            Ok(WaitEvent::Fs) => while rx.try_recv().is_ok_and(|e| matches!(e, WaitEvent::Fs)) {},
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(WaitEvent::Fs) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(Error::Probe("event channel closed".into()));
             }
@@ -489,34 +483,13 @@ fn cpu_peak_at(samples: &[(u64, u64)]) -> u64 {
         .map_or(0, |(ms, _)| *ms)
 }
 
-/// Sets the running job's file `cpu_settled` (releasing its CPU hold) or clears it (a risen CPU takes the hold again).
-/// The file change is the event that wakes the waiters. A job file already gone (the job ended) is not written again.
-/// Returns false when the lock could not be taken, so the caller retries.
-fn mark_settled(dir: &StateDir, id: &str, settled: bool) -> bool {
-    let Ok(_lock) = dir.lock() else { return false };
-    if let Some(mut job) = dir
-        .read_job(id)
-        .filter(|j| j.state == State::Running && j.cpu_settled != settled)
-    {
-        job.cpu_settled = settled;
-        let _ = dir.write_job(&job);
-    }
-    true
-}
-
 /// Samples the whole process tree (heavy's own pid down) while the job runs; returns the peak CPU and RSS.
-/// Uses the same sampler as the live accounting of running jobs. With `settle` (the state dir, the job id and its
-/// learned slowest time to peak), it marks the job settled once its CPU plateaus (and unmarks it if it rises again) (`admit::cpu_plateaued`).
-fn tree_sampler(
-    root: u32,
-    settle: Option<(StateDir, String, u64)>,
-) -> Option<(Sender<()>, std::thread::JoinHandle<TreePeak>)> {
+/// Uses the same sampler as the live accounting of running jobs.
+fn tree_sampler(root: u32) -> Option<(Sender<()>, std::thread::JoinHandle<TreePeak>)> {
     let mut sampler = TreeSampler::new(root).ok()?;
     let (stop_tx, stop_rx) = channel::<()>();
     let started = Instant::now();
     let handle = std::thread::spawn(move || {
-        let settle = settle;
-        let mut marked = false;
         let mut peak = TreePeak::default();
         let mut cpu = Vec::new();
         loop {
@@ -527,12 +500,6 @@ fn tree_sampler(
             }
             cpu.push((at, s.cpu));
             peak.usage = peak.usage.max(s);
-            if let Some((dir, id, after)) = &settle {
-                let plateaued = crate::admit::cpu_plateaued(&cpu, *after);
-                if plateaued != marked && mark_settled(dir, id, plateaued) {
-                    marked = plateaued;
-                }
-            }
             if !matches!(
                 stop_rx.recv_timeout(TREE_SAMPLE),
                 Err(RecvTimeoutError::Timeout)
@@ -711,11 +678,7 @@ fn record_finished(
     code
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the run context plus the learned settle time, in one place"
-)]
+#[expect(clippy::too_many_lines, reason = "the run context in one place")]
 fn execute(
     dir: &StateDir,
     cap: &Capacity,
@@ -724,15 +687,13 @@ fn execute(
     sig: &Sig,
     timeout: Duration,
     queued_ms: u64,
-    settle_after_ms: Option<u64>,
 ) -> Result<u8, Error> {
     let (first, rest) = job
         .cmd
         .split_first()
         .ok_or_else(|| Error::Usage("no command".into()))?;
-    let mut command = Command::new(first);
+    let mut command = niced(first, rest);
     command
-        .args(rest)
         .process_group(0)
         .env("STOKEHOLD_JOB", &job.id)
         .env("HEAVY_JOB", &job.id);
@@ -741,11 +702,7 @@ fn execute(
     let net_before = net_bytes();
     let steal_before = cpu_times().map(|t| t.steal);
     let sampler = vram_sampler(cap);
-    // Docker/VM work runs outside the tree, so its tree CPU says nothing: its hold is never released by a plateau.
-    let settle = settle_after_ms
-        .filter(|_| !hosts_vm_work(&job.cmd))
-        .map(|after| (dir.clone(), job.id.clone(), after));
-    let tree = tree_sampler(job.pid, settle);
+    let tree = tree_sampler(job.pid);
     let other = if hosts_vm_work(&job.cmd) {
         other_sampler(dir, job.pid, cap.cpu)
     } else {
@@ -848,82 +805,6 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mark_settled_sets_and_clears_the_flag_of_a_running_job_only() {
-        let t = tempfile::tempdir().unwrap();
-        let dir = StateDir::at(t.path().to_path_buf());
-        dir.ensure().unwrap();
-        let mk = |id: &str, state| Job {
-            id: id.into(),
-            pid: 1,
-            start_time: 0,
-            weights: Weights {
-                cpu: 1,
-                mem: 0,
-                vram: 0,
-                disk: 0,
-            },
-            cmd: vec!["x".into()],
-            cwd: "/".into(),
-            state,
-            enqueued_ms: 0,
-            started_ms: Some(0),
-            blocked_by: None,
-            mem_declared: false,
-            mem_peak_at_ms: None,
-            cpu_hold_ms: Some(1),
-            cpu_settled: false,
-            non_heavy_cpu_at_start: 0,
-            fast: false,
-            cpu_sustained: None,
-            run_p90_ms: None,
-            cold: false,
-            vram_declared: false,
-        };
-        dir.write_job(&mk("run", State::Running)).unwrap();
-        dir.write_job(&mk("wait", State::Queued)).unwrap();
-        assert!(mark_settled(&dir, "run", true));
-        assert!(dir.read_job("run").unwrap().cpu_settled);
-        assert!(mark_settled(&dir, "run", false));
-        assert!(!dir.read_job("run").unwrap().cpu_settled);
-        assert!(mark_settled(&dir, "wait", true));
-        assert!(!dir.read_job("wait").unwrap().cpu_settled, "not Running");
-        assert!(mark_settled(&dir, "gone", true));
-        assert!(
-            dir.read_job("gone").is_none(),
-            "an ended job is not rewritten"
-        );
-    }
-
-    #[test]
-    fn a_cold_job_holds_the_whole_machine_for_the_fallback_time_not_ten_seconds() {
-        let t = tempfile::tempdir().unwrap();
-        let state = StateDir::at(t.path().to_path_buf());
-        let cap = Capacity {
-            cpu: 16,
-            mem: 64 << 30,
-            vram: 0,
-            disk_total: 1 << 40,
-            vram_is_ram: true,
-        };
-        let flags = Flags {
-            cpu: None,
-            mem: None,
-            vram: None,
-            disk: None,
-            timeout: None,
-        };
-        let r = resolve_weights(
-            &state,
-            &flags,
-            &["cargo".into(), "build".into()],
-            "/x",
-            &cap,
-        );
-        assert_eq!(r.weights.cpu, 16);
-        assert_eq!(r.cpu_hold_ms, Some(crate::admit::CPU_FALLBACK_HOLD_MS));
-    }
 
     #[test]
     fn cold_and_docker_jobs_ask_for_the_whole_machine() {

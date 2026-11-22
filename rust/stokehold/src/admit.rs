@@ -1,83 +1,49 @@
 //! Admission: pure decisions.
 //!
-//! Memory is judged by measured headroom, like CPU: 95% of RAM minus non-heavy use, minus each running job's live use,
-//! minus the part of each running job's reservation it has not yet used (its unmet part). A declared (`--mem`) size is
-//! held for the whole run. A learned size is held until the job's learned time to peak (`mem_peak_at_ms`; at least
-//! `RAMP_MS`, and `MEM_FALLBACK_HOLD_MS` when unknown), then decays linearly to nothing over `MEM_DECAY_MS`: builds
-//! peak late, and a hold cut at 10 s let 12 jobs of a 12G peak start on a 64G Mac (reviewer's simulation). Only the decaying tails after
-//! the peak time are capped, together at `MEM_HELD_CAP` of the free memory, so measured use still admits jobs. Reservations that
-//! only sum high never block (2026-11-20: reservations summing over 85% blocked jobs at 43% memory used and left the
-//! Mac idle). VRAM stays reservation-based: running reservations plus the request within 90% of capacity.
-//! CPU is judged by live headroom only, never by peak-core reservations (a build
-//! that peaks near all cores would otherwise block everything on an idle machine):
+//! CPU is closed-loop (0.4.10): a job starts while the machine's measured CPU (`Live::cpu_sustained_pct`, the larger
+//! of the latest reading and the mean of the last `BUSY_WINDOW_MS`) is under `CPU_ADMIT_PCT`. A job's learned or
+//! declared CPU size counts only while it settles: for `SETTLE_MS` after a start the machine has not shown that job's
+//! CPU yet, so another job starts then only if the measured CPU, the settling jobs' sizes and its own size together
+//! stay under the admit line (`settle_fits`). After that only what is measured counts.
 //!
-//! cpu headroom = 95% of all cores - max(instant use, sustained use)
+//! Before 0.4.10 admission reserved each job's learned peak (and a sustained floor) for as long as the peak might
+//! come. Jobs here are very bursty: `make lint` learned a 13-core peak and averaged 1.4 cores over 15 minutes,
+//! `cargo test` 16 and 2.4. Reserving peaks left the Mac underused 86% of the time jobs waited (49% CPU on average),
+//! and the bursts still pinned it now and then, because nothing admitted before a burst can be taken back. Nine
+//! rounds of special cases (ramp holds, plateaus, floors, a fast lane, backfill and short-pass rules) moved the
+//! numbers without changing that.
 //!
-//! A job asks for one free core under that 95% target, so jobs start while the machine is at most about 89% busy (88%
-//! on 16 cores) and the CPU settles in the 88-95% band while jobs wait (90% before 0.4.5). Instant use is non-heavy usage plus each running
-//! job's live use (or its ramp hold); sustained use is the machine's CPU over the last `BUSY_WINDOW_MS` (max(latest,
-//! mean of the readings every heavy process shares)) plus the part of the ramp holds not yet in use. Without the
-//! sustained term a single 250 ms window that caught builds between steps read 80% on a machine pinned at 100%, and
-//! admitted another build into it (2026-11-20: 20% of admissions on the Mac and the rig came while the previous sample
-//! read 90-100%).
+//! Memory is judged by measured headroom: 95% of RAM minus non-heavy use, minus each running job's live use, minus
+//! the part of each running job's reservation it has not yet used (its unmet part). A declared (`--mem`) size is held
+//! for the whole run. A learned size is held until the job's learned time to peak (`mem_peak_at_ms`; at least
+//! `SETTLE_MS`, and `MEM_FALLBACK_HOLD_MS` when unknown), then decays linearly to nothing over `MEM_DECAY_MS`. Only
+//! the decaying tails are capped, together at `MEM_HELD_CAP` of the free memory. VRAM is reservation-based, netted
+//! against live use (`vram_reserved`), within 90% of capacity.
 //!
-//! A job with a learned (or declared) CPU size holds its peak cores (clamped to the machine) until that peak shows in its
-//! live use (3/4 of it) or its learned time to peak passes (`cpu_hold_ms`: history's slowest recent time to peak plus 25%, 10 s to 2 min, 30 s when
-//! unknown), the same way a learned memory size is held. A burst of builds then starts one at a time as their peaks
-//! show: after 0.4.2, holds that ended after 10 s (or at once on an idle-looking machine) let several 16-core cargo builds
-//! in before their CPU showed, and 42% of the samples while jobs waited read CPU over 95% with load1 over 3 x cores.
+//! The queue: a waiter never starts while an older waiter could start now or is settling-blocked (it goes first), nor
+//! while an older waiter has waited `QUEUE_PASS_MS` for memory or VRAM (younger jobs would keep taking it). Behind an
+//! older waiter blocked by the CPU line or a guard it may go: the same line and guards apply to it.
 //!
-//! Cold jobs hold the whole machine like that, for the 30 s fallback. Docker/VM work holds its peak for its whole hold
-//! time too (0.4.6), netted after `RAMP_MS` against other programs' CPU, where its VM's CPU shows. Job files from before 0.4.3 keep the ramp schedule: a job admitted in the last
-//! `RAMP_MS` holds its peak cores while its CPU ramps up, so a burst of waiters cannot all start at once. A full 10 s hold (`RAMP_MS`) covers cold jobs, Docker/VM jobs and
-//! learned peaks of 75% of the machine or more (`FULL_HOLD_FRACTION`), so those start at least 10 s apart: their real use
-//! is unknown or large and may show up late. Any smaller learned peak is full for the first `RAMP_FULL_MS` (the stagger floor); after that the measured machine decides:
-//! under `RAMP_IDLE_CPU_PCT` busy the job has shown its real use and the hold is released, otherwise it shrinks linearly
-//! to nothing at `RAMP_MS`. After the ramp only live use counts. Memory headroom likewise holds a job's unused
-//! reservation only until `RAMP_MS` after admission.
-//!
-//! Non-heavy usage (Chrome, Discord, other CLIs) is smoothed by the caller: max(latest sample, mean of the last 3), so
-//! a rise blocks at once and a fall is released slowly. Live guards (load, memory, disk) can only veto.
-//!
-//! Load: a 1-minute load of 4 x cores blocks always without Linux PSI (macOS), and with it once the CPU is at least 50%
-//! busy or PSI cpu `some avg10` reads at least 25% (on 2026-11-19 load 120 on 16 cores, CPU pinned, killed Docker; 0.4.8
-//! stops a PSI-confirmed load of I/O-waiting threads at 8-15% CPU from blocking); 6 x cores blocks whatever the CPU says. From 2 x cores up a PSI cpu `some` of 25% blocks, a load that is still rising (load1 > 1.1 x load5) blocks while the CPU is at
-//! least 75% busy, and any load there blocks while the CPU is at least 90% busy. Load without CPU is not CPU overload:
-//! on macOS load also counts threads blocked in I/O (network, disk), so it can read 20-60 with the CPU nearly idle
-//! (a power or network outage on 2026-11-20 read load1 58 at 26% CPU with nothing heavy running). Critical memory
-//! pressure (macOS level 4, Linux PSI) blocks; macOS warn (level 2) only with memory 85% used. Memory used at 95%
-//! blocks even a lone job.
+//! Live guards (`guard_block`) veto: a CPU pinned within `PINNED_WINDOW_MS`, a 1-minute load of 2-6 x cores as
+//! described there, memory pressure and memory used at 95%. With nothing running a job always passes the resource
+//! checks, so a busy desktop cannot starve it; the guards still apply.
 
 use std::collections::VecDeque;
 
 use crate::job::{Capacity, Job, Live, State, Usage, Weights};
 
-/// A backfilling job may pass the head only while the head has waited less than this.
-pub const BACKFILL_WINDOW_MS: i64 = 60_000;
 /// Memory target: jobs start while measured use plus holds stays within this % of RAM, and memory used at this % blocks.
 const MEM_PCT: u64 = 95;
 /// VRAM reservations stay within this % of capacity.
 const VRAM_PCT: u64 = 90;
-/// The CPU target: jobs start while the machine's CPU plus one core stays within this % of every core (2026-11-21: Todd
-/// wants the Mac about 95% hot; it was 90%).
-const CPU_PCT: u64 = 95;
 /// macOS memory pressure level 2 ("warn") blocks only while memory used is at least this %. Level 2 is common and sticky:
 /// on 2026-11-21 it held for hours at 49-58% used with 1.8 of 3 GB swap, and vetoed every start (40+ minutes with
 /// nothing running at 27% CPU). Level 4 ("critical") always blocks.
 const WARN_MEM_PCT: u64 = 85;
-/// A tiny job (at most the backfill share of cores and this fraction, 1/32, of RAM) may pass a head that is blocked by
-/// memory, VRAM or a guard (for up to `TINY_BYPASS_MS` of its wait), or a ramp hold it does not prolong.
-const TINY_MEM: (u64, u64) = (1, 32);
-/// Tiny jobs pass a head blocked by memory, VRAM or a guard only while it has waited under this long: a stream of them
-/// (up to 1/32 of RAM each) could otherwise hold its memory away until its timeout.
-pub const TINY_BYPASS_MS: i64 = 5 * 60_000;
 /// How far back the shared CPU readings count towards the sustained CPU.
 pub const BUSY_WINDOW_MS: i64 = 20_000;
-/// The CPU counts as pinned at or over this % busy: nothing new starts, whatever the holds and the load say (0.4.8).
-/// The 6 hours to 2026-11-21 21:50 UTC on 0.4.7: the Mac read over 95% CPU or 3 x cores of load in 80% of samples, and
-/// 190 of 272 starts came while it read at least 95% busy or load1 over 48. Bursty jobs (`make lint test-changed`, 25
-/// minutes at about 1 core with spikes to 10-11) swung the CPU between 35% and 99% within seconds, and starts landed in
-/// the dips.
+/// The CPU counts as pinned at or over this % busy: nothing new starts (0.4.8). Bursty jobs swing the CPU between 35%
+/// and 99% within seconds, and starts landed in the dips.
 pub const CPU_PINNED_PCT: u64 = 98;
 /// How far back a pinned CPU reading blocks starts (`CPU_PINNED_PCT`): a start in a dip between two spikes still waits.
 pub const PINNED_WINDOW_MS: i64 = 10_000;
@@ -85,37 +51,30 @@ pub const PINNED_WINDOW_MS: i64 = 10_000;
 const LOAD_SOFT: f64 = 2.0;
 const LOAD_BUSY_CPU_PCT: u64 = 90;
 /// A rising load at or over `LOAD_SOFT` x cores blocks only while the CPU is at least this busy; below it the load is
-/// threads waiting on I/O, not CPU work (and blocking there would leave the CPU under the 75% that counts as underused).
+/// threads waiting on I/O, not CPU work.
 const LOAD_RISING_CPU_PCT: u64 = 75;
 /// Load at or over this many times the core count blocks unless Linux PSI shows it is not CPU work: without a PSI
 /// reading (macOS) it always blocks; with one, it blocks once the CPU is at least `LOAD_HARD_CPU_PCT` busy or tasks
-/// stalled waiting for a CPU (PSI cpu `some avg10`) reach `CPU_PSI_PCT`.
-/// 0.4.8: before, it blocked whatever the CPU said; on the rig a load of 35 on 16 cores read 8-15% CPU with PSI cpu
-/// `some` under 1 (threads in I/O wait, mostly Postgres and WSL), which is no CPU overload. The 2026-11-19 Mac load
-/// of 120 on 16 cores came with the CPU pinned, so it still blocks.
+/// stalled waiting for a CPU (PSI cpu `some avg10`) reach `CPU_PSI_PCT`. The 2026-11-19 Mac load of 120 on 16 cores
+/// came with the CPU pinned.
 const LOAD_HARD: f64 = 4.0;
 /// The CPU % that confirms a load of `LOAD_HARD` x cores.
 const LOAD_HARD_CPU_PCT: u64 = 50;
-/// Load at or over this many times the core count blocks whatever the CPU says: a 6 x cores storm is never safe to add
-/// to, confirmed or not (the 2026-11-19 load of 120 on 16 cores was 7.5 x).
+/// Load at or over this many times the core count blocks whatever the CPU says.
 const LOAD_EXTREME: f64 = 6.0;
-/// Linux PSI cpu `some avg10` (% of the last 10 s some task waited for a CPU) at or over this confirms any load of
-/// `LOAD_SOFT` x cores or more: tasks really queue for the CPU.
+/// Linux PSI cpu `some avg10` at or over this confirms any load of `LOAD_SOFT` x cores or more.
 const CPU_PSI_PCT: u64 = 25;
-/// A job admitted this recently has not ramped its CPU yet.
-pub const RAMP_MS: i64 = 10_000;
-/// A learned or declared CPU size with no known time to peak is held this long, unless its peak shows sooner.
-pub const CPU_FALLBACK_HOLD_MS: i64 = 30_000;
-/// A learned CPU peak is never held longer than this, whatever history says: a run that never reaches its learned peak
-/// (an incremental build) must not keep the machine reserved.
-pub const CPU_MAX_HOLD_MS: i64 = 120_000;
-/// A held CPU peak has shown up once the job's live use reaches this fraction (3/4) of it.
-const CPU_SHOWN: (u64, u64) = (3, 4);
-/// For this long after admission a ramping job holds its full peak, whatever the machine reads: the stagger floor.
-pub const RAMP_FULL_MS: i64 = 3_000;
-/// A learned peak of at least this fraction (3/4) of the machine keeps the full `RAMP_MS` hold, like a whole-machine hold: two
-/// such jobs together would overload it, and an idle reading right after the floor proves nothing yet.
-const FULL_HOLD_FRACTION: (u64, u64) = (3, 4);
+/// A job starts while the machine's measured CPU (`Live::cpu_sustained_pct` or the latest reading, whichever is
+/// higher) is under this %. Jobs here average a fraction of their peak and burst for seconds, so the machine then
+/// runs mostly in the 80-90% band while jobs wait, with the bursts of the running jobs on top.
+pub const CPU_ADMIT_PCT: u64 = 80;
+/// For this long after a start the machine has not shown the new job's CPU yet: it is settling (`Block::Ramp`).
+pub const SETTLE_MS: i64 = 10_000;
+/// An older waiter that has waited this long for memory or VRAM holds back the younger ones, which would otherwise keep
+/// taking what it waits for.
+pub const QUEUE_PASS_MS: i64 = 5 * 60_000;
+/// A learned VRAM size's unused part is held this long after admission, then decays over `MEM_DECAY_MS`.
+pub const VRAM_HOLD_MS: i64 = 120_000;
 /// A learned memory size with no known time to peak is held this long after admission.
 pub const MEM_FALLBACK_HOLD_MS: i64 = 60_000;
 /// After its hold, a learned size's unused part shrinks linearly to nothing over this long.
@@ -123,61 +82,10 @@ pub const MEM_DECAY_MS: i64 = 60_000;
 /// The learned unused parts together may take at most this fraction (3/4) of the memory still free (ceiling minus
 /// machine use), so a burst cannot all peak at once while measured use still admits jobs.
 const MEM_HELD_CAP: (u64, u64) = (3, 4);
-/// After `RAMP_FULL_MS`, a machine measured under this CPU % has room the ramping job is not using: its hold is released.
-const RAMP_IDLE_CPU_PCT: u64 = 50;
-/// Granularity of the search for the moment a ramp-blocked waiter will fit.
-const RAMP_STEP_MS: i64 = 250;
-const CPU_ASK: u64 = 100;
-/// The least CPU (2 cores) a held peak leaves free in the band for small waiters (`backfill`).
-const BACKFILL_CPU: u64 = 200;
 /// How many recent non-heavy samples the smoother averages (waiters re-sample every 10 s).
 pub const SMOOTH_WINDOW: usize = 3;
-/// A running job's CPU has plateaued once it has not risen for this long (`cpu_plateaued`).
-pub const PLATEAU_MS: u64 = 10_000;
-/// A rise of at most this much (1 core, or 1/8 of the level reached if more) still counts as flat.
-const PLATEAU_SLACK_CPU: u64 = 100;
-/// A big waiter's own learned peak, projected: this fraction (1/2) of it must fit on top of the projected CPU (measured
-/// use plus the unrealized holds of the jobs still ramping) within every core. Learned peaks are the highest 500 ms tree
-/// sample, well above what a build sustains, so the whole peak would keep big jobs off a half-busy machine.
-/// 0.4.5: 2/5, from 1/2. Measured over 575 runs peaking at 6+ cores for 20 s+, average cores / peak cores is p50 0.18,
-/// p75 0.32, p90 0.51, so half sat above p90. 1/3 or 1/4 overran the machine 43-47% of the time in
-/// `bursty_big_jobs_start_one_at_a_time_without_pinning_the_machine` (bursts at p90); 2/5 keeps it at 0%.
-const PROJECTED_PEAK: (u64, u64) = (2, 5);
-/// Past `BACKFILL_WINDOW_MS`, a waiter of at most the backfill share of cores may still pass a head blocked on CPU room
-/// (or a ramp hold) while the machine reads under this CPU % and the head has waited under `TINY_BYPASS_MS`. Before
-/// 0.4.6 the queue was strict FIFO there: an 11-16 core head waiting for 4-5 free cores kept 1-2 core jobs queued for
-/// up to 30 minutes while the Mac swung between 30% and 100% (2026-11-21). The 5-minute bound keeps a stream of small
-/// jobs from starving the head. (Shrinking the head's projected peak after the window instead overran the machine 52%
-/// of the time in `bursty_big_jobs_start_one_at_a_time_without_pinning_the_machine`.)
-///
-/// 0.4.8: any waiter no bigger than the head (cores, memory and VRAM) may backfill there, not only 1-2 core ones. With
-/// 0.4.7 the 1-2 core jobs waited p50 42 s, but 3-8 core ones (`cargo clippy`, `cargo test` at 6 cores) waited p50
-/// 21 min behind 11-core `make lint` heads, on a Mac idle 23% of the time while jobs waited. Past `TINY_BYPASS_MS` the
-/// head holds the queue (no backfill at all), so only the jobs already running stand between it and its start. Aging
-/// its projected peak away instead (tried for 0.4.8) overran the machine 16% of the time in
-/// `bursty_big_jobs_start_one_at_a_time_without_pinning_the_machine`.
-const UNDERUSED_CPU_PCT: u64 = 75;
-/// A running job with a learned sustained level (`Job::cpu_sustained`) holds its full learned peak at least this long
-/// after its start, and until its learned time to peak plus margin (`Job::cpu_hold_ms`) has passed, then at most that
-/// sustained level (0.4.8): learned peaks are the highest 500 ms sample, and `make lint test-changed` learned 10 cores
-/// while it averaged 1.2. A job that sits on 1 core for 60 s and then spikes to 16 keeps its peak reserved until past
-/// its learned peak time, so two or three of them are never let in together to spike at once.
-pub const SUSTAINED_FULL_MS: i64 = RAMP_MS;
-/// A backfiller bigger than tiny may pass a blocked head only when its learned p90 run time (`Job::run_p90_ms`) ends by
-/// the head's `TINY_BYPASS_MS` plus this (0.4.8): otherwise a 12-core, 70-minute job arriving at 4:59 of the head's wait
-/// would hold the head's room for an hour.
-pub const BACKFILL_OVERRUN_MS: i64 = 30_000;
 /// The window (ms) of the sustained level: the highest mean of the process tree's CPU over any window this long.
 pub const SUSTAINED_WINDOW_MS: u64 = 10_000;
-/// Fast lane (0.4.7): a command whose recent runs all finished within this long (and at least
-/// `history::FAST_MIN_RUNS` of them, of this very command) is short.
-pub const FAST_RUN_MS: u64 = 10_000;
-/// A fast-lane job reserves at most this many cores (and a tiny share of RAM, `TINY_MEM`, and no VRAM).
-pub const FAST_MAX_CPU: u32 = 2;
-/// At most this many fast-lane jobs run at once, so the lane adds at most `FAST_MAX_JOBS` x `FAST_MAX_CPU` cores to a
-/// busy machine. A fast-lane job that runs long keeps its slot until it ends (it is never forgotten), and its long run
-/// takes the command out of the lane from then on.
-pub const FAST_MAX_JOBS: usize = 2;
 
 /// Which check blocked a waiter (recorded in the history; a disk that is too full fails instead of waiting).
 #[derive(
@@ -294,34 +202,12 @@ fn cores(centi: u64) -> String {
     format!("{}.{:02}", centi / 100, centi % 100)
 }
 
-/// A job small enough to pass a head blocked by anything but CPU room (`TINY_MEM`).
-fn tiny(w: Weights, cap: &Capacity) -> bool {
-    centi(w.cpu) <= backfill(cap) && w.mem <= cap.mem / TINY_MEM.1 * TINY_MEM.0
-}
-
 fn ceiling(cap: &Capacity) -> Usage {
     Usage {
-        cpu: centi(cap.cpu) * CPU_PCT / 100,
+        cpu: centi(cap.cpu),
         mem: cap.mem / 100 * MEM_PCT,
         vram: cap.vram / 100 * VRAM_PCT,
     }
-}
-
-/// The CPU (centi-cores) kept out of the hold reservation for small waiters: 2 cores, or 1/8 of the machine if more.
-fn backfill(cap: &Capacity) -> u64 {
-    (centi(cap.cpu) / 8).max(BACKFILL_CPU)
-}
-
-fn request(w: Weights) -> Usage {
-    Usage {
-        cpu: if w.cpu > 0 { CPU_ASK } else { 0 },
-        mem: w.mem,
-        vram: w.vram,
-    }
-}
-
-fn fits(ask: Usage, room: Usage) -> bool {
-    ask.cpu <= room.cpu && ask.mem <= room.mem && ask.vram <= room.vram
 }
 
 /// VRAM reservations only: the running jobs' VRAM (`vram_reserved`) plus the request within 90% of capacity. Memory
@@ -342,7 +228,7 @@ pub fn fits_reservations(
 
 /// The VRAM the running jobs hold, netted against live use (0.4.9): each job's live VRAM plus the unused part of its
 /// reservation. A declared (`--vram`) size's unused part is held for the whole run; a learned one's until
-/// `CPU_MAX_HOLD_MS`, then it decays over `MEM_DECAY_MS` (not on memory's learned time to peak: a GPU job that
+/// `VRAM_HOLD_MS`, then it decays over `MEM_DECAY_MS` (not on memory's learned time to peak: a GPU job that
 /// allocates after its memory peaked would lose its reservation before it used it). Before 0.4.9 the plain sum of
 /// reservations counted for the whole run: on the rig, jobs that had learned the desktop's 1.9G kept it reserved
 /// whatever the GPU used, and waiters waited 14 minutes on "vram" at 37% CPU with the GPU at 1.8 of 10G.
@@ -364,7 +250,7 @@ pub fn vram_reserved(running: &[&Job], live: &Live, now_ms: i64) -> u64 {
                         l,
                         now_ms.saturating_sub(t).max(0),
                         j.vram_declared,
-                        Some(CPU_MAX_HOLD_MS),
+                        Some(VRAM_HOLD_MS),
                     )
                 },
             );
@@ -374,7 +260,7 @@ pub fn vram_reserved(running: &[&Job], live: &Live, now_ms: i64) -> u64 {
 }
 
 /// The part of a reservation a job `elapsed_ms` after admission has not yet used. A `declared` size is held for the
-/// whole run. A learned one is held until `peak_at_ms` (at least `RAMP_MS`; `MEM_FALLBACK_HOLD_MS` when unknown), then
+/// whole run. A learned one is held until `peak_at_ms` (at least `SETTLE_MS`; `MEM_FALLBACK_HOLD_MS` when unknown), then
 /// shrinks linearly to nothing over `MEM_DECAY_MS`.
 #[must_use]
 pub fn mem_unmet(
@@ -402,7 +288,7 @@ pub fn mem_unmet_split(
     if declared {
         return (unmet, 0);
     }
-    let hold = peak_at_ms.unwrap_or(MEM_FALLBACK_HOLD_MS).max(RAMP_MS);
+    let hold = peak_at_ms.unwrap_or(MEM_FALLBACK_HOLD_MS).max(SETTLE_MS);
     if elapsed_ms <= hold {
         (unmet, 0)
     } else if elapsed_ms >= hold + MEM_DECAY_MS {
@@ -414,130 +300,6 @@ pub fn mem_unmet_split(
                 / u64::try_from(MEM_DECAY_MS).unwrap_or(1),
         )
     }
-}
-
-/// The CPU a job `elapsed_ms` into its ramp still holds beyond its live use (`peak` already clamped to `machine`). A
-/// hold of Docker/VM work (`vm`), a cold whole-machine hold or a peak of `FULL_HOLD_FRACTION` of the machine is full for
-/// all of `RAMP_MS`. A smaller learned peak is full for `RAMP_FULL_MS`, then nothing if the machine is measured under `RAMP_IDLE_CPU_PCT` busy, else it shrinks linearly to 0
-/// at `RAMP_MS`.
-#[must_use]
-pub fn ramp_hold(peak: u64, machine: u64, elapsed_ms: i64, cpu_pct: u64, vm: bool) -> u64 {
-    if elapsed_ms >= RAMP_MS {
-        return 0;
-    }
-    if elapsed_ms < RAMP_FULL_MS
-        || vm
-        || peak * FULL_HOLD_FRACTION.1 >= machine * FULL_HOLD_FRACTION.0
-    {
-        return peak;
-    }
-    if cpu_pct < RAMP_IDLE_CPU_PCT {
-        return 0;
-    }
-    let left = u64::try_from(RAMP_MS - elapsed_ms).unwrap_or(0);
-    let span = u64::try_from(RAMP_MS - RAMP_FULL_MS).unwrap_or(1);
-    peak * left / span
-}
-
-/// How long a learned or declared CPU peak is held, from history's slowest recent time to peak (`None`: unknown) plus
-/// a 25% margin: at least `RAMP_MS`, at most `CPU_MAX_HOLD_MS`, and `CPU_FALLBACK_HOLD_MS` when unknown.
-#[must_use]
-pub fn cpu_hold_ms(peak_at_ms: Option<u64>) -> i64 {
-    peak_at_ms
-        .and_then(|ms| i64::try_from(ms.saturating_add(ms / 4)).ok())
-        .unwrap_or(CPU_FALLBACK_HOLD_MS)
-        .clamp(RAMP_MS, CPU_MAX_HOLD_MS)
-}
-
-/// The CPU a running job holds beyond its live use. A job with a learned or declared size (`hold_ms`) holds its whole
-/// peak until the peak shows in its live use (3/4 of it), its CPU plateaus past its slowest time to peak (`settled`, see
-/// `cpu_plateaued`) or `hold_ms` has passed, like a learned memory size, never
-/// less than the `RAMP_FULL_MS` floor: a cargo build spends its first 10-30 s on a few cores, and a hold that ended
-/// sooner (or was released because the machine read idle) let several 16-core builds in before any of their CPU showed
-/// (2026-11-20). Docker/VM work (its CPU never shows in the tree) holds its whole peak for all of `hold_ms` (at least
-/// `RAMP_MS`): before 0.4.6 it kept the 10 s `ramp_hold`, a `docker build` took 10-30 s to show its CPU in the VM, and
-/// a second build or a burst of jobs started in between and took the Mac to 100% CPU with load1 130-330
-/// (2026-11-21). Job files without `hold_ms` keep the `RAMP_MS` schedule of `ramp_hold`.
-#[must_use]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one job's hold inputs: its size, age, live use and learned schedule"
-)]
-pub fn cpu_hold(
-    peak: u64,
-    machine: u64,
-    elapsed_ms: i64,
-    cpu_pct: u64,
-    vm: bool,
-    live_cpu: u64,
-    hold_ms: Option<i64>,
-    settled: bool,
-) -> u64 {
-    match hold_ms {
-        // Docker/VM work: its CPU never shows in the tree (it shows as other programs' CPU, which `headroom_for` nets
-        // against this hold), so neither the 3/4 test nor a plateau can release it; only its time can.
-        Some(hold) if vm => {
-            if elapsed_ms < hold.max(RAMP_MS) {
-                peak
-            } else {
-                0
-            }
-        }
-        Some(hold) => {
-            if elapsed_ms < RAMP_FULL_MS {
-                peak
-            } else if settled || elapsed_ms >= hold || live_cpu * CPU_SHOWN.1 >= peak * CPU_SHOWN.0
-            {
-                0
-            } else {
-                peak
-            }
-        }
-        _ => ramp_hold(peak, machine, elapsed_ms, cpu_pct, vm),
-    }
-}
-
-/// When the CPU hold of a job started at `started_ms` ends at the latest.
-fn cpu_hold_end(j: &Job, started_ms: i64) -> i64 {
-    started_ms
-        + match j.cpu_hold_ms {
-            Some(h) if crate::run::hosts_vm_work(&j.cmd) => h.max(RAMP_MS),
-            Some(h) => h.max(RAMP_FULL_MS),
-            None => RAMP_MS,
-        }
-}
-
-/// Whether a running job's CPU has plateaued: `samples` are `(ms after the start, centi-cores)` of its process tree,
-/// oldest first. Only from `PLATEAU_MS` after `slowest_ms` (its learned SLOWEST time to peak, at least `RAMP_MS`: a
-/// median would end the hold before the late half of its runs ramp) on, and only when the last `PLATEAU_MS` is flat
-/// within itself: its highest and lowest readings differ by at most 1 core (or 1/8 of the level). A lull between
-/// bursts, or a rise, is not flat; a flat run that later rises is no longer plateaued, so its hold is taken again.
-/// Such a run has shown its real use: an incremental build, or a test run whose learned peak is one 500 ms spike
-/// (2026-11-21: `make check` learned 15 cores, ran on 1.5, and its 2-minute hold kept waiters out at 10-50% CPU).
-#[must_use]
-pub fn cpu_plateaued(samples: &[(u64, u64)], slowest_ms: u64) -> bool {
-    let Some(&(now, _)) = samples.last() else {
-        return false;
-    };
-    let from = slowest_ms.max(u64::try_from(RAMP_MS).unwrap_or(0)) + PLATEAU_MS;
-    if now < from {
-        return false;
-    }
-    let cut = now - PLATEAU_MS;
-    let recent: Vec<u64> = samples
-        .iter()
-        .filter(|(ms, _)| *ms > cut)
-        .map(|(_, c)| *c)
-        .collect();
-    let (Some(&hi), Some(&lo)) = (recent.iter().max(), recent.iter().min()) else {
-        return false;
-    };
-    // The window must really span PLATEAU_MS, not one late sample.
-    let first = samples
-        .iter()
-        .find(|(ms, _)| *ms > cut)
-        .map_or(now, |s| s.0);
-    first <= cut + PLATEAU_MS / 4 && hi - lo <= (hi / 8).max(PLATEAU_SLACK_CPU)
 }
 
 /// The machine's sustained CPU %: max(latest, mean of the readings from the last `BUSY_WINDOW_MS`). Fast to block when
@@ -567,230 +329,6 @@ pub fn recent_peak_pct(readings: &[(i64, u64)], now_ms: i64) -> u64 {
         .map(|(_, pct)| *pct)
         .max()
         .unwrap_or(0)
-}
-
-/// What is left for a new job once the other programs and the running jobs' real use are counted. CPU counts the
-/// larger of the instant use (non-heavy plus each job's live use or ramp hold) and the sustained machine CPU plus the
-/// ramp holds not yet in use.
-#[cfg(test)]
-#[must_use]
-pub fn headroom(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> Usage {
-    headroom_for(running, cap, live, now_ms, false, false)
-}
-
-/// A running job's CPU hold (centi-cores) at `now_ms`: its `cpu_hold`, capped to its learned sustained level past its
-/// learned peak time (`sustained_hold`), and its sustained floor (`sustained_floor`, at least that hold). A job not yet
-/// stamped holds nothing here. `cold` (`Job::cold`) shrinks a cold hold on an idle machine (`cold_hold`), except for a
-/// `cold_waiter`: a cold job never starts within another cold job's whole hold.
-fn running_hold(
-    j: &Job,
-    cap: &Capacity,
-    live: &Live,
-    now_ms: i64,
-    vm: bool,
-    used: u64,
-    cold_waiter: bool,
-) -> (u64, u64) {
-    let peak = centi(j.weights.cpu).min(centi(cap.cpu));
-    j.started_ms.map_or((0, 0), |t| {
-        let elapsed = now_ms.saturating_sub(t).max(0);
-        let hold = sustained_hold(
-            cpu_hold(
-                peak,
-                centi(cap.cpu),
-                elapsed,
-                live.cpu_pct,
-                vm,
-                used,
-                j.cpu_hold_ms,
-                j.cpu_settled,
-            ),
-            j.cpu_sustained,
-            elapsed,
-            vm,
-            j.cpu_hold_ms,
-        );
-        let hold = if j.cold && !vm && !cold_waiter {
-            cold_hold(
-                hold,
-                peak,
-                elapsed,
-                live.cpu_pct.max(live.cpu_sustained_pct),
-            )
-        } else {
-            hold
-        };
-        (hold, sustained_floor(hold, peak, j.cpu_sustained, vm))
-    })
-}
-
-/// A cold job's whole-machine hold (`hold`, of its `peak`) `elapsed_ms` after its start, with the machine `busy_pct`
-/// busy (0.4.9): past `RAMP_MS`, while the machine reads under `RAMP_IDLE_CPU_PCT`, it holds half its peak, not all
-/// of it. The band stays reserved for half the machine, so on an idle Mac a small or mid-size learned waiter no longer
-/// waits the whole `CPU_FALLBACK_HOLD_MS` behind one cold job that has shown next to nothing. On a busy machine (or
-/// within `RAMP_MS`) the full hold stays, and a cold waiter always sees the full hold (`running_hold`): a cargo build
-/// spends its first 10-30 s on a few cores, and two whole-machine builds 10 s apart overran the Mac on 2026-11-20.
-#[must_use]
-pub fn cold_hold(hold: u64, peak: u64, elapsed_ms: i64, busy_pct: u64) -> u64 {
-    if elapsed_ms >= RAMP_MS && busy_pct < RAMP_IDLE_CPU_PCT {
-        hold.min(peak / 2)
-    } else {
-        hold
-    }
-}
-
-/// A running non-VM job with a learned sustained level holds at least that level (at most its peak) for its whole
-/// run, even once its peak hold is released (0.4.8): a bursty job (`make lint test-changed`, about 1 core between 10-core
-/// spikes for 25 minutes) otherwise counts only its live use in a dip, the next big job starts there, and their spikes
-/// coincide (the Mac on 2026-11-21: CPU 100% and load1 up to 77 with six of them running).
-#[must_use]
-pub fn sustained_floor(hold: u64, peak: u64, sustained: Option<u64>, vm: bool) -> u64 {
-    match sustained {
-        Some(level) if !vm => hold.max(level.min(peak)),
-        _ => hold,
-    }
-}
-
-/// Half of each unrealized sustained floor but the largest is reserved on top of the largest (`floor_reserve`).
-const FLOOR_REST_SHARE: (u64, u64) = (1, 2);
-
-/// The CPU reserved for the running bursty jobs' spikes (0.4.9): each job's sustained floor above its live use
-/// (`floors`, centi-cores) is a spike it may still take. The largest is reserved in full and half of each other one
-/// (`FLOOR_REST_SHARE`), so three running jobs reserve two whole spikes. In 0.4.8 every floor was summed for the whole
-/// run: `make lint` learned a best 10 s mean of 6.5-8 cores (peak 11) and averaged 1.3-2.2 over 9-22 minutes, so three
-/// of them reserved 20 cores on the 16-core Mac at 41-73% busy, and the next 11-core head waited 5-25 minutes on "cpu".
-/// Reserving only the largest let four of them admit a fifth, and two coinciding 7-11 core spikes then oversubscribe 16
-/// cores (the pinned and load guards only stop new starts). Now the Mac runs three lint-shaped jobs and a fourth
-/// waits.
-#[must_use]
-pub fn floor_reserve(mut floors: Vec<u64>) -> u64 {
-    floors.sort_unstable_by(|a, b| b.cmp(a));
-    let mut it = floors.into_iter();
-    let top = it.next().unwrap_or(0);
-    top + it.sum::<u64>() * FLOOR_REST_SHARE.0 / FLOOR_REST_SHARE.1
-}
-
-/// `headroom` for a request that is `small` (at most `backfill` cores): the unrealized part of the held peaks leaves
-/// that backfill share of the CPU band free, so a 1-core waiter is not blocked by a 16-core hold at 13% CPU. A big
-/// request sees the whole hold.
-#[must_use]
-pub fn headroom_for(
-    running: &[&Job],
-    cap: &Capacity,
-    live: &Live,
-    now_ms: i64,
-    small: bool,
-    cold_waiter: bool,
-) -> Usage {
-    let mut floors: Vec<u64> = Vec::new();
-    let (mut held, (mut unmet, mut unmet_small), (pre_peak, tail), vm_own, vm_base) =
-        running.iter().fold(
-            (Usage::default(), (0, 0), (0u64, 0u64), 0u64, 0u64),
-            |(a, unmet, learned, vm_own, vm_base), j| {
-                let l = live
-                    .per_job
-                    .iter()
-                    .find(|(id, _)| *id == j.id)
-                    .map_or_else(Usage::default, |(_, u)| *u);
-                let vm = crate::run::hosts_vm_work(&j.cmd);
-                let (hold, floor) = running_hold(j, cap, live, now_ms, vm, l.cpu, cold_waiter);
-                let cpu = l.cpu.max(hold);
-                // The unrealized floors are reserved together below (`floor_reserve`), not summed.
-                floors.push(floor.saturating_sub(cpu));
-                // A running job not yet stamped, or one with a declared size, holds its whole unused part; a learned size holds
-                // it by schedule, and those holds are capped together below.
-                let (mem, learned_unmet) = match j.started_ms {
-                    Some(t) if !j.mem_declared => (
-                        l.mem,
-                        mem_unmet_split(
-                            j.weights.mem,
-                            l.mem,
-                            now_ms.saturating_sub(t).max(0),
-                            false,
-                            j.mem_peak_at_ms,
-                        ),
-                    ),
-                    Some(t) => (
-                        l.mem
-                            + mem_unmet(
-                                j.weights.mem,
-                                l.mem,
-                                now_ms.saturating_sub(t).max(0),
-                                true,
-                                None,
-                            ),
-                        (0, 0),
-                    ),
-                    None => (l.mem + j.weights.mem.saturating_sub(l.mem), (0, 0)),
-                };
-                (
-                    Usage {
-                        cpu: a.cpu + cpu,
-                        mem: a.mem + mem,
-                        vram: 0,
-                    },
-                    {
-                        let own = hold.saturating_sub(l.cpu);
-                        // A small job's own unrealized hold is not part of the capped big reservation: it stacks.
-                        let is_small =
-                            small && centi(j.weights.cpu).min(centi(cap.cpu)) <= backfill(cap);
-                        (unmet.0 + own, unmet.1 + if is_small { own } else { 0 })
-                    },
-                    (learned.0 + learned_unmet.0, learned.1 + learned_unmet.1),
-                    // Netted only past `RAMP_MS`: before that, other programs' CPU is not yet this job's.
-                    vm_own
-                        + u64::from(vm && j.started_ms.is_some_and(|t| now_ms - t >= RAMP_MS))
-                            * hold.saturating_sub(l.cpu),
-                    // What other programs already used when this job started is not its CPU.
-                    vm_base + u64::from(vm) * j.non_heavy_cpu_at_start,
-                )
-            },
-        );
-    let floor_max = floor_reserve(floors);
-    held.cpu += floor_max;
-    unmet += floor_max;
-    // A Docker/VM job's CPU shows as other programs' CPU: what shows there is not counted twice with its hold.
-    let vm_shown = vm_own.min(live.non_heavy.cpu.saturating_sub(vm_base));
-    held.cpu = held.cpu.saturating_sub(vm_shown);
-    unmet = unmet.saturating_sub(vm_shown);
-    unmet_small = unmet_small.min(unmet);
-    held.vram = vram_reserved(running, live, now_ms);
-    let free = ceiling(cap)
-        .mem
-        .saturating_sub(live.non_heavy.mem)
-        .saturating_sub(held.mem);
-    // Before a job's learned time-to-peak its hold is full (the cap would leave free memory unprotected while peaks are
-    // still coming); only the decaying tail after the peak is capped to a fraction of what is still free.
-    held.mem += pre_peak;
-    let free = free.saturating_sub(pre_peak);
-    held.mem += tail.min(free / MEM_HELD_CAP.1 * MEM_HELD_CAP.0);
-    // The unrealized part of a held peak reserves the CPU band, except a backfill share: a big hold (16 cores on 16)
-    // would otherwise block even a 1-core waiter for its whole hold while the machine reads 13%. Real use still counts in
-    // full, so the band is never exceeded by what is measured, only by what is merely expected.
-    let limit = if small {
-        ceiling(cap).cpu.saturating_sub(backfill(cap))
-    } else {
-        u64::MAX
-    };
-    // The backfill share is one shared budget: the big holds are capped to leave it free, and every admitted small
-    // job's own unrealized hold (`unmet_small`) is then spent from it, on top of the cap.
-    let live_jobs = held.cpu.saturating_sub(unmet);
-    let held_cpu = held
-        .cpu
-        .saturating_sub(unmet_small)
-        .min(limit.saturating_sub(live.non_heavy.cpu))
-        .max(live_jobs)
-        + unmet_small;
-    let measured = live.cpu_sustained_pct * centi(cap.cpu) / 100;
-    let instant = live.non_heavy.cpu + held_cpu;
-    let sustained = (measured + unmet - unmet_small).min(limit).max(measured) + unmet_small;
-    let room = ceiling(cap)
-        .saturating_sub(live.non_heavy)
-        .saturating_sub(held);
-    Usage {
-        cpu: ceiling(cap).cpu.saturating_sub(instant.max(sustained)),
-        ..room
-    }
 }
 
 /// The disk cannot hold the request even with no heavy job running: waiting would never help.
@@ -898,141 +436,6 @@ pub fn guard_block(cap: &Capacity, live: &Live) -> Option<(String, Block)> {
     None
 }
 
-/// Why a request cannot start now, or `None`. Alone (nothing running) a clamped request always passes
-/// the resource checks, so a busy desktop cannot starve it forever; guards still apply.
-fn blocker(
-    want: &Job,
-    running: &[&Job],
-    cap: &Capacity,
-    live: &Live,
-    now_ms: i64,
-) -> Option<Blocked> {
-    let (w, sustained, waited_ms) = (want.weights, want.cpu_sustained, now_ms - want.enqueued_ms);
-    if !running.is_empty() {
-        if !fits_reservations(w, running, cap, live, now_ms) {
-            return Some(blocked("vram reservations full", false, Block::Vram));
-        }
-        let small = centi(w.cpu) <= backfill(cap);
-        let mut ask = request(w);
-        if small {
-            // A small waiter's learned peak must fit in what the band has left after every outstanding hold.
-            ask.cpu = ask.cpu.max(centi(w.cpu));
-        } else {
-            // A big waiter's projected peak (half its learned peak) must fit within every core on top of the projected
-            // CPU: one free core under the band let 13-core builds in at 83% busy, and they took the machine to 100%
-            // with load1 at 34 (2026-11-21). room = band - projected, so projected + peak/2 <= all cores is this ask.
-            // A whole-machine waiter (cold, or a learned 16-core peak) that has waited past `BACKFILL_WINDOW_MS` (it holds the queue) drops this: a cold head asks for the
-            // whole machine, and its projected peak fits only at 50% busy, which left a machine with one long job at 50-60%
-            // while jobs queued. It then starts under the band like in 0.4.3; the load, memory and stagger guards stay.
-            if waited_ms < BACKFILL_WINDOW_MS || w.cpu < cap.cpu {
-                let over_band = centi(cap.cpu) - ceiling(cap).cpu;
-                ask.cpu = ask.cpu.max(
-                    projected_peak(centi(w.cpu).min(centi(cap.cpu)), sustained)
-                        .saturating_sub(over_band),
-                );
-            }
-        }
-        let room_at = |t: i64| headroom_for(running, cap, live, t, small, want.cold);
-        if !fits(ask, room_at(now_ms)) {
-            // Would it fit without the ramp holds? Then the ramp is the blocker, and the holds shrink on a known schedule:
-            // name the first moment it fits with the machine as measured now (at the latest, when the last ramp ends).
-            if fits(ask, room_at(i64::MAX)) {
-                let last = running
-                    .iter()
-                    .filter_map(|j| j.started_ms.map(|t| cpu_hold_end(j, t)))
-                    .filter(|e| *e > now_ms)
-                    .max();
-                let end = last.map(|last| {
-                    // Every step, plus the exact moments the stagger floors end (where an idle machine releases a hold).
-                    let floors = running
-                        .iter()
-                        .filter_map(|j| j.started_ms)
-                        .map(|t| t + RAMP_FULL_MS);
-                    let mut at: Vec<i64> = (1..=(last - now_ms) / RAMP_STEP_MS)
-                        .map(|k| now_ms + k * RAMP_STEP_MS)
-                        .chain(floors)
-                        .filter(|t| *t > now_ms && *t < last)
-                        .collect();
-                    at.sort_unstable();
-                    at.into_iter()
-                        .find(|t| fits(ask, room_at(*t)))
-                        .unwrap_or(last)
-                });
-                return Some(Blocked {
-                    reason: format!(
-                        "cpu held for jobs still ramping up: needs {} cores, {} free now under the {CPU_PCT}% band",
-                        cores(ask.cpu),
-                        cores(room_at(now_ms).cpu)
-                    ),
-                    live: true,
-                    block: Block::Ramp,
-                    ramp_end_ms: end,
-                });
-            }
-            let room = room_at(now_ms);
-            let (reason, block) = if ask.cpu > room.cpu {
-                (
-                    format!(
-                        "cpu: needs {} cores, {} free under the {CPU_PCT}% band (machine {}% busy)",
-                        cores(ask.cpu),
-                        cores(room.cpu),
-                        live.cpu_pct.max(live.cpu_sustained_pct)
-                    ),
-                    Block::Cpu,
-                )
-            } else if ask.mem > room.mem {
-                (
-                    format!(
-                        "mem: needs {}, {} free under {MEM_PCT}% of RAM after running jobs' holds",
-                        crate::sizes::fmt_size(ask.mem),
-                        crate::sizes::fmt_size(room.mem)
-                    ),
-                    Block::Mem,
-                )
-            } else {
-                (
-                    format!(
-                        "vram: needs {}, {} free",
-                        crate::sizes::fmt_size(ask.vram),
-                        crate::sizes::fmt_size(room.vram)
-                    ),
-                    Block::Vram,
-                )
-            };
-            return Some(blocked(reason, true, block));
-        }
-    }
-    guard_block(cap, live).map(|(why, block)| blocked(why, true, block))
-}
-
-/// A big waiter's projected peak (centi-cores), what must fit on top of the projected CPU within every core: 2/5 of its
-/// learned `peak` (`PROJECTED_PEAK`), or its learned sustained level when lower (0.4.8, `Job::cpu_sustained`).
-#[must_use]
-pub fn projected_peak(peak: u64, sustained: Option<u64>) -> u64 {
-    (peak * PROJECTED_PEAK.0 / PROJECTED_PEAK.1).min(sustained.unwrap_or(u64::MAX))
-}
-
-/// A running job's CPU hold with its learned sustained level (`sustained`, centi-cores) applied: once past both
-/// `SUSTAINED_FULL_MS` and its learned time to peak plus margin (`hold_ms`, `cpu_hold_ms`), a non-VM job holds at most
-/// that level, not its brief learned peak. Before then its peak may still be ahead, so it keeps `hold`. Docker/VM work
-/// (its CPU does not show in the tree, so no sustained level is learned for it), jobs without a level and jobs without
-/// a learned time to peak keep `hold`.
-#[must_use]
-pub fn sustained_hold(
-    hold: u64,
-    sustained: Option<u64>,
-    elapsed_ms: i64,
-    vm: bool,
-    hold_ms: Option<i64>,
-) -> u64 {
-    match (sustained, hold_ms) {
-        (Some(level), Some(peak_by)) if !vm && elapsed_ms >= peak_by.max(SUSTAINED_FULL_MS) => {
-            hold.min(level)
-        }
-        _ => hold,
-    }
-}
-
 /// The sustained level of CPU samples `(ms after the start, centi-cores)`, oldest first: the highest mean over any
 /// `SUSTAINED_WINDOW_MS` window (the mean of the whole run when it is shorter). 0 with no samples.
 #[must_use]
@@ -1059,209 +462,178 @@ pub fn sustained_level(samples: &[(u64, u64)]) -> u64 {
     best
 }
 
-/// Whether a job may use the fast lane: its slowest recent run (`history::Defaults::slowest_run_ms`) was at most
-/// `FAST_RUN_MS`, and it reserves at most `FAST_MAX_CPU` cores, a tiny share of RAM and no VRAM.
+/// The memory left for a new job: 95% of RAM minus non-heavy use, minus each running job's live use, minus the unmet
+/// part of each running job's reservation (`mem_unmet_split`). A job not yet stamped, or one with a declared size, holds
+/// its whole unused part; a learned size holds it in full until its time to peak, and only the decaying tails after
+/// that are capped together, at `MEM_HELD_CAP` of the memory still free.
 #[must_use]
-pub fn fast_lane_eligible(w: Weights, cap: &Capacity, slowest_run_ms: Option<u64>) -> bool {
-    slowest_run_ms.is_some_and(|ms| ms <= FAST_RUN_MS)
-        && w.cpu <= FAST_MAX_CPU
-        && w.mem <= cap.mem / TINY_MEM.1 * TINY_MEM.0
-        && w.vram == 0
-}
-
-/// A running fast job whose live CPU is above `FAST_MAX_CPU` was misclassified (a cached no-op that became a real
-/// build): the lane closes until it ends, so a second one cannot join it.
-fn fast_job_outgrew_lane(running: &[&Job], live: &Live) -> bool {
-    running.iter().filter(|j| j.fast).any(|j| {
-        live.per_job
-            .iter()
-            .any(|(id, u)| *id == j.id && u.cpu > centi(FAST_MAX_CPU))
-    })
-}
-
-/// Real CPU room for the lane: the machine is below 100% busy and at least `FAST_MAX_CPU` cores are free by the live
-/// sample, so a misclassified job cannot stack onto a saturated machine.
-fn fast_cpu_room(cap: &Capacity, live: &Live) -> bool {
-    let busy = live.cpu_pct.max(live.cpu_sustained_pct);
-    let free_centi = u64::from(cap.cpu) * 100 * 100u64.saturating_sub(busy) / 100;
-    busy < 100 && free_centi >= centi(FAST_MAX_CPU)
-}
-
-/// The fast lane: a fast job (`Job::fast`) starts past the CPU band, ramp holds and the queue while fewer than
-/// `FAST_MAX_JOBS` fast jobs run, its memory fits the measured headroom and no guard (load, memory pressure, memory
-/// used) vetoes. A 1 s, 1-core `make lint` otherwise waited 204 s on a rig at 95-98% busy that it would have added
-/// next to nothing to (2026-11-21). False when the lane does not apply; the normal checks decide then.
-fn fast_lane(job: &Job, running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> bool {
-    job.fast
-        && running.iter().filter(|j| j.fast).count() < FAST_MAX_JOBS
-        && !fast_job_outgrew_lane(running, live)
-        && fast_cpu_room(cap, live)
-        && guard_block(cap, live).is_none()
-        && fits_reservations(job.weights, running, cap, live, now_ms)
-        && job.weights.mem <= headroom_for(running, cap, live, now_ms, true, false).mem
-}
-
-/// Would `job`, started at `now_ms`, still run (by its learned p90 run time) past the head's backfill time plus
-/// `BACKFILL_OVERRUN_MS`? True with no learned run time.
-fn outlasts_backfill(job: &Job, head: &Job, now_ms: i64) -> bool {
-    let by = head.enqueued_ms + TINY_BYPASS_MS + BACKFILL_OVERRUN_MS;
-    job.run_p90_ms
-        .and_then(|d| i64::try_from(d).ok())
-        .is_none_or(|d| now_ms.saturating_add(d) > by)
-}
-
-/// A short small job may pass a head held back by CPU room or a ramp hold at any age of the head's wait, up to this
-/// long (0.4.9; before that the queue held after `TINY_BYPASS_MS`).
-pub const SHORT_PASS_HEAD_MS: i64 = 30 * 60_000;
-/// A short small job's learned p90 run time is at most this.
-pub const SHORT_PASS_RUN_MS: u64 = 5 * 60_000;
-
-/// Short and small (0.4.9): at most the backfill share of cores, tiny memory, no VRAM, no Docker/VM work, and a
-/// learned p90 run time of at most `SHORT_PASS_RUN_MS`.
-fn short_small(j: &Job, cap: &Capacity) -> bool {
-    tiny(j.weights, cap)
-        && j.weights.vram == 0
-        && !crate::run::hosts_vm_work(&j.cmd)
-        && j.run_p90_ms.is_some_and(|d| d <= SHORT_PASS_RUN_MS)
-}
-
-/// May short small `job` pass `head` (blocked by CPU room or a ramp hold) though the head is past its backfill window?
-/// Only while the head has waited under `SHORT_PASS_HEAD_MS`, and only while the short small jobs running and this one
-/// together take at most the backfill share of cores, so at any time they keep at most that share from the head, and
-/// each for minutes. On 2026-11-22 the Mac idled 4h40m of 10h30m waiting on "queue": 1-2 core review and check jobs
-/// waited behind 11-core `make lint` heads that had waited over 5 minutes.
-fn short_small_passes(
-    job: &Job,
-    head: &Job,
-    running: &[&Job],
-    cap: &Capacity,
-    now_ms: i64,
-) -> bool {
-    let busy: u64 = running
+pub fn mem_room(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> u64 {
+    let (held, pre_peak, tail) = running
         .iter()
-        .filter(|j| short_small(j, cap))
-        .map(|j| centi(j.weights.cpu))
-        .sum();
-    short_small(job, cap)
-        && now_ms - head.enqueued_ms < SHORT_PASS_HEAD_MS
-        && busy + centi(job.weights.cpu) <= backfill(cap)
+        .fold((0u64, 0u64, 0u64), |(held, pre, tail), j| {
+            let l = live_use(j, live).mem;
+            match j.started_ms {
+                Some(t) if !j.mem_declared => {
+                    let (full, decaying) = mem_unmet_split(
+                        j.weights.mem,
+                        l,
+                        now_ms.saturating_sub(t).max(0),
+                        false,
+                        j.mem_peak_at_ms,
+                    );
+                    (held + l, pre + full, tail + decaying)
+                }
+                _ => (held + l.max(j.weights.mem), pre, tail),
+            }
+        });
+    let free = ceiling(cap)
+        .mem
+        .saturating_sub(live.non_heavy.mem)
+        .saturating_sub(held)
+        .saturating_sub(pre_peak);
+    free.saturating_sub(tail.min(free / MEM_HELD_CAP.1 * MEM_HELD_CAP.0))
 }
 
-/// Would `head` still wait on CPU room with the short small jobs running gone (their live CPU taken off the machine's)?
-/// Then they are not what holds it back, and another may pass it (`short_small_passes`).
-fn head_waits_without_short(
-    head: &Job,
+fn live_use(j: &Job, live: &Live) -> Usage {
+    live.per_job
+        .iter()
+        .find(|(id, _)| *id == j.id)
+        .map_or_else(Usage::default, |(_, u)| *u)
+}
+
+/// The machine's measured CPU %: the larger of the latest reading and the sustained one.
+fn measured_pct(live: &Live) -> u64 {
+    live.cpu_pct.max(live.cpu_sustained_pct)
+}
+
+/// The settling jobs (started under `SETTLE_MS` ago, or not yet stamped): the CPU (centi-cores) their sizes may still
+/// add beyond their live use, and the moment the first of them has settled.
+fn settling(running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> (u64, Option<i64>) {
+    running
+        .iter()
+        .filter(|j| j.started_ms.is_none_or(|t| now_ms - t < SETTLE_MS))
+        .fold((0, None), |(cpu, first), j| {
+            let size = centi(j.weights.cpu).min(centi(cap.cpu));
+            let end = j.started_ms.map_or(now_ms + SETTLE_MS, |t| t + SETTLE_MS);
+            (
+                cpu + size.saturating_sub(live_use(j, live).cpu),
+                Some(first.map_or(end, |f: i64| f.min(end))),
+            )
+        })
+}
+
+/// Why `want` cannot start now, or `None`. Alone (nothing running) a clamped request always passes the resource
+/// checks, so a busy desktop cannot starve it; the guards still apply.
+fn blocker(
+    want: &Job,
     running: &[&Job],
     cap: &Capacity,
     live: &Live,
     now_ms: i64,
-) -> bool {
-    let (short, rest): (Vec<&Job>, Vec<&Job>) =
-        running.iter().copied().partition(|j| short_small(j, cap));
-    let used: u64 = live
-        .per_job
-        .iter()
-        .filter(|(id, _)| short.iter().any(|j| j.id == *id))
-        .map(|(_, u)| u.cpu)
-        .sum();
-    let pct = used * 100 / centi(cap.cpu).max(1);
-    let without = Live {
-        cpu_pct: live.cpu_pct.saturating_sub(pct),
-        cpu_sustained_pct: live.cpu_sustained_pct.saturating_sub(pct),
-        ..live.clone()
-    };
-    blocker(head, &rest, cap, &without, now_ms).is_some_and(|b| b.block == Block::Cpu)
+) -> Option<Blocked> {
+    let w = want.weights;
+    if !running.is_empty() {
+        if !fits_reservations(w, running, cap, live, now_ms) {
+            return Some(blocked("vram reservations full", false, Block::Vram));
+        }
+        let room = mem_room(running, cap, live, now_ms);
+        if w.mem > room {
+            return Some(blocked(
+                format!(
+                    "mem: needs {}, {} free under {MEM_PCT}% of RAM after running jobs' holds",
+                    crate::sizes::fmt_size(w.mem),
+                    crate::sizes::fmt_size(room)
+                ),
+                true,
+                Block::Mem,
+            ));
+        }
+        let pct = measured_pct(live);
+        if pct >= CPU_ADMIT_PCT {
+            return Some(blocked(
+                format!("cpu: machine {pct}% busy, jobs start under {CPU_ADMIT_PCT}%"),
+                true,
+                Block::Cpu,
+            ));
+        }
+        let (unshown, settled_at) = settling(running, cap, live, now_ms);
+        if let Some(at) = settled_at {
+            let cpu_line = centi(cap.cpu) * CPU_ADMIT_PCT / 100;
+            let need = pct * centi(cap.cpu) / 100 + unshown + centi(w.cpu).min(centi(cap.cpu));
+            if need > cpu_line {
+                return Some(Blocked {
+                    reason: format!(
+                        "cpu: jobs that just started are settling; {} cores with theirs, {} under the {CPU_ADMIT_PCT}% line",
+                        cores(need),
+                        cores(cpu_line)
+                    ),
+                    live: true,
+                    block: Block::Ramp,
+                    ramp_end_ms: Some(at),
+                });
+            }
+        }
+    }
+    guard_block(cap, live).map(|(why, block)| blocked(why, true, block))
 }
 
 /// Can `job` start now, given every job file (already pruned of dead ones)?
 #[must_use]
 pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i64) -> Decision {
-    let running: Vec<&Job> = jobs.iter().filter(|j| j.state == State::Running).collect();
-    // A waiter that is stopped (Ctrl-Z) cannot start, so it never blocks the queue behind it.
-    let mut queued: Vec<&Job> = jobs
-        .iter()
-        .filter(|j| j.state == State::Queued && (j.id == job.id || !live.stopped.contains(&j.id)))
-        .collect();
-    queued.sort_by(|a, b| (a.enqueued_ms, &a.id).cmp(&(b.enqueued_ms, &b.id)));
-
     if let Some(why) = disk_full(job.weights, cap, live) {
         return Decision::Fail(why);
     }
-    if fast_lane(job, &running, cap, live, now_ms) {
-        return Decision::Start;
-    }
-    if let Some(head) = queued.first().filter(|h| h.id != job.id) {
-        let head_blocker = |rs: &[&Job]| blocker(head, rs, cap, live, now_ms);
-        let head_block = head_blocker(&running);
-        let me = Job {
-            state: State::Running,
-            started_ms: Some(now_ms),
-            ..job.clone()
-        };
-        let mut with_me = running.clone();
-        with_me.push(&me);
-        // Would this job starting now move the head's moment to fit (behind a ramp hold) later?
-        let delays_ramp = |b: &Blocked| {
-            head_blocker(&with_me).is_none_or(|after| {
-                after.block != Block::Ramp
-                    || after.ramp_end_ms.unwrap_or(i64::MAX) > b.ramp_end_ms.unwrap_or(i64::MAX)
-            })
-        };
-        if head_block.is_none() {
-            // The head could start now: this job may go first only if the head still fits next to it.
-            if head_blocker(&with_me).is_some() {
-                return wait("queued behind a job that fits now", Block::Queue);
+    let running: Vec<&Job> = jobs.iter().filter(|j| j.state == State::Running).collect();
+    // A waiter that is stopped (Ctrl-Z) cannot start, so it never holds back the ones behind it.
+    let mut older: Vec<&Job> = jobs
+        .iter()
+        .filter(|j| {
+            j.state == State::Queued
+                && j.id != job.id
+                && !live.stopped.contains(&j.id)
+                && (j.enqueued_ms, &j.id) < (job.enqueued_ms, &job.id)
+        })
+        .collect();
+    older.sort_by(|a, b| (a.enqueued_ms, &a.id).cmp(&(b.enqueued_ms, &b.id)));
+    for o in older {
+        match blocker(o, &running, cap, live, now_ms) {
+            // It goes first; this job then checks again with it running.
+            None => {
+                return Decision::Wait {
+                    reason: format!("queued behind {}, which can start now", o.id),
+                    live: true,
+                    block: Block::Queue,
+                    ramp_end_ms: None,
+                };
             }
-        } else if !tiny(job.weights, cap)
-            || head_block.as_ref().is_some_and(|b| match b.block {
-                Block::Cpu => true,
-                // Behind a ramp hold, only if the head's moment to fit does not move later.
-                Block::Ramp => delays_ramp(b),
-                _ => now_ms - head.enqueued_ms >= TINY_BYPASS_MS,
-            })
-        {
-            // A tiny job passes a head blocked by memory, VRAM or a guard until it has waited `TINY_BYPASS_MS`, and one held back by ramp holds
-            // when it does not delay the head's start: it takes next to nothing of what the head waits for. Behind CPU
-            // room it would, and a stream of them could starve the head.
-            // Past the window a waiter no bigger than the head still passes a head held back by CPU room while the machine reads
-            // underused (`UNDERUSED_CPU_PCT`), for the first `TINY_BYPASS_MS` of the head's wait.
-            // 0.4.8: any waiter no bigger than the head (checked below), not only a small one.
-            let backfills_idle_cpu = now_ms - head.enqueued_ms < TINY_BYPASS_MS
-                && live.cpu_pct.max(live.cpu_sustained_pct) < UNDERUSED_CPU_PCT
-                && head_block
-                    .as_ref()
-                    .is_some_and(|b| matches!(b.block, Block::Cpu | Block::Ramp));
-            // A short small job passes a head held back by CPU room only while the head would still wait on CPU once the
-            // short small jobs running had finished, and one held back by a ramp hold only if it does not move the
-            // head's moment to fit later: a stream of them can never keep the head waiting on themselves.
-            let short_pass = short_small_passes(job, head, &running, cap, now_ms)
-                && head_block.as_ref().is_some_and(|b| match b.block {
-                    Block::Cpu => head_waits_without_short(head, &running, cap, live, now_ms),
-                    Block::Ramp => !delays_ramp(b),
-                    _ => false,
-                });
-            if now_ms - head.enqueued_ms >= BACKFILL_WINDOW_MS && !backfills_idle_cpu && !short_pass
+            // Its turn comes when the jobs that just started have settled.
+            Some(b) if b.block == Block::Ramp => {
+                return Decision::Wait {
+                    reason: format!(
+                        "queued behind {}, which starts once the new jobs settle",
+                        o.id
+                    ),
+                    live: true,
+                    block: Block::Queue,
+                    ramp_end_ms: b.ramp_end_ms,
+                };
+            }
+            Some(b)
+                if matches!(b.block, Block::Mem | Block::Vram)
+                    && now_ms - o.enqueued_ms >= QUEUE_PASS_MS =>
             {
                 return wait(
-                    format!("queued behind {} (waited over 60 s)", head.id),
-                    Block::Queue,
-                );
-            }
-            let (a, h) = (job.weights, head.weights);
-            if a.cpu > h.cpu || a.mem > h.mem || a.vram > h.vram {
-                return wait("queued behind a smaller-or-equal head", Block::Queue);
-            }
-            // A backfiller bigger than tiny must be done before the head's backfill time is up (plus a small bound), so
-            // it cannot keep the head's room past it; with no learned run time it does not backfill at all.
-            if !tiny(a, cap) && outlasts_backfill(job, head, now_ms) {
-                return wait(
                     format!(
-                        "queued behind {} (its run would outlast the head's backfill time)",
-                        head.id
+                        "queued behind {} (waited over {} min for {})",
+                        o.id,
+                        QUEUE_PASS_MS / 60_000,
+                        b.block.name()
                     ),
                     Block::Queue,
                 );
             }
+            // Blocked by the CPU line or a guard: the same checks apply to this job.
+            Some(_) => {}
         }
     }
     match blocker(job, &running, cap, live, now_ms) {
@@ -1317,13 +689,6 @@ mod tests {
             blocked_by: None,
             mem_declared: false,
             mem_peak_at_ms: None,
-            cpu_hold_ms: None,
-            cpu_settled: false,
-            non_heavy_cpu_at_start: 0,
-            fast: false,
-            cpu_sustained: None,
-            run_p90_ms: None,
-            cold: false,
             vram_declared: false,
         }
     }
@@ -1427,14 +792,14 @@ mod tests {
             Decision::Start,
             "reservations 88G + 20G > 90G, measured 43G"
         );
-        // Right after admission the unused reservation still counts: the same pair blocks as a ramp, then releases.
+        // Right after admission the unused reservation still counts: the same pair blocks on memory, then releases.
         let d = evaluate(&me, &jobs, &c, &live, 1_000);
         assert!(
             matches!(
                 d,
                 Decision::Wait {
-                    block: Block::Ramp,
-                    ramp_end_ms: Some(_),
+                    block: Block::Mem,
+                    live: true,
                     ..
                 }
             ),
@@ -1472,7 +837,7 @@ mod tests {
             "live use over the reservation leaves nothing unmet"
         );
         // Learned peak at 90 s: held in full until then, half left 30 s later, nothing after the decay.
-        assert_eq!(unmet(RAMP_MS, false, Some(90_000)), 7 * G);
+        assert_eq!(unmet(SETTLE_MS, false, Some(90_000)), 7 * G);
         assert_eq!(unmet(90_000, false, Some(90_000)), 7 * G);
         assert_eq!(
             unmet(90_000 + MEM_DECAY_MS / 2, false, Some(90_000)),
@@ -1480,7 +845,7 @@ mod tests {
         );
         assert_eq!(unmet(90_000 + MEM_DECAY_MS, false, Some(90_000)), 0);
         // A peak earlier than the ramp still holds through the ramp; an unknown peak uses the fallback hold.
-        assert_eq!(unmet(RAMP_MS, false, Some(2_000)), 7 * G);
+        assert_eq!(unmet(SETTLE_MS, false, Some(2_000)), 7 * G);
         assert_eq!(unmet(MEM_FALLBACK_HOLD_MS, false, None), 7 * G);
         assert_eq!(unmet(MEM_FALLBACK_HOLD_MS + MEM_DECAY_MS, false, None), 0);
         // A declared size is held for the whole run.
@@ -1582,7 +947,7 @@ mod tests {
             ..job("r", 1, 40, State::Running, 0)
         };
         let usable = ceiling(&cap).mem;
-        let at = |ms| headroom(&[&r], &cap, &live, ms).mem;
+        let at = |ms| mem_room(&[&r], &cap, &live, ms);
         // Before the learned peak the hold is full: free = usable - 10G - 40G exactly.
         assert_eq!(at(30_000), usable - 50 * G);
         assert_eq!(at(120_000), usable - 50 * G);
@@ -1599,10 +964,7 @@ mod tests {
         let free = usable - 10 * G;
         let tail = 80 * G / 2;
         assert!(tail > free / 4 * 3);
-        assert_eq!(
-            headroom(&[&big], &cap, &live, 150_000).mem,
-            free - free / 4 * 3
-        );
+        assert_eq!(mem_room(&[&big], &cap, &live, 150_000), free - free / 4 * 3);
     }
 
     #[test]
@@ -1647,8 +1009,8 @@ mod tests {
 
     #[test]
     fn headroom_math_with_fake_non_heavy_usage() {
-        // 10 cores, 100G. Ceiling 950 centi-cores (95% of every core), 95G. Non-heavy: 2 cores, 30G.
-        // Running job reserves 10G but really uses 3 cores / 20G: CPU is live, memory max(reservation, live).
+        // 10 cores, 100G. Memory ceiling 95G. Non-heavy: 2 cores, 30G.
+        // Running job reserves 10G but really uses 3 cores / 20G: memory counts max(reservation, live).
         let run = job("r", 2, 10, State::Running, 0);
         let live = Live {
             non_heavy: Usage {
@@ -1666,15 +1028,8 @@ mod tests {
             )],
             ..calm()
         };
-        let room = headroom(&[&run], &cap(), &live, 100_000);
-        assert_eq!(
-            room,
-            Usage {
-                cpu: 950 - 200 - 300,
-                mem: 95 * G - 30 * G - 20 * G,
-                vram: 0
-            }
-        );
+        let room = mem_room(&[&run], &cap(), &live, 100_000);
+        assert_eq!(room, 95 * G - 30 * G - 20 * G);
         // Memory fits at exactly the edge, blocked one GiB over; both pass the reservation-only check.
         let edge = job("e", 4, 45, State::Queued, 1);
         assert_eq!(
@@ -1684,7 +1039,7 @@ mod tests {
         let over = job("o", 5, 46, State::Queued, 1);
         let d = evaluate(&over, &[run.clone(), over.clone()], &cap(), &live, 2);
         assert!(matches!(d, Decision::Wait { live: true, .. }), "{d:?}");
-        // Past its hold and decay an unused reservation holds nothing; CPU and memory are both just live.
+        // Past its hold and decay an unused reservation holds nothing; memory is just live.
         let idle = Live {
             per_job: vec![("r".into(), Usage::default())],
             non_heavy: Usage::default(),
@@ -1694,11 +1049,9 @@ mod tests {
             started_ms: Some(0),
             ..run
         };
-        let room = headroom(&[&run], &cap(), &idle, 200_000);
-        assert_eq!((room.cpu, room.mem), (950, 95 * G));
-        // Inside the ramp the unused part of the reservation still counts.
-        let room = headroom(&[&run], &cap(), &idle, 1_000);
-        assert_eq!(room.mem, 85 * G);
+        assert_eq!(mem_room(&[&run], &cap(), &idle, 200_000), 95 * G);
+        // Inside the settle time the unused part of the reservation still counts.
+        assert_eq!(mem_room(&[&run], &cap(), &idle, 1_000), 85 * G);
     }
 
     #[test]
@@ -1990,76 +1343,6 @@ mod tests {
     }
 
     #[test]
-    fn eight_cold_builds_start_one_ramp_apart() {
-        // 16 cores, 8 jobs with no history: each asks for the whole machine, so each holds all 16 cores while ramping.
-        let c = Capacity { cpu: 16, ..cap() };
-        let mut jobs: Vec<Job> = (0..8)
-            .map(|i| job(&format!("j{i}"), 16, 1, State::Queued, i))
-            .collect();
-        let mut starts = Vec::new();
-        let mut t = 100;
-        // Every waiter looks every 100 ms; they admit in FIFO order, as the lock serializes them.
-        while t < 100 + 8 * RAMP_MS && starts.len() < 8 {
-            for i in 0..jobs.len() {
-                if jobs[i].state == State::Queued
-                    && evaluate(&jobs[i].clone(), &jobs, &c, &calm(), t) == Decision::Start
-                {
-                    jobs[i].state = State::Running;
-                    jobs[i].started_ms = Some(t);
-                    starts.push(t);
-                }
-            }
-            t += 100;
-        }
-        assert_eq!(starts.len(), 8);
-        // Even on a machine that reads idle, whole-machine holds are never released early: one cold build per ramp.
-        assert!(
-            starts.windows(2).all(|w| w[1] - w[0] >= RAMP_MS),
-            "one cold build per ramp: {starts:?}"
-        );
-        // Same with the CPU measured 40% busy (a whole-machine waiter needs half the machine free, so not 60%).
-        let busy = Live {
-            cpu_pct: 40,
-            non_heavy: Usage {
-                cpu: 640,
-                mem: 0,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let mut jobs: Vec<Job> = (0..3)
-            .map(|i| job(&format!("k{i}"), 16, 1, State::Queued, i))
-            .collect();
-        let mut starts = Vec::new();
-        let mut t = 100;
-        while t < 100 + 4 * RAMP_MS && starts.len() < 3 {
-            for i in 0..jobs.len() {
-                if jobs[i].state == State::Queued
-                    && evaluate(&jobs[i].clone(), &jobs, &c, &busy, t) == Decision::Start
-                {
-                    jobs[i].state = State::Running;
-                    jobs[i].started_ms = Some(t);
-                    starts.push(t);
-                }
-            }
-            t += 100;
-        }
-        assert_eq!(starts.len(), 3);
-        assert!(
-            starts.windows(2).all(|w| w[1] - w[0] >= RAMP_MS),
-            "busy: one cold build per ramp: {starts:?}"
-        );
-        // At one instant only the first is admitted.
-        let mut now = jobs.clone();
-        for j in &mut now {
-            j.state = State::Queued;
-            j.started_ms = None;
-        }
-        let first = evaluate(&now[0], &now, &c, &calm(), 5000);
-        assert_eq!(first, Decision::Start);
-    }
-
-    #[test]
     fn disk_guard() {
         let mut me = job("a", 1, 1, State::Queued, 0);
         me.weights.disk = 500 * G;
@@ -2081,282 +1364,11 @@ mod tests {
     }
 
     #[test]
-    fn fifo_head_blocks_non_fitting_follower() {
-        let run = job("r", 8, 50, State::Running, 0);
-        let head = job("h", 5, 30, State::Queued, 1);
-        let big = job("z", 6, 40, State::Queued, 2);
-        assert!(waits(&evaluate(
-            &big,
-            &[run, head, big.clone()],
-            &cap(),
-            &calm(),
-            3
-        )));
-    }
-
-    #[test]
-    fn backfill_only_while_head_is_young_and_follower_smaller() {
-        let run = job("r", 8, 70, State::Running, 0);
-        let head = job("h", 5, 30, State::Queued, 1);
-        let small = Job {
-            run_p90_ms: Some(30_000),
-            ..job("s", 1, 5, State::Queued, 2)
-        };
-        let all = [run, head, small.clone()];
-        assert_eq!(
-            evaluate(&small, &all, &cap(), &calm(), 1000),
-            Decision::Start
-        );
-        assert!(waits(&evaluate(
-            &small,
-            &all,
-            &cap(),
-            &calm(),
-            BACKFILL_WINDOW_MS + 1
-        )));
-    }
-
-    #[test]
-    fn follower_starts_when_it_fits_together_with_the_head() {
-        let head = job("h", 5, 10, State::Queued, 1);
-        let small = job("s", 1, 5, State::Queued, 2);
-        let all = [head.clone(), small.clone()];
-        assert_eq!(evaluate(&small, &all, &cap(), &calm(), 3), Decision::Start);
-        assert_eq!(evaluate(&head, &all, &cap(), &calm(), 3), Decision::Start);
-    }
-
-    #[test]
-    fn follower_waits_when_it_would_stop_the_head_fitting() {
-        // The memory ceiling is 90G: head 50 fits alone, but 50 + 50 does not.
-        let head = job("h", 5, 50, State::Queued, 1);
-        let other = job("o", 5, 50, State::Queued, 2);
-        let all = [head.clone(), other.clone()];
-        assert!(waits(&evaluate(&other, &all, &cap(), &calm(), 3)));
-        assert_eq!(evaluate(&head, &all, &cap(), &calm(), 3), Decision::Start);
-        // Same with a running job: head fits (50 + 30), a follower of 20 would push it over 90.
-        let run = job("r", 3, 30, State::Running, 0);
-        let follow = job("f", 2, 20, State::Queued, 3);
-        let all = [run, head.clone(), follow.clone()];
-        assert!(waits(&evaluate(&follow, &all, &cap(), &calm(), 4)));
-    }
-
-    #[test]
-    fn a_ramp_blocker_names_the_moment_it_ends() {
-        let c = Capacity { cpu: 16, ..cap() };
-        let live = Live {
-            non_heavy: Usage {
-                cpu: 320,
-                mem: 8 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let ra = Job {
-            state: State::Running,
-            started_ms: Some(10),
-            ..job("a", 16, 8, State::Running, 0)
-        };
-        let b = job("b", 16, 8, State::Queued, 2);
-        // A whole-machine hold (cold) lasts the full ramp, idle or not.
-        let d = evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 500);
-        assert!(
-            matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), live: true, .. } if e == 10 + RAMP_MS),
-            "{d:?}"
-        );
-        let warm = Live {
-            cpu_pct: 60,
-            ..live.clone()
-        };
-        let d = evaluate(&b, &[ra, b.clone()], &c, &warm, 500);
-        assert!(
-            matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), .. } if e == 10 + RAMP_MS),
-            "{d:?}"
-        );
-        // A learned 8-core peak (under 75%) on a machine that reads idle: released when the stagger floor ends.
-        let live = Live {
-            non_heavy: Usage {
-                cpu: 800,
-                mem: 8 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let warm = Live {
-            cpu_pct: 60,
-            ..live.clone()
-        };
-        let rl = Job {
-            state: State::Running,
-            started_ms: Some(10),
-            ..job("l", 8, 8, State::Running, 0)
-        };
-        // A 4-core waiter asks for one free core (a whole-machine one would need half the machine free).
-        let b = job("b", 4, 8, State::Queued, 2);
-        let d = evaluate(&b, &[rl.clone(), b.clone()], &c, &live, 500);
-        assert!(
-            matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(e), .. } if e == 10 + RAMP_FULL_MS),
-            "{d:?}"
-        );
-        // At 60% busy it shrinks linearly: 800 x (10 s - e) / 7 s, rounded down, fits the 620 left (1520 - 800 - the
-        // 100 ask) from e = 4.58 s; the next 250 ms step is 4.75 s.
-        let d = evaluate(&b, &[rl.clone(), b.clone()], &c, &warm, 500);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Ramp,
-                    ramp_end_ms: Some(4750),
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-        assert_eq!(
-            evaluate(&b, &[rl, b.clone()], &c, &warm, 4750),
-            Decision::Start
-        );
-        // A genuinely busy CPU is a cpu block, with no ramp time.
-        let busy = Live {
-            non_heavy: Usage {
-                cpu: 1550,
-                mem: 8 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let run = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            ..job("r", 1, 8, State::Running, 0)
-        };
-        let d = evaluate(&b, &[run, b.clone()], &c, &busy, 100_000);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Cpu,
-                    ramp_end_ms: None,
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-    }
-
-    #[test]
-    fn peak_core_waiters_start_on_a_mostly_idle_machine() {
-        // Both builds peaked near all cores in history (weights.cpu = ncpu); live CPU is 20%.
-        let c = Capacity { cpu: 16, ..cap() };
-        let live = Live {
-            non_heavy: Usage {
-                cpu: 320,
-                mem: 8 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let a = job("a", 16, 8, State::Queued, 1);
-        let b = job("b", 16, 8, State::Queued, 2);
-        assert_eq!(
-            evaluate(&a, &[a.clone(), b.clone()], &c, &live, 10),
-            Decision::Start
-        );
-        // a was admitted just now and holds its full 16 cores while ramping: b waits for the ramp, then starts.
-        let ra = Job {
-            state: State::Running,
-            started_ms: Some(10),
-            ..a
-        };
-        assert!(
-            waits(&evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 11)),
-            "blocked by a's ramp hold"
-        );
-        assert!(
-            waits(&evaluate(
-                &b,
-                &[ra.clone(), b.clone()],
-                &c,
-                &live,
-                10 + RAMP_FULL_MS
-            )),
-            "a whole-machine hold is not released early"
-        );
-        assert_eq!(
-            evaluate(&b, &[ra.clone(), b.clone()], &c, &live, 10 + RAMP_MS),
-            Decision::Start,
-            "the second starts once the first one's ramp has ended"
-        );
-        let ca = job("c", 16, 8, State::Queued, 3);
-        // A genuinely busy CPU still blocks.
-        let busy = Live {
-            non_heavy: Usage {
-                cpu: 1550,
-                mem: 8 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let run = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            ..job("r", 16, 8, State::Running, 0)
-        };
-        assert!(waits(&evaluate(
-            &ca,
-            &[run, ca.clone()],
-            &c,
-            &busy,
-            100_000
-        )));
-    }
-
-    #[test]
-    fn burst_is_held_back_by_ramp_holds() {
-        // 16 cores, ceiling 1520 (95%); every build peaked at 4 cores but is at 0% live while ramping.
-        let c = Capacity { cpu: 16, ..cap() };
-        let mut jobs: Vec<Job> = (0..8)
-            .map(|i| job(&format!("j{i}"), 4, 1, State::Queued, i))
-            .collect();
-        let mut started = 0;
-        // All eight evaluate at the same instant; admit in FIFO order, as the lock serializes them.
-        for i in 0..jobs.len() {
-            let me = jobs[i].clone();
-            if evaluate(&me, &jobs, &c, &calm(), 100) == Decision::Start {
-                jobs[i].state = State::Running;
-                jobs[i].started_ms = Some(100);
-                started += 1;
-            }
-        }
-        assert_eq!(
-            started, 4,
-            "holds of 400 each leave 320 for the 4th and none for the 5th: not a burst of 8"
-        );
-        // Once the ramp window passes and live CPU is low, the rest follow.
-        let next = jobs
-            .iter()
-            .find(|j| j.state == State::Queued)
-            .unwrap()
-            .clone();
-        assert_eq!(
-            evaluate(&next, &jobs, &c, &calm(), 100 + RAMP_MS),
-            Decision::Start
-        );
-        // Not blocked on peaks long-term: after the ramp the hold is gone entirely.
-        let ramped = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            ..job("r", 16, 1, State::Running, 0)
-        };
-        let room = headroom(&[&ramped], &c, &calm(), RAMP_MS + 1);
-        assert_eq!(room.cpu, 1520);
-    }
-
-    #[test]
     fn stopped_waiter_file_does_not_block_the_next_waiter() {
         let run = job("r", 1, 50, State::Running, 0);
         let head = job("h", 1, 30, State::Queued, 1);
         let next = job("n", 1, 40, State::Queued, 2);
-        let t = 3 + BACKFILL_WINDOW_MS;
+        let t = 3 + QUEUE_PASS_MS;
         assert!(waits(&evaluate(
             &next,
             &[run.clone(), head.clone(), next.clone()],
@@ -2381,21 +1393,15 @@ mod tests {
         let next = job("n", 1, 40, State::Queued, 2);
         let all = [run, head, next.clone()];
         assert!(
-            waits(&evaluate(
-                &next,
-                &all,
-                &cap(),
-                &calm(),
-                3 + BACKFILL_WINDOW_MS
-            )),
-            "a live head blocks the bigger follower"
+            waits(&evaluate(&next, &all, &cap(), &calm(), 3 + QUEUE_PASS_MS)),
+            "a live head that fits goes first"
         );
         let live = Live {
             stopped: vec!["h".into()],
             ..calm()
         };
         assert_eq!(
-            evaluate(&next, &all, &cap(), &live, 3 + BACKFILL_WINDOW_MS),
+            evaluate(&next, &all, &cap(), &live, 3 + QUEUE_PASS_MS),
             Decision::Start
         );
     }
@@ -2458,348 +1464,6 @@ mod tests {
             evaluate(&me, &[run, me.clone()], &mac(), &live, 100_000),
             Decision::Start
         );
-    }
-
-    #[test]
-    fn a_small_job_starts_at_seventy_percent_cpu() {
-        // 2026-11-20 03:31-03:36: cpu 67-73%, one or two jobs running, a waiter blocked by cpu.
-        let run = Job {
-            started_ms: Some(0),
-            ..job("r", 8, 4, State::Running, 0)
-        };
-        let me = job("a", 4, 4, State::Queued, 1);
-        let live = Live {
-            load1: 26.0,
-            load5: 31.0,
-            cpu_pct: 72,
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: 800,
-                    mem: 4 * G,
-                    vram: 0,
-                },
-            )],
-            non_heavy: Usage {
-                cpu: 352,
-                mem: 22 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        assert_eq!(
-            evaluate(&me, &[run.clone(), me.clone()], &mac(), &live, 100_000),
-            Decision::Start
-        );
-        // Jobs keep starting until about one core is left (15 of 16 busy), then wait on cpu.
-        let full = Live {
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: 1100,
-                    mem: 4 * G,
-                    vram: 0,
-                },
-            )],
-            non_heavy: Usage {
-                cpu: 420,
-                mem: 22 * G,
-                vram: 0,
-            },
-            cpu_pct: 95,
-            ..live
-        };
-        assert!(matches!(
-            evaluate(&me, &[run, me.clone()], &mac(), &full, 100_000),
-            Decision::Wait {
-                block: Block::Cpu,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn ramp_hold_is_released_while_measured_cpu_is_low() {
-        // 2026-11-20 07:01:33: cpu 20%, one job running (ramping), one waiting, blocked by ramp.
-        // 0.3.0 held the running job's peak for the whole 10 s ramp, so the waiter sat with 80% of the CPU idle.
-        // Here the running job has a learned 8-core peak (under 75% of the machine), and the waiter a 4-core one.
-        let run = Job {
-            started_ms: Some(0),
-            ..job("r", 8, 4, State::Running, 0)
-        };
-        let me = job("a", 4, 4, State::Queued, 1);
-        let all = [run.clone(), me.clone()];
-        let live = Live {
-            load1: 29.4,
-            load5: 23.7,
-            cpu_pct: 20,
-            mem_used_pct: 38,
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: 150,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            non_heavy: Usage {
-                cpu: 800,
-                mem: 22 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        // Inside the stagger floor the hold is full: no simultaneous starts.
-        let d = evaluate(&me, &all, &mac(), &live, 1_000);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Ramp,
-                    ramp_end_ms: Some(RAMP_FULL_MS),
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-        // After it, the idle machine shows the ramping job's real use: admitted (0.3.0 waited until 10 s).
-        assert_eq!(evaluate(&me, &all, &mac(), &live, 4_000), Decision::Start);
-        assert_eq!(
-            evaluate(&me, &all, &mac(), &live, RAMP_FULL_MS),
-            Decision::Start
-        );
-        // The same moment with a cold running job (whole-machine hold): held for the full 10 s, as in 0.3.0.
-        let cold = Job {
-            started_ms: Some(0),
-            ..job("r", 16, 4, State::Running, 0)
-        };
-        let all_cold = [cold, me.clone()];
-        let d = evaluate(&me, &all_cold, &mac(), &live, 4_000);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Ramp,
-                    ramp_end_ms: Some(RAMP_MS),
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-        assert!(waits(&evaluate(&me, &all_cold, &mac(), &live, RAMP_MS - 1)));
-        assert_eq!(
-            evaluate(&me, &all_cold, &mac(), &live, RAMP_MS),
-            Decision::Start
-        );
-    }
-
-    #[test]
-    fn ramp_hold_shrinks_for_a_recent_job_with_a_learned_peak() {
-        let me = job("a", 4, 4, State::Queued, 1);
-        // 06:22:23: cpu 24%, four running (three ramped, one admitted 5 s ago with a learned 8-core peak), one waiting.
-        let mut all: Vec<Job> = (0..3)
-            .map(|i| Job {
-                started_ms: Some(0),
-                ..job(&format!("d{i}"), 4, 2, State::Running, 0)
-            })
-            .collect();
-        all.push(Job {
-            started_ms: Some(95_000),
-            ..job("new", 8, 2, State::Running, 1)
-        });
-        all.push(me.clone());
-        let live = Live {
-            load1: 15.5,
-            load5: 14.3,
-            cpu_pct: 24,
-            mem_used_pct: 46,
-            per_job: vec![
-                (
-                    "d0".into(),
-                    Usage {
-                        cpu: 80,
-                        mem: G,
-                        vram: 0,
-                    },
-                ),
-                (
-                    "d1".into(),
-                    Usage {
-                        cpu: 60,
-                        mem: G,
-                        vram: 0,
-                    },
-                ),
-                (
-                    "d2".into(),
-                    Usage {
-                        cpu: 40,
-                        mem: G,
-                        vram: 0,
-                    },
-                ),
-                (
-                    "new".into(),
-                    Usage {
-                        cpu: 50,
-                        mem: G,
-                        vram: 0,
-                    },
-                ),
-            ],
-            non_heavy: Usage {
-                cpu: 150,
-                mem: 25 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        assert_eq!(evaluate(&me, &all, &mac(), &live, 100_000), Decision::Start);
-        // The same moment with the CPU busy keeps a shrinking hold: 1180 busy plus the new job's 571 held (800 x 5/7) is
-        // over the 1500 that leaves a core free.
-        let busy = Live {
-            cpu_pct: 70,
-            non_heavy: Usage {
-                cpu: 1180 - 230,
-                mem: 25 * G,
-                vram: 0,
-            },
-            ..live
-        };
-        assert!(matches!(
-            evaluate(&me, &all, &mac(), &busy, 100_000),
-            Decision::Wait {
-                block: Block::Ramp,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn big_learned_peaks_and_docker_keep_the_full_hold() {
-        let c = Capacity { cpu: 16, ..cap() };
-        let idle = Live {
-            non_heavy: Usage {
-                cpu: 100,
-                mem: 8 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let b = job("b", 15, 8, State::Queued, 2);
-        // Two learned 15-core waiters arriving together on an idle machine start at least 10 s apart.
-        let ra = Job {
-            state: State::Running,
-            started_ms: Some(10),
-            ..job("a", 15, 8, State::Running, 0)
-        };
-        assert!(
-            waits(&evaluate(
-                &b,
-                &[ra.clone(), b.clone()],
-                &c,
-                &idle,
-                10 + RAMP_FULL_MS
-            )),
-            "no early release at 94%"
-        );
-        assert!(waits(&evaluate(
-            &b,
-            &[ra.clone(), b.clone()],
-            &c,
-            &idle,
-            10 + RAMP_MS - 1
-        )));
-        assert_eq!(
-            evaluate(&b, &[ra, b.clone()], &c, &idle, 10 + RAMP_MS),
-            Decision::Start
-        );
-        // Under 75% (8 of 16 cores) is still released at 3 s on an idle machine.
-        let busy_other = Live {
-            non_heavy: Usage {
-                cpu: 800,
-                mem: 8 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let rh = Job {
-            state: State::Running,
-            started_ms: Some(10),
-            ..job("h", 8, 8, State::Running, 0)
-        };
-        assert!(waits(&evaluate(
-            &b,
-            &[rh.clone(), b.clone()],
-            &c,
-            &busy_other,
-            11
-        )));
-        assert_eq!(
-            evaluate(&b, &[rh, b.clone()], &c, &busy_other, 10 + RAMP_FULL_MS),
-            Decision::Start
-        );
-        // A learned Docker job keeps the 10 s hold even at 8 cores.
-        let rd = Job {
-            state: State::Running,
-            started_ms: Some(10),
-            cmd: vec!["docker".into(), "build".into()],
-            ..job("d", 8, 8, State::Running, 0)
-        };
-        assert!(waits(&evaluate(
-            &b,
-            &[rd.clone(), b.clone()],
-            &c,
-            &busy_other,
-            10 + RAMP_FULL_MS
-        )));
-        assert_eq!(
-            evaluate(&b, &[rd, b.clone()], &c, &busy_other, 10 + RAMP_MS),
-            Decision::Start
-        );
-        // The 75% line itself: 12 of 16 cores is a full hold, 11 is not.
-        assert_eq!(ramp_hold(1200, 1600, RAMP_FULL_MS, 0, false), 1200);
-        assert_eq!(ramp_hold(1100, 1600, RAMP_FULL_MS, 0, false), 0);
-        assert_eq!(ramp_hold(800, 1600, RAMP_FULL_MS, 0, true), 800);
-    }
-
-    #[test]
-    fn ramp_hold_schedule() {
-        let (peak, machine) = (800, 1600);
-        assert_eq!(
-            ramp_hold(peak, machine, 0, 0, false),
-            peak,
-            "full at admission"
-        );
-        assert_eq!(
-            ramp_hold(peak, machine, RAMP_FULL_MS - 1, 0, false),
-            peak,
-            "full through the floor, however idle"
-        );
-        assert_eq!(
-            ramp_hold(peak, machine, RAMP_FULL_MS, 49, false),
-            0,
-            "released on an idle machine"
-        );
-        assert_eq!(
-            ramp_hold(peak, machine, RAMP_FULL_MS, 50, false),
-            peak,
-            "shrinks from the full peak on a busy one"
-        );
-        assert_eq!(
-            ramp_hold(peak, machine, 6_500, 80, false),
-            400,
-            "halfway down at the middle of the shrink"
-        );
-        assert_eq!(
-            ramp_hold(peak, machine, RAMP_MS, 100, false),
-            0,
-            "gone when the ramp ends"
-        );
-        // A whole-machine hold (cold or Docker) is full for the whole ramp, however idle the machine reads.
-        assert_eq!(ramp_hold(machine, machine, RAMP_FULL_MS, 0, false), machine);
-        assert_eq!(ramp_hold(machine, machine, RAMP_MS - 1, 0, false), machine);
-        assert_eq!(ramp_hold(machine, machine, RAMP_MS, 0, false), 0);
     }
 
     #[test]
@@ -2893,27 +1557,21 @@ mod tests {
     #[test]
     fn nothing_starts_while_the_cpu_reads_pinned() {
         // 2026-11-21 on 0.4.7: 190 of 272 Mac starts in 6 hours came at 95-100% CPU, most in a dip between spikes of
-        // bursty jobs. A pinned reading in the last 10 s blocks every start, the fast lane and a job alone included.
+        // bursty jobs. A pinned reading in the last 10 s blocks every start, a job alone included.
         let me = job("a", 1, 0, State::Queued, 0);
-        let fast = Job {
-            fast: true,
-            ..me.clone()
-        };
         let dip = Live {
             cpu_pct: 40,
             cpu_sustained_pct: 70,
             cpu_recent_peak_pct: CPU_PINNED_PCT,
             ..calm()
         };
-        for j in [&me, &fast] {
-            assert!(matches!(
-                evaluate(j, std::slice::from_ref(j), &mac(), &dip, 0),
-                Decision::Wait {
-                    block: Block::Cpu,
-                    ..
-                }
-            ));
-        }
+        assert!(matches!(
+            evaluate(&me, std::slice::from_ref(&me), &mac(), &dip, 0),
+            Decision::Wait {
+                block: Block::Cpu,
+                ..
+            }
+        ));
         let calm_again = Live {
             cpu_recent_peak_pct: CPU_PINNED_PCT - 1,
             ..dip
@@ -2928,51 +1586,6 @@ mod tests {
             "only the last 10 s count"
         );
         assert_eq!(recent_peak_pct(&[], 0), 0);
-    }
-
-    #[test]
-    fn a_bursty_job_keeps_its_sustained_level_after_its_hold_is_released() {
-        // Six `make lint test-changed` runs (about 1 core between 10-core spikes for 25 minutes) pinned the Mac on
-        // 2026-11-21: each counted only its live use in a dip once its peak hold was released.
-        assert_eq!(sustained_floor(0, 1_000, Some(400), false), 400);
-        assert_eq!(sustained_floor(900, 1_000, Some(400), false), 900);
-        assert_eq!(
-            sustained_floor(0, 300, Some(400), false),
-            300,
-            "never over the peak"
-        );
-        assert_eq!(
-            sustained_floor(0, 1_000, Some(400), true),
-            0,
-            "a VM job shows as other programs"
-        );
-        assert_eq!(sustained_floor(0, 1_000, None, false), 0);
-        let c = mac();
-        let run = Job {
-            started_ms: Some(0),
-            cpu_hold_ms: Some(RAMP_MS),
-            cpu_sustained: Some(1_100),
-            ..job("bursty", 11, 2, State::Running, 0)
-        };
-        let dip = Live {
-            cpu_pct: 10,
-            cpu_sustained_pct: 10,
-            per_job: vec![(
-                "bursty".into(),
-                Usage {
-                    cpu: 100,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            ..calm()
-        };
-        let now = 10 * 60_000;
-        let free = headroom(&[&run], &c, &dip, now).cpu;
-        assert!(free <= ceiling(&c).cpu - 1_100, "free {free}");
-        let next = job("next", 12, 2, State::Queued, now);
-        let jobs = [run, next.clone()];
-        assert!(waits(&evaluate(&next, &jobs, &c, &dip, now)));
     }
 
     #[test]
@@ -3053,110 +1666,6 @@ mod tests {
         );
     }
 
-    /// Two builds that started long ago (no ramp holds) using `jobs` centi-cores between them, the rest non-heavy.
-    fn pinned(jobs: u64, non_heavy: u64) -> (Vec<Job>, Live) {
-        let a = Job {
-            started_ms: Some(0),
-            ..job("a", 8, 2, State::Running, 0)
-        };
-        let b = Job {
-            started_ms: Some(0),
-            ..job("b", 8, 2, State::Running, 0)
-        };
-        let live = Live {
-            cpu_pct: (jobs + non_heavy) / 16,
-            per_job: vec![
-                (
-                    "a".into(),
-                    Usage {
-                        cpu: jobs / 2,
-                        mem: 2 * G,
-                        vram: 0,
-                    },
-                ),
-                (
-                    "b".into(),
-                    Usage {
-                        cpu: jobs / 2,
-                        mem: 2 * G,
-                        vram: 0,
-                    },
-                ),
-            ],
-            non_heavy: Usage {
-                cpu: non_heavy,
-                mem: 20 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        (vec![a, b], live)
-    }
-
-    #[test]
-    fn a_dip_between_build_steps_does_not_admit_onto_a_pinned_machine() {
-        // 2026-11-20 on the Mac and the rig: samples read 98-100% for minutes, yet jobs were admitted between them. A
-        // waiter's single 250 ms window that fell between two builds' steps read 80% (1280 of 1600). 0.3.1 measured
-        // headroom against every core (1600 - 1280 = 320 >= one core) and started another build into a pinned machine.
-        let (mut jobs, dip) = pinned(1_100, 180);
-        let me = job("c", 4, 2, State::Queued, 50_000);
-        jobs.push(me.clone());
-        assert_eq!(dip.cpu_pct, 80);
-        // With the readings every heavy process shared over the last 20 s (100, 100, 98, then this 80): mean 94%.
-        let readings = [(40_000, 100), (45_000, 100), (52_000, 98), (60_000, 80)];
-        let live = Live {
-            cpu_sustained_pct: sustained_pct(dip.cpu_pct, &readings, 60_000),
-            ..dip.clone()
-        };
-        assert_eq!(live.cpu_sustained_pct, 94);
-        let d = evaluate(&me, &jobs, &mac(), &live, 60_000);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Cpu,
-                    ramp_end_ms: None,
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-        // Once the machine really has settled at 80% (the readings agree), the job starts: inside the band.
-        let settled = [(45_000, 81), (52_000, 79), (60_000, 80)];
-        let live = Live {
-            cpu_sustained_pct: sustained_pct(80, &settled, 60_000),
-            ..dip
-        };
-        assert_eq!(evaluate(&me, &jobs, &mac(), &live, 60_000), Decision::Start);
-    }
-
-    #[test]
-    fn jobs_start_up_to_the_band_and_wait_inside_it() {
-        // 16 cores: the ceiling is 1520 (95%) and a job asks for one core (100), so it starts up to 88% busy.
-        let me = job("c", 4, 2, State::Queued, 1);
-        for (busy, starts) in [
-            (60, true),
-            (75, true),
-            (83, true),
-            (88, true),
-            (89, false),
-            (93, false),
-            (100, false),
-        ] {
-            let (mut jobs, live) = pinned(busy * 16 - 160, 160);
-            jobs.push(me.clone());
-            let live = Live {
-                cpu_sustained_pct: busy,
-                ..live
-            };
-            assert_eq!(
-                evaluate(&me, &jobs, &mac(), &live, 100_000) == Decision::Start,
-                starts,
-                "{busy}% busy"
-            );
-        }
-    }
-
     #[test]
     fn sustained_cpu_rises_at_once_and_falls_slowly() {
         assert_eq!(sustained_pct(70, &[], 0), 70, "no readings: the latest");
@@ -3179,412 +1688,6 @@ mod tests {
             sustained_pct(40, &[(0, 100), (25_000, 40)], 25_000),
             40,
             "readings over 20 s old are dropped"
-        );
-    }
-
-    #[test]
-    fn a_rising_load_in_the_underused_zone_admits() {
-        // 2026-11-20 on the Mac: waiters blocked on a rising load1 over 32 with the CPU at 60-74%, under the band.
-        let me = job("c", 4, 2, State::Queued, 1);
-        let (mut jobs, live) = pinned(1_000, 120);
-        jobs.push(me.clone());
-        let rising = Live {
-            load1: 40.0,
-            load5: 30.0,
-            cpu_sustained_pct: 70,
-            ..live
-        };
-        assert_eq!(rising.cpu_pct, 70);
-        assert_eq!(
-            evaluate(&me, &jobs, &mac(), &rising, 100_000),
-            Decision::Start
-        );
-        // The same rising load with the sustained CPU at 80% is builds piling up: blocked.
-        let busy = Live {
-            cpu_sustained_pct: 80,
-            ..rising
-        };
-        assert!(matches!(
-            evaluate(&me, &jobs, &mac(), &busy, 100_000),
-            Decision::Wait {
-                block: Block::Load1,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn thread_inflated_memory_reservations_no_longer_starve_an_idle_rig() {
-        // 2026-11-20 09:00 on the rig: cpu 21%, memory 6% used, 3 running, a waiter blocked on "mem". Each `cargo
-        // install` had learned a 46 GB peak by summing every rustc thread's copy of its process RSS (2.6 GB real).
-        let rig = Capacity {
-            cpu: 32,
-            mem: 64 * G,
-            vram: 0,
-            disk_total: 1000 * G,
-            vram_is_ram: false,
-        };
-        let live = Live {
-            cpu_pct: 21,
-            cpu_sustained_pct: 21,
-            mem_used_pct: 6,
-            ..calm()
-        };
-        let me = job("w", 4, 3, State::Queued, 1);
-        let inflated = |id: &str| Job {
-            started_ms: Some(0),
-            ..job(id, 32, 46, State::Running, 0)
-        };
-        let d = evaluate(
-            &me,
-            &[inflated("r"), inflated("s"), me.clone()],
-            &rig,
-            &live,
-            100_000,
-        );
-        // Past the ramp the inflated reservations are only a number: measured memory is 6% used, so the job starts.
-        assert_eq!(d, Decision::Start, "{d:?}");
-        // Learned without threads (3 GB, 4 cores) the same job starts.
-        let real = |id: &str| Job {
-            started_ms: Some(0),
-            ..job(id, 4, 3, State::Running, 0)
-        };
-        assert_eq!(
-            evaluate(
-                &me,
-                &[real("r"), real("s"), me.clone()],
-                &rig,
-                &live,
-                100_000
-            ),
-            Decision::Start
-        );
-    }
-
-    /// Six cargo-like builds, each with a learned 16-core peak and time to peak `ttp`, queued at once on the 16-core
-    /// Mac. Each runs on 2 cores until `ttp` after its start, then takes all 16 (scaled down when over-subscribed),
-    /// and finishes `run` after its start. Returns the start times and the most builds ever running before their peak.
-    fn burst_of_six(cpu_hold: Option<i64>, ttp: i64, run: i64) -> (Vec<i64>, usize) {
-        let c = mac();
-        let mut jobs: Vec<Job> = (0..6)
-            .map(|i| Job {
-                cpu_hold_ms: cpu_hold,
-                ..job(&format!("b{i}"), 16, 2, State::Queued, i)
-            })
-            .collect();
-        let (mut starts, mut most_ramping) = (Vec::new(), 0);
-        let mut t = 0;
-        while t <= 700_000 && starts.len() < 6 {
-            jobs.retain(|j| j.started_ms.is_none_or(|s| t - s < run));
-            let demand: Vec<(String, u64)> = jobs
-                .iter()
-                .filter_map(|j| {
-                    j.started_ms
-                        .map(|s| (j.id.clone(), if t - s < ttp { 200 } else { 1600 }))
-                })
-                .collect();
-            let total: u64 = demand.iter().map(|d| d.1).sum();
-            let pct = total.min(1600) * 100 / 1600;
-            let live = Live {
-                cpu_pct: pct,
-                cpu_sustained_pct: pct,
-                per_job: demand
-                    .iter()
-                    .map(|(id, d)| {
-                        let cpu = if total > 1600 { d * 1600 / total } else { *d };
-                        (
-                            id.clone(),
-                            Usage {
-                                cpu,
-                                mem: 2 * G,
-                                vram: 0,
-                            },
-                        )
-                    })
-                    .collect(),
-                ..calm()
-            };
-            // Every waiter evaluates; the state lock serializes them in FIFO order.
-            for i in 0..jobs.len() {
-                if jobs[i].state == State::Queued
-                    && evaluate(&jobs[i].clone(), &jobs, &c, &live, t) == Decision::Start
-                {
-                    jobs[i].state = State::Running;
-                    jobs[i].started_ms = Some(t);
-                    starts.push(t);
-                }
-            }
-            let ramping = jobs
-                .iter()
-                .filter(|j| j.started_ms.is_some_and(|s| t - s < ttp))
-                .count();
-            most_ramping = most_ramping.max(ramping);
-            t += 500;
-        }
-        (starts, most_ramping)
-    }
-
-    #[test]
-    fn a_burst_of_six_16_core_cargo_builds_starts_one_at_a_time_as_their_peaks_show() {
-        // 2026-11-20 after 0.4.2: holds that ended 10 s after admission let builds in before their CPU showed; CPU sat at
-        // 95-100% with load1 over 48 (3 x cores). Before the fix (no learned hold): three builds in the first 30 s.
-        let (old, old_ramping) = burst_of_six(None, 30_000, 90_000);
-        assert!(
-            old.iter().filter(|t| **t < 30_000).count() >= 3 && old_ramping >= 3,
-            "the 0.4.2 schedule admits a burst: {old:?}"
-        );
-        // Held until its peak shows (or its learned 30 s time to peak passes): one build at a time.
-        let (starts, ramping) = burst_of_six(Some(cpu_hold_ms(Some(30_000))), 30_000, 90_000);
-        assert_eq!(ramping, 1, "never two builds ramping at once: {starts:?}");
-        assert_eq!(
-            starts.len(),
-            6,
-            "all six still run (no starvation): {starts:?}"
-        );
-        assert!(
-            starts.windows(2).all(|w| w[1] - w[0] >= 30_000),
-            "each start waits for the previous peak: {starts:?}"
-        );
-        // A history from before 0.4.3 (time to peak unknown) holds for the 30 s fallback: still one at a time.
-        let (starts, ramping) = burst_of_six(Some(cpu_hold_ms(None)), 20_000, 60_000);
-        assert_eq!((ramping, starts.len()), (1, 6), "{starts:?}");
-        // Cold jobs (whole machine, nothing learned) get the same hold: never admitted 10 s apart.
-        let (starts, ramping) = burst_of_six(Some(CPU_FALLBACK_HOLD_MS), 25_000, 60_000);
-        assert_eq!((ramping, starts.len()), (1, 6), "{starts:?}");
-        assert!(
-            starts.windows(2).all(|w| w[1] - w[0] >= 25_000),
-            "cold jobs wait for each other's peak: {starts:?}"
-        );
-    }
-
-    #[test]
-    fn a_hold_from_the_slowest_ramp_outlasts_a_median_length_ramp() {
-        // Runs peaked at 20, 30 and 40 s: the median is 30 s. A build that ramps for 38 s is still ramping when a
-        // median-length hold ends, but not when the hold is the slowest ramp plus a margin.
-        let median_hold = 30_000;
-        let hold = cpu_hold_ms(Some(40_000));
-        assert!(hold > 40_000, "{hold}");
-        let (peak, machine) = (1_600, 1_600);
-        let still_ramping = |at, h| cpu_hold(peak, machine, at, 10, false, 200, Some(h), false);
-        assert_eq!(still_ramping(38_000, median_hold), 0);
-        assert_eq!(still_ramping(38_000, hold), peak);
-        assert_eq!(still_ramping(hold, hold), 0, "still bounded");
-    }
-
-    #[test]
-    fn a_learned_cpu_peak_is_held_until_it_shows_or_its_time_passes() {
-        let (peak, machine) = (1_600, 1_600);
-        let hold = Some(cpu_hold_ms(Some(32_000)));
-        assert_eq!(hold, Some(40_000), "the slowest ramp plus 25%");
-        // Before the floor: full, whatever the job shows.
-        assert_eq!(
-            cpu_hold(peak, machine, 1_000, 10, false, 1_600, hold, false),
-            peak
-        );
-        // After the 0.4.2 ramp end and on an idle-looking machine, a peak that has not shown is still held.
-        assert_eq!(
-            cpu_hold(peak, machine, 20_000, 10, false, 200, hold, false),
-            peak
-        );
-        // Shown (3/4 of it in live use): live use counts instead.
-        assert_eq!(
-            cpu_hold(peak, machine, 20_000, 90, false, 1_200, hold, false),
-            0
-        );
-        // Its time to peak passed without it showing (an incremental build): released, so the machine is not kept idle.
-        assert_eq!(
-            cpu_hold(peak, machine, 40_000, 10, false, 200, hold, false),
-            0
-        );
-        // Docker work holds for its whole hold time (0.4.6), whatever its tree shows or a plateau says.
-        assert_eq!(
-            cpu_hold(peak, machine, 9_000, 10, true, 0, hold, false),
-            peak
-        );
-        assert_eq!(
-            cpu_hold(peak, machine, 39_999, 10, true, 1_600, hold, true),
-            peak
-        );
-        assert_eq!(cpu_hold(peak, machine, 40_000, 10, true, 0, hold, false), 0);
-        // Docker work from old job files keeps the 10 s ramp schedule.
-        assert_eq!(
-            cpu_hold(peak, machine, RAMP_MS, 10, true, 0, None, false),
-            0
-        );
-        assert_eq!(
-            cpu_hold(peak, machine, RAMP_MS, 10, false, 0, None, false),
-            0
-        );
-        // The hold length: history's slowest ramp plus 25%, clamped to 10 s .. 2 min, 30 s when unknown.
-        assert_eq!(cpu_hold_ms(None), CPU_FALLBACK_HOLD_MS);
-        assert_eq!(cpu_hold_ms(Some(500)), RAMP_MS);
-        assert_eq!(cpu_hold_ms(Some(3_600_000)), CPU_MAX_HOLD_MS);
-    }
-
-    #[test]
-    fn a_small_waiter_starts_under_a_held_16_core_peak_when_the_band_has_room() {
-        let c = mac();
-        let run = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            cpu_hold_ms: Some(40_000),
-            ..job("r", 16, 2, State::Running, 0)
-        };
-        // The 16-core build ramps on 2 cores; the machine reads 13%.
-        let live = Live {
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: 200,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            cpu_pct: 13,
-            cpu_sustained_pct: 13,
-            ..calm()
-        };
-        let one = job("one", 1, 1, State::Queued, 1);
-        assert_eq!(
-            evaluate(&one, &[run.clone(), one.clone()], &c, &live, 20_000),
-            Decision::Start,
-            "a 1-core waiter fits in the band minus the held reservation"
-        );
-        // A big waiter still waits for the hold: it sees the whole 16-core reservation.
-        let big = job("big", 16, 1, State::Queued, 1);
-        assert!(waits(&evaluate(
-            &big,
-            &[run.clone(), big.clone()],
-            &c,
-            &live,
-            20_000
-        )));
-        // Real use counts in full: with the machine measured at 90% the small waiter waits too.
-        let busy = Live {
-            cpu_pct: 90,
-            cpu_sustained_pct: 90,
-            ..live
-        };
-        assert!(waits(&evaluate(
-            &one,
-            &[run, one.clone()],
-            &c,
-            &busy,
-            20_000
-        )));
-    }
-
-    fn six_small_waiters(live: &Live, run: &Job, now: i64) -> usize {
-        let c = mac();
-        let mut running = vec![run.clone()];
-        for i in 0..6 {
-            let id = format!("s{i}");
-            let w = job(&id, 2, 1, State::Queued, 1);
-            let mut jobs = running.clone();
-            jobs.push(w.clone());
-            if evaluate(&w, &jobs, &c, live, now) == Decision::Start {
-                running.push(Job {
-                    state: State::Running,
-                    started_ms: Some(now),
-                    cpu_hold_ms: Some(40_000),
-                    ..w
-                });
-            }
-        }
-        running.len() - 1
-    }
-
-    fn held_big() -> (Job, Live) {
-        let run = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            cpu_hold_ms: Some(40_000),
-            ..job("r", 16, 2, State::Running, 0)
-        };
-        let live = Live {
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: 200,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            cpu_pct: 13,
-            cpu_sustained_pct: 13,
-            ..calm()
-        };
-        (run, live)
-    }
-
-    #[test]
-    fn small_waiters_share_one_backfill_budget_under_a_held_peak() {
-        let (run, live) = held_big();
-        // Band 14.4 cores, big hold capped to leave 2 free: only one 2-core waiter fits, not all six.
-        assert_eq!(six_small_waiters(&live, &run, 20_000), 1);
-    }
-
-    #[test]
-    fn the_rest_start_once_the_big_peak_shows_or_its_hold_expires() {
-        let (run, live) = held_big();
-        // Peak shows (1200+ cores-centi in live use at 75% of 16): live use counts, holds are gone; 6 x 2 cores fit
-        // only as far as the measured 75% leaves room.
-        let shown = Live {
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: 1_200,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            cpu_pct: 75,
-            cpu_sustained_pct: 75,
-            ..live.clone()
-        };
-        assert_eq!(six_small_waiters(&shown, &run, 20_000), 1);
-        // Hold expired with the machine reading low (an incremental build): all six are admitted.
-        assert_eq!(six_small_waiters(&live, &run, 41_000), 6);
-    }
-
-    #[test]
-    fn a_ramp_blocker_on_a_learned_hold_names_the_hold_end() {
-        let c = mac();
-        let run = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            cpu_hold_ms: Some(40_000),
-            ..job("r", 16, 2, State::Running, 0)
-        };
-        let me = job("w", 8, 2, State::Queued, 1);
-        let live = Live {
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: 200,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            cpu_pct: 13,
-            cpu_sustained_pct: 13,
-            ..calm()
-        };
-        let d = evaluate(&me, &[run.clone(), me.clone()], &c, &live, 20_000);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Ramp,
-                    ramp_end_ms: Some(40_000),
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-        assert_eq!(
-            evaluate(&me, &[run, me.clone()], &c, &live, 40_000),
-            Decision::Start
         );
     }
 
@@ -3620,414 +1723,6 @@ mod tests {
             ..over
         };
         assert_eq!(guard_block(&c, &io), None);
-    }
-
-    #[test]
-    fn a_run_plateaus_once_its_cpu_is_flat_past_its_slowest_time_to_peak() {
-        let run = |f: &dyn Fn(u64) -> u64, until: u64| -> Vec<(u64, u64)> {
-            (0..=until / 500).map(|k| (k * 500, f(k * 500))).collect()
-        };
-        // Flat at 1.5 cores (an incremental `make check` with a learned 15-core spike): settled 10 s after the
-        // 10 s ramp floor, not before.
-        let flat = |_| 150;
-        assert!(!cpu_plateaued(&run(&flat, 19_500), 9_000));
-        assert!(cpu_plateaued(&run(&flat, 20_000), 9_000));
-        // Still rising: never settled.
-        let rising = |ms| 100 + ms / 50;
-        assert!(!cpu_plateaued(&run(&rising, 60_000), 9_000));
-        // Step ramp: flat on 2 cores until its 30 s slowest ramp, then 16. Not settled while it waits, nor in the
-        // window that contains the step.
-        let cargo = |ms| if ms < 30_000 { 200 } else { 1_600 };
-        assert!(!cpu_plateaued(&run(&cargo, 29_500), 30_000));
-        assert!(!cpu_plateaued(&run(&cargo, 35_000), 30_000));
-        assert!(!cpu_plateaued(&run(&cargo, 39_500), 30_000));
-        // A step later than a short slowest time (20 s here, ramp at 25 s): the window with the step is not flat.
-        let late = |ms| if ms < 25_000 { 200 } else { 1_600 };
-        assert!(!cpu_plateaued(&run(&late, 25_500), 15_000));
-        // Spike, then a lull, then the real ramp at 40 s (slowest 40 s): the lull never releases, and the ramp
-        // takes it back.
-        let lull = |ms| {
-            if (1_000..40_000).contains(&ms) {
-                150
-            } else {
-                1_500
-            }
-        };
-        assert!(!cpu_plateaued(&run(&lull, 30_000), 40_000));
-        assert!(!cpu_plateaued(&run(&lull, 45_000), 40_000));
-        // Settled in a lull after the slowest time, then the CPU rises: no longer plateaued (re-reserved).
-        let again = |ms| if ms < 30_000 { 150 } else { 1_500 };
-        assert!(cpu_plateaued(&run(&again, 29_500), 5_000));
-        assert!(!cpu_plateaued(&run(&again, 33_000), 5_000));
-        // Jitter within a core (or 1/8 of the level) is flat; an empty run is not.
-        let jitter = |ms| if (ms / 500) % 2 == 0 { 800 } else { 880 };
-        assert!(cpu_plateaued(&run(&jitter, 20_000), 0));
-        assert!(!cpu_plateaued(&[], 0));
-    }
-
-    #[test]
-    fn a_cold_head_that_waited_starts_beside_one_long_job_under_the_band() {
-        // One long 10-core job (62% of 16 cores) and a cold whole-machine head: it must not wait for 60% busy for as long
-        // as the job runs. Past the backfill window it starts like in 0.4.3 (the band), with the guards still on.
-        let c = mac();
-        let run = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            cpu_hold_ms: Some(cpu_hold_ms(Some(4_000))),
-            ..job("long", 10, 2, State::Running, 0)
-        };
-        let head = job("cold", 16, 2, State::Queued, 1_000);
-        let behind = Job {
-            run_p90_ms: Some(60_000),
-            ..job("small", 4, 2, State::Queued, 2_000)
-        };
-        let live = Live {
-            per_job: vec![(
-                "long".into(),
-                Usage {
-                    cpu: 1_000,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            cpu_pct: 62,
-            cpu_sustained_pct: 62,
-            ..calm()
-        };
-        let all = [run, head.clone(), behind.clone()];
-        let t0 = 1_000 + 10_000;
-        assert!(waits(&evaluate(&head, &all, &c, &live, t0)));
-        let t = 1_000 + BACKFILL_WINDOW_MS;
-        assert_eq!(evaluate(&head, &all, &c, &live, t), Decision::Start);
-        // The 4x load guard still blocks it.
-        let hot = Live {
-            load1: 70.0,
-            load5: 70.0,
-            ..live.clone()
-        };
-        assert!(waits(&evaluate(&head, &all, &c, &hot, t)));
-        // Before then the smaller waiter backfills, so the machine is not idle while the head waits.
-        assert_eq!(evaluate(&behind, &all, &c, &live, t0), Decision::Start);
-    }
-
-    /// A running 15-core-peak job (a 2-minute learned hold) on 1.5 cores, the Mac at 15%, and an 8-core waiter.
-    fn low_cpu_hold(settled: bool) -> Decision {
-        let c = mac();
-        let run = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            cpu_hold_ms: Some(CPU_MAX_HOLD_MS),
-            cpu_settled: settled,
-            ..job("r", 15, 2, State::Running, 0)
-        };
-        let me = job("w", 8, 2, State::Queued, 1);
-        let live = Live {
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: 150,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            non_heavy: Usage {
-                cpu: 100,
-                ..Usage::default()
-            },
-            cpu_pct: 15,
-            cpu_sustained_pct: 15,
-            ..calm()
-        };
-        evaluate(&me, &[run, me.clone()], &c, &live, 30_000)
-    }
-
-    #[test]
-    fn a_plateaued_hold_is_released_while_the_machine_reads_low() {
-        // 2026-11-21: ramp holds kept waiters out at 10-50% CPU on the Mac (and 2-9% on the rig) for up to 2 minutes.
-        assert!(
-            matches!(
-                low_cpu_hold(false),
-                Decision::Wait {
-                    block: Block::Ramp,
-                    ..
-                }
-            ),
-            "an unsettled hold still holds"
-        );
-        assert_eq!(
-            low_cpu_hold(true),
-            Decision::Start,
-            "settled: the job's real use counts"
-        );
-        // Docker/VM work keeps its full 10 s ramp hold whatever the file says (its CPU never shows in the tree).
-        assert_eq!(
-            cpu_hold(
-                1_500,
-                1_600,
-                5_000,
-                15,
-                true,
-                0,
-                Some(CPU_MAX_HOLD_MS),
-                true
-            ),
-            1_500
-        );
-        // The stagger floor holds even a settled job.
-        assert_eq!(
-            cpu_hold(
-                1_500,
-                1_600,
-                1_000,
-                15,
-                false,
-                0,
-                Some(CPU_MAX_HOLD_MS),
-                true
-            ),
-            1_500
-        );
-    }
-
-    /// The Mac with one running job past its hold on `busy` centi-cores, and a waiter with a learned `cpu` peak.
-    fn onto_busy_mac(busy: u64, cpu: u32) -> Decision {
-        let c = mac();
-        let run = Job {
-            state: State::Running,
-            started_ms: Some(0),
-            cpu_hold_ms: Some(RAMP_MS),
-            ..job("r", 13, 2, State::Running, 0)
-        };
-        let me = job("w", cpu, 2, State::Queued, 1);
-        let pct = busy * 100 / 1_600;
-        let live = Live {
-            per_job: vec![(
-                "r".into(),
-                Usage {
-                    cpu: busy,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            cpu_pct: pct,
-            cpu_sustained_pct: pct,
-            ..calm()
-        };
-        evaluate(&me, &[run, me.clone()], &c, &live, 60_000)
-    }
-
-    #[test]
-    fn a_big_waiter_starts_only_where_two_fifths_of_its_peak_fit_on_the_projected_cpu() {
-        // 2026-11-21: 13-core builds admitted at up to 83% busy took the Mac to 100% with load1 34. Half the peak (0.4.4)
-        // kept them out above 59%; 2/5 of it admits them up to 67%.
-        assert!(
-            matches!(
-                onto_busy_mac(1_100, 13),
-                Decision::Wait {
-                    block: Block::Cpu,
-                    ..
-                }
-            ),
-            "68% busy + 5.2 cores > 16"
-        );
-        assert_eq!(onto_busy_mac(1_080, 13), Decision::Start, "67% + 5.2 fits");
-        assert_eq!(
-            onto_busy_mac(900, 13),
-            Decision::Start,
-            "56% fits (blocked in 0.4.4 above 59%)"
-        );
-        // Small and mid-size waiters fill the band under 95%; a mid-size one up to one free core.
-        assert_eq!(
-            onto_busy_mac(1_300, 2),
-            Decision::Start,
-            "a small waiter asks its own peak"
-        );
-        assert_eq!(onto_busy_mac(1_400, 4), Decision::Start);
-        assert!(waits(&onto_busy_mac(1_440, 4)));
-        // A whole-machine (cold) waiter starts up to 60% busy (50% in 0.4.4).
-        assert!(waits(&onto_busy_mac(1_000, 16)));
-        assert_eq!(onto_busy_mac(960, 16), Decision::Start);
-    }
-
-    /// Eight 13-core-peak jobs queued at once on the 16-core Mac. Each runs 150 s: 3 s on 1 core, then cycles of 15 s
-    /// at its 13-core peak and 25 s on 2 cores (compile, then test). Demand over 16 cores is scaled down. Returns the
-    /// share (%) of the samples where demand exceeded the machine, the share where jobs waited at under 75% CPU, and
-    /// when the last job started.
-    fn bursty_eight() -> (u64, u64, i64) {
-        let c = mac();
-        let mut jobs: Vec<Job> = (0..8)
-            .map(|i| Job {
-                cpu_hold_ms: Some(cpu_hold_ms(Some(4_000))),
-                ..job(&format!("b{i}"), 13, 2, State::Queued, i)
-            })
-            .collect();
-        let demand_at = |since: i64| -> u64 {
-            if since < 3_000 {
-                100
-            } else if (since - 3_000) % 40_000 < 15_000 {
-                1_300
-            } else {
-                200
-            }
-        };
-        let (mut samples, mut over, mut under, mut last) = (0u64, 0u64, 0u64, 0);
-        let mut readings: Vec<(i64, u64)> = Vec::new();
-        let mut t = 0;
-        while t <= 1_200_000 && !jobs.is_empty() {
-            jobs.retain(|j| j.started_ms.is_none_or(|s| t - s < 150_000));
-            let demand: Vec<(String, u64)> = jobs
-                .iter()
-                .filter_map(|j| j.started_ms.map(|s| (j.id.clone(), demand_at(t - s))))
-                .collect();
-            let total: u64 = demand.iter().map(|d| d.1).sum();
-            let pct = total.min(1_600) * 100 / 1_600;
-            readings.push((t, pct));
-            readings.retain(|(ts, _)| t - ts <= BUSY_WINDOW_MS);
-            let live = Live {
-                cpu_pct: pct,
-                cpu_sustained_pct: sustained_pct(pct, &readings, t),
-                per_job: demand
-                    .iter()
-                    .map(|(id, d)| {
-                        let cpu = if total > 1_600 { d * 1_600 / total } else { *d };
-                        (
-                            id.clone(),
-                            Usage {
-                                cpu,
-                                mem: 2 * G,
-                                vram: 0,
-                            },
-                        )
-                    })
-                    .collect(),
-                ..calm()
-            };
-            let waiting = jobs.iter().any(|j| j.state == State::Queued);
-            samples += 1;
-            over += u64::from(total > 1_600);
-            under += u64::from(waiting && pct < 75);
-            for i in 0..jobs.len() {
-                if jobs[i].state == State::Queued
-                    && evaluate(&jobs[i].clone(), &jobs, &c, &live, t) == Decision::Start
-                {
-                    jobs[i].state = State::Running;
-                    jobs[i].started_ms = Some(t);
-                    last = t;
-                }
-            }
-            t += 500;
-        }
-        assert!(jobs.is_empty(), "every job ran");
-        (over * 100 / samples, under * 100 / samples, last)
-    }
-
-    #[test]
-    fn bursty_big_jobs_start_one_at_a_time_without_pinning_the_machine() {
-        let (over, under, last) = bursty_eight();
-        // 0.4.3 (one free core under the band) read over the machine 67% of the time; 0.4.4 reads 0% over, 22% under.
-        assert!(over <= 10, "demand over the machine {over}% of the time");
-        assert!(
-            under <= 30,
-            "jobs waited at under 75% CPU {under}% of the time"
-        );
-        assert!(last <= 600_000, "the last job started at {last} ms");
-    }
-
-    /// 2026-11-21, 10:17-11:18 local, from the job files and history: four jobs queued, nothing running, the Mac 27-41%
-    /// busy, 49-58% memory used, load1 8-12 on 16 cores, macOS pressure level 2 (warn) throughout with 1.8 of 3 GB swap.
-    /// 0.4.4 counted level 2 as pressure and vetoed even the 1-core head: 40+ minutes idle.
-    fn stuck_queue() -> (Vec<Job>, Live) {
-        let mi = 1 << 20;
-        let jobs = vec![
-            Job {
-                weights: Weights {
-                    cpu: 1,
-                    mem: 148 * mi,
-                    vram: 0,
-                    disk: 0,
-                },
-                mem_peak_at_ms: Some(2_190),
-                cpu_hold_ms: Some(RAMP_MS),
-                ..job("lint", 1, 0, State::Queued, 1_000)
-            },
-            Job {
-                mem_peak_at_ms: Some(106_250),
-                cpu_hold_ms: Some(CPU_MAX_HOLD_MS),
-                ..job("ui-update-ios", 11, 7, State::Queued, 331_000)
-            },
-            job("xcodebuild", 8, 8, State::Queued, 1_111_000),
-            Job {
-                weights: Weights {
-                    cpu: 1,
-                    mem: 310 * mi,
-                    vram: 0,
-                    disk: 0,
-                },
-                ..job("typecheck", 1, 0, State::Queued, 3_534_000)
-            },
-        ];
-        let live = Live {
-            load1: 8.0,
-            load5: 8.0,
-            mem_used_pct: 49,
-            cpu_pct: 27,
-            cpu_sustained_pct: 27,
-            mem_pressure_warn: true,
-            non_heavy: Usage {
-                cpu: 430,
-                mem: 31 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        (jobs, live)
-    }
-
-    #[test]
-    fn replay_the_stuck_queue_of_2026_11_21() {
-        let c = mac();
-        let (mut jobs, live) = stuck_queue();
-        let now = 3_600_000;
-        // The head starts at once: warn pressure at 49% used is not exhaustion.
-        assert_eq!(evaluate(&jobs[0], &jobs, &c, &live, now), Decision::Start);
-        // Critical pressure (level 4) still vetoes it, alone or not.
-        let critical = Live {
-            mem_pressure: true,
-            ..live.clone()
-        };
-        assert!(matches!(
-            evaluate(&jobs[0], &jobs, &c, &critical, now),
-            Decision::Wait {
-                block: Block::Mem,
-                ..
-            }
-        ));
-        // Admit in queue order as each re-evaluates: the queue drains instead of stalling, the big ones staggered by
-        // their holds, and the machine is never left idle with jobs waiting.
-        let mut t = now;
-        while jobs.iter().any(|j| j.state == State::Queued) && t < now + 600_000 {
-            let order: Vec<usize> = (0..jobs.len()).collect();
-            for i in order {
-                if jobs[i].state == State::Queued
-                    && evaluate(&jobs[i].clone(), &jobs, &c, &live, t) == Decision::Start
-                {
-                    jobs[i].state = State::Running;
-                    jobs[i].started_ms = Some(t);
-                }
-            }
-            t += 500;
-        }
-        let started: Vec<i64> = jobs.iter().map(|j| j.started_ms.unwrap_or(-1)).collect();
-        assert!(
-            started.iter().all(|s| *s >= 0),
-            "every job started: {started:?}"
-        );
-        assert_eq!(started[0], now, "the head at once");
-        assert_eq!(started[3], now, "the tiny typecheck beside it");
-        assert!(
-            started[2] <= now + CPU_MAX_HOLD_MS,
-            "the xcodebuild once the 11-core hold ends: {started:?}"
-        );
     }
 
     #[test]
@@ -4115,630 +1810,22 @@ mod tests {
     }
 
     #[test]
-    fn tiny_jobs_stop_passing_a_memory_blocked_head_after_the_bypass_window() {
-        let c = mac();
-        let run = Job {
-            started_ms: Some(0),
-            mem_declared: true,
-            ..job("r", 2, 40, State::Running, 0)
-        };
-        let head = job("head", 4, 30, State::Queued, 1_000);
-        let tiny_one = job("tiny", 1, 1, State::Queued, 2_000);
-        let all = [run, head.clone(), tiny_one.clone()];
-        let live = Live {
-            non_heavy: Usage {
-                cpu: 200,
-                mem: 15 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let before = 1_000 + TINY_BYPASS_MS - 1;
-        assert_eq!(
-            evaluate(&tiny_one, &all, &c, &live, before),
-            Decision::Start
-        );
-        let after = 1_000 + TINY_BYPASS_MS;
-        assert!(matches!(
-            evaluate(&tiny_one, &all, &c, &live, after),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn a_tiny_job_passes_a_vram_blocked_head_until_the_bypass_window_ends() {
-        let c = Capacity {
-            vram: 100 * G,
-            ..cap()
-        };
-        let vr = |id: &str, g: u64, state| {
-            let j = job(id, 1, 1, state, 0);
-            Job {
-                weights: Weights {
-                    vram: g * G,
-                    ..j.weights
-                },
-                started_ms: Some(0),
-                ..j
-            }
-        };
-        // Declared: a learned reservation would decay once its time to peak passed (`vram_reserved`).
-        let run = Job {
-            vram_declared: true,
-            ..vr("r", 50, State::Running)
-        };
-        let head = Job {
-            enqueued_ms: 1_000,
-            ..vr("head", 41, State::Queued)
-        };
-        let tiny_one = Job {
-            enqueued_ms: 2_000,
-            ..vr("tiny", 0, State::Queued)
-        };
-        let all = [run, head.clone(), tiny_one.clone()];
-        let t = 1_000 + BACKFILL_WINDOW_MS + 1;
-        assert!(matches!(
-            evaluate(&head, &all, &c, &calm(), t),
-            Decision::Wait {
-                block: Block::Vram,
-                ..
-            }
-        ));
-        assert_eq!(evaluate(&tiny_one, &all, &c, &calm(), t), Decision::Start);
-        assert!(waits(&evaluate(
-            &tiny_one,
-            &all,
-            &c,
-            &calm(),
-            1_000 + TINY_BYPASS_MS
-        )));
-    }
-
-    #[test]
-    fn a_tiny_job_passes_a_ramp_blocked_head_only_if_the_head_is_not_delayed() {
-        let c = mac();
-        let ra = Job {
-            started_ms: Some(10),
-            ..job("a", 16, 8, State::Running, 0)
-        };
-        let head = job("b", 16, 8, State::Queued, 2);
-        let tiny_one = job("t", 1, 1, State::Queued, 3);
-        let all = [ra, head.clone(), tiny_one.clone()];
-        let live = Live {
-            non_heavy: Usage {
-                cpu: 320,
-                mem: 8 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let d = evaluate(&head, &all, &c, &live, 500);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Ramp,
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-        // The tiny job takes next to nothing of the held CPU: it starts, and the head's ramp end does not move.
-        assert_eq!(evaluate(&tiny_one, &all, &c, &live, 500), Decision::Start);
-    }
-
-    #[test]
-    fn a_tiny_job_passes_an_old_head_blocked_by_memory_but_not_by_cpu() {
-        let c = mac();
-        let run = Job {
-            started_ms: Some(0),
-            mem_declared: true,
-            ..job("r", 2, 40, State::Running, 0)
-        };
-        // The head needs 30G; the running job's declared 40G plus 15G of other programs leave 5.8G.
-        let head = job("head", 4, 30, State::Queued, 1_000);
-        let tiny_one = job("tiny", 1, 1, State::Queued, 2_000);
-        let mid = job("mid", 4, 1, State::Queued, 3_000);
-        let all = [run, head.clone(), tiny_one.clone(), mid.clone()];
-        let live = Live {
-            non_heavy: Usage {
-                cpu: 200,
-                mem: 15 * G,
-                vram: 0,
-            },
-            ..calm()
-        };
-        let t = 1_000 + BACKFILL_WINDOW_MS + 1;
-        assert!(matches!(
-            evaluate(&head, &all, &c, &live, t),
-            Decision::Wait {
-                block: Block::Mem,
-                ..
-            }
-        ));
-        assert_eq!(evaluate(&tiny_one, &all, &c, &live, t), Decision::Start);
-        assert!(
-            matches!(
-                evaluate(&mid, &all, &c, &live, t),
-                Decision::Wait {
-                    block: Block::Queue,
-                    ..
-                }
-            ),
-            "4 cores is not tiny: it keeps the 60 s rule"
-        );
-        // A head blocked on CPU room keeps every follower behind it after 60 s, tiny ones too.
-        let busy = Live {
-            cpu_pct: 90,
-            cpu_sustained_pct: 90,
-            non_heavy: Usage {
-                cpu: 1_440,
-                mem: 0,
-                vram: 0,
-            },
-            ..calm()
-        };
-        assert!(matches!(
-            evaluate(&tiny_one, &all, &c, &busy, t),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn a_blocked_waiter_says_why_with_the_numbers() {
-        let d = onto_busy_mac(1_100, 13);
-        let Decision::Wait { reason, .. } = d else {
-            panic!("{d:?}")
-        };
-        assert_eq!(
-            reason,
-            "cpu: needs 4.40 cores, 4.20 free under the 95% band (machine 68% busy)"
-        );
-    }
-
-    /// 2026-11-21, 19:47-20:31 UTC: a cold `docker build` (the whole machine, 30 s fallback hold) on a calm Mac. Its
-    /// work runs in Docker's VM, so its tree reads 0.1 cores and the VM's CPU shows late, as other programs' CPU.
-    fn docker_build_at(other_cpu: u64, pct: u64) -> (Vec<Job>, Live) {
-        let build = |id: &str, state, enq| Job {
-            cmd: vec!["docker".into(), "build".into(), ".".into()],
-            cpu_hold_ms: Some(cpu_hold_ms(None)),
-            ..job(id, 16, 4, state, enq)
-        };
         let run = Job {
             started_ms: Some(0),
-            ..build("b1", State::Running, 0)
+            ..job("r", 1, 1, State::Running, 0)
         };
-        let live = Live {
-            cpu_pct: pct,
-            cpu_sustained_pct: pct,
-            non_heavy: Usage {
-                cpu: other_cpu,
-                mem: 20 * G,
-                vram: 0,
-            },
-            per_job: vec![(
-                "b1".into(),
-                Usage {
-                    cpu: 10,
-                    mem: G / 10,
-                    vram: 0,
-                },
-            )],
-            ..calm()
-        };
-        (vec![run, build("b2", State::Queued, 1_000)], live)
-    }
-
-    #[test]
-    fn a_docker_build_holds_the_machine_until_its_vm_cpu_shows() {
-        let c = mac();
-        // 15 s in, the VM has not ramped yet (3 cores of other programs, 20% busy). 0.4.5 released the hold at 10 s and
-        // started the second build here; both then ran and the Mac read 100% with load1 130-330.
-        let (jobs, live) = docker_build_at(300, 20);
-        assert!(matches!(
-            evaluate(&jobs[1], &jobs, &c, &live, 15_000),
-            Decision::Wait {
-                block: Block::Ramp,
-                ..
-            }
-        ));
-        let small = job("lint", 4, 2, State::Queued, 2_000);
-        let with_small = [jobs[0].clone(), small.clone()];
-        assert!(waits(&evaluate(&small, &with_small, &c, &live, 15_000)));
-        // Its hold ends with its time (30 s, cold): a lull then admits the next one.
-        assert_eq!(
-            evaluate(&jobs[1], &jobs, &c, &live, CPU_FALLBACK_HOLD_MS),
-            Decision::Start
-        );
-        // While held, the VM CPU that already shows (as other programs) is not counted twice: an 8-core learned build
-        // 20 s in with 6 of its cores showing holds 8 cores in all, not 6 + 8.
-        let d8 = Job {
-            started_ms: Some(0),
-            cmd: vec!["docker".into(), "build".into(), ".".into()],
-            cpu_hold_ms: Some(cpu_hold_ms(None)),
-            ..job("d8", 8, 4, State::Running, 0)
-        };
-        let showing = Live {
-            non_heavy: Usage {
-                cpu: 600,
-                mem: 20 * G,
-                vram: 0,
-            },
-            per_job: vec![],
-            ..calm()
-        };
-        assert_eq!(headroom(&[&d8], &c, &showing, 20_000).cpu, 1_520 - 800);
-        // In its first 10 s the hold still counts on top of everything else, as before.
-        assert_eq!(headroom(&[&d8], &c, &showing, 5_000).cpu, 1_520 - 1_400);
-    }
-
-    /// A docker build WITH history: its VM CPU peaked 20 s in (learned from the other-programs sampler), so it holds
-    /// 8 cores for 25 s, not the 10 s a docker CLI tree peak would give.
-    #[test]
-    fn a_docker_build_with_history_holds_until_its_learned_vm_cpu_time() {
-        let c = mac();
-        let d8 = Job {
-            started_ms: Some(0),
-            cmd: vec!["docker".into(), "build".into(), ".".into()],
-            cpu_hold_ms: Some(cpu_hold_ms(Some(20_000))),
-            ..job("d8", 8, 4, State::Running, 0)
-        };
-        assert_eq!(d8.cpu_hold_ms, Some(25_000));
-        let live = Live {
-            per_job: vec![],
-            ..calm()
-        };
-        assert_eq!(headroom(&[&d8], &c, &live, 15_000).cpu, 1_520 - 800);
-        assert_eq!(headroom(&[&d8], &c, &live, 24_000).cpu, 1_520 - 800);
-        assert_eq!(headroom(&[&d8], &c, &live, 26_000).cpu, 1_520);
-    }
-
-    /// 4 cores of unrelated other-program CPU were already there when the 8-core docker build started: the hold at 11 s
-    /// counts 12 cores (4 + 8), not 8. Only the rise above that baseline is the build's.
-    #[test]
-    fn a_docker_hold_is_netted_only_against_the_rise_above_its_start_baseline() {
-        let c = mac();
-        let d8 = Job {
-            started_ms: Some(0),
-            cmd: vec!["docker".into(), "build".into(), ".".into()],
-            cpu_hold_ms: Some(cpu_hold_ms(Some(20_000))),
-            non_heavy_cpu_at_start: 400,
-            ..job("d8", 8, 4, State::Running, 0)
-        };
-        let live = |other| Live {
-            non_heavy: Usage {
-                cpu: other,
-                mem: 20 * G,
-                vram: 0,
-            },
-            per_job: vec![],
-            ..calm()
-        };
-        assert_eq!(headroom(&[&d8], &c, &live(400), 11_000).cpu, 1_520 - 1_200);
-        // The VM's own 3 cores showing (400 + 300) are netted once: 7 cores in all.
-        assert_eq!(headroom(&[&d8], &c, &live(700), 11_000).cpu, 1_520 - 1_200);
-    }
-
-    /// 2026-11-21, 20:19-20:48 UTC: one long 10-core job, the Mac at 70%, a 13-core head that needs 4.4 free cores, and
-    /// a 2-core waiter behind it.
-    fn big_head_at(pct: u64) -> (Vec<Job>, Live) {
-        let run = Job {
-            started_ms: Some(0),
-            cpu_hold_ms: Some(cpu_hold_ms(Some(4_000))),
-            ..job("long", 10, 6, State::Running, 0)
-        };
-        let head = Job {
-            cpu_hold_ms: Some(CPU_MAX_HOLD_MS),
-            ..job("ui-update", 13, 4, State::Queued, 100_000)
-        };
-        let small = Job {
-            cpu_hold_ms: Some(RAMP_MS),
-            run_p90_ms: Some(30_000),
-            ..job("typecheck", 2, 4, State::Queued, 101_000)
-        };
-        let live = Live {
-            cpu_pct: pct,
-            cpu_sustained_pct: pct,
-            non_heavy: Usage {
-                cpu: 100,
-                mem: 20 * G,
-                vram: 0,
-            },
-            per_job: vec![(
-                "long".into(),
-                Usage {
-                    cpu: 900,
-                    mem: 6 * G,
-                    vram: 0,
-                },
-            )],
-            ..calm()
-        };
-        (vec![run, head, small], live)
-    }
-
-    #[test]
-    fn a_small_job_passes_a_cpu_blocked_head_on_an_underused_machine() {
-        let c = mac();
-        let (jobs, live) = big_head_at(70);
-        let past = 100_000 + BACKFILL_WINDOW_MS + 1;
-        assert!(matches!(
-            evaluate(&jobs[1], &jobs, &c, &live, past),
-            Decision::Wait {
-                block: Block::Cpu,
-                ..
-            }
-        ));
-        // 0.4.5 queued it behind the head (strict FIFO past 60 s) for as long as the head waited.
-        assert_eq!(evaluate(&jobs[2], &jobs, &c, &live, past), Decision::Start);
-        // At 75% busy the machine is in the band's approach: it waits for the head again.
-        let (jobs, warm) = big_head_at(UNDERUSED_CPU_PCT);
-        assert!(matches!(
-            evaluate(&jobs[2], &jobs, &c, &warm, past),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-        // And once the head has waited 5 minutes, so a stream of small jobs cannot starve it.
-        assert!(matches!(
-            evaluate(&jobs[2], &jobs, &c, &live, 100_000 + TINY_BYPASS_MS),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-        // 0.4.8: a mid-size waiter no bigger than the head backfills too (0.4.7 kept it behind the 60 s rule), when its
-        // learned run time ends within the head's backfill time; with none learned it waits.
-        let mid = job("check", 4, 4, State::Queued, 102_000);
-        let all = [jobs[0].clone(), jobs[1].clone(), mid.clone()];
-        assert!(matches!(
-            evaluate(&mid, &all, &c, &live, past),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-        let mid = Job {
-            run_p90_ms: Some(60_000),
-            ..mid
-        };
-        let all = [jobs[0].clone(), jobs[1].clone(), mid.clone()];
-        assert_eq!(evaluate(&mid, &all, &c, &live, past), Decision::Start);
-    }
-
-    /// The rig on 2026-11-21: 16 cores, 10G of VRAM, a 14-core test run and the desktop keeping it 97% busy.
-    fn busy_rig() -> (Capacity, Vec<Job>, Live) {
-        let c = Capacity {
-            cpu: 16,
-            mem: 64 * G,
-            vram: 10 * G,
-            disk_total: 1000 * G,
-            vram_is_ram: false,
-        };
-        let big = Job {
-            started_ms: Some(0),
-            cpu_hold_ms: Some(RAMP_MS),
-            ..job("tests", 14, 12, State::Running, 0)
-        };
-        let live = Live {
-            load1: 20.0,
-            load5: 20.0,
-            cpu_pct: 97,
-            cpu_sustained_pct: 97,
-            per_job: vec![(
-                "tests".into(),
-                Usage {
-                    cpu: 1_400,
-                    mem: 8 * G,
-                    vram: 0,
-                },
-            )],
-            non_heavy: Usage {
-                cpu: 150,
-                mem: 10 * G,
-                vram: 2 * G,
-            },
-            ..calm()
-        };
-        (c, vec![big], live)
-    }
-
-    /// The busy rig with 2.4 free cores: the fast lane needs real room (`fast_cpu_room`).
-    fn roomy(live: Live) -> Live {
-        Live {
+        let me = job("w", 2, 1, State::Queued, 1);
+        let busy = Live {
             cpu_pct: 85,
-            cpu_sustained_pct: 85,
-            ..live
-        }
-    }
-
-    fn lint(id: &str, enq: i64, fast: bool, state: State) -> Job {
-        let mut j = job(id, 1, 0, state, enq);
-        j.weights.mem = 72 << 20;
-        j.fast = fast;
-        if state == State::Running {
-            j.started_ms = Some(enq);
-        }
-        j
-    }
-
-    #[test]
-    fn a_learned_short_small_job_starts_in_the_fast_lane_on_a_busy_machine() {
-        // 2026-11-21 on the rig: `make lint` (1 core, 72M, ran 1.2 s) waited 204 s behind "cpu: needs 1.00 cores,
-        // 0.00 free under the 95% band (machine 95-98% busy)" with a bigger job queued ahead of it.
-        let (c, mut jobs, live) = busy_rig();
-        let live = roomy(live);
-        jobs.push(job("head", 8, 4, State::Queued, 50_000));
-        let now = 60_000;
-        let slow = lint("lint", 55_000, false, State::Queued);
-        let mut all = jobs.clone();
-        all.push(slow.clone());
-        assert!(
-            waits(&evaluate(&slow, &all, &c, &live, now)),
-            "no fast lane: it waits"
-        );
-        let quick = lint("lint", 55_000, true, State::Queued);
-        let mut all = jobs.clone();
-        all.push(quick.clone());
-        assert_eq!(evaluate(&quick, &all, &c, &live, now), Decision::Start);
-    }
-
-    #[test]
-    fn the_fast_lane_is_bounded_and_keeps_the_guards() {
-        let (c, jobs, live) = busy_rig();
-        let live = roomy(live);
-        let now = 60_000;
-        let with = |extra: &[Job]| {
-            let mut v = jobs.clone();
-            v.extend_from_slice(extra);
-            v
+            ..calm()
         };
-        let me = lint("me", 59_000, true, State::Queued);
-        // `FAST_MAX_JOBS` fast jobs already running: a third waits, even one that ran long (never forgotten).
-        let running = [
-            lint("f1", 1_000, true, State::Running),
-            lint("f2", 58_000, true, State::Running),
-        ];
-        let all = with(&[running[0].clone(), running[1].clone(), me.clone()]);
-        assert!(waits(&evaluate(&me, &all, &c, &live, now)));
-        // One slot left: it starts.
-        let all = with(&[running[1].clone(), me.clone()]);
-        assert_eq!(evaluate(&me, &all, &c, &live, now), Decision::Start);
-        // Guards still veto: a runaway load, critical memory pressure, memory 95% used.
-        let all = with(std::slice::from_ref(&me));
-        for bad in [
-            Live {
-                load1: 64.0,
-                ..live.clone()
-            },
-            Live {
-                mem_pressure: true,
-                ..live.clone()
-            },
-            Live {
-                mem_used_pct: 96,
-                ..live.clone()
-            },
-        ] {
-            assert!(waits(&evaluate(&me, &all, &c, &bad, now)), "{bad:?}");
-        }
-        // Memory still has to fit the measured headroom.
-        let full = Live {
-            non_heavy: Usage {
-                mem: 52 * G,
-                ..live.non_heavy
-            },
-            ..live.clone()
+        let Decision::Wait { reason, .. } =
+            evaluate(&me, &[run, me.clone()], &cap(), &busy, 60_000)
+        else {
+            panic!()
         };
-        assert!(waits(&evaluate(&me, &all, &c, &full, now)));
-    }
-
-    #[test]
-    fn a_running_fast_job_using_16_cores_closes_the_lane() {
-        let (c, jobs, live) = busy_rig();
-        let live = roomy(live);
-        let now = 60_000;
-        let me = lint("me", 59_000, true, State::Queued);
-        let runner = lint("f1", 58_000, true, State::Running);
-        let mut all = jobs;
-        all.extend([runner, me.clone()]);
-        assert_eq!(evaluate(&me, &all, &c, &live, now), Decision::Start);
-        let mut hot = live.clone();
-        hot.per_job.push((
-            "f1".into(),
-            Usage {
-                cpu: 1_600,
-                mem: 72 << 20,
-                vram: 0,
-            },
-        ));
-        assert!(waits(&evaluate(&me, &all, &c, &hot, now)));
-    }
-
-    #[test]
-    fn a_machine_with_no_free_cores_refuses_the_fast_lane() {
-        let (c, mut jobs, live) = busy_rig();
-        let now = 60_000;
-        let me = lint("me", 59_000, true, State::Queued);
-        jobs.push(me.clone());
-        for pct in [97, 100] {
-            let full = Live {
-                cpu_pct: pct,
-                cpu_sustained_pct: pct,
-                ..live.clone()
-            };
-            assert!(waits(&evaluate(&me, &jobs, &c, &full, now)), "{pct}%");
-        }
-        assert!(!fast_cpu_room(&c, &live));
-        assert!(fast_cpu_room(&c, &roomy(live)));
-    }
-
-    #[test]
-    fn only_short_small_jobs_without_vram_are_fast_lane_eligible() {
-        let c = Capacity {
-            cpu: 16,
-            mem: 64 * G,
-            vram: 10 * G,
-            disk_total: 1000 * G,
-            vram_is_ram: false,
-        };
-        let w = |cpu, mem, vram| Weights {
-            cpu,
-            mem,
-            vram,
-            disk: 0,
-        };
-        assert!(fast_lane_eligible(w(1, 72 << 20, 0), &c, Some(1_285)));
-        assert!(fast_lane_eligible(
-            w(FAST_MAX_CPU, 2 * G, 0),
-            &c,
-            Some(FAST_RUN_MS)
-        ));
-        assert!(!fast_lane_eligible(w(1, 0, 0), &c, None), "cold or pooled");
-        assert!(
-            !fast_lane_eligible(w(1, 0, 0), &c, Some(FAST_RUN_MS + 1)),
-            "one recent run was long"
-        );
-        assert!(!fast_lane_eligible(
-            w(FAST_MAX_CPU + 1, 0, 0),
-            &c,
-            Some(1_000)
-        ));
-        assert!(
-            !fast_lane_eligible(w(1, 3 * G, 0), &c, Some(1_000)),
-            "over 1/32 of RAM"
-        );
-        assert!(
-            !fast_lane_eligible(w(1, 0, 1 << 30), &c, Some(1_000)),
-            "uses VRAM"
-        );
-    }
-
-    #[test]
-    fn a_burst_of_fast_jobs_adds_at_most_the_lane_cap_to_a_pinned_machine() {
-        // Twelve fast jobs arrive at once on the busy rig: each start is written as running before the next decides.
-        let (c, jobs, live) = busy_rig();
-        let live = roomy(live);
-        let mut all = jobs.clone();
-        let mut started = 0;
-        for k in 0..12 {
-            let me = lint(&format!("l{k:02}"), 60_000 + k, true, State::Queued);
-            all.push(me.clone());
-            if evaluate(&me, &all, &c, &live, 61_000) == Decision::Start {
-                started += 1;
-                let last = all.len() - 1;
-                all[last].state = State::Running;
-                all[last].started_ms = Some(61_000);
-            }
-        }
-        assert_eq!(started, FAST_MAX_JOBS);
+        assert_eq!(reason, "cpu: machine 85% busy, jobs start under 80%");
     }
 
     #[test]
@@ -4804,685 +1891,6 @@ mod tests {
         assert!(guard_block(&c, &mac_meltdown).is_some());
     }
 
-    /// A 13-core head on the Mac, enqueued at 0, with a 6-core waiter behind it and the machine `pct` busy from one
-    /// long-running job.
-    fn mid_behind_head(pct: u64) -> (Vec<Job>, Live) {
-        let run = Job {
-            started_ms: Some(0),
-            cpu_hold_ms: Some(RAMP_MS),
-            ..job("long", 10, 6, State::Running, 0)
-        };
-        let head = Job {
-            cpu_hold_ms: Some(CPU_MAX_HOLD_MS),
-            ..job("lint", 13, 8, State::Queued, 0)
-        };
-        let mid = Job {
-            cpu_hold_ms: Some(RAMP_MS),
-            run_p90_ms: Some(20_000),
-            ..job("clippy", 6, 4, State::Queued, 1_000)
-        };
-        let busy = pct * 1_600 / 100;
-        let live = Live {
-            cpu_pct: pct,
-            cpu_sustained_pct: pct,
-            per_job: vec![(
-                "long".into(),
-                Usage {
-                    cpu: busy,
-                    mem: 6 * G,
-                    vram: 0,
-                },
-            )],
-            ..calm()
-        };
-        (vec![run, head, mid], live)
-    }
-
-    #[test]
-    fn a_mid_size_job_backfills_a_young_cpu_blocked_head_on_an_underused_machine() {
-        // 2026-11-21 after 0.4.7: 6-core clippy and test runs waited 73-74 minutes behind 11-core make lint heads, at
-        // p50 21 minutes for 3-8 core jobs, while the Mac sat idle 23% of the time jobs waited.
-        let c = mac();
-        let (jobs, live) = mid_behind_head(72);
-        let past = BACKFILL_WINDOW_MS + 1;
-        assert!(matches!(
-            evaluate(&jobs[1], &jobs, &c, &live, past),
-            Decision::Wait {
-                block: Block::Cpu,
-                ..
-            }
-        ));
-        assert_eq!(evaluate(&jobs[2], &jobs, &c, &live, past), Decision::Start);
-        // Not near the band, not once the head has waited 5 minutes, and never a waiter bigger than the head.
-        let (_, warm) = mid_behind_head(UNDERUSED_CPU_PCT);
-        assert!(waits(&evaluate(&jobs[2], &jobs, &c, &warm, past)));
-        assert!(matches!(
-            evaluate(&jobs[2], &jobs, &c, &live, TINY_BYPASS_MS),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-        let bigger = Job {
-            weights: Weights {
-                cpu: 14,
-                ..jobs[2].weights
-            },
-            ..jobs[2].clone()
-        };
-        let all = [jobs[0].clone(), jobs[1].clone(), bigger.clone()];
-        assert!(matches!(
-            evaluate(&bigger, &all, &c, &live, past),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn a_long_backfiller_cannot_hold_the_head_past_its_backfill_time() {
-        // A 12-core, 70-minute job arriving at 4:59 of the 13-core head's wait on an underused Mac: passing would keep
-        // the head's room for 70 minutes. It waits; a shorter one passes only if it ends within the bound.
-        let c = mac();
-        let (mut jobs, live) = mid_behind_head(72);
-        let at = TINY_BYPASS_MS - 1_000;
-        jobs[2] = Job {
-            run_p90_ms: Some(70 * 60_000),
-            ..job("long-test", 12, 4, State::Queued, at)
-        };
-        assert!(matches!(
-            evaluate(&jobs[2], &jobs, &c, &live, at),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-        // A 6-core one fits the room: it passes only if its run ends within the bound.
-        jobs[2] = Job {
-            cpu_hold_ms: Some(RAMP_MS),
-            ..job("clippy", 6, 4, State::Queued, at)
-        };
-        jobs[2].run_p90_ms = Some(u64::try_from(1_000 + BACKFILL_OVERRUN_MS).unwrap_or(0));
-        assert_eq!(evaluate(&jobs[2], &jobs, &c, &live, at), Decision::Start);
-        jobs[2].run_p90_ms = Some(u64::try_from(2_000 + BACKFILL_OVERRUN_MS).unwrap_or(0));
-        assert!(
-            waits(&evaluate(&jobs[2], &jobs, &c, &live, at)),
-            "past the bound"
-        );
-        jobs[2].run_p90_ms = None;
-        assert!(
-            waits(&evaluate(&jobs[2], &jobs, &c, &live, at)),
-            "no learned run time"
-        );
-        // A tiny job needs no learned run time.
-        let tiny_job = job("fmt", 1, 1, State::Queued, at);
-        let all = [jobs[0].clone(), jobs[1].clone(), tiny_job.clone()];
-        assert_eq!(evaluate(&tiny_job, &all, &c, &live, at), Decision::Start);
-    }
-
-    #[test]
-    fn a_head_that_holds_the_queue_is_never_passed_and_projects_its_sustained_level() {
-        assert_eq!(projected_peak(1_300, None), 520, "2/5 of the peak");
-        assert_eq!(
-            projected_peak(1_300, Some(300)),
-            300,
-            "a lower sustained level"
-        );
-        assert_eq!(
-            projected_peak(1_300, Some(900)),
-            520,
-            "never above 2/5 of the peak"
-        );
-        // Once the head has waited `TINY_BYPASS_MS`, the mid job no longer backfills, even on an underused machine.
-        let c = mac();
-        let (jobs, live) = mid_behind_head(72);
-        let held = TINY_BYPASS_MS;
-        assert_eq!(
-            evaluate(&jobs[2], &jobs, &c, &live, held - 1),
-            Decision::Start
-        );
-        assert!(matches!(
-            evaluate(&jobs[2], &jobs, &c, &live, held),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-        // A learned sustained level of 3 cores lets the 13-core head fit at 72% busy (2/5 of its peak would not).
-        assert!(waits(&evaluate(&jobs[1], &jobs, &c, &live, held)));
-        let mut lower = jobs.clone();
-        lower[1].cpu_sustained = Some(300);
-        assert_eq!(
-            evaluate(&lower[1], &lower, &c, &live, held),
-            Decision::Start
-        );
-    }
-
-    #[test]
-    fn a_held_peak_drops_to_the_sustained_level_only_after_its_learned_peak_time() {
-        let by = Some(cpu_hold_ms(Some(60_000)));
-        assert_eq!(
-            sustained_hold(1_100, Some(300), 0, false, by),
-            1_100,
-            "full peak while it ramps"
-        );
-        assert_eq!(
-            sustained_hold(1_100, Some(300), SUSTAINED_FULL_MS, false, by),
-            1_100,
-            "its learned peak (60 s plus margin) is still ahead"
-        );
-        assert_eq!(
-            sustained_hold(1_100, Some(300), 75_000, false, by),
-            300,
-            "past the learned peak time and margin"
-        );
-        assert_eq!(
-            sustained_hold(1_100, Some(300), SUSTAINED_FULL_MS, false, Some(RAMP_MS)),
-            300,
-            "an early peak: from SUSTAINED_FULL_MS"
-        );
-        assert_eq!(sustained_hold(1_100, Some(1_500), 75_000, false, by), 1_100);
-        assert_eq!(
-            sustained_hold(0, Some(300), 75_000, false, by),
-            0,
-            "a released hold stays released"
-        );
-        assert_eq!(
-            sustained_hold(1_100, Some(300), 200_000, true, by),
-            1_100,
-            "Docker/VM keeps its hold"
-        );
-        assert_eq!(
-            sustained_hold(1_100, None, 200_000, false, by),
-            1_100,
-            "nothing learned"
-        );
-        assert_eq!(
-            sustained_hold(1_100, Some(300), 200_000, false, None),
-            1_100,
-            "no learned time to peak"
-        );
-        // 2026-11-21: make lint test-changed learned 11 cores (a brief spike at 15 s) and averaged 1.2. Its peak stays
-        // held until 15 s plus margin even with a 3-core sustained level learned; a 6-core waiter fits only after.
-        let c = mac();
-        let lint = Job {
-            started_ms: Some(0),
-            cpu_hold_ms: Some(cpu_hold_ms(Some(15_000))),
-            cpu_sustained: Some(300),
-            ..job("lint", 11, 4, State::Running, 0)
-        };
-        let me = job("clippy", 6, 4, State::Queued, 1);
-        let live = Live {
-            cpu_pct: 32,
-            cpu_sustained_pct: 32,
-            non_heavy: Usage {
-                cpu: 400,
-                mem: 10 * G,
-                vram: 0,
-            },
-            per_job: vec![(
-                "lint".into(),
-                Usage {
-                    cpu: 120,
-                    mem: 2 * G,
-                    vram: 0,
-                },
-            )],
-            ..calm()
-        };
-        let at = |t| evaluate(&me, &[lint.clone(), me.clone()], &c, &live, t);
-        assert!(waits(&at(5_000)), "the full peak during the ramp");
-        assert!(
-            waits(&at(12_000)),
-            "the full peak before its learned peak time"
-        );
-        assert_eq!(at(cpu_hold_ms(Some(15_000))), Decision::Start);
-    }
-
-    /// Three 16-core-peak jobs on the 16-core Mac that each sit on 1 core for 60 s, spike to 16 cores for 2 s (a link
-    /// or test fan-out) and run 1 core to 120 s. Their best 10 s mean is under 5 cores, so a sustained cap that kicked
-    /// in at 10 s would let all three in within seconds of each other, and at 60 s they would spike to 48 cores at once.
-    #[test]
-    fn late_spiking_jobs_are_not_let_in_together_by_their_sustained_level() {
-        let c = mac();
-        let shape = |since: i64| -> u64 {
-            if (60_000..62_000).contains(&since) {
-                1_600
-            } else {
-                100
-            }
-        };
-        let samples: Vec<(u64, u64)> = (0..240)
-            .map(|i| (i * 500, shape(i64::try_from(i * 500).unwrap_or(0))))
-            .collect();
-        let level = sustained_level(&samples);
-        assert!(level < 500, "the learned sustained level {level}");
-        let mut jobs: Vec<Job> = (0..3)
-            .map(|i| Job {
-                cpu_hold_ms: Some(cpu_hold_ms(Some(60_000))),
-                cpu_sustained: Some(level),
-                run_p90_ms: Some(120_000),
-                ..job(&format!("s{i}"), 16, 2, State::Queued, i)
-            })
-            .collect();
-        let (mut worst, mut t) = (0u64, 0);
-        while t <= 900_000 && !jobs.is_empty() {
-            jobs.retain(|j| j.started_ms.is_none_or(|s| t - s < 120_000));
-            let demand: Vec<(String, u64)> = jobs
-                .iter()
-                .filter_map(|j| j.started_ms.map(|s| (j.id.clone(), shape(t - s))))
-                .collect();
-            let total: u64 = demand.iter().map(|d| d.1).sum();
-            worst = worst.max(total);
-            let pct = total.min(1_600) * 100 / 1_600;
-            let live = Live {
-                cpu_pct: pct,
-                cpu_sustained_pct: pct,
-                per_job: demand
-                    .iter()
-                    .map(|(id, d)| {
-                        (
-                            id.clone(),
-                            Usage {
-                                cpu: (*d).min(1_600),
-                                mem: 2 * G,
-                                vram: 0,
-                            },
-                        )
-                    })
-                    .collect(),
-                ..calm()
-            };
-            for i in 0..jobs.len() {
-                if jobs[i].state == State::Queued
-                    && evaluate(&jobs[i].clone(), &jobs, &c, &live, t) == Decision::Start
-                {
-                    jobs[i].state = State::Running;
-                    jobs[i].started_ms = Some(t);
-                }
-            }
-            t += 500;
-        }
-        assert!(jobs.is_empty(), "every job ran");
-        assert!(
-            worst <= 1_700,
-            "demand peaked at {worst} centi-cores on a 16-core machine"
-        );
-    }
-
-    /// `n` running `make lint`-like jobs (11-core peak, 7-core sustained floor, 1.5 cores live) 10 minutes in.
-    fn lints(n: usize) -> (Vec<Job>, Live) {
-        let jobs: Vec<Job> = (0..n)
-            .map(|i| Job {
-                started_ms: Some(0),
-                cpu_hold_ms: Some(RAMP_MS),
-                cpu_sustained: Some(700),
-                ..job(&format!("lint{i}"), 11, 1, State::Running, 0)
-            })
-            .collect();
-        let used = 150 * u64::try_from(n).unwrap_or(0);
-        let pct = used * 100 / 1_600;
-        let live = Live {
-            cpu_pct: pct,
-            cpu_sustained_pct: pct,
-            per_job: jobs
-                .iter()
-                .map(|j| {
-                    (
-                        j.id.clone(),
-                        Usage {
-                            cpu: 150,
-                            mem: G,
-                            vram: 0,
-                        },
-                    )
-                })
-                .collect(),
-            ..calm()
-        };
-        (jobs, live)
-    }
-
-    #[test]
-    fn the_largest_floor_and_half_of_the_rest_are_reserved() {
-        // 2026-11-22: three `make lint` runs (floors 6.5-8 cores, about 1.5 cores used each) reserved 21 cores on the
-        // 16-core Mac at 41-73% busy, so the next 11-core head waited 5-25 minutes on "cpu". Reserving only the
-        // largest floor let four running admit a fifth. Now the largest spike and half of each other one are reserved.
-        assert_eq!(floor_reserve(vec![]), 0);
-        assert_eq!(floor_reserve(vec![300, 550, 100]), 550 + 200);
-        let c = mac();
-        let now = 10 * 60_000;
-        let (two, live2) = lints(2);
-        let refs: Vec<&Job> = two.iter().collect();
-        assert_eq!(
-            headroom(&refs, &c, &live2, now).cpu,
-            ceiling(&c).cpu - 300 - 550 - 275,
-            "live use plus the largest unrealized floor and half of the other"
-        );
-        let next = Job {
-            cpu_sustained: Some(700),
-            ..job("next", 11, 1, State::Queued, now)
-        };
-        // Two running: 3 cores used, 8.25 reserved, 3.95 free for an ask of 3.60 (2/5 of 11 cores less the 0.8 cores
-        // above the band): a third starts. Three running reserve two whole spikes: a fourth waits, and so does a fifth.
-        let blocked_on_cpu = |d: &Decision| {
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Cpu,
-                    ..
-                }
-            )
-        };
-        for n in 0..=4 {
-            let (mut jobs, live) = lints(n);
-            jobs.push(next.clone());
-            let d = evaluate(&next, &jobs, &c, &live, now);
-            if n < 3 {
-                assert_eq!(d, Decision::Start, "{n} running");
-            } else {
-                assert!(blocked_on_cpu(&d), "{n} running: {d:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn two_coinciding_spikes_of_the_admitted_lints_fit_the_machine() {
-        // The most lint-shaped jobs that admission lets run together is three: two of their 7-core spikes coinciding
-        // with the third at its 1.5 cores still fit 16 cores. With only the largest floor reserved five ran, and two
-        // coinciding spikes took 17.5 cores.
-        let c = mac();
-        let now = 10 * 60_000;
-        let next = Job {
-            cpu_sustained: Some(700),
-            ..job("next", 11, 1, State::Queued, now)
-        };
-        let admitted = (0..8)
-            .take_while(|n| {
-                let (mut jobs, live) = lints(*n);
-                jobs.push(next.clone());
-                evaluate(&next, &jobs, &c, &live, now) == Decision::Start
-            })
-            .count();
-        let together = u64::try_from(admitted).unwrap_or(0);
-        assert_eq!(together, 3);
-        assert!(2 * 700 + (together - 2) * 150 <= centi(c.cpu));
-        // Two of the three spike at once: nothing big starts on top.
-        let (mut jobs, mut live) = lints(3);
-        for (i, (_, u)) in live.per_job.iter_mut().enumerate() {
-            if i < 2 {
-                u.cpu = 700;
-            }
-        }
-        live.cpu_pct = 1_550 * 100 / 1_600;
-        live.cpu_sustained_pct = live.cpu_pct;
-        jobs.push(next.clone());
-        assert!(waits(&evaluate(&next, &jobs, &c, &live, now)));
-    }
-
-    #[test]
-    fn a_short_small_job_passes_a_cpu_blocked_head_past_its_backfill_window() {
-        // 2026-11-22: 1-2 core jobs waited on "queue" behind 11-core heads that had waited over 5 minutes.
-        let c = mac();
-        let busy = Job {
-            started_ms: Some(0),
-            ..job("busy", 13, 4, State::Running, 0)
-        };
-        let live = Live {
-            cpu_pct: 81,
-            cpu_sustained_pct: 81,
-            per_job: vec![(
-                "busy".into(),
-                Usage {
-                    cpu: 1_300,
-                    mem: 4 * G,
-                    vram: 0,
-                },
-            )],
-            ..calm()
-        };
-        let head = job("head", 11, 4, State::Queued, 0);
-        let small = |run: Option<u64>| Job {
-            run_p90_ms: run,
-            ..job("small", 2, 1, State::Queued, 1)
-        };
-        let at = |me: &Job, others: &[Job], now: i64| {
-            let mut jobs = vec![busy.clone(), head.clone(), me.clone()];
-            jobs.extend_from_slice(others);
-            evaluate(me, &jobs, &c, &live, now)
-        };
-        let queue = |d: &Decision| {
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Queue,
-                    ..
-                }
-            )
-        };
-        let ten_min = 10 * 60_000;
-        assert_eq!(at(&small(Some(60_000)), &[], ten_min), Decision::Start);
-        assert!(
-            queue(&at(&small(None), &[], ten_min)),
-            "no learned run time"
-        );
-        assert!(
-            queue(&at(&small(Some(10 * 60_000)), &[], ten_min)),
-            "not short"
-        );
-        assert!(
-            queue(&at(&small(Some(60_000)), &[], SHORT_PASS_HEAD_MS)),
-            "the head has waited too long"
-        );
-        // One short small job already running takes the backfill share: the next one waits for the head.
-        let other = Job {
-            state: State::Running,
-            started_ms: Some(ten_min - 1_000),
-            ..small(Some(60_000))
-        };
-        let other = Job {
-            id: "other".into(),
-            ..other
-        };
-        assert!(queue(&at(&small(Some(60_000)), &[other], ten_min)));
-    }
-
-    #[test]
-    fn a_short_small_job_never_pushes_a_ramp_blocked_heads_start_later() {
-        // A 4-core job's 30 s hold ends 1 s from now; then the 11-core head fits, by 0.56 cores. A short 1-core job
-        // starting now holds its core for a few seconds more: it would move the head's start later, so it waits.
-        let c = mac();
-        let now = 6 * 60_000;
-        let busy = Job {
-            started_ms: Some(0),
-            ..job("busy", 11, 4, State::Running, 0)
-        };
-        let ramping = Job {
-            started_ms: Some(now - 29_000),
-            cpu_hold_ms: Some(30_000),
-            ..job("ramping", 4, 1, State::Running, 0)
-        };
-        let live = Live {
-            cpu_pct: 69,
-            cpu_sustained_pct: 69,
-            per_job: vec![(
-                "busy".into(),
-                Usage {
-                    cpu: 1_100,
-                    mem: 4 * G,
-                    vram: 0,
-                },
-            )],
-            ..calm()
-        };
-        let head = job("head", 11, 4, State::Queued, 0);
-        let short = Job {
-            run_p90_ms: Some(60_000),
-            ..job("short", 1, 1, State::Queued, 1)
-        };
-        let jobs = [busy, ramping, head, short.clone()];
-        let d = evaluate(&jobs[2], &jobs, &c, &live, now);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Ramp,
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-        let d = evaluate(&short, &jobs, &c, &live, now);
-        assert!(
-            matches!(
-                d,
-                Decision::Wait {
-                    block: Block::Queue,
-                    ..
-                }
-            ),
-            "{d:?}"
-        );
-    }
-
-    #[test]
-    fn a_short_small_job_waits_once_the_head_fits_after_the_short_jobs_finish() {
-        // The head waits on CPU. When the short small job already running is all that keeps it out, the next short
-        // job waits for the head; when the head would still wait without it, the next one passes.
-        let c = mac();
-        let now = 10 * 60_000;
-        let at = |busy_cpu: u64| {
-            let busy = Job {
-                started_ms: Some(0),
-                ..job("busy", 13, 4, State::Running, 0)
-            };
-            let other = Job {
-                state: State::Running,
-                started_ms: Some(now - 1_000),
-                run_p90_ms: Some(60_000),
-                ..job("other", 1, 1, State::Running, 1)
-            };
-            let me = Job {
-                run_p90_ms: Some(60_000),
-                ..job("me", 1, 1, State::Queued, 2)
-            };
-            let pct = (busy_cpu + 100) * 100 / 1_600;
-            let u = |cpu| Usage {
-                cpu,
-                mem: G,
-                vram: 0,
-            };
-            let live = Live {
-                cpu_pct: pct,
-                cpu_sustained_pct: pct,
-                per_job: vec![("busy".into(), u(busy_cpu)), ("other".into(), u(100))],
-                ..calm()
-            };
-            let jobs = [busy, job("head", 11, 4, State::Queued, 0), other, me];
-            let head = evaluate(&jobs[1], &jobs, &c, &live, now);
-            assert!(
-                matches!(
-                    head,
-                    Decision::Wait {
-                        block: Block::Cpu,
-                        ..
-                    }
-                ),
-                "{head:?}"
-            );
-            evaluate(&jobs[3], &jobs, &c, &live, now)
-        };
-        // 11.5 + 1 cores used: without the short job the head's 3.60 cores fit (3.68 free).
-        assert!(matches!(
-            at(1_150),
-            Decision::Wait {
-                block: Block::Queue,
-                ..
-            }
-        ));
-        // 12.5 + 1 cores used: the head would still wait without it, so the next short job passes.
-        assert_eq!(at(1_250), Decision::Start);
-    }
-
-    #[test]
-    fn a_cold_job_holds_half_the_machine_while_it_reads_idle() {
-        assert_eq!(cold_hold(1_600, 1_600, RAMP_MS - 1, 10), 1_600);
-        assert_eq!(cold_hold(1_600, 1_600, RAMP_MS, 10), 800);
-        assert_eq!(
-            cold_hold(1_600, 1_600, RAMP_MS, RAMP_IDLE_CPU_PCT),
-            1_600,
-            "busy"
-        );
-        assert_eq!(cold_hold(300, 1_600, RAMP_MS, 10), 300);
-        let c = mac();
-        let cold = |is_cold: bool| Job {
-            started_ms: Some(0),
-            cpu_hold_ms: Some(cpu_hold_ms(None)),
-            cold: is_cold,
-            ..job("cold", 16, 2, State::Running, 0)
-        };
-        let live = Live {
-            cpu_pct: 10,
-            cpu_sustained_pct: 10,
-            ..calm()
-        };
-        let next = job("next", 4, 2, State::Queued, 1);
-        let now = RAMP_MS + 5_000;
-        assert_eq!(
-            evaluate(&next, &[cold(true), next.clone()], &c, &live, now),
-            Decision::Start
-        );
-        assert!(waits(&evaluate(
-            &next,
-            &[cold(false), next.clone()],
-            &c,
-            &live,
-            now
-        )));
-    }
-
-    #[test]
-    fn a_cold_job_never_starts_within_another_cold_jobs_hold() {
-        // A cargo build spends its first 10-30 s on a few cores: two whole-machine cold builds 10 s apart overran the
-        // Mac on 2026-11-20. The half hold lets a mid-size learned waiter in, never a second cold job.
-        let c = mac();
-        let running = Job {
-            started_ms: Some(0),
-            cpu_hold_ms: Some(cpu_hold_ms(None)),
-            cold: true,
-            ..job("cold", 16, 2, State::Running, 0)
-        };
-        let live = Live {
-            cpu_pct: 10,
-            cpu_sustained_pct: 10,
-            ..calm()
-        };
-        let second = Job {
-            cold: true,
-            ..job("second", 16, 2, State::Queued, 1)
-        };
-        for now in [RAMP_MS, RAMP_MS + 5_000, CPU_FALLBACK_HOLD_MS - 1] {
-            let d = evaluate(&second, &[running.clone(), second.clone()], &c, &live, now);
-            assert!(waits(&d), "{now} ms: {d:?}");
-        }
-        assert_eq!(
-            evaluate(
-                &second,
-                &[running.clone(), second.clone()],
-                &c,
-                &live,
-                CPU_FALLBACK_HOLD_MS
-            ),
-            Decision::Start
-        );
-        let mid = job("mid", 8, 2, State::Queued, 1);
-        assert_eq!(
-            evaluate(&mid, &[running, mid.clone()], &c, &live, RAMP_MS + 5_000),
-            Decision::Start
-        );
-    }
-
     #[test]
     fn a_learned_vram_reservation_is_netted_against_live_use() {
         // 2026-11-21 on the rig: learned 1.9G reservations held for the whole run kept waiters on "vram" for 14 minutes
@@ -5523,7 +1931,7 @@ mod tests {
             )],
             ..calm()
         };
-        let late = CPU_MAX_HOLD_MS + MEM_DECAY_MS;
+        let late = VRAM_HOLD_MS + MEM_DECAY_MS;
         assert_eq!(vram_reserved(&[&run(false)], &live, late), G);
         assert_eq!(vram_reserved(&[&run(true)], &live, late), 5 * G);
         assert_eq!(vram_reserved(&[&run(false)], &live, 5_000), 5 * G);
@@ -5559,5 +1967,199 @@ mod tests {
         assert_eq!(sustained_level(&burst), 800);
         // Shorter than the window: the mean of the run.
         assert_eq!(sustained_level(&[(0, 100), (500, 300)]), 200);
+    }
+
+    fn started(id: &str, cpu: u32, at: i64) -> Job {
+        Job {
+            started_ms: Some(at),
+            ..job(id, cpu, 1, State::Running, at)
+        }
+    }
+
+    fn on_mac(pct: u64) -> Live {
+        Live {
+            cpu_pct: pct,
+            cpu_sustained_pct: pct,
+            ..calm()
+        }
+    }
+
+    #[test]
+    fn jobs_start_while_the_machine_reads_under_the_cpu_line() {
+        // A long-running job whatever its learned peak: only the measured CPU counts once it has settled.
+        let run = started("r", 16, 0);
+        let me = job("w", 16, 1, State::Queued, 1);
+        let jobs = [run, me.clone()];
+        let at = |pct| evaluate(&me, &jobs, &mac(), &on_mac(pct), 60_000);
+        assert_eq!(at(CPU_ADMIT_PCT - 1), Decision::Start);
+        assert!(matches!(
+            at(CPU_ADMIT_PCT),
+            Decision::Wait {
+                block: Block::Cpu,
+                live: true,
+                ..
+            }
+        ));
+        // The sustained reading counts too: a dip between spikes does not admit.
+        let dip = Live {
+            cpu_pct: 20,
+            cpu_sustained_pct: 85,
+            ..calm()
+        };
+        assert!(waits(&evaluate(&me, &jobs, &mac(), &dip, 60_000)));
+    }
+
+    #[test]
+    fn a_new_job_settles_before_its_size_is_trusted_to_the_measured_cpu() {
+        // A 16-core job that started 2 s ago reads 1 core: the 80% line (12.8 cores) has no room for another big one
+        // until it settles, and the waiter sleeps until exactly then.
+        let run = started("r", 16, 0);
+        let live = Live {
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: 100,
+                    mem: G,
+                    vram: 0,
+                },
+            )],
+            ..on_mac(10)
+        };
+        let me = job("w", 8, 1, State::Queued, 1);
+        let jobs = [run, me.clone()];
+        assert_eq!(
+            evaluate(&me, &jobs, &mac(), &live, 2_000),
+            Decision::Wait {
+                reason: "cpu: jobs that just started are settling; 24.60 cores with theirs, 12.80 under the 80% line"
+                    .into(),
+                live: true,
+                block: Block::Ramp,
+                ramp_end_ms: Some(SETTLE_MS),
+            }
+        );
+        assert_eq!(
+            evaluate(&me, &jobs, &mac(), &live, SETTLE_MS),
+            Decision::Start
+        );
+    }
+
+    #[test]
+    fn small_jobs_fit_beside_settling_ones() {
+        // Two 2-core jobs just started on an idle Mac: 1.6 + 2 + 2 + 2 cores is under the 12.8-core line.
+        let jobs = [
+            started("a", 2, 0),
+            started("b", 2, 0),
+            job("w", 2, 1, State::Queued, 1),
+        ];
+        assert_eq!(
+            evaluate(&jobs[2], &jobs, &mac(), &on_mac(10), 1_000),
+            Decision::Start
+        );
+        // A not-yet-stamped job settles too (it holds its full size).
+        let unstamped = Job {
+            started_ms: None,
+            ..started("c", 12, 0)
+        };
+        let jobs = [unstamped, job("w", 2, 1, State::Queued, 1)];
+        let d = evaluate(&jobs[1], &jobs, &mac(), &on_mac(10), 1_000);
+        assert!(
+            matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(t), .. } if t == 1_000 + SETTLE_MS),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn the_oldest_waiter_that_can_start_goes_first() {
+        let run = started("r", 1, 0);
+        let head = job("h", 4, 1, State::Queued, 1);
+        let next = job("n", 1, 1, State::Queued, 2);
+        let jobs = [run, head.clone(), next.clone()];
+        let d = evaluate(&next, &jobs, &mac(), &on_mac(10), 60_000);
+        assert!(
+            matches!(
+                d,
+                Decision::Wait {
+                    block: Block::Queue,
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+        assert_eq!(
+            evaluate(&head, &jobs, &mac(), &on_mac(10), 60_000),
+            Decision::Start
+        );
+    }
+
+    #[test]
+    fn a_settle_blocked_head_holds_the_ones_behind_it_until_the_settle_ends() {
+        // A big head waits for a fresh job to settle; a small follower that would fit now must not take its room.
+        let run = started("r", 8, 50_000);
+        let head = job("h", 8, 1, State::Queued, 1);
+        let next = job("n", 1, 1, State::Queued, 2);
+        let jobs = [run, head, next.clone()];
+        let d = evaluate(&next, &jobs, &mac(), &on_mac(10), 52_000);
+        assert!(
+            matches!(d, Decision::Wait { block: Block::Queue, ramp_end_ms: Some(t), .. } if t == 50_000 + SETTLE_MS),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn a_cpu_blocked_head_does_not_hold_the_queue_but_a_long_memory_wait_does() {
+        let run = Job {
+            started_ms: Some(0),
+            ..job("r", 1, 40, State::Running, 0)
+        };
+        let live = Live {
+            per_job: vec![(
+                "r".into(),
+                Usage {
+                    cpu: 100,
+                    mem: 40 * G,
+                    vram: 0,
+                },
+            )],
+            ..on_mac(85)
+        };
+        // At 85% both wait on the CPU line; the follower names its own reason, not the queue.
+        let head = job("h", 1, 1, State::Queued, 1);
+        let next = job("n", 1, 1, State::Queued, 2);
+        let d = evaluate(
+            &next,
+            &[run.clone(), head, next.clone()],
+            &mac(),
+            &live,
+            60_000,
+        );
+        assert!(
+            matches!(
+                d,
+                Decision::Wait {
+                    block: Block::Cpu,
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+        // A head blocked on memory: small followers pass it for 5 minutes, then the queue holds for it.
+        let calm_cpu = Live {
+            cpu_pct: 10,
+            cpu_sustained_pct: 10,
+            ..live
+        };
+        let big = job("h", 1, 30, State::Queued, 1);
+        let jobs = [run, big, next.clone()];
+        assert_eq!(
+            evaluate(&next, &jobs, &mac(), &calm_cpu, 60_000),
+            Decision::Start
+        );
+        assert!(matches!(
+            evaluate(&next, &jobs, &mac(), &calm_cpu, 1 + QUEUE_PASS_MS),
+            Decision::Wait {
+                block: Block::Queue,
+                ..
+            }
+        ));
     }
 }

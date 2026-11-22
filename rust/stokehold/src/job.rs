@@ -113,10 +113,6 @@ pub enum State {
 
 /// One JSON file per job in the state dir.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent serialized flags of a job file, read by older and newer versions"
-)]
 pub struct Job {
     pub id: String,
     pub pid: u32,
@@ -139,38 +135,6 @@ pub struct Job {
     /// `None` when unknown (cold, or history from before 0.4.2).
     #[serde(default)]
     pub mem_peak_at_ms: Option<i64>,
-    /// A learned or declared CPU size: how long (ms after the start) its peak cores are held while they have not shown
-    /// up in the job's live use (`admit::cpu_hold_ms`). `None` only for job files from before 0.4.3 (cold jobs hold the whole machine for the fallback time): the
-    /// short `admit::RAMP_MS` ramp hold.
-    #[serde(default)]
-    pub cpu_hold_ms: Option<i64>,
-    /// Set by the running job itself once its CPU has plateaued past its learned slowest time to peak (`admit::cpu_plateaued`):
-    /// it has shown its real use, so its CPU hold is released early.
-    #[serde(default)]
-    pub cpu_settled: bool,
-    /// Centi-cores of other programs' CPU (not heavy jobs) when this job started: a Docker/VM job's hold is netted only
-    /// against the rise above it, so unrelated apps and always-on containers do not cancel the hold.
-    #[serde(default)]
-    pub non_heavy_cpu_at_start: u64,
-    /// Learned short and small (`admit::fast_lane_eligible`): it may start in the bounded fast lane past CPU room and
-    /// the queue (`admit::fast_lane`).
-    #[serde(default)]
-    pub fast: bool,
-    /// The learned sustained CPU level (centi-cores) of recent runs, each their best 10 s mean, picked like the peak
-    /// (`admit::sustained_level`). Past `admit::SUSTAINED_FULL_MS` the job holds at most this, and as a waiter it
-    /// projects at most this (`admit::projected_peak`). `None` for cold, declared (`--cpu`) and Docker/VM sizes, and
-    /// job files from before 0.4.8.
-    #[serde(default)]
-    pub cpu_sustained: Option<u64>,
-    /// The learned p90 run time (ms) of this very command (`history::Defaults::run_p90_ms`). A waiter bigger than tiny
-    /// passes a blocked head only when this ends within the head's backfill time (`admit::evaluate`); `None` (cold,
-    /// pooled history, job files from before 0.4.8) never backfills unless tiny.
-    #[serde(default)]
-    pub run_p90_ms: Option<u64>,
-    /// Cold: no history and no declared `--cpu`, so it holds the whole machine (`admit::cold_hold` shrinks that hold
-    /// on an idle machine past `admit::RAMP_MS`). False for job files from before 0.4.9.
-    #[serde(default)]
-    pub cold: bool,
     /// The VRAM size was declared (`--vram`): its unused part is held for the whole run (`admit::vram_reserved`).
     #[serde(default)]
     pub vram_declared: bool,
