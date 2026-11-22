@@ -373,12 +373,12 @@ fn write_timeline(o: &mut String, buckets: &[Bucket]) {
     }
 }
 
-#[must_use]
 /// `(p50, p95)` as `41% / 88%`, or `-`.
 fn pair_pct(p: Option<(u64, u64)>) -> String {
     p.map_or_else(|| "-".to_string(), |(a, b)| format!("{a}% / {b}%"))
 }
 
+#[must_use]
 pub fn render_text(r: &Report) -> String {
     let mut o = String::new();
     let _ = writeln!(

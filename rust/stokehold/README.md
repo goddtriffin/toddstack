@@ -41,8 +41,8 @@ All of these must hold:
 
 - VRAM reservations: the running jobs' VRAM plus this request are at most 90% of capacity. RAM has no reservation sum
   (see Memory headroom). Since 0.4.9 each running job counts its live VRAM plus the unused part of its reservation: a
-  declared (`--vram`) size holds that part for the whole run, a learned one like a learned memory size (until its
-  learned time to peak, then it decays over 1 minute). Before, the plain sum held for the whole run, and on the rig
+  declared (`--vram`) size holds that part for the whole run, a learned one for 2 minutes (the longest CPU hold, not
+  memory's time to peak, so a GPU job that allocates late keeps it), then it decays over 1 minute. Before, the plain sum held for the whole run, and on the rig
   waiters waited 14 minutes on "vram" at 37% CPU with the GPU at 1.8 of 10G.
 - CPU headroom: `95% of all cores - max(instant use, sustained use)` leaves one free core (90% before 0.4.5; Todd wants
   the machine about 95% hot). Instant use is non-heavy
@@ -54,8 +54,8 @@ All of these must hold:
   pinned machine, and is not free CPU. A job with a learned (or `--cpu`) size holds its peak cores until that peak shows
   in its live use (3/4 of it) or its learned time to peak passes (history records when the CPU first reached 3/4 of its
   peak; the slowest recent ramp plus 25%, at least 10 s, at most 2 min, 30 s when unknown), the same way a learned memory size is held (a cold job holds the whole machine for 30 s; since 0.4.9 only half of it after the first 10 s while the machine reads
-  under 50% busy, so cold jobs still start at least 10 s apart but a waiter need not sit out the whole 30 s behind one
-  that shows next to nothing). The unrealized part of a hold reserves the CPU band except a backfill share (2 cores, or 1/8 of the machine): a waiter of that size or smaller still starts beside a held peak while the machine reads idle. So a
+  under 50% busy, so a mid-size learned waiter need not sit out the whole 30 s behind one that shows next to nothing; a
+  cold waiter always sees the whole hold, so two cold jobs never start within 30 s of each other). The unrealized part of a hold reserves the CPU band except a backfill share (2 cores, or 1/8 of the machine): a waiter of that size or smaller still starts beside a held peak while the machine reads idle. So a
   burst of builds starts one at a time as their peaks show (0.4.3: in 0.4.2 holds ended after 10 s, or after 3 s on a
   machine reading under 50%, so several 16-core cargo builds started before their CPU showed and the Mac sat at 95-100%
   CPU with load1 up to 184). Docker/VM jobs (their CPU never shows in the tree) hold their whole peak for their
@@ -89,10 +89,11 @@ All of these must hold:
   sustained level), applied to the picked peak: a fresh cached 1-core run cannot shrink a 14-core command's level. A
   running job holds its full learned peak until its learned time to peak plus margin (at least 10 s), then at most
   that sustained level, and never less than it for the whole run: a bursty job's later spikes stay reserved. Since
-  0.4.9 only the largest running floor above its live use is reserved (one spike in reserve), not every one: with
-  0.4.8 three `make lint` runs (floors 6.5-8 cores, 1.3-2.2 cores used each) reserved 20 cores on the 16-core Mac at
-  41-73% busy, and the rig (floors 10-14 cores, 1.3 used) idled 82% of the time jobs waited. The pinned (98%) and load
-  guards stop a start onto spikes that do coincide. Learned peaks are the highest 500 ms sample: `make lint
+  0.4.9 the largest running floor above its live use is reserved in full and half of each other one, not every one
+  whole: with 0.4.8 three `make lint` runs (floors 6.5-8 cores, 1.3-2.2 cores used each) reserved 20 cores on the
+  16-core Mac at 41-73% busy, and the rig (floors 10-14 cores, 1.3 used) idled 82% of the time jobs waited. Three
+  running reserve two whole spikes, so the Mac runs three lint-shaped jobs and a fourth waits (reserving only the
+  largest let four admit a fifth, and two coinciding spikes then took 17.5 of 16 cores). Learned peaks are the highest 500 ms sample: `make lint
   test-changed` learned 10-11 cores (a spike about 15 s in) and averaged 1.2 cores over a 23-minute run, so its hold
   and its projected peak kept 6-core waiters out on a machine 20-40% busy. Cold, `--cpu` declared and Docker/VM sizes
   (whose CPU shows outside the tree) have no sustained level and keep the full peak.
@@ -153,7 +154,9 @@ Short small jobs (0.4.9): a job of at most the backfill share of cores, 1/32 of 
 with a learned p90 run time of at most 5 minutes passes a head blocked on CPU room or a ramp hold past those 5
 minutes too, up to 30 minutes of the head's wait, if it fits by its own checks. The short small jobs running and it
 together take at most the backfill share of cores, so they keep at most 2 cores (1/8 of the machine) from the head at
-any time, each for minutes. On 2026-11-22 the Mac idled 4h40m on "queue" in 10h30m of waiting: 1-2 core jobs waited
+any time, each for minutes. It passes a head on CPU room only while the head would still wait with the short small jobs
+running gone, and a head on a ramp hold only if it does not move the head's start later, so a stream of them never
+keeps the head waiting on themselves. On 2026-11-22 the Mac idled 4h40m on "queue" in 10h30m of waiting: 1-2 core jobs waited
 behind 11-core `make lint` heads that had waited over 5 minutes.
 
 Fast lane (0.4.7): a job whose own recent runs (at least 2 of this very command, never the pooled program tier) all
