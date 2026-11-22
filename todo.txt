@@ -1,0 +1,21 @@
+toddstack-renderer v0 (rust/toddstack_renderer). Delete this file in the final commit.
+
+Baseline (boggledygook PR #348, docs/renderer-arena.md): wgpu 30.0.2 on Metal vs tiny-skia, board scene 800x520.
+Budget vs CPU: >1 level <=2% of pixels, >8 <=0.6%, >32 <=0.05%, max <=48. Arena measured 0.909% / 0.258% / 0% / 31.
+Not runnable on this Mac (stay untested): Vulkan, DX12, GLES, WebGL2, WebGPU in a browser unless a Chrome run is possible.
+
+[ ] crate skeleton in the workspace, lints as the other crates, deps pinned
+[ ] Scene + primitives: rect, rounded rect, line (capsule), text (shared glyph atlas)
+[ ] CPU backend (tiny-skia), the pixel reference
+[ ] wgpu backend + backend selection chain + capabilities report
+[ ] custom batches: instance data as storage buffer or data texture, partial updates, CPU closure
+[ ] compute Kernel: compute -> fragment -> CPU fallbacks, readback
+[ ] parity test: each available GPU backend vs CPU on the board scene, inside the budget
+[ ] example: dice board (GPU + CPU PNG)
+[ ] example: bar/line chart (GPU + CPU PNG)
+[ ] example: 1000x1000 grid via custom batch (GPU + CPU PNG)
+[ ] example: nearest-palette quantize kernel (compute, fragment, CPU PNGs)
+[ ] wasm build + tiny TS wrapper + minimal web example page; wasm size raw + brotli
+[ ] README: API, fallback chain, demos, how to run
+[ ] clippy clean (workspace lints) and tests green via stokehold
+[ ] not in v0 (documented): image quads, paths/fills, direct-to-canvas surface
