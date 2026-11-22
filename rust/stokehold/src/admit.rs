@@ -3,7 +3,7 @@
 //! CPU is closed-loop (0.4.10): a job starts while the machine's measured CPU (`Live::cpu_sustained_pct`, the larger
 //! of the latest reading and the mean of the last `BUSY_WINDOW_MS`) is under `CPU_ADMIT_PCT`. A job's learned or
 //! declared CPU size counts only while it settles: for `settle_window_ms` after a start (10 s, or the learned time to
-//! its CPU peak, at most 60 s; 30 s for cold and Docker/VM jobs) the machine has not shown that job's CPU yet, so
+//! its CPU peak, at most 60 s; 15 s for cold and 30 s for Docker/VM jobs) the machine has not shown that job's CPU yet, so
 //! another job starts then only if the measured CPU, the settling jobs' sizes and its own size together stay under
 //! the admit line. After that only what is measured counts, with two backstops: the measured busy cores plus the new
 //! job's typical cores stay within `SIZE_PCT` of the machine, and the running jobs' expected peaks stay within
@@ -75,10 +75,14 @@ pub const CPU_ADMIT_PCT: u64 = 80;
 /// For at least this long after a start the machine has not shown the new job's CPU yet: it is settling
 /// (`Block::Ramp`). A job settles for `settle_window_ms`.
 pub const SETTLE_MS: i64 = 10_000;
-/// A cold job (no history) or a Docker/VM job settles at least this long. Cold `cargo build`s spend 30-60 s fetching
-/// crates or waiting on a build-dir lock, and `docker build`s pull images, before they compile: with a 10 s settle a
-/// herd of them started 10 s apart and then all compiled at once (load about 120 on 16 cores, 2026-11-19).
-pub const SETTLE_COLD_MS: i64 = 30_000;
+/// A cold job (no history) settles at least this long. Cold `cargo build`s spend 30-60 s fetching crates or waiting
+/// on a build-dir lock before they compile: with a 10 s settle a herd of them started 10 s apart and then all compiled
+/// at once (load about 120 on 16 cores, 2026-11-19). 15 s spaces them out; the backstop against a herd is
+/// `PEAK_SUM_CAP`, which counts each cold job at the whole machine for `SETTLE_MAX_MS`, so at most two start a minute.
+pub const SETTLE_COLD_MS: i64 = 15_000;
+/// A Docker/VM job settles at least this long: its work runs in the VM, outside its process tree, so its own CPU never
+/// shows and it cannot stop settling early. `docker build`s pull images for tens of seconds before they compile.
+pub const SETTLE_VM_MS: i64 = 30_000;
 /// No job settles longer than this, however late its learned peak.
 pub const SETTLE_MAX_MS: i64 = 60_000;
 /// The expected peaks (`Job::weights.cpu`: learned peak, `--cpu`, or the whole machine when cold) of the running jobs
@@ -543,11 +547,14 @@ fn measured_pct(live: &Live) -> u64 {
     live.cpu_pct.max(live.cpu_sustained_pct)
 }
 
-/// How long a job settles: `SETTLE_MS`, or `SETTLE_COLD_MS` for a cold (`peak_at_ms` unknown) or Docker/VM job, or
+/// How long a job settles: `SETTLE_MS`, or `SETTLE_VM_MS` for a Docker/VM job, or `SETTLE_COLD_MS` for a cold one
+/// (`peak_at_ms` unknown), or
 /// the learned time to its CPU peak when that is later; at most `SETTLE_MAX_MS`.
 #[must_use]
 pub fn settle_window_ms(vm: bool, peak_at_ms: Option<u64>) -> i64 {
-    let base = if vm || peak_at_ms.is_none() {
+    let base = if vm {
+        SETTLE_VM_MS
+    } else if peak_at_ms.is_none() {
         SETTLE_COLD_MS
     } else {
         SETTLE_MS
@@ -2306,7 +2313,8 @@ mod tests {
         assert_eq!(settle_window_ms(false, Some(45_000)), 45_000);
         assert_eq!(settle_window_ms(false, Some(600_000)), SETTLE_MAX_MS);
         assert_eq!(settle_window_ms(false, None), SETTLE_COLD_MS);
-        assert_eq!(settle_window_ms(true, Some(0)), SETTLE_COLD_MS);
+        assert_eq!(settle_window_ms(true, Some(0)), SETTLE_VM_MS);
+        assert_eq!(settle_window_ms(true, None), SETTLE_VM_MS);
         assert_eq!(settle_window_ms(true, Some(50_000)), 50_000);
     }
 
@@ -2341,12 +2349,13 @@ mod tests {
                 "peak cap broken at {now}"
             );
         }
-        // One start per settle window, and never more than two young whole-machine jobs.
+        // One start per settle window, and never more than two young whole-machine jobs: the third waits on the cap
+        // until the first is `SETTLE_MAX_MS` old.
         assert!(
             starts.windows(2).all(|w| w[1] - w[0] >= SETTLE_COLD_MS),
             "{starts:?}"
         );
-        assert_eq!(&starts[..3], &[0, SETTLE_COLD_MS, 2 * SETTLE_COLD_MS]);
+        assert_eq!(&starts[..3], &[0, SETTLE_COLD_MS, SETTLE_MAX_MS]);
         // The cap alone: two cold builds 40 s and 10 s old already compile at 4 cores each (settled), so a third
         // cold one waits on the 40-core cap until the older one is a minute old; a 1-core job still fits.
         let busy = |id: &str, at: i64| Job {
@@ -2407,15 +2416,15 @@ mod tests {
             per_job: vec![("d".into(), Usage::default())],
             ..on_mac(10)
         };
-        for now in [SETTLE_MS, 20_000, SETTLE_COLD_MS - 1] {
+        for now in [SETTLE_MS, 20_000, SETTLE_VM_MS - 1] {
             let d = evaluate(&me, &jobs, &mac(), &live, now);
             assert!(
-                matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(t), .. } if t == SETTLE_COLD_MS),
+                matches!(d, Decision::Wait { block: Block::Ramp, ramp_end_ms: Some(t), .. } if t == SETTLE_VM_MS),
                 "{now}: {d:?}"
             );
         }
         assert_eq!(
-            evaluate(&me, &jobs, &mac(), &live, SETTLE_COLD_MS),
+            evaluate(&me, &jobs, &mac(), &live, SETTLE_VM_MS),
             Decision::Start
         );
     }

@@ -24,7 +24,7 @@ Cores, RAM, GPU memory and free disk the job needs. Without flags: the median me
 sampled every 0.5 s while the job runs: peak cores at once and peak RSS) from
 `~/.local/state/stokehold/history.jsonl` for the same command and cwd; else for the same command in the same place of
 the same repository (any worktree or clone sharing its git dir, so a fresh agent worktree is not cold); else for the
-same program and first argument there (`make ui-check`, `cargo test`); else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 30 s apart; after one run, history gives the real peak). A request larger than
+same program and first argument there (`make ui-check`, `cargo test`); else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 15 s apart, at most two a minute; after one run, history gives the real peak). A request larger than
 the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
 VRAM is learned only from the job's own use (0.4.7): the machine-wide VRAM in use at its peak minus what was in use
 just before it started (`vram_rise` in history), 0 under 256M. Before 0.4.7 the machine-wide peak itself was learned,
@@ -72,12 +72,12 @@ All of these must hold (a job with nothing running needs only the guards and the
   different times (counting every running job's peak replayed the Mac's 2026-11-21 day at 12% in band).
 - Settle: a job that started less than its settle window ago (or has not yet stamped its start) is settling: its CPU
   has not shown yet. The window is 10 s, or the learned time to its CPU peak when later, at most 60 s; cold jobs
-  (no history) and Docker/VM jobs settle at least 30 s (cold `cargo build`s fetch crates and `docker build`s pull
-  images before they compile). A job past 10 s that already uses its typical cores shows in the measurement and
+  (no history) settle at least 15 s and Docker/VM jobs at least 30 s (cold `cargo build`s fetch crates and `docker
+  build`s pull images before they compile; the peak cap keeps a herd to two cold jobs a minute). A job past 10 s that already uses its typical cores shows in the measurement and
   stops settling early.
   While any job settles, a new job starts only if the measured CPU, plus each settling job's size (learned peak,
   `--cpu`, or the whole machine when cold) minus its live use, plus the new job's own size fit under the 80% line.
-  So small jobs still start beside a fresh build, two cold jobs start at least 30 s apart, and a burst of big builds
+  So small jobs still start beside a fresh build, two cold jobs start at least 15 s apart, and a burst of big builds
   starts one per settle as each one's CPU shows in the measurement. A waiter held by the settle sleeps until the first
   settle ends. Once a job has settled, only the measurement, the size check and the peak cap count it.
 - Pinned CPU: nothing starts, a job alone included, while any shared CPU reading in the last 10 s is 98% busy or more.

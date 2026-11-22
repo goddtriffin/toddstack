@@ -5,7 +5,7 @@ Earlier releases are described in the git history and the README.
 ## 0.4.10
 
 - Closed-loop admission: a job starts while the measured CPU is under 80%. Learned peak and floor reservations are gone.
-- A job settles for 10 s, or its learned time to CPU peak (at most 60 s); cold and Docker/VM jobs for at least 30 s.
+- A job settles for 10 s, or its learned time to CPU peak (at most 60 s); cold jobs for at least 15 s, Docker/VM jobs 30 s.
   A job that already uses its typical cores stops settling after 10 s.
 - Size check: measured busy cores plus the new job's typical cores stay within 95% of the cores.
 - Peak cap: the expected peaks of jobs started in the last 60 s stay within 2.5 x cores.
