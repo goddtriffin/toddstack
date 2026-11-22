@@ -115,3 +115,49 @@ fn ceilings_come_from_a_shared_json_file() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const CHECK: &str = "[check]\nbuiltin = [\"budgets.sizes\"]\n";
+
+#[test]
+fn check_fails_on_an_unbuilt_artifact_and_skip_unbuilt_passes_it() {
+    let dir = repo("check", &format!("{HEAD}{CHECK}{SIZES}"), None);
+    let o = run(&dir, &["check"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(text(&o).contains("not built"), "{}", text(&o));
+    let o = run(&dir, &["check", "--skip-unbuilt"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_json_gives_the_reason_for_an_unbuilt_artifact() {
+    let dir = repo("checkjson", &format!("{HEAD}{CHECK}{SIZES}"), None);
+    let o = run(&dir, &["check", "--skip-unbuilt", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    let json = std::fs::read_to_string(dir.join("target/shakedown/summary.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let row = v["budgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["label"] == "ios raw")
+        .unwrap();
+    assert_eq!(row["status"], "skipped");
+    assert_eq!(row["reason"], "ios/App not built");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_ambiguous_glob_is_not_an_unbuilt_artifact() {
+    let toml =
+        format!("{HEAD}[budgets.sizes]\n\"web raw\" = {{ file = \"web/a.*.js\", raw = 2000 }}\n");
+    let dir = repo("glob", &toml, None);
+    std::fs::write(dir.join("web/a.1.js"), "x").unwrap();
+    std::fs::write(dir.join("web/a.2.js"), "x").unwrap();
+    let o = run(&dir, &["budgets", "sizes", "--skip-unbuilt"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(text(&o).contains("could not be measured"), "{}", text(&o));
+    assert!(!text(&o).contains("not built"), "{}", text(&o));
+    assert!(!text(&o).contains("use --skip-unbuilt"), "{}", text(&o));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -68,10 +68,13 @@ pub fn failure(rows: &[Row], skip_unbuilt: bool) -> Option<String> {
     };
     if over > 0 {
         Some(format!("{over} over budget"))
-    } else if skipped + unbuilt > 0 {
+    } else if skipped > 0 {
         Some(format!(
-            "{} not built (a skipped artifact is never a pass; --skip-unbuilt or [budgets].skip_unbuilt skips the missing ones)",
-            skipped + unbuilt
+            "{skipped} could not be measured (a skipped artifact is never a pass; fix the file or glob)"
+        ))
+    } else if unbuilt > 0 {
+        Some(format!(
+            "{unbuilt} not built (--skip-unbuilt or [budgets].skip_unbuilt skips the missing ones)"
         ))
     } else {
         None
@@ -278,6 +281,18 @@ mod tests {
                 .contains("not built")
         );
         assert!(failure(&rows[..2], true).unwrap().contains("over budget"));
+        let broken = Row {
+            label: "d".into(),
+            verdict: Verdict::Skipped("a.*.js matches 2 files".into()),
+        };
+        for skip in [false, true] {
+            let why = failure(&[rows[0].clone(), broken.clone()], skip).unwrap();
+            assert!(why.contains("could not be measured"), "{why}");
+            assert!(
+                !why.contains("--skip-unbuilt") && !why.contains("not built"),
+                "{why}"
+            );
+        }
         assert_eq!(failure(&[rows[0].clone(), rows[2].clone()], true), None);
         assert!(failure(&[rows[0].clone(), rows[2].clone()], false).is_some());
         assert!(
