@@ -24,7 +24,8 @@ buffers, limits) report what you got.
 
 A CPU-type adapter (a software Vulkan) is skipped: the tiny-skia path is the one CPU renderer.
 `Options { force, data_texture }` pins a backend; `Options::from_env()` reads `WGPU_BACKEND`
-(`vulkan|dx12|metal|gl|cpu`). Tested here: Metal, CPU. Untested: Vulkan, DX12, GLES, WebGPU, WebGL2.
+(`vulkan|dx12|metal|gl|cpu`). Tested (Apple M3 Max): Metal, CPU. Untested: Vulkan, DX12, GLES, WebGPU and WebGL2 in a browser (the web
+build compiles; no browser run yet). `x86_64-pc-windows-gnu` is clippy-checked, not linked or run.
 
 ## API
 
@@ -85,5 +86,6 @@ rust/toddstack_renderer/web/build.sh        # wasm + glue (web/pkg) + example bu
 deno run -A jsr:@std/http/file-server rust/toddstack_renderer/web   # then open /index.html
 ```
 
-`web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
+The wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,225,963 bytes
+raw, 689,062 bytes brotli. `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
 `demo`, `resize`, `render`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend.

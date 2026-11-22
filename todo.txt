@@ -4,18 +4,20 @@ Baseline (boggledygook PR #348, docs/renderer-arena.md): wgpu 30.0.2 on Metal vs
 Budget vs CPU: >1 level <=2% of pixels, >8 <=0.6%, >32 <=0.05%, max <=48. Arena measured 0.909% / 0.258% / 0% / 31.
 Not runnable on this Mac (stay untested): Vulkan, DX12, GLES, WebGL2, WebGPU in a browser unless a Chrome run is possible.
 
-[ ] crate skeleton in the workspace, lints as the other crates, deps pinned
-[ ] Scene + primitives: rect, rounded rect, line (capsule), text (shared glyph atlas)
-[ ] CPU backend (tiny-skia), the pixel reference
-[ ] wgpu backend + backend selection chain + capabilities report
-[ ] custom batches: instance data as storage buffer or data texture, partial updates, CPU closure
-[ ] compute Kernel: compute -> fragment -> CPU fallbacks, readback
-[ ] parity test: each available GPU backend vs CPU on the board scene, inside the budget
-[ ] example: dice board (GPU + CPU PNG)
-[ ] example: bar/line chart (GPU + CPU PNG)
-[ ] example: 1000x1000 grid via custom batch (GPU + CPU PNG)
-[ ] example: nearest-palette quantize kernel (compute, fragment, CPU PNGs)
-[ ] wasm build + tiny TS wrapper + minimal web example page; wasm size raw + brotli
-[ ] README: API, fallback chain, demos, how to run
+[x] crate skeleton in the workspace, lints as the other crates, deps pinned
+[x] Scene + primitives: rect, rounded rect, line (capsule), text (shared glyph atlas)
+[x] CPU backend (tiny-skia), the pixel reference
+[x] wgpu backend + backend selection chain + capabilities report
+[x] custom batches: instance data as storage buffer or data texture, partial updates, CPU closure
+[x] compute Kernel: compute -> fragment -> CPU fallbacks, readback
+[x] parity test: each available GPU backend vs CPU on the board scene, inside the budget
+[x] example: dice board (GPU + CPU PNG)
+[x] example: bar/line chart (GPU + CPU PNG)
+[x] example: 1000x1000 grid via custom batch (GPU + CPU PNG)
+[x] example: nearest-palette quantize kernel (compute, fragment, CPU PNGs)
+[x] wasm build + tiny TS wrapper + minimal web example page; wasm size raw + brotli
+[x] README: API, fallback chain, demos, how to run
 [ ] clippy clean (workspace lints) and tests green via stokehold
 [ ] not in v0 (documented): image quads, paths/fills, direct-to-canvas surface
+[ ] run the web example in a real browser (WebGPU, WebGL2): denied here, Todd or the rig
+[ ] Vulkan, DX12, GLES runs: the rig (Windows, RTX 3080)
