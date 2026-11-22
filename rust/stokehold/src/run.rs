@@ -424,7 +424,7 @@ fn exit_code(status: ExitStatus) -> i32 {
 pub const VRAM_NOISE: u64 = 256 << 20;
 
 /// The job's own VRAM from the machine-wide numbers: the peak minus what was in use just before it started, 0 when
-/// that is under `VRAM_NOISE`. Other programs that grow while it runs count too, so it errs high, never low.
+/// that is under `VRAM_NOISE`. Other programs that grow while it runs count too (it errs high), but when jobs overlap the peak starts at the baseline, so a rise that began before this job's start is missed (it can err low).
 #[must_use]
 pub fn vram_rise(baseline: u64, peak: u64) -> u64 {
     Some(peak.saturating_sub(baseline))
