@@ -6,16 +6,18 @@ use tiny_skia::Pixmap;
 /// The CPU form of a batch: draws what the WGSL draws, into the target. It is also what runs when
 /// no GPU backend is available.
 pub trait CpuBatch: Send + Sync {
-    /// `data` is the batch's current instance data, `params` its current parameters.
-    fn draw(&self, data: &[u32], params: [f32; 4], target: &mut Pixmap);
+    /// `data` is the batch's current instance data, `instances` how many instances to draw (the
+    /// GPU's `instance_index` runs `0..instances`; it may be below or above the data length), `params`
+    /// its current parameters.
+    fn draw(&self, data: &[u32], instances: u32, params: [f32; 4], target: &mut Pixmap);
 }
 
 impl<F> CpuBatch for F
 where
-    F: Fn(&[u32], [f32; 4], &mut Pixmap) + Send + Sync,
+    F: Fn(&[u32], u32, [f32; 4], &mut Pixmap) + Send + Sync,
 {
-    fn draw(&self, data: &[u32], params: [f32; 4], target: &mut Pixmap) {
-        self(data, params, target);
+    fn draw(&self, data: &[u32], instances: u32, params: [f32; 4], target: &mut Pixmap) {
+        self(data, instances, params, target);
     }
 }
 

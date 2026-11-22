@@ -46,19 +46,39 @@ impl Ctx2d {
         .map_err(|e| Error::Surface(format!("{e:?}")))
     }
 
-    /// Replaces the canvas content with the top-left `w` x `h` of `sheet`, alpha included.
-    pub fn copy_from(&self, sheet: &web_sys::OffscreenCanvas, w: u32, h: u32) -> Result<()> {
+    /// Replaces the canvas content with the top-left `w` x `h` of `sheet`. Transparent keeps the
+    /// sheet's alpha; opaque forces alpha to 255 (the sheet over black), as the other backends do.
+    pub fn copy_from(
+        &self,
+        sheet: &web_sys::OffscreenCanvas,
+        w: u32,
+        h: u32,
+        opaque: bool,
+    ) -> Result<()> {
         let (w, h): (f64, f64) = (f64::from(w), f64::from(h));
+        let op: &str = if opaque { "source-over" } else { "copy" };
         match self {
             Self::Html(c) => {
-                c.set_global_composite_operation("copy")
+                if opaque {
+                    c.set_global_composite_operation("copy")
+                        .map_err(|e| Error::Surface(format!("{e:?}")))?;
+                    c.set_fill_style_str("#000");
+                    c.fill_rect(0.0, 0.0, w, h);
+                }
+                c.set_global_composite_operation(op)
                     .map_err(|e| Error::Surface(format!("{e:?}")))?;
                 c.draw_image_with_offscreen_canvas_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
                     sheet, 0.0, 0.0, w, h, 0.0, 0.0, w, h,
                 )
             }
             Self::Offscreen(c) => {
-                c.set_global_composite_operation("copy")
+                if opaque {
+                    c.set_global_composite_operation("copy")
+                        .map_err(|e| Error::Surface(format!("{e:?}")))?;
+                    c.set_fill_style_str("#000");
+                    c.fill_rect(0.0, 0.0, w, h);
+                }
+                c.set_global_composite_operation(op)
                     .map_err(|e| Error::Surface(format!("{e:?}")))?;
                 c.draw_image_with_offscreen_canvas_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
                     sheet, 0.0, 0.0, w, h, 0.0, 0.0, w, h,

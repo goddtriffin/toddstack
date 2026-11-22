@@ -171,6 +171,10 @@ impl PathPipes {
 
 /// The multisampled layer paths are drawn into, its resolve, and the stencil.
 pub struct Layer {
+    /// The layer's size in target pixels; frames up to this size draw in its top-left.
+    pub size: (u32, u32),
+    /// Layer pixels per target pixel (2, or 1 for a target past half the texture limit).
+    scale: u32,
     msaa: wgpu::TextureView,
     depth_stencil: wgpu::TextureView,
     resolve: wgpu::TextureView,
@@ -215,6 +219,8 @@ impl Layer {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         Self {
+            size: (w, h),
+            scale,
             msaa: view(&msaa),
             depth_stencil: view(&ds),
             resolve: view(&resolve),
@@ -222,10 +228,24 @@ impl Layer {
         }
     }
 
-    /// Draws `ranges` of `verts` into the layer (cleared transparent) and resolves it.
+    /// The part of the layer a `frame`-sized target covers, as texture coordinates `[0, 0, u, v]`.
+    #[expect(clippy::cast_precision_loss, reason = "sizes are far below 2^23")]
+    pub fn uv(&self, frame: (u32, u32)) -> [f32; 4] {
+        [
+            0.0,
+            0.0,
+            frame.0 as f32 / self.size.0 as f32,
+            frame.1 as f32 / self.size.1 as f32,
+        ]
+    }
+
+    /// Draws `ranges` of `verts` into the top-left of the layer for a `frame`-sized target (the
+    /// layer is cleared transparent) and resolves it.
+    #[expect(clippy::cast_precision_loss, reason = "sizes are far below 2^23")]
     pub fn draw(
         &self,
         enc: &mut wgpu::CommandEncoder,
+        frame: (u32, u32),
         pipes: &PathPipes,
         verts: &wgpu::Buffer,
         ranges: &[PathRange],
@@ -256,6 +276,14 @@ impl Layer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        pass.set_viewport(
+            0.0,
+            0.0,
+            (frame.0 * self.scale) as f32,
+            (frame.1 * self.scale) as f32,
+            0.0,
+            1.0,
+        );
         pass.set_bind_group(0, &pipes.bind, &[]);
         pass.set_vertex_buffer(0, verts.slice(..));
         pass.set_stencil_reference(0);

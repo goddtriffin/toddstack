@@ -66,7 +66,7 @@ target is over half the device's texture limit) that is averaged down and compos
 consecutive paths is one layer pass; text, shapes, images and batches drawn between runs keep paint order.
 
 **Custom batch** (`BatchDesc`): `wgsl` with entry points `vs` and `fs`, a `Vec<u32>` of packed instance data,
-an instance count, and a `CpuBatch` (any `Fn(&[u32], [f32; 4], &mut Pixmap)`). The renderer prepends a
+an instance count, and a `CpuBatch` (any `Fn(&[u32], u32, [f32; 4], &mut Pixmap)`: data, instance count, params, target; draw instances `0..count`, as the GPU's `instance_index` does). The renderer prepends a
 prelude with `globals` (target size, four params), `to_clip(px)` and `data_at(i)`; `data_at` reads a storage
 buffer, or a data texture where storage buffers are missing (WebGL2), so one WGSL runs on both.
 `add_batch` is `async` (see below). `update_batch(id, offset, words)` uploads only that range (a data texture, whole rows holding it); `set_batch_params`, `set_batch_instances` (the count is not checked against the data length: a batch may draw from `instance_index` and `params` alone).
@@ -161,8 +161,8 @@ The `WebRenderer` wasm-bindgen class and the `demo` scenes sit behind the cargo 
 consumers compile neither (the crate is `rlib` only, and `wgpu` is not re-exported). The example, tests and `demo`
 example get the feature through a self dev-dependency; `build.sh` builds `examples/web.rs` as a cdylib.
 
-Sizes: the wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,223,609 bytes
-raw, 690,547 bytes brotli (0.1.0: 2,205,571 and 683,190). `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
+Sizes: the wasm (WebGPU + WebGL2 + CPU, `opt-level z`, `wasm-opt -Oz`, fontdue and tiny-skia included) is 2,225,138 bytes
+raw, 690,792 bytes brotli (0.1.0: 2,205,571 and 683,190). `web/renderer.ts` is the wrapper (`Renderer.create(canvas, { font })`, `begin`, `rrect`, `line`, `text`,
 `demo` (async), `resize`, `render` (presents to the canvas; `{ readback: true }` reads back and `putImageData`s instead); demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend, `?readback=1` times the readback path. `?boards=24` draws 24 transparent board-like tiles with rotated, tinted sprites onto 24 canvases over a CSS gradient on one renderer (`Boards` in `web/renderer.ts`) and prints the median frame time; on an Apple M3 Max in Chrome: WebGPU 1.9 ms, WebGL2 (sheet copy) 2.2 ms, CPU 282 ms per frame of 24 tiles (381 px).
 
 ## Changelog
@@ -175,12 +175,21 @@ Added: `Options::with_transparent`; `Target::device_only`, `Renderer::attach`, `
 
 Breaking:
 
-- `Prim` gained a variant (`Sprite`): exhaustive matches need an arm.
+- `Prim` is now `#[non_exhaustive]` and gained a variant (`Sprite`): matches need a wildcard arm.
+- `CpuBatch::draw` (and the closure form) takes the instance count as its second argument:
+  `Fn(&[u32], u32, [f32; 4], &mut Pixmap)`. Draw instances `0..count`.
 - `Renderer::set_batch_instances` no longer rejects a count above the data length (it returned `BadInput`); it now only
   fails for an unknown batch.
-- `Run`/`Inst` internals changed: an image draw's `Inst.p.x` is now rotation, not opacity (batches never see it).
 - GPU alpha now accumulates (premultiplied "over"): a target cleared to alpha below 255 is no longer left at the clear
-  alpha, and readback is documented premultiplied. Opaque scenes are byte-for-byte unchanged in alpha (255).
-- The CPU canvas `present` unpremultiplies (transparent) or forces alpha 255 (opaque) before `putImageData`.
+  alpha, the clear colour is premultiplied as on the CPU, and readback is documented premultiplied. Opaque scenes are
+  byte-for-byte unchanged in alpha (255).
+- The CPU canvas `present` unpremultiplies (transparent) or forces alpha 255 (opaque) before `putImageData`; the WebGL2
+  sheet copy forces alpha 255 on an opaque target.
 - `Renderer::resize`, `render` and `present` on a `Target::device_only()` renderer return `BadInput`.
-- Wasm grew by 7,357 bytes brotli.
+- `Renderer::attach` returns `BadInput` for a canvas that is already the target or attached.
+- A sprite or image `dst` with a zero or negative width or height draws nothing on every backend.
+
+Notes:
+
+- `Run`/`Inst` internals changed (private): an image draw's `Inst.p.x` is now rotation, not opacity.
+- Wasm grew by 7,602 bytes brotli.

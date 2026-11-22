@@ -224,24 +224,26 @@ pub fn grid_batch(cols: u32, rows: u32) -> BatchDesc {
         wgsl: GRID_WGSL.to_owned(),
         data: grid_tiles(cols, rows),
         instances: cols * rows,
-        cpu: Arc::new(|data: &[u32], params: [f32; 4], pm: &mut Pixmap| {
-            let (cols, t): (u32, u32) = (params[0] as u32, params[1] as u32);
-            let (w, h): (u32, u32) = (pm.width(), pm.height());
-            let px: &mut [u8] = pm.data_mut();
-            for (i, tile) in data.iter().enumerate() {
-                let (cx, cy): (u32, u32) = (i as u32 % cols, i as u32 / cols);
-                let c: [u8; 3] = grid_color(*tile, cx, cy);
-                for dy in 0..t {
-                    for dx in 0..t {
-                        let (x, y): (u32, u32) = (cx * t + dx, cy * t + dy);
-                        if x < w && y < h {
-                            let o: usize = ((y * w + x) * 4) as usize;
-                            px[o..o + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+        cpu: Arc::new(
+            |data: &[u32], instances: u32, params: [f32; 4], pm: &mut Pixmap| {
+                let (cols, t): (u32, u32) = (params[0] as u32, params[1] as u32);
+                let (w, h): (u32, u32) = (pm.width(), pm.height());
+                let px: &mut [u8] = pm.data_mut();
+                for (i, tile) in data.iter().take(instances as usize).enumerate() {
+                    let (cx, cy): (u32, u32) = (i as u32 % cols, i as u32 / cols);
+                    let c: [u8; 3] = grid_color(*tile, cx, cy);
+                    for dy in 0..t {
+                        for dx in 0..t {
+                            let (x, y): (u32, u32) = (cx * t + dx, cy * t + dy);
+                            if x < w && y < h {
+                                let o: usize = ((y * w + x) * 4) as usize;
+                                px[o..o + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+                            }
                         }
                     }
                 }
-            }
-        }),
+            },
+        ),
     }
 }
 

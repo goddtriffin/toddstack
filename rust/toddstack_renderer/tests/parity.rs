@@ -399,7 +399,7 @@ fn paths_fill_non_zero_winding_keep_holes_and_respect_paint_order_on_every_backe
 }
 
 #[test]
-fn batch_input_is_checked_on_the_cpu_backend() {
+fn batch_updates_and_instance_counts_are_range_checked_on_the_cpu_backend() {
     pollster::block_on(async {
         let mut r: Renderer = Renderer::with_options(
             Target::offscreen(8, 8),
@@ -572,7 +572,8 @@ fn a_quarter_turn_moves_the_source_corner_and_a_tint_multiplies_on_every_backend
         );
         s
     };
-    // Only the right texel column, doubled, tinted half-transparent red over white.
+    // Only the bottom-right texel (the source rect [1, 1, 1, 1]), stretched over the whole target,
+    // tinted half-transparent red over white.
     let tinted = |r: &mut Renderer| {
         let id = r
             .add_image(2, 2, &texels, Sampling::Nearest)
@@ -650,4 +651,85 @@ fn surfaces_need_a_canvas_and_a_device_only_renderer_has_no_target_of_its_own() 
         .expect("offscreen renderer");
         assert!(other.attach(Target::offscreen(8, 8)).is_err());
     });
+}
+
+#[test]
+fn a_batch_instance_count_below_the_data_length_draws_that_many_on_every_backend() {
+    let render = |force: Backend| -> Option<Vec<u8>> {
+        pollster::block_on(async {
+            let mut r: Renderer =
+                Renderer::with_options(Target::offscreen(8, 8), Options::new().with_force(force))
+                    .await
+                    .ok()?;
+            let id = r.add_batch(demo::grid_batch(8, 8)).await.expect("batch");
+            r.set_batch_params(id, [8.0, 1.0, 0.0, 0.0])
+                .expect("params");
+            r.set_batch_instances(id, 10).expect("count");
+            let mut s: Scene = Scene::new([255, 255, 255, 255]);
+            s.batch(id);
+            Some(r.render(&s).await.expect("render"))
+        })
+    };
+    let cpu: Vec<u8> = render(Backend::Cpu).expect("cpu");
+    // Rows 2.. are untouched white.
+    assert_eq!(
+        [255; 4],
+        cpu[(2 * 8) * 4..(2 * 8) * 4 + 4],
+        "cpu draws only 10 tiles"
+    );
+    for b in gpu_backends() {
+        let Some(px) = render(b) else { continue };
+        assert_eq!(
+            0.0,
+            Diff::between(&cpu, &px).over_1,
+            "{} differs from the CPU",
+            b.name()
+        );
+    }
+}
+
+#[test]
+fn a_clear_with_partial_alpha_and_colour_is_premultiplied_the_same_on_every_backend() {
+    for clear in [[255_u8, 0, 0, 128], [255, 255, 255, 0], [10, 200, 90, 77]] {
+        let build = |_: &mut Renderer| Scene::new(clear);
+        let cpu: Vec<u8> =
+            render_transparent_on(Backend::Cpu, Target::offscreen(8, 8), build).expect("cpu");
+        for b in gpu_backends() {
+            let Some(px) = render_transparent_on(b, Target::offscreen(8, 8), build) else {
+                continue;
+            };
+            for (g, c) in px.iter().zip(&cpu) {
+                assert!(
+                    g.abs_diff(*c) <= 1,
+                    "{} clear {clear:?}: gpu {g} cpu {c}",
+                    b.name()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_sprite_with_a_zero_or_negative_destination_draws_nothing_on_every_backend() {
+    let build = |r: &mut Renderer| {
+        let id = r
+            .add_image(2, 2, &[255; 16], Sampling::Nearest)
+            .expect("image");
+        let mut s: Scene = Scene::new([0, 0, 0, 255]);
+        s.image_rect(id, [0, 0, 2, 2], [6.0, 6.0, -4.0, -4.0], 0.0, [255; 4]);
+        s.image_rect(id, [0, 0, 2, 2], [2.0, 2.0, 0.0, 4.0], 0.0, [255; 4]);
+        s
+    };
+    let mut all: Vec<Backend> = vec![Backend::Cpu];
+    all.extend(gpu_backends());
+    for b in all {
+        let Some(px) = render_on(b, Target::offscreen(8, 8), build) else {
+            continue;
+        };
+        assert!(
+            px.chunks(4).all(|p| p == [0, 0, 0, 255]),
+            "{} drew something",
+            b.name()
+        );
+    }
 }
