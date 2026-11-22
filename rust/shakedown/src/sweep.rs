@@ -228,6 +228,38 @@ fn out_dir(root: &Path) -> PathBuf {
     root.join("target/shakedown/sweep")
 }
 
+/// The operating system part of a baseline's path: `macos`, `linux` or `windows` (font metrics differ, so each has
+/// its own pictures).
+pub fn os_key() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => "linux",
+    }
+}
+
+/// `<dir>/baseline/<os>/`: where this machine's baseline lives.
+fn baseline_dir(dir: &Path) -> PathBuf {
+    dir.join("baseline").join(os_key())
+}
+
+/// The baseline from before 0.4.3, `<dir>/baseline/<id>.png`. Only macOS reads it (it was always made on a Mac).
+fn legacy_baseline(dir: &Path, id: &str) -> Option<PathBuf> {
+    (os_key() == "macos")
+        .then(|| dir.join("baseline").join(format!("{id}.png")))
+        .filter(|p| p.is_file())
+}
+
+/// This machine's baseline picture for a shot: the per-OS one, or on macOS the old path.
+fn baseline_png(dir: &Path, id: &str) -> Option<PathBuf> {
+    let own = baseline_dir(dir).join(format!("{id}.png"));
+    if own.is_file() {
+        Some(own)
+    } else {
+        legacy_baseline(dir, id)
+    }
+}
+
 fn pack_dir(root: &Path) -> PathBuf {
     root.join("target/shakedown/review")
 }
@@ -463,7 +495,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     if opts.pack {
         let _ = std::fs::remove_dir_all(pack_dir(root));
     }
-    std::fs::create_dir_all(dir.join("baseline")).map_err(|e| io(&e))?;
+    std::fs::create_dir_all(baseline_dir(&dir)).map_err(|e| io(&e))?;
     // Each shot is judged on its own thread the moment it is drawn, while the others are still being drawn.
     let judged: Arc<Mutex<Vec<Result<Judged, Error>>>> = Arc::default();
     let sink: capture::Sink = {
@@ -511,7 +543,13 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     // The run finished whole: only now do new pictures (or all of them, on `--rebase`) become the baseline, so a
     // failed or interrupted run never leaves a half-written one.
     if opts.out.is_none() {
-        keep_baseline(&dir, &records, &pictures, opts.rebase)?;
+        let migrated = keep_baseline(&dir, &records, &pictures, opts.rebase)?;
+        if migrated > 0 {
+            outcome.notes.push(format!(
+                "note: moved {migrated} baseline picture(s) from baseline/ to baseline/{}/ (baselines are per operating system now; on macOS the old path is still read when the new one is missing)",
+                os_key()
+            ));
+        }
     }
     outcome.new = records.iter().filter(|r| r.change == Change::New).count();
     outcome.changed = records.iter().filter(|r| r.change.line().is_some()).count();
@@ -548,13 +586,12 @@ struct Judged {
 /// Writes `current/` and compares with `baseline/` (which is only read here: `keep_baseline` writes it once the
 /// whole run has finished). Shots are independent: this runs for each as soon as it is drawn.
 fn judge_shot(dir: &Path, shot: &Shot) -> Result<Judged, Error> {
-    let (current, baseline, diff) = (dir.join("current"), dir.join("baseline"), dir.join("diff"));
+    let (current, diff) = (dir.join("current"), dir.join("diff"));
     std::fs::create_dir_all(&current).map_err(|e| io(&e))?;
     let (route, device, theme) =
         split_id(&shot.id).ok_or_else(|| Error::Environment(format!("shot id {:?}", shot.id)))?;
     let png = png_of(shot)?;
-    let old_path = baseline.join(format!("{}.png", shot.id));
-    let old = std::fs::read(&old_path).ok();
+    let old = baseline_png(dir, &shot.id).and_then(|p| std::fs::read(p).ok());
     let change = judge(old.as_deref(), &png);
     if !png.is_empty() {
         std::fs::write(current.join(format!("{}.png", shot.id)), &png).map_err(|e| io(&e))?;
@@ -585,26 +622,36 @@ fn judge_shot(dir: &Path, shot: &Shot) -> Result<Judged, Error> {
     })
 }
 
-/// Writes `baseline/`: the pictures that have no baseline yet, or every picture on `rebase`.
+/// Writes `baseline/<os>/`: the pictures that have no baseline yet, or every picture on `rebase`. A picture that
+/// only has the old macOS path is moved over unchanged, so it keeps being the thing later runs compare with.
+/// Returns how many were moved.
 fn keep_baseline(
     dir: &Path,
     records: &[Record],
     pictures: &Pictures,
     rebase: bool,
-) -> Result<(), Error> {
-    let baseline = dir.join("baseline");
+) -> Result<usize, Error> {
+    let baseline = baseline_dir(dir);
     std::fs::create_dir_all(&baseline).map_err(|e| io(&e))?;
+    let mut migrated = 0;
     for r in records {
         let id = format!("{}@{}-{}", r.route, r.device, r.theme);
         let Some(png) = pictures.get(&id).filter(|p| !p.is_empty()) else {
             continue;
         };
         let path = baseline.join(format!("{id}.png"));
-        if rebase || !path.exists() {
+        if rebase || path.exists() {
+            if rebase {
+                std::fs::write(&path, png).map_err(|e| io(&e))?;
+            }
+        } else if let Some(old) = legacy_baseline(dir, &id) {
+            std::fs::copy(old, &path).map_err(|e| io(&e))?;
+            migrated += 1;
+        } else {
             std::fs::write(&path, png).map_err(|e| io(&e))?;
         }
     }
-    Ok(())
+    Ok(migrated)
 }
 
 /// The judged shots as sorted records and the pictures by id.
@@ -655,7 +702,8 @@ fn write_report(
         items.push(PixelFailure {
             id: id.clone(),
             reason: notes.join("; "),
-            reference: file("baseline"),
+            reference: baseline_png(dir, &id)
+                .and_then(|p| p.strip_prefix(dir).ok().map(|r| r.display().to_string())),
             actual: file("current"),
             diff: file("diff"),
             notes,
@@ -882,6 +930,64 @@ mod tests {
             Some(("account-friends", "small-phone-land", "dark"))
         );
         assert_eq!(split_id("nope"), None);
+    }
+
+    #[test]
+    fn baselines_are_per_os_and_macos_migrates_the_old_path() {
+        let d = std::env::temp_dir().join(format!("shakedown-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("baseline")).unwrap();
+        assert!(["macos", "linux", "windows"].contains(&os_key()));
+        let rec = Record {
+            route: "home".into(),
+            device: "phone".into(),
+            theme: "light".into(),
+            findings: Vec::new(),
+            change: Change::New,
+        };
+        let id = "home@phone-light";
+        let pictures: Pictures = [(id.to_string(), b"new".to_vec())].into();
+        // The old path, as 0.4.2 wrote it.
+        std::fs::write(d.join("baseline").join(format!("{id}.png")), b"old").unwrap();
+        let own = baseline_dir(&d).join(format!("{id}.png"));
+        assert!(d.join("baseline").join(os_key()).ends_with(os_key()));
+        if os_key() == "macos" {
+            assert_eq!(
+                baseline_png(&d, id),
+                Some(d.join("baseline").join(format!("{id}.png")))
+            );
+            assert_eq!(
+                keep_baseline(&d, std::slice::from_ref(&rec), &pictures, false).unwrap(),
+                1
+            );
+            assert_eq!(
+                std::fs::read(&own).unwrap(),
+                b"old",
+                "moved unchanged, not replaced by this run"
+            );
+            assert_eq!(baseline_png(&d, id), Some(own.clone()));
+        } else {
+            assert_eq!(
+                baseline_png(&d, id),
+                None,
+                "another OS never reads the Mac baseline"
+            );
+            assert_eq!(
+                keep_baseline(&d, std::slice::from_ref(&rec), &pictures, false).unwrap(),
+                0
+            );
+            assert_eq!(std::fs::read(&own).unwrap(), b"new");
+        }
+        std::fs::write(&own, b"kept").unwrap();
+        keep_baseline(&d, std::slice::from_ref(&rec), &pictures, false).unwrap();
+        assert_eq!(
+            std::fs::read(&own).unwrap(),
+            b"kept",
+            "an existing baseline is left alone"
+        );
+        keep_baseline(&d, &[rec], &pictures, true).unwrap();
+        assert_eq!(std::fs::read(&own).unwrap(), b"new", "--rebase replaces it");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

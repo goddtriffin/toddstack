@@ -29,7 +29,8 @@
       for (const e of l.getEntries()) {
         // hadRecentInput is not consulted: no person is typing, our own actions are judged separately, and mobile
         // emulation marks the shifts of a plain page load as input-driven.
-        S.shifts.push({ value: e.value, sources: e.sources.map((x) => `${name(x.node)} ${box(x.previousRect)} -> ${box(x.currentRect)}`) });
+        const mv = (x) => { const a = x.previousRect, b = x.currentRect; return Math.max(Math.abs(a.left - b.left), Math.abs(a.top - b.top), Math.abs(a.right - b.right), Math.abs(a.bottom - b.bottom)); };
+        S.shifts.push({ value: e.value, max_px: e.sources.length ? Math.max(...e.sources.map(mv)) : null, sources: e.sources.map((x) => `${name(x.node)} ${box(x.previousRect)} -> ${box(x.currentRect)}`) });
       }
     }).observe({ type: 'layout-shift', buffered: true });
   } catch { /* no layout-shift entries: nothing to record */ }
@@ -187,7 +188,8 @@
           if (dec && lines.length) decorEls.push({ e, id });
           nodes.push({
             id, label: label(e), text: own.slice(0, 30), kind, rect: rc(rect), lines, top_lines: topLines,
-            font_size: parseFloat(cs.fontSize) || 0, clipped, decor: dec, scroll_x: sx,
+            font_size: parseFloat(cs.fontSize) || 0, clipped,
+            clip_px: clipped ? Math.max(e.scrollWidth - e.clientWidth, e.scrollHeight - e.clientHeight) : 0, decor: dec, scroll_x: sx,
             inline: kind === 'tap' && tag === 'a' && cs.display === 'inline',
             ignore: ign,
           });

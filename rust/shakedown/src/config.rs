@@ -262,6 +262,10 @@ pub struct Layout {
     /// Opt-outs by CSS selector. Every one needs a reason.
     #[serde(default)]
     pub ignore: Vec<LayoutIgnore>,
+    /// Font metrics differ between operating systems. Clipped text that overflows its box by no more than this many
+    /// px, and a layout shift in which no element moves more, are not findings. Off (0) by default.
+    #[serde(default)]
+    pub text_tolerance_px: f64,
 }
 
 /// One opt-out.
@@ -411,6 +415,47 @@ pub struct Budgets {
     /// Exact byte ceilings per artifact, keyed by label.
     #[serde(default)]
     pub sizes: BTreeMap<String, SizeBudget>,
+    /// A JSON file shared with other tools (boggledygook's `scripts/budgets.json`), from the directory holding
+    /// `shakedown.toml`. Its `"sizes"` object gives ceilings by label: a number, or a full `[budgets.sizes]`
+    /// table as an object. `files` says which artifact each numeric label measures.
+    pub file: Option<String>,
+    /// For a numeric label in `file`: the artifact it measures. The metric is the label's last word when that is
+    /// `raw`, `gzip` or `brotli`, otherwise the plain size (`max`, or the stripped size with `strip = true`).
+    #[serde(default)]
+    pub files: BTreeMap<String, SharedTarget>,
+    /// An artifact that was not built is skipped (a "skipped (not built)" line) instead of failing the budget.
+    /// `budgets sizes --skip-unbuilt` sets it for one run. Off by default.
+    #[serde(default)]
+    pub skip_unbuilt: bool,
+}
+
+/// Where a ceiling from the shared JSON file is measured.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SharedTarget {
+    /// The path, from the repo root.
+    Path(String),
+    /// The path, and whether to measure it after `strip -S -x`.
+    Table(SharedFile),
+}
+
+/// A shared-file target with options.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedFile {
+    /// Path from the repo root; the last component may hold one `*`.
+    pub file: String,
+    /// Measure after `strip -S -x`.
+    #[serde(default)]
+    pub strip: bool,
+}
+
+/// One entry of the shared file's `"sizes"`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SharedSize {
+    Ceiling(u64),
+    Full(SizeBudget),
 }
 
 /// One artifact's ceilings. `file` may hold one `*` in its last component (hashed names).
@@ -468,7 +513,7 @@ impl Config {
         let mut table: toml::Table =
             toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
         merge_includes(&mut table, dir)?;
-        let config: Self = toml::Value::Table(table)
+        let mut config: Self = toml::Value::Table(table)
             .try_into()
             .map_err(|e: toml::de::Error| Error::Config(e.to_string()))?;
         if config.shakedown != tool_version {
@@ -477,8 +522,71 @@ impl Config {
                 config.shakedown, config.shakedown
             )));
         }
+        config.merge_shared_budgets(dir)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Reads `[budgets].file` and adds its ceilings to `[budgets.sizes]`.
+    fn merge_shared_budgets(&mut self, dir: &Path) -> Result<(), Error> {
+        let Some(file) = self.budgets.file.clone() else {
+            if self.budgets.files.is_empty() {
+                return Ok(());
+            }
+            return Err(Error::Config("[budgets.files] needs [budgets].file".into()));
+        };
+        let path = dir.join(&file);
+        let bad = |m: String| Error::Config(format!("[budgets].file {file}: {m}"));
+        let text = std::fs::read_to_string(&path).map_err(|e| bad(e.to_string()))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
+        let sizes: BTreeMap<String, SharedSize> = match json.get("sizes") {
+            Some(v) => {
+                serde_json::from_value(v.clone()).map_err(|e| bad(format!("\"sizes\": {e}")))?
+            }
+            None => return Err(bad("has no \"sizes\" object".into())),
+        };
+        for label in self.budgets.files.keys() {
+            if !sizes.contains_key(label) {
+                return Err(bad(format!(
+                    "[budgets.files] names {label:?}, which \"sizes\" does not have"
+                )));
+            }
+        }
+        for (label, size) in sizes {
+            let budget = match size {
+                SharedSize::Full(b) => b,
+                SharedSize::Ceiling(bytes) => {
+                    // A bare number with no `[budgets.files]` entry is another tool's budget: not measured here.
+                    let Some(target) = self.budgets.files.get(&label) else {
+                        continue;
+                    };
+                    let (file, strip) = match target {
+                        SharedTarget::Path(p) => (p.clone(), false),
+                        SharedTarget::Table(t) => (t.file.clone(), t.strip),
+                    };
+                    let mut b = SizeBudget {
+                        file,
+                        raw: None,
+                        gzip: None,
+                        brotli: None,
+                        strip,
+                        max: None,
+                    };
+                    match label.rsplit(' ').next().unwrap_or("") {
+                        "raw" if !strip => b.raw = Some(bytes),
+                        "gzip" if !strip => b.gzip = Some(bytes),
+                        "brotli" if !strip => b.brotli = Some(bytes),
+                        _ => b.max = Some(bytes),
+                    }
+                    b
+                }
+            };
+            if self.budgets.sizes.insert(label.clone(), budget).is_some() {
+                return Err(bad(format!("{label:?} is also in [budgets.sizes]")));
+            }
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), Error> {
@@ -526,6 +634,11 @@ impl Config {
             {
                 return Err(Error::Config(format!("budget {label:?} sets no ceiling")));
             }
+        }
+        if self.layout.text_tolerance_px < 0.0 || !self.layout.text_tolerance_px.is_finite() {
+            return Err(Error::Config(
+                "[layout].text_tolerance_px must be 0 or more".into(),
+            ));
         }
         crate::steps::order(&self.check.steps)?;
         Ok(())
@@ -827,7 +940,7 @@ mod tests {
     use super::*;
 
     const OK: &str = r#"
-shakedown = "0.4.2"
+shakedown = "0.4.3"
 project = "p"
 [check]
 steps = [
@@ -843,7 +956,7 @@ ios = []
 
     #[test]
     fn parses_and_reports_unused() {
-        let c = Config::parse(OK, "0.4.2").unwrap();
+        let c = Config::parse(OK, "0.4.3").unwrap();
         assert_eq!(c.check.steps.len(), 2);
         assert_eq!(c.unused_sections(), vec!["simulators"]);
     }
@@ -851,21 +964,21 @@ ios = []
     #[test]
     fn version_mismatch_names_install_command() {
         let e = Config::parse(OK, "0.3.0").unwrap_err().to_string();
-        assert!(e.contains("cargo install shakedown@0.4.2 --locked"), "{e}");
+        assert!(e.contains("cargo install shakedown@0.4.3 --locked"), "{e}");
     }
 
     #[test]
     fn rejects_bad_graphs() {
         let dup = OK.replace(r#"name = "b""#, r#"name = "a""#);
-        assert!(Config::parse(&dup, "0.4.2").is_err());
+        assert!(Config::parse(&dup, "0.4.3").is_err());
         let unknown = OK.replace(r#"["a"]"#, r#"["zzz"]"#);
-        assert!(Config::parse(&unknown, "0.4.2").is_err());
+        assert!(Config::parse(&unknown, "0.4.3").is_err());
         let cycle = OK.replace(
             r#"{ name = "a", run = "true" }"#,
             r#"{ name = "a", run = "true", after = ["b"] }"#,
         );
         assert!(
-            Config::parse(&cycle, "0.4.2")
+            Config::parse(&cycle, "0.4.3")
                 .unwrap_err()
                 .to_string()
                 .contains("cycle")
@@ -879,7 +992,7 @@ ios = []
             "{ file = \"a.js\", strip = true, raw = 10 }",
         );
         assert!(
-            Config::parse(&bad, "0.4.2")
+            Config::parse(&bad, "0.4.3")
                 .unwrap_err()
                 .to_string()
                 .contains("strip needs max")
@@ -887,13 +1000,88 @@ ios = []
     }
 
     #[test]
+    fn shared_budgets_file_maps_labels_and_skip_unbuilt_parses() {
+        let dir = std::env::temp_dir().join(format!("shakedown-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("budgets.json"),
+            r#"{"_doc":"x","sizes":{"web wasm gzip":405000,"web wasm raw":1050000,"iOS stripped per arch":3350000,"other tool":5,"full":{"file":"a.bin","max":9}},"timing":{"x":1}}"#,
+        )
+        .unwrap();
+        let toml = r#"
+shakedown = "0.4.3"
+project = "p"
+[budgets]
+file = "budgets.json"
+skip_unbuilt = true
+[budgets.files]
+"web wasm gzip" = "web/*.wasm"
+"web wasm raw" = "web/*.wasm"
+"iOS stripped per arch" = { file = "lib.a", strip = true }
+"#;
+        let c = Config::parse_in(toml, "0.4.3", &dir).unwrap();
+        assert!(c.budgets.skip_unbuilt);
+        let s = &c.budgets.sizes;
+        assert_eq!(s.len(), 4, "the unmapped number belongs to another tool");
+        assert_eq!(
+            (s["web wasm gzip"].gzip, s["web wasm gzip"].raw),
+            (Some(405_000), None)
+        );
+        assert_eq!(s["web wasm raw"].raw, Some(1_050_000));
+        assert_eq!(s["iOS stripped per arch"].max, Some(3_350_000));
+        assert!(s["iOS stripped per arch"].strip);
+        assert_eq!(s["full"].file, "a.bin");
+        // Existing configs are untouched, and default is a failure.
+        assert!(!Config::parse(OK, "0.4.3").unwrap().budgets.skip_unbuilt);
+        let clash = format!("{toml}[budgets.sizes.full]\nfile = \"x\"\nmax = 1\n");
+        assert!(
+            Config::parse_in(&clash, "0.4.3", &dir)
+                .unwrap_err()
+                .to_string()
+                .contains("also in")
+        );
+        let unknown = toml.replace("\"web wasm raw\" = \"web/*.wasm\"", "\"nope\" = \"x\"");
+        assert!(
+            Config::parse_in(&unknown, "0.4.3", &dir)
+                .unwrap_err()
+                .to_string()
+                .contains("nope")
+        );
+        let missing = toml.replace("budgets.json", "gone.json");
+        assert!(Config::parse_in(&missing, "0.4.3", &dir).is_err());
+        let no_file = "shakedown = \"0.4.3\"\nproject = \"p\"\n[budgets.files]\n\"a\" = \"b\"\n";
+        assert!(Config::parse_in(no_file, "0.4.3", &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_tolerance_defaults_off_and_rejects_negatives() {
+        assert!(
+            (Config::parse(OK, "0.4.3").unwrap().layout.text_tolerance_px).abs() < f64::EPSILON
+        );
+        let on = format!("{OK}\n[layout]\ntext_tolerance_px = 2.5\n");
+        assert!(
+            (Config::parse(&on, "0.4.3")
+                .unwrap()
+                .layout
+                .text_tolerance_px
+                - 2.5)
+                .abs()
+                < f64::EPSILON
+        );
+        let neg = format!("{OK}\n[layout]\ntext_tolerance_px = -1\n");
+        assert!(Config::parse(&neg, "0.4.3").is_err());
+    }
+
+    #[test]
     fn rejects_typos_in_known_sections() {
         let bad = OK.replace("gzip = 10", "gzp = 10");
-        assert!(Config::parse(&bad, "0.4.2").is_err());
+        assert!(Config::parse(&bad, "0.4.3").is_err());
     }
 
     const UI: &str = r#"
-shakedown = "0.4.2"
+shakedown = "0.4.3"
 project = "p"
 [server]
 start = "serve {port}"
@@ -915,7 +1103,7 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
 
     #[test]
     fn parses_screens_actions_and_defaults() {
-        let c = Config::parse(UI, "0.4.2").unwrap();
+        let c = Config::parse(UI, "0.4.3").unwrap();
         assert_eq!(c.screen.len(), 2);
         assert_eq!(c.screen[0].player, "guest");
         assert_eq!(c.screen[1].act.len(), 7);
@@ -931,7 +1119,7 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
     #[test]
     fn rejects_bad_ui_config() {
         let bad = |from: &str, to: &str| {
-            Config::parse(&UI.replace(from, to), "0.4.2")
+            Config::parse(&UI.replace(from, to), "0.4.3")
                 .unwrap_err()
                 .to_string()
         };
@@ -944,7 +1132,7 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
         assert!(bad("{ click = \"button\" }", "{ hover = \"button\" }").contains("hover"));
         let devices = format!("{UI}\n[devices]\nui = [\"nokia\"]\n");
         assert!(
-            Config::parse(&devices, "0.4.2")
+            Config::parse(&devices, "0.4.3")
                 .unwrap_err()
                 .to_string()
                 .contains("unknown device")
@@ -956,7 +1144,7 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
         let ok = format!(
             "{OK}\n[smoke]\nup = \"make smoke_up PORT={{port}}\"\ndown = \"make smoke_down\"\nchecks = [{{ path = \"/\", contains = \"x\" }}]\n"
         );
-        let c = Config::parse(&ok, "0.4.2").unwrap();
+        let c = Config::parse(&ok, "0.4.3").unwrap();
         let s = c.smoke.unwrap();
         assert_eq!(
             (s.timeout, s.ready.as_str(), s.checks[0].status),
@@ -964,13 +1152,13 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
         );
         let bad = ok.replace("path = \"/\"", "path = \"x\"");
         assert!(
-            Config::parse(&bad, "0.4.2")
+            Config::parse(&bad, "0.4.3")
                 .unwrap_err()
                 .to_string()
                 .contains("must start with /")
         );
         let typo = ok.replace("down =", "dwon = \"x\"\ndown =");
-        assert!(Config::parse(&typo, "0.4.2").is_err());
+        assert!(Config::parse(&typo, "0.4.3").is_err());
     }
 
     #[test]
@@ -988,8 +1176,8 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
             "[[screen]]\nname = \"a\"\npath = \"/a\"\n",
         )
         .unwrap();
-        let main = "shakedown = \"0.4.2\"\nproject = \"p\"\ninclude = [\"screens/*.toml\"]\n[server]\nstart = \"x\"\n[[screen]]\nname = \"home\"\npath = \"/\"\n";
-        let c = Config::parse_in(main, "0.4.2", &dir).unwrap();
+        let main = "shakedown = \"0.4.3\"\nproject = \"p\"\ninclude = [\"screens/*.toml\"]\n[server]\nstart = \"x\"\n[[screen]]\nname = \"home\"\npath = \"/\"\n";
+        let c = Config::parse_in(main, "0.4.3", &dir).unwrap();
         let names: Vec<_> = c.screen.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -997,16 +1185,16 @@ act = [{ click = "button" }, { type = { selector = "input", text = "hi" } }, { p
             "own screens first, then each file in name order"
         );
         std::fs::write(dir.join("screens/c.toml"), "project = \"x\"\n").unwrap();
-        let e = Config::parse_in(main, "0.4.2", &dir)
+        let e = Config::parse_in(main, "0.4.3", &dir)
             .unwrap_err()
             .to_string();
         assert!(e.contains("screen"), "{e}");
         let none = main.replace("screens/*.toml", "nowhere/*.toml");
-        assert!(Config::parse_in(&none, "0.4.2", &dir).is_err());
+        assert!(Config::parse_in(&none, "0.4.3", &dir).is_err());
         let dup = format!("{main}[[screen]]\nname = \"a\"\npath = \"/\"\n");
         std::fs::remove_file(dir.join("screens/c.toml")).unwrap();
         assert!(
-            Config::parse_in(&dup, "0.4.2", &dir)
+            Config::parse_in(&dup, "0.4.3", &dir)
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate")

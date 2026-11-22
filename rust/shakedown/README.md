@@ -11,7 +11,7 @@ Chrome, `ui web` with layout rules and approved references, `update`, fake and s
 ## Install
 
 ```sh
-cargo install shakedown@0.4.2 --locked          # from crates.io
+cargo install shakedown@0.4.3 --locked          # from crates.io
 cargo install --path rust/shakedown --locked    # from a toddstack checkout
 shakedown doctor                                # what is installed, what is missing, and the fix for each miss
 ```
@@ -22,8 +22,8 @@ Pin the version in each project's `shakedown.toml`; a mismatch stops with the ex
 
 | command | does |
 |---|---|
-| `shakedown check [--only a,b] [--json]` | runs `[check]`: shell steps as a graph, independent steps in parallel |
-| `shakedown budgets sizes` | exact byte ceilings from `[budgets.sizes]` |
+| `shakedown check [--only a,b] [--json] [--skip-unbuilt]` | runs `[check]`: shell steps as a graph, independent steps in parallel |
+| `shakedown budgets sizes [--skip-unbuilt]` | exact byte ceilings from `[budgets.sizes]` and the shared `[budgets].file`; `--skip-unbuilt` skips artifacts that were not built |
 | `shakedown pixels compare <reference.png> <actual.png> [--out DIR]` | the pixel compare; on failure writes the diff image and `report.html` to `DIR` (default `target/shakedown/pixels`) |
 | `shakedown pixels encode <in.png> <out.png> [--step 8]` | stores a PNG the way references are stored |
 | `shakedown ui web [--screens a,b] [--repeat N] [--json]` | draws every `[[screen]]` on every `[devices].ui` device and theme in the pinned Chrome; layout rules, console errors and layout shift, then pixels against the references; report on failure |
@@ -48,7 +48,7 @@ Exit codes: 0 pass, 1 a check failed, 2 config or usage error, 3 environment mis
 At the repo root.
 
 ```toml
-shakedown = "0.4.2"        # the tool version this repo expects (exact)
+shakedown = "0.4.3"        # the tool version this repo expects (exact)
 project   = "example"
 
 [check]
@@ -173,7 +173,7 @@ groups = [{ name = "lobby", path = "/lobby/test", players = 4 }]   # frame i is 
 
 `shakedown sweep` draws every page on every device in both themes, with the same page, rules and settle as `ui web`
 (fake worlds take `routes = { "GET /api/v1/me" = "fixtures/me.json" }` on a page). Layout rules and layout shift fail
-it. Each picture is also compared with the local baseline in `target/shakedown/sweep/baseline/` (never committed):
+it. Each picture is also compared with the local baseline in `target/shakedown/sweep/baseline/<os>/` (`macos`, `linux` or `windows`, never committed; font metrics differ per OS, so each has its own. Migration from 0.4.2: on macOS the old `baseline/<id>.png` is still read and moved to `baseline/macos/` on the next run; Linux and Windows start fresh):
 the first sweep makes the baseline, later ones report what changed (`pixels: N changed against the baseline`), and
 `--rebase` makes the current run the baseline. `report.html` lists every shot with a finding or a change.
 `--base http://127.0.0.1:PORT` draws against a server you already run; any other host is refused.
@@ -261,3 +261,31 @@ Exit codes: 0 pass, 1 a step failed (including `up` and `down`), 2 no `[smoke]` 
 `make` target the Makefile does not have, 3 a tool `up` needs is not installed. `--json` writes
 `target/shakedown/smoke/summary.json` (with the digest); `up.log`, `down.log`, `container.log` and, on failure,
 `report.html` are in the same folder.
+
+## Budgets from a shared file, unbuilt artifacts
+
+```toml
+[budgets]
+file = "scripts/budgets.json"   # from the directory holding shakedown.toml
+skip_unbuilt = false            # true (or --skip-unbuilt): a missing artifact prints "skipped (not built)" and passes
+[budgets.files]                 # which artifact each numeric label in the JSON measures
+"web wasm gzip" = "web/pkg/*.wasm"                        # metric = the label's last word: raw, gzip or brotli
+"iOS stripped per arch" = { file = "ios/libcore.a", strip = true }   # any other label: the plain (or stripped) size
+```
+
+The JSON's `"sizes"` object (the shape boggledygook's `budgets.json` uses, which also feeds vitals through its
+`"timing"` object, ignored here) maps a label to a byte ceiling. A number is measured only when `[budgets.files]` names
+its label; numbers with no mapping belong to another tool. An object value is a complete `[budgets.sizes]` table
+(`file`, `raw`, `gzip`, `brotli`, `strip`, `max`). A label in both `[budgets.sizes]` and the file is an error. A
+missing artifact fails by default; an over-budget one and one that cannot be measured fail even with `skip_unbuilt`.
+
+## Text-metrics tolerance
+
+```toml
+[layout]
+text_tolerance_px = 2   # default 0 (off)
+```
+
+Fonts measure differently per OS. With a tolerance, `clipped-text` ignores text that overflows its box by no more than
+this many px, and `layout-shift` ignores a shift in which no element moves more than this. A shift the browser gave no
+element positions for is never forgiven. Applies to `ui`, `sweep` and `devices serve`.

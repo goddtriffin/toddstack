@@ -35,8 +35,10 @@ pub enum Verdict {
         /// Ceiling.
         max: u64,
     },
-    /// The artifact was not built. Never a pass.
+    /// The artifact could not be measured (two files match, a read error, `strip` missing). Never a pass.
     Skipped(String),
+    /// The artifact file does not exist. A failure unless the run skips unbuilt artifacts (`skip_unbuilt`).
+    NotBuilt(String),
 }
 
 impl Row {
@@ -48,7 +50,31 @@ impl Row {
                 format!("OVER {} {bytes} > {max} (+{})", self.label, bytes - max)
             }
             Verdict::Skipped(why) => format!("skipped {} ({why})", self.label),
+            Verdict::NotBuilt(file) => format!("skipped (not built) {}: {file}", self.label),
         }
+    }
+}
+
+/// Why a run of rows fails, or `None` when it passes. A not-built artifact fails unless `skip_unbuilt`; anything
+/// else skipped never passes.
+pub fn failure(rows: &[Row], skip_unbuilt: bool) -> Option<String> {
+    let count = |f: fn(&Verdict) -> bool| rows.iter().filter(|r| f(&r.verdict)).count();
+    let over = count(|v| matches!(v, Verdict::Over { .. }));
+    let skipped = count(|v| matches!(v, Verdict::Skipped(_)));
+    let unbuilt = if skip_unbuilt {
+        0
+    } else {
+        count(|v| matches!(v, Verdict::NotBuilt(_)))
+    };
+    if over > 0 {
+        Some(format!("{over} over budget"))
+    } else if skipped + unbuilt > 0 {
+        Some(format!(
+            "{} not built (a skipped artifact is never a pass; --skip-unbuilt or [budgets].skip_unbuilt skips the missing ones)",
+            skipped + unbuilt
+        ))
+    } else {
+        None
     }
 }
 
@@ -60,7 +86,11 @@ pub fn check<'a>(
     let mut rows = Vec::new();
     for (label, b) in budgets {
         match resolve(root, &b.file) {
-            Err(why) => rows.push(Row {
+            Err(Missing::NotBuilt) => rows.push(Row {
+                label: label.clone(),
+                verdict: Verdict::NotBuilt(b.file.clone()),
+            }),
+            Err(Missing::Other(why)) => rows.push(Row {
                 label: label.clone(),
                 verdict: Verdict::Skipped(why),
             }),
@@ -145,17 +175,26 @@ fn stripped(path: &Path) -> Result<u64, String> {
     size
 }
 
+/// Why a file was not found.
+#[derive(Debug, PartialEq, Eq)]
+enum Missing {
+    /// Nothing is there: the artifact was not built.
+    NotBuilt,
+    /// Something else is wrong.
+    Other(String),
+}
+
 /// Finds the file. The last path component may hold one `*`; it must then match exactly one file.
-fn resolve(root: &Path, file: &str) -> Result<PathBuf, String> {
+fn resolve(root: &Path, file: &str) -> Result<PathBuf, Missing> {
     let full = root.join(file);
     let Some(name) = full.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
-        return Err(format!("{file}: not a file path"));
+        return Err(Missing::Other(format!("{file}: not a file path")));
     };
     let Some((pre, post)) = name.split_once('*') else {
         return if full.is_file() {
             Ok(full)
         } else {
-            Err(format!("{file} not built"))
+            Err(Missing::NotBuilt)
         };
     };
     let dir = full.parent().unwrap_or(root);
@@ -174,9 +213,11 @@ fn resolve(root: &Path, file: &str) -> Result<PathBuf, String> {
         .collect();
     hits.sort();
     match hits.len() {
-        0 => Err(format!("{file} not built")),
+        0 => Err(Missing::NotBuilt),
         1 => Ok(hits.remove(0)),
-        n => Err(format!("{file} matches {n} files; clean the stale ones")),
+        n => Err(Missing::Other(format!(
+            "{file} matches {n} files; clean the stale ones"
+        ))),
     }
 }
 
@@ -228,7 +269,17 @@ mod tests {
                 max: 9_999
             }
         );
-        assert!(matches!(rows[2].verdict, Verdict::Skipped(_)));
+        assert_eq!(rows[2].verdict, Verdict::NotBuilt("bin/missing.js".into()));
+        assert_eq!(rows[2].line(), "skipped (not built) c: bin/missing.js");
+        assert!(failure(&rows, false).unwrap().contains("over budget"));
+        assert!(
+            failure(&[rows[0].clone(), rows[2].clone()], false)
+                .unwrap()
+                .contains("not built")
+        );
+        assert!(failure(&rows[..2], true).unwrap().contains("over budget"));
+        assert_eq!(failure(&[rows[0].clone(), rows[2].clone()], true), None);
+        assert!(failure(&[rows[0].clone(), rows[2].clone()], false).is_some());
         assert!(
             matches!(rows[3].verdict, Verdict::Ok { .. }),
             "{:?}",
@@ -245,7 +296,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("a.1.js"), "x").unwrap();
         std::fs::write(d.join("a.2.js"), "x").unwrap();
-        assert!(resolve(&d, "a.*.js").unwrap_err().contains("matches 2"));
+        assert!(matches!(resolve(&d, "a.*.js"), Err(Missing::Other(m)) if m.contains("matches 2")));
         let _ = std::fs::remove_dir_all(&d);
     }
 

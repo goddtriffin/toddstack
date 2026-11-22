@@ -52,6 +52,8 @@ pub struct Settings {
     pub players: Option<(Vec<String>, String)>,
     /// `[layout].ignore`, as JSON for the collector.
     pub ignores: String,
+    /// `[layout].text_tolerance_px`.
+    pub text_tolerance: f64,
 }
 
 /// One entry of the page picker.
@@ -69,6 +71,7 @@ impl Settings {
     /// Settings from a `shakedown.toml`, when there is one.
     pub fn with_config(mut self, config: &Config) -> Self {
         self.ignores = serde_json::to_string(&config.layout.ignore).unwrap_or_else(|_| "[]".into());
+        self.text_tolerance = config.layout.text_tolerance_px;
         self.players = config
             .players
             .as_ref()
@@ -390,7 +393,8 @@ fn internal(
         "/__devices/check" if method == "POST" => {
             let findings: Vec<String> = serde_json::from_slice::<Tree>(body).map_or_else(
                 |e| vec![format!("could not read the layout tree: {e}")],
-                |t| {
+                |mut t| {
+                    t.text_tolerance = s.text_tolerance;
                     layout::check(&t)
                         .iter()
                         .map(layout::Finding::line)
@@ -671,6 +675,7 @@ mod tests {
             config_routes: Vec::new(),
             players: None,
             ignores: "[]".into(),
+            text_tolerance: 0.0,
         };
         std::thread::spawn(move || serve_on(&listener, &settings));
         let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -773,6 +778,7 @@ mod tests {
             config_routes: Vec::new(),
             players: None,
             ignores: "[]".into(),
+            text_tolerance: 0.0,
         };
         let s2 = settings.clone();
         std::thread::spawn(move || serve_on(&listener, &s2));

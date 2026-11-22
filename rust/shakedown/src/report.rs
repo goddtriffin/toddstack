@@ -53,6 +53,9 @@ pub fn summary_json(project: &str, results: &[StepResult], budget_rows: &[Row]) 
             Verdict::Skipped(why) => {
                 json!({ "label": r.label, "status": "skipped", "reason": why })
             }
+            Verdict::NotBuilt(file) => {
+                json!({ "label": r.label, "status": "skipped", "reason": format!("{file} not built") })
+            }
         })
         .collect();
     let passed = results.iter().all(|r| r.status == Status::Ok);
