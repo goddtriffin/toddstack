@@ -77,8 +77,11 @@ pixels, more than 8 on 0.6%, more than 32 on 0.05%, max 48 (from boggledygook's 
 canvas surface and present it; the CPU backend `putImageData`s into its 2D context. `resize` reconfigures the
 surface and sets the canvas size, so pass device pixels. A lost or outdated surface is reconfigured and retried once,
 then `Error::Surface`. `render` (readback) is for offscreen targets only, for tests and callers that want pixels.
-A canvas has one context for life: the chain tries WebGPU, then WebGL2, then 2D, so a GPU context that was taken and
-then rejected (a software WebGL2 adapter) leaves the CPU fallback without a context. Native surfaces from a raw window
+A canvas has one context for life, so the chain is decided before the real canvas is touched: WebGPU needs no
+canvas to probe, WebGL2 is probed on a throwaway 1x1 `OffscreenCanvas` (adapter, software check, device, format), and
+only an accepted backend creates its surface on the canvas. Every rejection therefore falls through to the CPU. The one
+remaining failure is an accepted backend whose surface (or WebGL2 adapter and device, requested again on the canvas)
+then fails on the real canvas: `Error::Surface` or `Error::Device`. Native surfaces from a raw window
 handle are left to the iOS and Android integrations.
 
 Not in v0: resizing a batch's

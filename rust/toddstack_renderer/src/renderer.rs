@@ -1,6 +1,6 @@
 //! `Renderer`: backend selection, scenes, custom batches and kernels behind one type.
 
-use crate::backend::{Backend, Capabilities};
+use crate::backend::{self, Backend, Capabilities};
 use crate::batch::{BatchDesc, BatchState};
 use crate::cpu::Cpu;
 use crate::error::{Error, Result};
@@ -140,37 +140,32 @@ impl Renderer {
         let chain: Vec<Backend> = options
             .force
             .map_or_else(|| Backend::chain().to_vec(), |b| vec![b]);
-        let mut tried: Vec<&str> = Vec::new();
-        for b in chain {
-            tried.push(b.name());
-            if b == Backend::Cpu {
-                return Ok(Self {
-                    inner: Inner::Cpu(Cpu::new(&target)?),
-                    caps: Capabilities::cpu(),
-                    atlas: Atlas::new(),
-                    batches: Vec::new(),
-                    images: Vec::new(),
-                    width,
-                    height,
-                    canvas,
+        // Choose before touching a canvas: each GPU candidate is probed off the real canvas.
+        let picked = backend::select(&chain, |b| Gpu::probe(b, &target)).await?;
+        let inner: Inner = match picked {
+            Some((Backend::Cpu, _)) => Inner::Cpu(Cpu::new(&target)?),
+            Some((_, Some(probe))) => {
+                Inner::Gpu(Box::new(Gpu::create(probe, &target, options.data_texture).await?))
+            }
+            _ => {
+                return Err(Error::NoBackend {
+                    tried: chain.iter().map(|b| b.name()).collect::<Vec<_>>().join(", "),
                 });
             }
-            if let Some(gpu) = Gpu::create(b, &target, options.data_texture).await? {
-                let caps: Capabilities = gpu.caps.clone();
-                return Ok(Self {
-                    inner: Inner::Gpu(Box::new(gpu)),
-                    caps,
-                    atlas: Atlas::new(),
-                    batches: Vec::new(),
-                    images: Vec::new(),
-                    width,
-                    height,
-                    canvas,
-                });
-            }
-        }
-        Err(Error::NoBackend {
-            tried: tried.join(", "),
+        };
+        let caps: Capabilities = match &inner {
+            Inner::Gpu(g) => g.caps.clone(),
+            Inner::Cpu(_) => Capabilities::cpu(),
+        };
+        Ok(Self {
+            inner,
+            caps,
+            atlas: Atlas::new(),
+            batches: Vec::new(),
+            images: Vec::new(),
+            width,
+            height,
+            canvas,
         })
     }
 
