@@ -1,7 +1,8 @@
 //! Demos and the parity check, each on a GPU backend and on the CPU, writing PNGs.
 //!
-//! `cargo run --release --example demo -- <board|chart|grid|images|paths|texture|quantize|parity|all> [--backend B] [--frames N] [--out DIR]`
-//! `B` is vulkan, dx12, metal, gl or cpu; `WGPU_BACKEND` does the same. Default: the fallback chain.
+//! `cargo run --release --example demo -- <board|chart|grid|images|paths|texture|quantize|parity|all>... [--backend B] [--frames N] [--out DIR]`
+//! Several demo names run in order. `B` is vulkan, dx12, metal, gl or cpu. `--backend` wins over
+//! `WGPU_BACKEND`, which wins over the default (the fallback chain).
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -16,7 +17,7 @@ const FONT: &[u8] = include_bytes!(concat!(
 ));
 
 struct Args {
-    demo: String,
+    demos: Vec<String>,
     backend: Option<Backend>,
     frames: usize,
     out: PathBuf,
@@ -24,21 +25,30 @@ struct Args {
 
 fn args() -> Args {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Positional names are every argument before the first flag.
+    let mut demos: Vec<String> = argv
+        .iter()
+        .take_while(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
+    if demos.is_empty() {
+        demos.push("all".to_owned());
+    }
     let get = |k: &str| {
         argv.iter()
             .position(|a| a == k)
             .and_then(|i| argv.get(i + 1))
             .cloned()
     };
-    let backend: Option<Backend> = get("--backend")
-        .or_else(|| std::env::var("WGPU_BACKEND").ok())
-        .and_then(|s| Backend::parse(&s));
+    let named: Option<String> = get("--backend").or_else(|| std::env::var("WGPU_BACKEND").ok());
+    let backend: Option<Backend> = named.as_deref().map(|s| {
+        Backend::parse(s).unwrap_or_else(|| {
+            eprintln!("unknown backend {s:?} (vulkan, dx12, metal, gl, cpu)");
+            std::process::exit(2);
+        })
+    });
     Args {
-        demo: argv
-            .first()
-            .filter(|a| !a.starts_with("--"))
-            .cloned()
-            .unwrap_or_else(|| "all".to_owned()),
+        demos,
         backend,
         frames: get("--frames").and_then(|s| s.parse().ok()).unwrap_or(30),
         out: PathBuf::from(get("--out").unwrap_or_else(|| "out".to_owned())),
@@ -81,8 +91,9 @@ async fn renderer(a: &Args, t: Target, force: Option<Backend>) -> Renderer {
 }
 
 /// Renders `build`'s scene `frames` times on the chosen backend and once on the CPU; prints frame
-/// time (render + readback) p50 and max, writes both PNGs, prints the diff.
-async fn scene_demo<F>(a: &Args, name: &str, t: Target, build: F)
+/// time (render + readback) p50 and max, writes both PNGs, prints the diff. With a `budget`, returns
+/// whether the diff is within it.
+async fn scene_demo<F>(a: &Args, name: &str, t: Target, budget: Option<&Budget>, build: F) -> bool
 where
     F: Fn(&mut Renderer) -> Scene,
 {
@@ -118,7 +129,13 @@ where
         t.height,
         &reference,
     );
-    println!("  gpu vs cpu: {}", Diff::between(&reference, &px));
+    let diff: Diff = Diff::between(&reference, &px);
+    println!("  gpu vs cpu: {diff}");
+    budget.is_none_or(|b| {
+        let pass: bool = diff.within(b);
+        println!("  budget {b:?}: {}", if pass { "PASS" } else { "FAIL" });
+        pass
+    })
 }
 
 async fn quantize(a: &Args) {
@@ -220,56 +237,88 @@ async fn parity(a: &Args) -> bool {
 fn main() {
     let a: Args = args();
     pollster::block_on(async {
-        let all: bool = a.demo == "all";
         let mut ok: bool = true;
-        if all || a.demo == "board" {
-            scene_demo(&a, "board", Target::offscreen(520, 520), |r| {
-                demo::board_scene(r.add_font(FONT).expect("font"))
-            })
-            .await;
-        }
-        if all || a.demo == "chart" {
-            scene_demo(&a, "chart", Target::offscreen(640, 400), |r| {
-                demo::chart_scene(r.add_font(FONT).expect("font"))
-            })
-            .await;
-        }
-        if all || a.demo == "grid" {
-            scene_demo(&a, "grid", Target::offscreen(1000, 1000), |r| {
-                let id = r.add_batch(demo::grid_batch(1000, 1000)).expect("batch");
-                r.set_batch_params(id, [1000.0, 1.0, 0.0, 0.0])
-                    .expect("params");
-                let mut s: Scene = Scene::new([255, 255, 255, 255]);
-                s.batch(id);
-                s
-            })
-            .await;
-        }
-        if all || a.demo == "images" {
-            scene_demo(&a, "images", Target::offscreen(640, 260), |r| {
-                let font = r.add_font(FONT).expect("font");
-                demo::images_scene(r, font).expect("images scene")
-            })
-            .await;
-        }
-        if all || a.demo == "paths" {
-            scene_demo(&a, "paths", Target::offscreen(640, 400), |r| {
-                demo::paths_scene(r.add_font(FONT).expect("font"))
-            })
-            .await;
-        }
-        if all || a.demo == "texture" {
-            scene_demo(&a, "texture", Target::offscreen(640, 270), |r| {
-                let font = r.add_font(FONT).expect("font");
-                demo::texture_scene(r, font).expect("texture scene")
-            })
-            .await;
-        }
-        if all || a.demo == "quantize" {
-            quantize(&a).await;
-        }
-        if all || a.demo == "parity" {
-            ok = parity(&a).await;
+        for demo_name in &a.demos {
+            let all: bool = demo_name == "all";
+            let is = |n: &str| all || demo_name == n;
+            let mut known: bool = all;
+            if is("board") {
+                known = true;
+                scene_demo(&a, "board", Target::offscreen(520, 520), None, |r| {
+                    demo::board_scene(r.add_font(FONT).expect("font"))
+                })
+                .await;
+            }
+            if is("chart") {
+                known = true;
+                scene_demo(&a, "chart", Target::offscreen(640, 400), None, |r| {
+                    demo::chart_scene(r.add_font(FONT).expect("font"))
+                })
+                .await;
+            }
+            if is("grid") {
+                known = true;
+                scene_demo(&a, "grid", Target::offscreen(1000, 1000), None, |r| {
+                    let id = r.add_batch(demo::grid_batch(1000, 1000)).expect("batch");
+                    r.set_batch_params(id, [1000.0, 1.0, 0.0, 0.0])
+                        .expect("params");
+                    let mut s: Scene = Scene::new([255, 255, 255, 255]);
+                    s.batch(id);
+                    s
+                })
+                .await;
+            }
+            if is("images") {
+                known = true;
+                ok &= scene_demo(
+                    &a,
+                    "images",
+                    Target::offscreen(640, 260),
+                    Some(&Budget::ARENA),
+                    |r| {
+                        let font = r.add_font(FONT).expect("font");
+                        demo::images_scene(r, font).expect("images scene")
+                    },
+                )
+                .await;
+            }
+            if is("paths") {
+                known = true;
+                ok &= scene_demo(
+                    &a,
+                    "paths",
+                    Target::offscreen(640, 400),
+                    Some(&Budget::PATHS),
+                    |r| demo::paths_scene(r.add_font(FONT).expect("font")),
+                )
+                .await;
+            }
+            if is("texture") {
+                known = true;
+                ok &= scene_demo(
+                    &a,
+                    "texture",
+                    Target::offscreen(640, 270),
+                    Some(&Budget::KERNEL),
+                    |r| {
+                        let font = r.add_font(FONT).expect("font");
+                        demo::texture_scene(r, font).expect("texture scene")
+                    },
+                )
+                .await;
+            }
+            if is("quantize") {
+                known = true;
+                quantize(&a).await;
+            }
+            if is("parity") {
+                known = true;
+                ok &= parity(&a).await;
+            }
+            if !known {
+                eprintln!("unknown demo {demo_name:?}");
+                ok = false;
+            }
         }
         if !ok {
             std::process::exit(1);
