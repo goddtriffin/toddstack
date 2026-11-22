@@ -1108,13 +1108,19 @@ impl Gpu {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen(inline_js = "export function tick() { return new Promise((r) => setTimeout(r, 0)); }")]
-extern "C" {
-    fn tick() -> js_sys::Promise;
-}
-
+/// Yields to the JS event loop with `setTimeout(0)`, in a window or a worker.
 #[cfg(target_arch = "wasm32")]
 async fn yield_to_event_loop() {
-    drop(wasm_bindgen_futures::JsFuture::from(tick()).await);
+    use wasm_bindgen::JsCast as _;
+    let promise: js_sys::Promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let g: wasm_bindgen::JsValue = js_sys::global().into();
+        if let Some(w) = g.dyn_ref::<web_sys::Window>() {
+            drop(w.set_timeout_with_callback(&resolve));
+        } else if let Some(w) = g.dyn_ref::<web_sys::WorkerGlobalScope>() {
+            drop(w.set_timeout_with_callback(&resolve));
+        } else {
+            drop(resolve.call0(&wasm_bindgen::JsValue::UNDEFINED));
+        }
+    });
+    drop(wasm_bindgen_futures::JsFuture::from(promise).await);
 }
