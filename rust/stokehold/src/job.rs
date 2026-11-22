@@ -87,6 +87,9 @@ pub struct Live {
     pub mem_pressure: bool,
     /// macOS level 2 ("warn"): common and sticky, so it blocks only with memory nearly used up (`admit::guard_block`).
     pub mem_pressure_warn: bool,
+    /// Linux PSI cpu `some avg10`, rounded: the % of the last 10 s some task waited for a CPU. `None` on macOS and when
+    /// it cannot be read. It confirms a high load as CPU overload (`admit::guard_block`).
+    pub cpu_pressure: Option<u64>,
     pub disk_free: u64,
     /// Machine-wide usage minus the process trees of running heavy jobs (smoothed by the caller).
     pub non_heavy: Usage,
@@ -146,4 +149,10 @@ pub struct Job {
     /// the queue (`admit::fast_lane`).
     #[serde(default)]
     pub fast: bool,
+    /// The learned sustained CPU level (centi-cores) of recent runs, each their best 10 s mean, picked like the peak
+    /// (`admit::sustained_level`). Past `admit::SUSTAINED_FULL_MS` the job holds at most this, and as a waiter it
+    /// projects at most this (`admit::projected_peak`). `None` for cold, declared (`--cpu`) and Docker/VM sizes, and
+    /// job files from before 0.4.8.
+    #[serde(default)]
+    pub cpu_sustained: Option<u64>,
 }

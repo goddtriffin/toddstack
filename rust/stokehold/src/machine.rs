@@ -287,6 +287,38 @@ pub fn psi_pressure(text: &str) -> bool {
     })
 }
 
+/// Linux PSI cpu (`/proc/pressure/cpu`): the `some avg10` %, rounded (the share of the last 10 s some task waited for a
+/// CPU). `None` when the line is missing or malformed.
+#[must_use]
+pub fn psi_cpu_some(text: &str) -> Option<u64> {
+    text.lines()
+        .find(|l| l.starts_with("some "))?
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("avg10="))?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a finite, non-negative percentage"
+            )]
+            let pct = v.round() as u64;
+            pct
+        })
+}
+
+/// Linux PSI cpu `some avg10` (`psi_cpu_some`); `None` on macOS and when it cannot be read.
+fn cpu_pressure() -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    std::fs::read_to_string("/proc/pressure/cpu")
+        .ok()
+        .and_then(|t| psi_cpu_some(&t))
+}
+
 /// Whether the system is under memory pressure, as `(warn, critical)`. Cheap, and fails open (false) when it cannot be
 /// read. Linux PSI counts stalled time, a real signal: it is critical.
 fn memory_pressure() -> (bool, bool) {
@@ -443,6 +475,12 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         None if o.is_empty() => memory_pressure(),
         None => (false, false),
     };
+    // The override is the PSI cpu `some avg10` %.
+    let cpu_pressure = match get(&o, "cpu_psi") {
+        Some(v) => Some(v.parse::<u64>().map_err(|_| bad("cpu_psi", v))?),
+        None if o.is_empty() => cpu_pressure(),
+        None => None,
+    };
     let (non_heavy, per_job, cpu_pct) = if fake {
         let num = |k: &str| -> Result<u64, Error> {
             get(&o, k).map_or(Ok(0), |v| {
@@ -484,6 +522,7 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         cpu_sustained_pct: 0,
         mem_pressure,
         mem_pressure_warn,
+        cpu_pressure,
         disk_free,
         non_heavy,
         per_job,
@@ -572,6 +611,19 @@ mod tests {
             "some avg10=3.00 avg60=1.00 avg300=0.50 total=1\nfull avg10=6.00 avg60=0.0 avg300=0.0 total=0\n"
         ));
         assert!(!psi_pressure(""));
+    }
+
+    #[test]
+    fn cpu_psi_some_avg10() {
+        // The rig on 2026-11-21: load 10-18 on 16 cores, CPU about 8%.
+        let rig = "some avg10=0.19 avg60=2.40 avg300=13.20 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!(psi_cpu_some(rig), Some(0));
+        assert_eq!(
+            psi_cpu_some("some avg10=37.62 avg60=20.00 avg300=5.00 total=9"),
+            Some(38)
+        );
+        assert_eq!(psi_cpu_some(""), None, "unreadable is unknown, not zero");
+        assert_eq!(psi_cpu_some("some avg10=nan"), None);
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub struct Stats {
     /// how long a learned CPU peak is held while it has not shown up (`admit::cpu_hold_ms`).
     #[serde(default)]
     pub peak_cpu_at_ms: u64,
+    /// The process tree's sustained CPU (times 100): its highest mean over any 10 s window (`admit::sustained_level`).
+    /// 0 when unknown (entries from before 0.4.8, and Docker/VM work whose CPU shows outside the tree).
+    #[serde(default)]
+    pub sustained_centi_cores: u64,
     pub blocks_in: u64,
     pub blocks_out: u64,
     /// Machine-wide, not just this job.
@@ -193,6 +197,7 @@ mod tests {
             peak_other_mem: 0,
             peak_mem_at_ms: 0,
             peak_cpu_at_ms: 0,
+            sustained_centi_cores: 0,
             peak_tree_rss: 3 << 30,
             peak_centi_cores: 450,
             blocks_in: 5,
