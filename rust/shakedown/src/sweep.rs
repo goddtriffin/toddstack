@@ -999,6 +999,12 @@ mod tests {
             std::fs::remove_file(&own).unwrap();
             std::fs::write(d.join("baseline").join(format!("{id}.png")), b"old").unwrap();
             keep_baseline(&d, std::slice::from_ref(&rec), &pictures, false).unwrap();
+            // Leftover old file while the per-OS file exists: the old one goes, the per-OS one is unchanged.
+            std::fs::write(&own, b"mine").unwrap();
+            std::fs::write(d.join("baseline").join(format!("{id}.png")), b"old").unwrap();
+            keep_baseline(&d, std::slice::from_ref(&rec), &pictures, false).unwrap();
+            assert!(!d.join("baseline").join(format!("{id}.png")).exists());
+            assert_eq!(std::fs::read(&own).unwrap(), b"mine");
         } else {
             assert_eq!(
                 baseline_png(&d, id),
