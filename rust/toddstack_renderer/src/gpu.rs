@@ -9,11 +9,17 @@ use crate::backend::{Backend, Capabilities};
 use crate::batch::{BatchState, DATA_TEXTURE_WIDTH, prelude};
 use crate::error::{Error, Result};
 use crate::glyphs::{ATLAS_SIZE, Flat, Inst, Run};
+use crate::gpu_image::{GpuImage, ImagePipes};
+use crate::gpu_path::{self, Layer, PVert, PathPipes};
 use crate::kernel::{Binding, FULLSCREEN_VS, Kernel, KernelPath};
-use crate::scene::Rgba;
+use crate::scene::{ImageId, Rgba, Sampling};
 use wgpu::util::DeviceExt;
 
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// The attributes of one [`Inst`], shared by the shape and image pipelines.
+pub const INST_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
+
+pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 struct GpuBatch {
     pipeline: wgpu::RenderPipeline,
@@ -38,6 +44,13 @@ pub struct Gpu {
     insts: wgpu::Buffer,
     insts_cap: u64,
     batches: Vec<GpuBatch>,
+    image_pipes: ImagePipes,
+    images: Vec<Option<GpuImage>>,
+    /// Made on the first path; its composite bind group; dropped on resize.
+    path_pipes: Option<PathPipes>,
+    layer: Option<(Layer, GpuImage)>,
+    path_buf: wgpu::Buffer,
+    path_cap: u64,
 }
 
 fn blend() -> wgpu::BlendState {
@@ -70,15 +83,18 @@ fn target_texture(device: &wgpu::Device, w: u32, h: u32, storage: bool) -> wgpu:
         usage: if storage {
             wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::STORAGE_BINDING
         } else {
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING
         },
         view_formats: &[],
     })
 }
 
-fn uniform_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+pub fn uniform_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: vis,
@@ -91,7 +107,7 @@ fn uniform_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayout
     }
 }
 
-fn texture_entry(
+pub fn texture_entry(
     binding: u32,
     vis: wgpu::ShaderStages,
     sample_type: wgpu::TextureSampleType,
@@ -254,7 +270,6 @@ impl Gpu {
                 bind_group_layouts: &[Some(&bgl)],
                 immediate_size: 0,
             });
-        let attrs: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
         let pipeline: wgpu::RenderPipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("shapes"),
@@ -266,7 +281,7 @@ impl Gpu {
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: size_of::<Inst>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &attrs,
+                        attributes: &INST_ATTRS,
                     })],
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -295,6 +310,14 @@ impl Gpu {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let path_cap: u64 = 1024 * size_of::<PVert>() as u64;
+        let path_buf: wgpu::Buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("path vertices"),
+            size: path_cap,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let image_pipes: ImagePipes = ImagePipes::new(&device);
         let target: wgpu::Texture = target_texture(&device, width, height, false);
         Ok(Some(Self {
             device,
@@ -311,6 +334,12 @@ impl Gpu {
             insts,
             insts_cap,
             batches: Vec::new(),
+            image_pipes,
+            images: Vec::new(),
+            path_pipes: None,
+            layer: None,
+            path_buf,
+            path_cap,
         }))
     }
 
@@ -318,6 +347,7 @@ impl Gpu {
         self.width = width;
         self.height = height;
         self.target = target_texture(&self.device, width, height, false);
+        self.layer = None;
         self.queue.write_buffer(
             &self.view_buf,
             0,
@@ -531,6 +561,107 @@ impl Gpu {
         }
     }
 
+    /// Uploads premultiplied RGBA8 as image `id`.
+    pub fn set_image(&mut self, id: ImageId, w: u32, h: u32, premul: &[u8], sampling: Sampling) {
+        let tex: wgpu::Texture = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("image"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            premul,
+        );
+        self.put_image(id, tex, sampling, false);
+    }
+
+    fn put_image(&mut self, id: ImageId, tex: wgpu::Texture, sampling: Sampling, straight: bool) {
+        let img: GpuImage =
+            self.image_pipes
+                .image(&self.device, &self.view_buf, tex, sampling, straight);
+        if self.images.len() <= id.0 {
+            self.images.resize_with(id.0 + 1, || None);
+        }
+        self.images[id.0] = Some(img);
+    }
+
+    pub fn remove_image(&mut self, id: ImageId) {
+        if let Some(slot) = self.images.get_mut(id.0) {
+            *slot = None;
+        }
+    }
+
+    /// Runs the kernel into a texture and keeps it as image `id`: no readback.
+    pub fn kernel_image(
+        &mut self,
+        k: &Kernel,
+        path: KernelPath,
+        id: ImageId,
+        sampling: Sampling,
+    ) -> Result<()> {
+        let tex: wgpu::Texture = self.dispatch_kernel(k, path)?;
+        self.put_image(id, tex, sampling, true);
+        Ok(())
+    }
+
+    fn grow(device: &wgpu::Device, buf: &mut wgpu::Buffer, cap: &mut u64, need: u64, label: &str) {
+        if need > *cap {
+            *cap = need.next_power_of_two();
+            *buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: *cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+    }
+
+    fn main_pass(
+        enc: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        clear: Option<Rgba>,
+    ) -> wgpu::RenderPass<'static> {
+        let load: wgpu::LoadOp<wgpu::Color> = clear.map_or(wgpu::LoadOp::Load, |c| {
+            wgpu::LoadOp::Clear(wgpu::Color {
+                r: f64::from(c[0]) / 255.0,
+                g: f64::from(c[1]) / 255.0,
+                b: f64::from(c[2]) / 255.0,
+                a: f64::from(c[3]) / 255.0,
+            })
+        });
+        enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        })
+        .forget_lifetime()
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear frame: uploads, then passes in paint order"
+    )]
     pub async fn render(
         &mut self,
         flat: &Flat,
@@ -554,19 +685,62 @@ impl Gpu {
                 },
             );
         }
-        let need: u64 = (flat.insts.len().max(1) * size_of::<Inst>()) as u64;
-        if need > self.insts_cap {
-            self.insts_cap = need.next_power_of_two();
-            self.insts = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("instances"),
-                size: self.insts_cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
+        // One extra record after the scene's: the quad that composites the path layer.
+        let composite: u32 = flat.insts.len() as u32;
+        let need: u64 = ((flat.insts.len() + 1) * size_of::<Inst>()) as u64;
+        Self::grow(
+            &self.device,
+            &mut self.insts,
+            &mut self.insts_cap,
+            need,
+            "instances",
+        );
         if !flat.insts.is_empty() {
             self.queue
                 .write_buffer(&self.insts, 0, bytemuck::cast_slice(&flat.insts));
+        }
+        let quad: Inst = Inst {
+            a: [0.0, 0.0, self.width as f32, self.height as f32],
+            uv: [0.0; 4],
+            p: [1.0, 0.0, 0.0, 0.0],
+            color: [1.0; 4],
+        };
+        self.queue.write_buffer(
+            &self.insts,
+            u64::from(composite) * size_of::<Inst>() as u64,
+            bytemuck::bytes_of(&quad),
+        );
+        let (pverts, pranges): (Vec<PVert>, Vec<gpu_path::PathRange>) =
+            gpu_path::build(&flat.paths);
+        if !pverts.is_empty() {
+            Self::grow(
+                &self.device,
+                &mut self.path_buf,
+                &mut self.path_cap,
+                (pverts.len() * size_of::<PVert>()) as u64,
+                "path vertices",
+            );
+            self.queue
+                .write_buffer(&self.path_buf, 0, bytemuck::cast_slice(&pverts));
+            if self.path_pipes.is_none() {
+                self.path_pipes = Some(PathPipes::new(&self.device, &self.view_buf));
+            }
+            if self.layer.is_none() {
+                let layer: Layer = Layer::new(
+                    &self.device,
+                    self.width,
+                    self.height,
+                    self.caps.max_texture_dimension_2d,
+                );
+                let comp: GpuImage = self.image_pipes.image(
+                    &self.device,
+                    &self.view_buf,
+                    layer.texture.clone(),
+                    Sampling::Linear,
+                    false,
+                );
+                self.layer = Some((layer, comp));
+            }
         }
         let view: wgpu::TextureView = self
             .target
@@ -574,46 +748,55 @@ impl Gpu {
         let mut enc: wgpu::CommandEncoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            let mut pass: wgpu::RenderPass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(clear[0]) / 255.0,
-                            g: f64::from(clear[1]) / 255.0,
-                            b: f64::from(clear[2]) / 255.0,
-                            a: f64::from(clear[3]) / 255.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            for run in &flat.runs {
-                match run {
-                    Run::Insts(r) => {
-                        pass.set_pipeline(&self.pipeline);
-                        pass.set_bind_group(0, &self.bind, &[]);
-                        pass.set_vertex_buffer(0, self.insts.slice(..));
-                        pass.draw(0..4, r.clone());
-                    }
-                    Run::Batch(id) => {
-                        if let (Some(g), Some(s)) = (self.batches.get(id.0), batches.get(id.0)) {
-                            pass.set_pipeline(&g.pipeline);
-                            pass.set_bind_group(0, &g.bind, &[]);
-                            pass.draw(0..4, 0..s.instances);
-                        }
+        let mut pass: Option<wgpu::RenderPass<'static>> =
+            Some(Self::main_pass(&mut enc, &view, Some(clear)));
+        for run in &flat.runs {
+            if let Run::Paths(r) = run {
+                // The layer draws between two target passes, then lands as one quad.
+                pass = None;
+                if let (Some(pipes), Some((layer, comp))) = (&self.path_pipes, &self.layer) {
+                    layer.draw(
+                        &mut enc,
+                        pipes,
+                        &self.path_buf,
+                        &pranges[r.start as usize..r.end as usize],
+                    );
+                    let p = pass.insert(Self::main_pass(&mut enc, &view, None));
+                    p.set_pipeline(&self.image_pipes.pipes[0]);
+                    p.set_bind_group(0, &comp.bind, &[]);
+                    p.set_vertex_buffer(0, self.insts.slice(..));
+                    p.draw(0..4, composite..composite + 1);
+                }
+                continue;
+            }
+            let p: &mut wgpu::RenderPass<'static> =
+                pass.get_or_insert_with(|| Self::main_pass(&mut enc, &view, None));
+            match run {
+                Run::Insts(r) => {
+                    p.set_pipeline(&self.pipeline);
+                    p.set_bind_group(0, &self.bind, &[]);
+                    p.set_vertex_buffer(0, self.insts.slice(..));
+                    p.draw(0..4, r.clone());
+                }
+                Run::Batch(id) => {
+                    if let (Some(g), Some(s)) = (self.batches.get(id.0), batches.get(id.0)) {
+                        p.set_pipeline(&g.pipeline);
+                        p.set_bind_group(0, &g.bind, &[]);
+                        p.draw(0..4, 0..s.instances);
                     }
                 }
+                Run::Image { id, inst } => {
+                    if let Some(Some(img)) = self.images.get(id.0) {
+                        p.set_pipeline(&self.image_pipes.pipes[usize::from(img.straight)]);
+                        p.set_bind_group(0, &img.bind, &[]);
+                        p.set_vertex_buffer(0, self.insts.slice(..));
+                        p.draw(0..4, *inst..*inst + 1);
+                    }
+                }
+                Run::Paths(_) => {}
             }
         }
+        drop(pass);
         self.queue.submit([enc.finish()]);
         self.read_texture(&self.target, self.width, self.height)
             .await
@@ -670,11 +853,17 @@ impl Gpu {
         Ok(px)
     }
 
+    pub async fn run_kernel(&self, k: &Kernel, path: KernelPath) -> Result<Vec<u8>> {
+        let tex: wgpu::Texture = self.dispatch_kernel(k, path)?;
+        self.read_texture(&tex, k.width, k.height).await
+    }
+
+    /// Runs the kernel and returns its output texture, still on the GPU.
     #[expect(
         clippy::too_many_lines,
         reason = "one linear bind-group and pipeline setup for two forms"
     )]
-    pub async fn run_kernel(&self, k: &Kernel, path: KernelPath) -> Result<Vec<u8>> {
+    fn dispatch_kernel(&self, k: &Kernel, path: KernelPath) -> Result<wgpu::Texture> {
         let compute: bool = path == KernelPath::Compute;
         let stage: wgpu::ShaderStages = if compute {
             wgpu::ShaderStages::COMPUTE
@@ -881,6 +1070,6 @@ impl Gpu {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([enc.finish()]);
-        self.read_texture(&out_tex, k.width, k.height).await
+        Ok(out_tex)
     }
 }

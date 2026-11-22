@@ -2,6 +2,7 @@
 //! render, get RGBA bytes back.
 
 use crate::{Backend, BatchId, Error, FontId, Options, Renderer, Scene, Target, demo};
+use std::collections::HashMap;
 use wasm_bindgen::prelude::{JsError, wasm_bindgen};
 
 fn js(e: &Error) -> JsError {
@@ -15,6 +16,8 @@ pub struct WebRenderer {
     scene: Scene,
     font: FontId,
     grid: Option<BatchId>,
+    /// Demos that upload images or kernel output, built once.
+    built: HashMap<String, Scene>,
 }
 
 #[wasm_bindgen]
@@ -39,6 +42,7 @@ impl WebRenderer {
             scene: Scene::new([255, 255, 255, 255]),
             font,
             grid: None,
+            built: HashMap::new(),
         })
     }
 
@@ -111,7 +115,7 @@ impl WebRenderer {
             .text(self.font, text, x, y, size, [cr, cg, cb, ca]);
     }
 
-    /// Replaces the scene with a built-in demo: `board`, `chart` or `grid` (a 1000x1000 batch).
+    /// Replaces the scene with a built-in demo: `board`, `chart`, `grid` (a 1000x1000 batch), `images`, `paths` or `texture` (a kernel's output as an image).
     pub fn demo(&mut self, name: &str) -> Result<(), JsError> {
         self.scene = match name {
             "board" => demo::board_scene(self.font),
@@ -136,9 +140,24 @@ impl WebRenderer {
                 s.batch(id);
                 s
             }
+            "paths" => demo::paths_scene(self.font),
+            "images" | "texture" => {
+                if let Some(s) = self.built.get(name) {
+                    s.clone()
+                } else {
+                    let s: Scene = if name == "images" {
+                        demo::images_scene(&mut self.inner, self.font)
+                    } else {
+                        demo::texture_scene(&mut self.inner, self.font)
+                    }
+                    .map_err(|e| js(&e))?;
+                    self.built.insert(name.to_owned(), s.clone());
+                    s
+                }
+            }
             other => {
                 return Err(JsError::new(&format!(
-                    "unknown demo `{other}`: board, chart or grid"
+                    "unknown demo `{other}`: board, chart, grid, images, paths or texture"
                 )));
             }
         };

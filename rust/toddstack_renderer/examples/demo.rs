@@ -1,6 +1,6 @@
 //! Demos and the parity check, each on a GPU backend and on the CPU, writing PNGs.
 //!
-//! `cargo run --release --example demo -- <board|chart|grid|quantize|parity|all> [--backend B] [--frames N] [--out DIR]`
+//! `cargo run --release --example demo -- <board|chart|grid|images|paths|texture|quantize|parity|all> [--backend B] [--frames N] [--out DIR]`
 //! `B` is vulkan, dx12, metal, gl or cpu; `WGPU_BACKEND` does the same. Default: the fallback chain.
 
 use std::path::{Path, PathBuf};
@@ -242,6 +242,26 @@ fn main() {
                 let mut s: Scene = Scene::new([255, 255, 255, 255]);
                 s.batch(id);
                 s
+            })
+            .await;
+        }
+        if all || a.demo == "images" {
+            scene_demo(&a, "images", Target::offscreen(640, 260), |r| {
+                let font = r.add_font(FONT).expect("font");
+                demo::images_scene(r, font).expect("images scene")
+            })
+            .await;
+        }
+        if all || a.demo == "paths" {
+            scene_demo(&a, "paths", Target::offscreen(640, 400), |r| {
+                demo::paths_scene(r.add_font(FONT).expect("font"))
+            })
+            .await;
+        }
+        if all || a.demo == "texture" {
+            scene_demo(&a, "texture", Target::offscreen(640, 270), |r| {
+                let font = r.add_font(FONT).expect("font");
+                demo::texture_scene(r, font).expect("texture scene")
             })
             .await;
         }

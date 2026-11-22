@@ -1,7 +1,7 @@
 //! Each GPU backend available here against the CPU reference, on the board scene.
 
 use toddstack_renderer::{
-    Backend, Budget, Diff, Kernel, KernelPath, Options, Renderer, Target, demo,
+    Backend, Budget, Diff, Kernel, KernelPath, Options, Renderer, Sampling, Scene, Target, demo,
 };
 
 const FONT: &[u8] = include_bytes!(concat!(
@@ -167,5 +167,234 @@ fn a_partial_batch_update_changes_only_those_tiles_and_matches_the_cpu() {
             assert_eq!(cpu_before, before, "{} {dt:?} before the update", b.name());
             assert_eq!(cpu_after, after, "{} {dt:?} after the update", b.name());
         }
+    }
+}
+
+/// Renders `build`'s scene on `force`; `None` if that backend is not here.
+fn render_on<F>(force: Backend, target: Target, build: F) -> Option<Vec<u8>>
+where
+    F: Fn(&mut Renderer) -> Scene,
+{
+    pollster::block_on(async {
+        let mut r: Renderer = Renderer::with_options(
+            target,
+            Options {
+                force: Some(force),
+                data_texture: None,
+            },
+        )
+        .await
+        .ok()?;
+        let scene: Scene = build(&mut r);
+        Some(r.render(&scene).await.expect("render"))
+    })
+}
+
+fn gpu_backends() -> impl Iterator<Item = Backend> {
+    Backend::chain()
+        .iter()
+        .copied()
+        .filter(|b| *b != Backend::Cpu)
+}
+
+fn scene_parity<F>(name: &str, target: Target, budget: &Budget, build: F)
+where
+    F: Fn(&mut Renderer) -> toddstack_renderer::Result<Scene> + Copy,
+{
+    for b in gpu_backends() {
+        let Some((caps, diff)) =
+            pollster::block_on(demo::parity_scene(b, target, build)).expect("parity run")
+        else {
+            println!("{name} {}: skipped, no adapter", b.name());
+            continue;
+        };
+        println!("{name} {}: {diff} ({})", b.name(), caps.adapter);
+        assert!(
+            diff.within(budget),
+            "{name} on {} is outside the budget: {diff}",
+            b.name()
+        );
+    }
+}
+
+#[test]
+fn image_quads_scaled_nearest_and_linear_with_opacity_match_the_cpu_within_the_arena_budget() {
+    scene_parity("images", Target::offscreen(640, 260), &Budget::ARENA, |r| {
+        let font = r.add_font(FONT)?;
+        demo::images_scene(r, font)
+    });
+}
+
+#[test]
+fn paths_with_curves_dashes_joins_holes_and_text_between_runs_match_the_cpu() {
+    scene_parity("paths", Target::offscreen(640, 400), &Budget::PATHS, |r| {
+        Ok(demo::paths_scene(r.add_font(FONT)?))
+    });
+}
+
+#[test]
+fn a_kernel_output_drawn_as_a_scene_image_matches_the_cpu_form() {
+    scene_parity(
+        "texture",
+        Target::offscreen(640, 270),
+        &Budget::KERNEL,
+        |r| {
+            let font = r.add_font(FONT)?;
+            demo::texture_scene(r, font)
+        },
+    );
+}
+
+#[test]
+fn a_kernel_image_drawn_one_to_one_equals_the_kernel_readback_on_every_gpu_form() {
+    let (width, height): (u32, u32) = (96, 64);
+    let kernel: Kernel = demo::quantize_kernel(width, height);
+    for b in gpu_backends() {
+        let Ok(mut r) = pollster::block_on(Renderer::with_options(
+            Target::offscreen(width, height),
+            Options {
+                force: Some(b),
+                data_texture: None,
+            },
+        )) else {
+            continue;
+        };
+        for path in [KernelPath::Compute, KernelPath::Fragment] {
+            let Ok((id, ran)) = r.kernel_image_with(&kernel, path, Sampling::Nearest) else {
+                println!("{} {path:?}: not available", b.name());
+                continue;
+            };
+            assert_eq!(path, ran);
+            let mut s: Scene = Scene::new([0, 0, 0, 255]);
+            s.image(id, 0.0, 0.0, 96.0, 64.0, 1.0);
+            let drawn: Vec<u8> = pollster::block_on(r.render(&s)).expect("render");
+            let read: Vec<u8> = pollster::block_on(r.run_kernel_with(&kernel, path))
+                .expect("readback")
+                .rgba8;
+            println!("{} {path:?}: {}", b.name(), Diff::between(&read, &drawn));
+            assert_eq!(
+                read,
+                drawn,
+                "{} {path:?}: drawn image != readback",
+                b.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_nearest_upscale_is_exact_and_a_removed_or_unknown_image_is_refused() {
+    let tiny: Vec<u8> = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [9, 9, 9, 0],
+    ]
+    .concat();
+    let build = |r: &mut Renderer| {
+        let id = r.add_image(2, 2, &tiny, Sampling::Nearest).expect("image");
+        let mut s: Scene = Scene::new([255, 255, 255, 255]);
+        s.image(id, 0.0, 0.0, 8.0, 8.0, 1.0);
+        s
+    };
+    let cpu: Vec<u8> = render_on(Backend::Cpu, Target::offscreen(8, 8), build).expect("cpu");
+    assert_eq!([255, 0, 0, 255], cpu[..4], "top-left texel");
+    assert_eq!([0, 255, 0, 255], cpu[7 * 4..8 * 4], "top-right texel");
+    assert_eq!(
+        [255, 255, 255, 255],
+        cpu[(7 * 8 + 7) * 4..],
+        "transparent texel"
+    );
+    for b in gpu_backends() {
+        let Some(px) = render_on(b, Target::offscreen(8, 8), build) else {
+            continue;
+        };
+        assert_eq!(cpu, px, "{} nearest upscale", b.name());
+    }
+    let mut r: Renderer = pollster::block_on(Renderer::with_options(
+        Target::offscreen(8, 8),
+        Options {
+            force: Some(Backend::Cpu),
+            data_texture: None,
+        },
+    ))
+    .expect("cpu renderer");
+    assert!(r.add_image(2, 2, &[0; 3], Sampling::Linear).is_err());
+    let id = r.add_image(2, 2, &tiny, Sampling::Linear).expect("image");
+    r.remove_image(id).expect("remove");
+    assert!(r.remove_image(id).is_err());
+}
+
+#[test]
+fn paths_fill_non_zero_winding_keep_holes_and_respect_paint_order_on_every_backend() {
+    use toddstack_renderer::tiny_skia::PathBuilder;
+    let build = |_: &mut Renderer| {
+        let mut s: Scene = Scene::new([255, 255, 255, 255]);
+        // A pentagram: its centre is wound twice and is filled.
+        let mut star: PathBuilder = PathBuilder::new();
+        for k in 0..5_u8 {
+            let a: f32 =
+                f32::from(k * 2) * std::f32::consts::TAU / 5.0 - std::f32::consts::FRAC_PI_2;
+            let (x, y): (f32, f32) = (40.0 + 36.0 * a.cos(), 40.0 + 36.0 * a.sin());
+            if k == 0 {
+                star.move_to(x, y);
+            } else {
+                star.line_to(x, y);
+            }
+        }
+        star.close();
+        s.fill_path(&star.finish().expect("star"), [200, 0, 0, 255]);
+        // A frame whose inner square is wound the other way: a hole.
+        let mut frame: PathBuilder = PathBuilder::new();
+        frame.move_to(80.0, 4.0);
+        frame.line_to(156.0, 4.0);
+        frame.line_to(156.0, 76.0);
+        frame.line_to(80.0, 76.0);
+        frame.close();
+        for (i, (x, y)) in [(96.0, 20.0), (96.0, 60.0), (140.0, 60.0), (140.0, 20.0)]
+            .iter()
+            .enumerate()
+        {
+            if i == 0 {
+                frame.move_to(*x, *y);
+            } else {
+                frame.line_to(*x, *y);
+            }
+        }
+        frame.close();
+        s.fill_path(&frame.finish().expect("frame"), [0, 0, 200, 255]);
+        // A plain rect between two path runs, then a path over it.
+        s.rect(0.0, 84.0, 160.0, 12.0, [0, 160, 0, 255]);
+        let tile = toddstack_renderer::rounded_rect(60.0, 80.0, 40.0, 20.0, 6.0).expect("tile");
+        s.fill_path(&tile, [255, 255, 0, 255]);
+        s
+    };
+    let target: Target = Target::offscreen(160, 100);
+    let at = |px: &[u8], x: usize, y: usize| -> [u8; 3] {
+        let o: usize = (y * 160 + x) * 4;
+        [px[o], px[o + 1], px[o + 2]]
+    };
+    let mut all: Vec<Backend> = vec![Backend::Cpu];
+    all.extend(gpu_backends());
+    for b in all {
+        let Some(px) = render_on(b, target, build) else {
+            continue;
+        };
+        assert_eq!(
+            [200, 0, 0],
+            at(&px, 40, 40),
+            "{} star centre is filled",
+            b.name()
+        );
+        assert_eq!([255, 255, 255], at(&px, 4, 4), "{} outside", b.name());
+        assert_eq!([0, 0, 200], at(&px, 88, 40), "{} frame ring", b.name());
+        assert_eq!([255, 255, 255], at(&px, 118, 40), "{} frame hole", b.name());
+        assert_eq!([0, 160, 0], at(&px, 10, 90), "{} rect", b.name());
+        assert_eq!(
+            [255, 255, 0],
+            at(&px, 80, 90),
+            "{} path over the rect",
+            b.name()
+        );
     }
 }
