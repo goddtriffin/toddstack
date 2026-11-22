@@ -139,6 +139,9 @@ mod tests {
             mem_declared: false,
             mem_peak_at_ms: None,
             vram_declared: false,
+            v: crate::job::JOB_VERSION,
+            settle_ms: None,
+            typical_cpu: None,
             blocked_by: by.map(Into::into),
         }
     }

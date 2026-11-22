@@ -44,7 +44,7 @@ pub struct Stats {
     #[serde(default)]
     pub peak_mem_at_ms: u64,
     /// Milliseconds after the start at which the process tree's CPU first reached 3/4 of its peak (0 when unknown):
-    /// how long a learned CPU peak is held while it has not shown up (`admit::cpu_hold_ms`).
+    /// how long the job settles (`admit::settle_window_ms`).
     #[serde(default)]
     pub peak_cpu_at_ms: u64,
     /// The process tree's sustained CPU (times 100): its highest mean over any 10 s window (`admit::sustained_level`).

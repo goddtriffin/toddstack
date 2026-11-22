@@ -24,7 +24,7 @@ Cores, RAM, GPU memory and free disk the job needs. Without flags: the median me
 sampled every 0.5 s while the job runs: peak cores at once and peak RSS) from
 `~/.local/state/stokehold/history.jsonl` for the same command and cwd; else for the same command in the same place of
 the same repository (any worktree or clone sharing its git dir, so a fresh agent worktree is not cold); else for the
-same program and first argument there (`make ui-check`, `cargo test`); else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 10 s apart; after one run, history gives the real peak). A request larger than
+same program and first argument there (`make ui-check`, `cargo test`); else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 30 s apart; after one run, history gives the real peak). A request larger than
 the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
 VRAM is learned only from the job's own use (0.4.7): the machine-wide VRAM in use at its peak minus what was in use
 just before it started (`vram_rise` in history), 0 under 256M. Before 0.4.7 the machine-wide peak itself was learned,
@@ -62,12 +62,24 @@ All of these must hold (a job with nothing running needs only the guards and the
   max(latest, mean of the last 20 s of readings in `~/.local/state/stokehold/busy`), which every stokehold process
   adds to, so a single window between build steps cannot admit onto a busy machine. Jobs start under 80% and their
   bursts fill the rest: the target is 80-90% busy while jobs wait. On Linux CPU includes steal time.
-- Settle: a job that started under 10 s ago (or has not yet stamped its start) is settling: its CPU has not shown yet.
+- Size: the measured busy cores plus the new job's typical cores (`--cpu`, else the median of its past runs' mean
+  cores, else a quarter of the machine when cold) stay within 95% of the cores, settling or not, so a job that averages 16
+  cores does not start at 79% busy. A waiter blocked by this for 5 minutes holds the queue, like a memory wait.
+- Peak cap (a backstop that rarely binds): the expected peaks (learned peak, `--cpu`, or the whole machine when cold)
+  of the jobs started under 60 s ago, plus the new one's, stay within 2.5 x cores. It stops cold builds that idle on
+  downloads or a build-dir lock past their settle and then compile together: on 16 cores at most two cold jobs start
+  in any minute. Older jobs do not count: their CPU shows in the measurement and their peaks are short bursts at
+  different times (counting every running job's peak replayed the Mac's 2026-11-21 day at 12% in band).
+- Settle: a job that started less than its settle window ago (or has not yet stamped its start) is settling: its CPU
+  has not shown yet. The window is 10 s, or the learned time to its CPU peak when later, at most 60 s; cold jobs
+  (no history) and Docker/VM jobs settle at least 30 s (cold `cargo build`s fetch crates and `docker build`s pull
+  images before they compile). A job past 10 s that already uses its typical cores shows in the measurement and
+  stops settling early.
   While any job settles, a new job starts only if the measured CPU, plus each settling job's size (learned peak,
   `--cpu`, or the whole machine when cold) minus its live use, plus the new job's own size fit under the 80% line.
-  So small jobs still start beside a fresh build, two cold jobs start at least 10 s apart, and a burst of big builds
+  So small jobs still start beside a fresh build, two cold jobs start at least 30 s apart, and a burst of big builds
   starts one per settle as each one's CPU shows in the measurement. A waiter held by the settle sleeps until the first
-  settle ends. Sizes matter only here: once a job has run 10 s, only the measurement counts it.
+  settle ends. Once a job has settled, only the measurement, the size check and the peak cap count it.
 - Pinned CPU: nothing starts, a job alone included, while any shared CPU reading in the last 10 s is 98% busy or more.
 - Hard guards (veto only, they block even a job that would run alone): memory used at 95% or more; 1-minute load at
   or over 4 x cores once the CPU confirms it (at least 50% busy, or Linux `/proc/pressure/cpu` `some avg10` at least
@@ -94,12 +106,15 @@ CPU drops below the line the oldest one that fits starts first.
 
 Nice: jobs run at `nice 10` (through `/usr/bin/nice`, which execs the command, so the pid and process group stay the
 same), so the desktop, shells and stokehold itself stay responsive while builds fill the CPU. `STOKEHOLD_NICE` sets the
-level (0 turns it off).
+level (0 turns it off). Nice is inherited: daemons a job starts (the Gradle daemon, an sccache server) keep running at
+nice 10 after the job ends, and serve later un-niced builds at that level. Nice does not reach Docker's VM: the work
+of `docker build` or `docker compose` runs in the VM at normal priority, so Docker/VM jobs (any command word
+containing `docker`) run un-niced.
 
 Learned CPU sizes: a job's recorded peak is the larger of its process tree's peak and the machine-wide CPU rise of
 other programs over the pre-start baseline, so work hosted in Docker's VM also teaches a real peak. On Linux a
 process's threads are not counted as children (before 0.3.2 a 16-thread rustc counted 17 times). History still records
-each run's time to CPU peak and its best 10 s mean (`sustained_centi_cores`) for the stats; admission no longer uses them.
+each run's time to CPU peak, which sets its settle window, and its best 10 s mean (`sustained_centi_cores`) for the stats.
 
 `stokehold status` evaluates every waiter by these rules and prints why it waits, with the numbers (`cpu: machine 85%
 busy, jobs start under 80%`, `cpu: jobs that just started are settling; 24.60 cores with theirs, 12.80 under the 80%

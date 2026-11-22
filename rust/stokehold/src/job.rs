@@ -111,6 +111,9 @@ pub enum State {
     Stopped,
 }
 
+/// The job-file version this release writes (`Job::v`): 1 from 0.4.10 (closed-loop admission) on.
+pub const JOB_VERSION: u32 = 1;
+
 /// One JSON file per job in the state dir.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
@@ -138,4 +141,15 @@ pub struct Job {
     /// The VRAM size was declared (`--vram`): its unused part is held for the whole run (`admit::vram_reserved`).
     #[serde(default)]
     pub vram_declared: bool,
+    /// Job-file version (`JOB_VERSION`); 0 (absent) from a release before 0.4.10. An old waiter decides by its own
+    /// release's rules, so it never holds the queue for a newer one (`admit::evaluate`).
+    #[serde(default)]
+    pub v: u32,
+    /// How long (ms) after its start this job settles (`admit::settle_window_ms`); `None` means `admit::SETTLE_MS`.
+    #[serde(default)]
+    pub settle_ms: Option<i64>,
+    /// The cores this job typically uses: the median of past runs' mean cores, or `--cpu`. `None` when cold (then
+    /// `admit::typical_centi` assumes a quarter of the machine).
+    #[serde(default)]
+    pub typical_cpu: Option<u32>,
 }

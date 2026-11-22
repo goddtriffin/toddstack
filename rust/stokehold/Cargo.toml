@@ -11,7 +11,7 @@ description = "stokehold (formerly heavy): a machine-wide admission queue for he
 license-file.workspace = true
 keywords = ["queue", "scheduler", "build", "resources", "toddstack"]
 categories = ["development-tools", "command-line-utilities"]
-include = ["**/*.rs", "Cargo.toml", "LICENSE", "README.md"]
+include = ["**/*.rs", "Cargo.toml", "LICENSE", "README.md", "CHANGELOG.md"]
 
 [lints]
 workspace = true
