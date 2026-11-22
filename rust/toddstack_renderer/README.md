@@ -84,11 +84,13 @@ readback) p50 and max over `--frames N` (default 30), writes `out/<demo>-<backen
 cd rust
 stokehold cargo run --release -p toddstack-renderer --example demo -- all          # board chart grid images paths texture quantize parity
 stokehold cargo run --release -p toddstack-renderer --example demo -- board --backend vulkan --frames 100
+stokehold cargo run --release -p toddstack-renderer --example demo -- parity paths images texture   # several, in order
 WGPU_BACKEND=dx12 stokehold cargo run --release -p toddstack-renderer --example demo -- parity
 stokehold cargo test --release -p toddstack-renderer -- --nocapture                 # parity + batch + kernel tests
 ```
 
-- `--backend` (or `WGPU_BACKEND`) is `vulkan`, `dx12`, `metal`, `gl` or `cpu`.
+- `--backend` (or `WGPU_BACKEND`; the flag wins) is `vulkan`, `dx12`, `metal`, `gl` or `cpu`; an unknown name exits 2.
+- Name several demos to run them in order. `images`, `paths` and `texture` check their budget like `parity` and exit 1 on a breach.
 - `parity` prints `PASS` or `FAIL` plus the diff numbers per backend, `SKIP` if there is no adapter, and exits
   1 on a failure. Without `--backend` it tries every GPU backend in the platform's chain.
 - `grid` is a 1000x1000 instanced grid (1M tiles, one packed u32 each) as a custom batch.
