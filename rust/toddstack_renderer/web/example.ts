@@ -28,7 +28,11 @@ const sizes = {
   texture: [640, 270],
 } as const;
 for (const name of Object.keys(sizes) as Demo[]) {
-  document.querySelector(`#${name}`)!.addEventListener("click", () => show(name, [...sizes[name]]));
+  document.querySelector(`#${name}`)!.addEventListener("click", () => {
+    show(name, [...sizes[name]]).catch((e) => {
+      info.textContent = `${name}: ${e instanceof Error ? e.message : String(e)}`;
+    });
+  });
 }
 const first = (params.get("demo") as Demo | null) ?? "board";
 await show(first, [...sizes[first]]);
