@@ -12,7 +12,10 @@ use crate::glyphs::{ATLAS_SIZE, Flat, Inst, Run};
 use crate::gpu_image::{GpuImage, ImagePipes};
 use crate::gpu_path::{self, Layer, PVert, PathPipes};
 use crate::kernel::{Binding, FULLSCREEN_VS, Kernel, KernelPath};
+use crate::renderer::Target;
 use crate::scene::{ImageId, Rgba, Sampling};
+#[cfg(target_arch = "wasm32")]
+use crate::renderer::Kind;
 use wgpu::util::DeviceExt;
 
 /// The attributes of one [`Inst`], shared by the shape and image pipelines.
@@ -20,6 +23,14 @@ pub const INST_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
 
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// A canvas surface and the configuration it was last given.
+struct Surf {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    #[cfg(target_arch = "wasm32")]
+    kind: Kind,
+}
 
 struct GpuBatch {
     pipeline: wgpu::RenderPipeline,
@@ -36,7 +47,9 @@ pub struct Gpu {
     data_texture: bool,
     width: u32,
     height: u32,
-    target: wgpu::Texture,
+    /// The offscreen image; `None` for a canvas, which draws into the surface's texture.
+    target: Option<wgpu::Texture>,
+    surface: Option<Surf>,
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
     view_buf: wgpu::Buffer,
@@ -166,10 +179,10 @@ impl Gpu {
     )]
     pub async fn create(
         backend: Backend,
-        width: u32,
-        height: u32,
+        target: &Target,
         data_texture: Option<bool>,
     ) -> Result<Option<Self>> {
+        let (width, height): (u32, u32) = (target.width, target.height);
         let Some(backends) = backend.wgpu_backends() else {
             return Ok(None);
         };
@@ -177,24 +190,20 @@ impl Gpu {
             wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = backends;
         let instance: wgpu::Instance = wgpu::Instance::new(desc);
-        // wgpu's web GL backend only finds an adapter for a given surface, so probe with a 1x1 one.
+        // wgpu's web GL backend only finds an adapter for a given surface: a canvas target
+        // brings its own; an offscreen target probes with a 1x1 one. WebGPU asks for the adapter
+        // first, so a browser without one leaves the canvas free for the next backend.
         #[cfg(target_arch = "wasm32")]
-        let probe: Option<wgpu::Surface<'static>> = if backend == Backend::WebGl2 {
-            let canvas: web_sys::OffscreenCanvas = web_sys::OffscreenCanvas::new(1, 1)
-                .map_err(|e| Error::Device(format!("{e:?}")))?;
-            Some(
-                instance
-                    .create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas))
-                    .map_err(|e| Error::Device(e.to_string()))?,
-            )
+        let mut surface: Option<wgpu::Surface<'static>> = if backend == Backend::WebGl2 {
+            Some(web_surface(&instance, &target.kind)?)
         } else {
             None
         };
         #[cfg(not(target_arch = "wasm32"))]
-        let probe: Option<wgpu::Surface<'static>> = None;
+        let surface: Option<wgpu::Surface<'static>> = None;
         let Ok(adapter) = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: probe.as_ref(),
+                compatible_surface: surface.as_ref(),
                 ..Default::default()
             })
             .await
@@ -232,6 +241,30 @@ impl Gpu {
             max_texture_dimension_2d: limits.max_texture_dimension_2d,
             max_buffer_size: limits.max_buffer_size,
             max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+        };
+        #[cfg(target_arch = "wasm32")]
+        if surface.is_none() && target.is_canvas() {
+            surface = Some(web_surface(&instance, &target.kind)?);
+        }
+        let surf: Option<Surf> = match surface {
+            Some(surface) if target.is_canvas() => {
+                let Some(config) =
+                    surface_config(&surface, &adapter, width, height, caps.max_texture_dimension_2d)?
+                else {
+                    return Ok(None);
+                };
+                surface.configure(&device, &config);
+                #[cfg(target_arch = "wasm32")]
+                set_canvas_size(&target.kind, width, height);
+                Some(Surf {
+                    surface,
+                    config,
+                    #[cfg(target_arch = "wasm32")]
+                    kind: target.kind.clone(),
+                })
+            }
+            // The WebGL2 probe for an offscreen target has done its job.
+            _ => None,
         };
         let shader: wgpu::ShaderModule =
             device.create_shader_module(wgpu::include_wgsl!("shapes.wgsl"));
@@ -336,7 +369,11 @@ impl Gpu {
             mapped_at_creation: false,
         });
         let image_pipes: ImagePipes = ImagePipes::new(&device);
-        let target: wgpu::Texture = target_texture(&device, width, height, false);
+        let target: Option<wgpu::Texture> = if surf.is_some() {
+            None
+        } else {
+            Some(target_texture(&device, width, height, false))
+        };
         Ok(Some(Self {
             device,
             queue,
@@ -345,6 +382,7 @@ impl Gpu {
             width,
             height,
             target,
+            surface: surf,
             pipeline,
             bind,
             view_buf,
@@ -361,10 +399,24 @@ impl Gpu {
         }))
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        if let Some(s) = &mut self.surface {
+            let max: u32 = self.caps.max_texture_dimension_2d;
+            if width == 0 || height == 0 || width > max || height > max {
+                return Err(Error::BadInput(format!(
+                    "canvas {width}x{height} is empty or larger than {max}"
+                )));
+            }
+            s.config.width = width;
+            s.config.height = height;
+            #[cfg(target_arch = "wasm32")]
+            set_canvas_size(&s.kind, width, height);
+            s.surface.configure(&self.device, &s.config);
+        } else {
+            self.target = Some(target_texture(&self.device, width, height, false));
+        }
         self.width = width;
         self.height = height;
-        self.target = target_texture(&self.device, width, height, false);
         self.layer = None;
         self.queue.write_buffer(
             &self.view_buf,
@@ -378,6 +430,7 @@ impl Gpu {
                 bytemuck::cast_slice(&[width as f32, height as f32, 0.0, 0.0]),
             );
         }
+        Ok(())
     }
 
     #[expect(
@@ -676,10 +729,7 @@ impl Gpu {
         .forget_lifetime()
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one linear frame: uploads, then passes in paint order"
-    )]
+    /// Draws the frame and reads it back (offscreen targets).
     pub async fn render(
         &mut self,
         flat: &Flat,
@@ -687,6 +737,83 @@ impl Gpu {
         clear: Rgba,
         batches: &[BatchState],
     ) -> Result<Vec<u8>> {
+        let view: wgpu::TextureView = self
+            .target
+            .as_ref()
+            .ok_or_else(|| Error::BadInput("a canvas target has no readback".to_owned()))?
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.draw(flat, atlas, clear, batches, &view);
+        let target: &wgpu::Texture = self.target.as_ref().ok_or_else(|| {
+            Error::BadInput("a canvas target has no readback".to_owned())
+        })?;
+        self.read_texture(target, self.width, self.height).await
+    }
+
+    /// Draws the frame with no readback: into the canvas surface and presents it, or (offscreen)
+    /// just runs it.
+    pub fn present(
+        &mut self,
+        flat: &Flat,
+        atlas: Option<&[u8]>,
+        clear: Rgba,
+        batches: &[BatchState],
+    ) -> Result<()> {
+        if self.surface.is_none() {
+            let view: wgpu::TextureView = self
+                .target
+                .as_ref()
+                .ok_or_else(|| Error::Surface("no target".to_owned()))?
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.draw(flat, atlas, clear, batches, &view);
+            return Ok(());
+        }
+        // Lost or outdated: reconfigure and retry once, then give up.
+        let mut last: &str = "";
+        for attempt in 0..2 {
+            let Some(s) = &self.surface else { break };
+            let frame: wgpu::SurfaceTexture = match s.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(f)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+                // Nothing to show this frame (hidden, or slow): not an error.
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return Ok(());
+                }
+                other => {
+                    last = match other {
+                        wgpu::CurrentSurfaceTexture::Outdated => "outdated",
+                        wgpu::CurrentSurfaceTexture::Lost => "lost",
+                        _ => "validation error",
+                    };
+                    if attempt == 0 {
+                        s.surface.configure(&self.device, &s.config);
+                    }
+                    continue;
+                }
+            };
+            let view: wgpu::TextureView = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.draw(flat, atlas, clear, batches, &view);
+            self.queue.present(frame);
+            return Ok(());
+        }
+        Err(Error::Surface(format!(
+            "{last} after a reconfigure; recreate the renderer"
+        )))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear frame: uploads, then passes in paint order"
+    )]
+    fn draw(
+        &mut self,
+        flat: &Flat,
+        atlas: Option<&[u8]>,
+        clear: Rgba,
+        batches: &[BatchState],
+        view: &wgpu::TextureView,
+    ) {
         if let Some(px) = atlas {
             self.queue.write_texture(
                 self.atlas.as_image_copy(),
@@ -760,14 +887,11 @@ impl Gpu {
                 self.layer = Some((layer, comp));
             }
         }
-        let view: wgpu::TextureView = self
-            .target
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc: wgpu::CommandEncoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let mut pass: Option<wgpu::RenderPass<'static>> =
-            Some(Self::main_pass(&mut enc, &view, Some(clear)));
+            Some(Self::main_pass(&mut enc, view, Some(clear)));
         for run in &flat.runs {
             if let Run::Paths(r) = run {
                 // The layer draws between two target passes, then lands as one quad.
@@ -779,7 +903,7 @@ impl Gpu {
                         &self.path_buf,
                         &pranges[r.start as usize..r.end as usize],
                     );
-                    let p = pass.insert(Self::main_pass(&mut enc, &view, None));
+                    let p = pass.insert(Self::main_pass(&mut enc, view, None));
                     p.set_pipeline(&self.image_pipes.pipes[0]);
                     p.set_bind_group(0, &comp.bind, &[]);
                     p.set_vertex_buffer(0, self.insts.slice(..));
@@ -788,7 +912,7 @@ impl Gpu {
                 continue;
             }
             let p: &mut wgpu::RenderPass<'static> =
-                pass.get_or_insert_with(|| Self::main_pass(&mut enc, &view, None));
+                pass.get_or_insert_with(|| Self::main_pass(&mut enc, view, None));
             match run {
                 Run::Insts(r) => {
                     p.set_pipeline(&self.pipeline);
@@ -816,8 +940,6 @@ impl Gpu {
         }
         drop(pass);
         self.queue.submit([enc.finish()]);
-        self.read_texture(&self.target, self.width, self.height)
-            .await
     }
 
     async fn read_texture(&self, tex: &wgpu::Texture, w: u32, h: u32) -> Result<Vec<u8>> {
@@ -1106,6 +1228,73 @@ impl Gpu {
         self.queue.submit([enc.finish()]);
         Ok(out_tex)
     }
+}
+
+/// The wgpu surface for a canvas target (an offscreen target gets a 1x1 probe canvas).
+#[cfg(target_arch = "wasm32")]
+fn web_surface(instance: &wgpu::Instance, kind: &Kind) -> Result<wgpu::Surface<'static>> {
+    let target: wgpu::SurfaceTarget<'static> = match kind {
+        Kind::Html(c) => wgpu::SurfaceTarget::Canvas(c.clone()),
+        Kind::Offscreen(c) => wgpu::SurfaceTarget::OffscreenCanvas(c.clone()),
+        Kind::Image => wgpu::SurfaceTarget::OffscreenCanvas(
+            web_sys::OffscreenCanvas::new(1, 1).map_err(|e| Error::Device(format!("{e:?}")))?,
+        ),
+    };
+    instance
+        .create_surface(target)
+        .map_err(|e| Error::Device(e.to_string()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_canvas_size(kind: &Kind, width: u32, height: u32) {
+    match kind {
+        Kind::Html(c) => {
+            c.set_width(width);
+            c.set_height(height);
+        }
+        Kind::Offscreen(c) => {
+            c.set_width(width);
+            c.set_height(height);
+        }
+        Kind::Image => {}
+    }
+}
+
+/// The surface configuration: our one render format, opaque alpha. `None` if the surface cannot
+/// take that format.
+fn surface_config(
+    surface: &wgpu::Surface<'static>,
+    adapter: &wgpu::Adapter,
+    width: u32,
+    height: u32,
+    max: u32,
+) -> Result<Option<wgpu::SurfaceConfiguration>> {
+    if width == 0 || height == 0 || width > max || height > max {
+        return Err(Error::BadInput(format!(
+            "canvas {width}x{height} is empty or larger than {max}"
+        )));
+    }
+    let caps: wgpu::SurfaceCapabilities = surface.get_capabilities(adapter);
+    if !caps.formats.contains(&FORMAT) {
+        return Ok(None);
+    }
+    let alpha: wgpu::CompositeAlphaMode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque)
+    {
+        wgpu::CompositeAlphaMode::Opaque
+    } else {
+        caps.alpha_modes.first().copied().unwrap_or_default()
+    };
+    Ok(Some(wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: FORMAT,
+        color_space: wgpu::SurfaceColorSpace::Auto,
+        width,
+        height,
+        present_mode: wgpu::PresentMode::Fifo,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: alpha,
+        view_formats: vec![],
+    }))
 }
 
 /// Yields to the JS event loop with `setTimeout(0)`, in a window or a worker.
