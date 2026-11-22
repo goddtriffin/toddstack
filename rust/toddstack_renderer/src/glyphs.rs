@@ -6,7 +6,7 @@
 )]
 
 use crate::error::{Error, Result};
-use crate::scene::{BatchId, FontId, Prim, Rgba, Scene};
+use crate::scene::{BatchId, FontId, ImageId, Prim, Rgba, Scene};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -29,10 +29,24 @@ pub struct Inst {
 pub enum Run {
     Insts(Range<u32>),
     Batch(BatchId),
+    /// One image quad: its record is `insts[inst]` (`a` = quad, `p.x` = opacity).
+    Image {
+        id: ImageId,
+        inst: u32,
+    },
+    /// A range of `Flat::paths`, filled in order.
+    Paths(Range<u32>),
+}
+
+/// One filled outline (a stroke is already its outline) in a straight 0..1 colour.
+pub struct PathDraw {
+    pub outline: tiny_skia::Path,
+    pub color: [f32; 4],
 }
 
 pub struct Flat {
     pub insts: Vec<Inst>,
+    pub paths: Vec<PathDraw>,
     pub runs: Vec<Run>,
 }
 
@@ -56,6 +70,28 @@ pub struct Atlas {
     row_h: u32,
     /// Set when a glyph was added since the last upload.
     pub dirty: bool,
+}
+
+/// Closes the open run of plain instances.
+fn flush(runs: &mut Vec<Run>, start: &mut u32, len: usize) {
+    let end: u32 = len as u32;
+    if end > *start {
+        runs.push(Run::Insts(*start..end));
+    }
+    *start = end;
+}
+
+/// Adds an outline, extending the previous path run when nothing was drawn between.
+fn push_path(runs: &mut Vec<Run>, paths: &mut Vec<PathDraw>, outline: tiny_skia::Path, c: Rgba) {
+    let at: u32 = paths.len() as u32;
+    paths.push(PathDraw {
+        outline,
+        color: col(c),
+    });
+    match runs.last_mut() {
+        Some(Run::Paths(r)) if r.end == at => r.end = at + 1,
+        _ => runs.push(Run::Paths(at..at + 1)),
+    }
 }
 
 fn col(c: Rgba) -> [f32; 4] {
@@ -121,9 +157,11 @@ impl Atlas {
     }
 
     /// Lays text out into the atlas and flattens the scene to instances, in paint order.
+    #[expect(clippy::too_many_lines, reason = "one match over every primitive kind")]
     pub fn flatten(&mut self, scene: &Scene) -> Result<Flat> {
         let mut insts: Vec<Inst> = Vec::new();
         let mut runs: Vec<Run> = Vec::new();
+        let mut paths: Vec<PathDraw> = Vec::new();
         let mut start: u32 = 0;
         for p in &scene.prims {
             match p {
@@ -182,19 +220,51 @@ impl Atlas {
                     }
                 }
                 Prim::Batch(id) => {
-                    let end: u32 = insts.len() as u32;
-                    if end > start {
-                        runs.push(Run::Insts(start..end));
-                    }
-                    start = end;
+                    flush(&mut runs, &mut start, insts.len());
                     runs.push(Run::Batch(*id));
+                }
+                Prim::Image {
+                    image,
+                    x,
+                    y,
+                    w,
+                    h,
+                    opacity,
+                } => {
+                    flush(&mut runs, &mut start, insts.len());
+                    runs.push(Run::Image {
+                        id: *image,
+                        inst: insts.len() as u32,
+                    });
+                    insts.push(Inst {
+                        a: [*x, *y, *w, *h],
+                        uv: [0.0; 4],
+                        p: [opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
+                        color: [1.0; 4],
+                    });
+                    start = insts.len() as u32;
+                }
+                Prim::Fill { path, color } => {
+                    flush(&mut runs, &mut start, insts.len());
+                    push_path(&mut runs, &mut paths, path.clone(), *color);
+                }
+                Prim::Stroke {
+                    path,
+                    stroke,
+                    color,
+                } => {
+                    let dashed: Option<tiny_skia::Path> = match &stroke.dash {
+                        Some(d) => path.dash(d, 1.0),
+                        None => Some(path.clone()),
+                    };
+                    if let Some(outline) = dashed.and_then(|p| p.stroke(stroke, 1.0)) {
+                        flush(&mut runs, &mut start, insts.len());
+                        push_path(&mut runs, &mut paths, outline, *color);
+                    }
                 }
             }
         }
-        let end: u32 = insts.len() as u32;
-        if end > start {
-            runs.push(Run::Insts(start..end));
-        }
-        Ok(Flat { insts, runs })
+        flush(&mut runs, &mut start, insts.len());
+        Ok(Flat { insts, paths, runs })
     }
 }

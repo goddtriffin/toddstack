@@ -18,6 +18,9 @@ Not runnable on this Mac (stay untested): Vulkan, DX12, GLES, WebGL2, WebGPU in 
 [x] wasm build + tiny TS wrapper + minimal web example page; wasm size raw + brotli
 [x] README: API, fallback chain, demos, how to run
 [ ] clippy clean (workspace lints) and tests green via stokehold
-[ ] not in v0 (documented): image quads, paths/fills, direct-to-canvas surface
+[x] image quads (nearest/linear, opacity), CPU + wgpu, demo + parity test
+[x] paths: fill + stroke (lines, quads, cubics, rounded rects), stencil-then-cover on wgpu, tiny-skia on CPU, demo + parity test
+[x] kernel output as a scene image without readback, demo + parity tests
+[ ] not in v0 (documented): direct-to-canvas surface
 [ ] run the web example in a real browser (WebGPU, WebGL2): denied here, Todd or the rig
 [ ] Vulkan, DX12, GLES runs: the rig (Windows, RTX 3080)

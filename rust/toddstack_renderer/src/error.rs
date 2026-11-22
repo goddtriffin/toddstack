@@ -22,6 +22,9 @@ pub enum Error {
     /// A `BatchId` that this renderer never issued.
     #[error("unknown batch: add it with Renderer::add_batch first")]
     UnknownBatch,
+    /// An `ImageId` that this renderer never issued, or one already removed.
+    #[error("unknown image: add it with Renderer::add_image first")]
+    UnknownImage,
     /// The font bytes did not parse.
     #[error("the font did not parse: {0}")]
     Font(String),

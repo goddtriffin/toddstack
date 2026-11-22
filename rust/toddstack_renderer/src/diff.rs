@@ -35,6 +35,24 @@ impl Budget {
         over_32: 0.05,
         max: 48,
     };
+
+    /// For scenes full of path edges: the GPU fills with 16 samples a pixel and tiny-skia with its
+    /// own 16, so edge pixels differ by a coverage step (measured 0.76% / 0.71% / 0.006% / 41).
+    pub const PATHS: Self = Self {
+        over_1: 2.0,
+        over_8: 1.0,
+        over_32: 0.05,
+        max: 48,
+    };
+
+    /// For a kernel's output drawn in a scene: float rounding in the GPU kernel can flip a
+    /// nearest-palette pick on a few pixels (measured 0.08% / 0.04% / 0.005% / 120).
+    pub const KERNEL: Self = Self {
+        over_1: 0.2,
+        over_8: 0.1,
+        over_32: 0.02,
+        max: 255,
+    };
 }
 
 impl Diff {

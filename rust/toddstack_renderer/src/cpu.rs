@@ -10,36 +10,73 @@
 use crate::batch::BatchState;
 use crate::error::{Error, Result};
 use crate::glyphs::{ATLAS_SIZE, Flat, Run};
+use crate::paths::rounded_rect;
 use crate::scene::Rgba;
-use tiny_skia::{Color, FillRule, LineCap, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
+use crate::scene::{ImageId, Sampling};
+use tiny_skia::{
+    Color, FillRule, FilterQuality, LineCap, Paint, PathBuilder, Pattern, Pixmap, Rect, SpreadMode,
+    Stroke, Transform,
+};
 
 pub struct Cpu {
     pm: Pixmap,
-}
-
-fn rrect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
-    let mut b: PathBuilder = PathBuilder::new();
-    if r <= 0.0 {
-        b.push_rect(tiny_skia::Rect::from_xywh(x, y, w, h)?);
-        return b.finish();
-    }
-    let k: f32 = r * 0.552_284_8;
-    let (x1, y1): (f32, f32) = (x + w, y + h);
-    b.move_to(x + r, y);
-    b.line_to(x1 - r, y);
-    b.cubic_to(x1 - r + k, y, x1, y + r - k, x1, y + r);
-    b.line_to(x1, y1 - r);
-    b.cubic_to(x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1);
-    b.line_to(x + r, y1);
-    b.cubic_to(x + r - k, y1, x, y1 - r + k, x, y1 - r);
-    b.line_to(x, y + r);
-    b.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
-    b.close();
-    b.finish()
+    /// Premultiplied pixels and how to sample them, by image id.
+    images: Vec<Option<(Pixmap, FilterQuality)>>,
 }
 
 fn to8(v: f32) -> u8 {
     (v * 255.0).round() as u8
+}
+
+/// Stretches `img` over the quad in `i`, in the instance's opacity.
+#[expect(clippy::cast_precision_loss, reason = "image sizes are far below 2^23")]
+fn draw_image(pm: &mut Pixmap, img: &Pixmap, quality: FilterQuality, i: &crate::glyphs::Inst) {
+    let (x, y, w, h): (f32, f32, f32, f32) = (i.a[0], i.a[1], i.a[2], i.a[3]);
+    let Some(rect) = Rect::from_xywh(x, y, w, h) else {
+        return;
+    };
+    let shader = Pattern::new(
+        img.as_ref(),
+        SpreadMode::Pad,
+        quality,
+        i.p[0],
+        Transform::from_row(
+            w / img.width() as f32,
+            0.0,
+            0.0,
+            h / img.height() as f32,
+            x,
+            y,
+        ),
+    );
+    let paint: Paint = Paint {
+        shader,
+        anti_alias: false,
+        ..Paint::default()
+    };
+    pm.fill_rect(rect, &paint, Transform::identity(), None);
+}
+
+fn fill_paths(pm: &mut Pixmap, paths: &[crate::glyphs::PathDraw]) {
+    let mut paint: Paint = Paint {
+        anti_alias: true,
+        ..Paint::default()
+    };
+    for d in paths {
+        paint.set_color_rgba8(
+            to8(d.color[0]),
+            to8(d.color[1]),
+            to8(d.color[2]),
+            to8(d.color[3]),
+        );
+        pm.fill_path(
+            &d.outline,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
 }
 
 impl Cpu {
@@ -47,12 +84,39 @@ impl Cpu {
         let pm: Pixmap = Pixmap::new(width, height).ok_or_else(|| {
             Error::BadInput(format!("target {width}x{height} is empty or too large"))
         })?;
-        Ok(Self { pm })
+        Ok(Self {
+            pm,
+            images: Vec::new(),
+        })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
-        *self = Self::new(width, height)?;
+        self.pm = Self::new(width, height)?.pm;
         Ok(())
+    }
+
+    /// Stores an image from premultiplied RGBA8 bytes.
+    pub fn set_image(&mut self, id: ImageId, w: u32, h: u32, premul: Vec<u8>, sampling: Sampling) {
+        let pm: Option<Pixmap> =
+            tiny_skia::IntSize::from_wh(w, h).and_then(|s| Pixmap::from_vec(premul, s));
+        if self.images.len() <= id.0 {
+            self.images.resize_with(id.0 + 1, || None);
+        }
+        self.images[id.0] = pm.map(|pm| {
+            (
+                pm,
+                match sampling {
+                    Sampling::Linear => FilterQuality::Bilinear,
+                    Sampling::Nearest => FilterQuality::Nearest,
+                },
+            )
+        });
+    }
+
+    pub fn remove_image(&mut self, id: ImageId) {
+        if let Some(slot) = self.images.get_mut(id.0) {
+            *slot = None;
+        }
     }
 
     pub fn render(
@@ -75,6 +139,17 @@ impl Cpu {
                     if let Some(b) = batches.get(id.0) {
                         b.cpu.draw(&b.data, b.params, &mut self.pm);
                     }
+                }
+                Run::Image { id, inst } => {
+                    if let Some(Some((img, quality))) = self.images.get(id.0) {
+                        draw_image(&mut self.pm, img, *quality, &flat.insts[*inst as usize]);
+                    }
+                }
+                Run::Paths(range) => {
+                    fill_paths(
+                        &mut self.pm,
+                        &flat.paths[range.start as usize..range.end as usize],
+                    );
                 }
                 Run::Insts(range) => {
                     for i in &flat.insts[range.start as usize..range.end as usize] {
@@ -109,7 +184,7 @@ impl Cpu {
                                 paint.set_color_rgba8(to8(c[0]), to8(c[1]), to8(c[2]), to8(c[3]));
                                 if kind == 0 {
                                     if let Some(p) =
-                                        rrect_path(i.a[0], i.a[1], i.a[2], i.a[3], i.p[0])
+                                        rounded_rect(i.a[0], i.a[1], i.a[2], i.a[3], i.p[0])
                                     {
                                         self.pm.fill_path(
                                             &p,
