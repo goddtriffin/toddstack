@@ -78,7 +78,13 @@ fn p50_max(mut ms: Vec<f64>) -> (f64, f64) {
 async fn renderer(a: &Args, t: Target, force: Option<Backend>) -> Renderer {
     let mut opts: Options = Options::from_env();
     opts.force = force.or(a.backend);
-    let r: Renderer = Renderer::with_options(t, opts).await.expect("a renderer");
+    let r: Renderer = match Renderer::with_options(t, opts).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("no renderer: {e}");
+            std::process::exit(2);
+        }
+    };
     let c = r.capabilities();
     println!(
         "  backend {} | adapter {} | compute {} | storage buffers {}",
