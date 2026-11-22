@@ -144,12 +144,16 @@ impl Renderer {
         let picked = backend::select(&chain, |b| Gpu::probe(b, &target)).await?;
         let inner: Inner = match picked {
             Some((Backend::Cpu, _)) => Inner::Cpu(Cpu::new(&target)?),
-            Some((_, Some(probe))) => {
-                Inner::Gpu(Box::new(Gpu::create(probe, &target, options.data_texture).await?))
-            }
+            Some((_, Some(probe))) => Inner::Gpu(Box::new(
+                Gpu::create(probe, &target, options.data_texture).await?,
+            )),
             _ => {
                 return Err(Error::NoBackend {
-                    tried: chain.iter().map(|b| b.name()).collect::<Vec<_>>().join(", "),
+                    tried: chain
+                        .iter()
+                        .map(|b| b.name())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 });
             }
         };
