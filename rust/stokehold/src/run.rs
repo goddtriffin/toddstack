@@ -132,7 +132,7 @@ struct Resolved {
 }
 
 /// How long a job settles (`admit::settle_window_ms`, from its learned time to CPU peak; cold and Docker/VM jobs at
-/// least 30 s) and the cores it typically uses (`--cpu`, else the learned typical; `None` when cold).
+/// least 15 s, Docker 30 s) and the cores it typically uses (`--cpu`, else the learned typical; `None` when cold).
 pub(crate) fn admit_shape(
     cmd: &[String],
     hist: Option<history::Defaults>,
@@ -622,7 +622,7 @@ fn p90(samples: &mut [u64]) -> u64 {
 }
 
 /// Only Docker-style jobs run their work outside the process tree (in a VM), so only they learn from the machine, and they
-/// settle at least `admit::SETTLE_COLD_MS`.
+/// settle at least `admit::SETTLE_VM_MS`.
 pub(crate) fn hosts_vm_work(cmd: &[String]) -> bool {
     cmd.iter().any(|a| a.contains("docker"))
 }
@@ -852,7 +852,7 @@ mod tests {
             typical_cpu: 3,
         };
         let build = c(&["cargo", "build"]);
-        assert_eq!(admit_shape(&build, None, None, &cap), (30_000, None));
+        assert_eq!(admit_shape(&build, None, None, &cap), (15_000, None));
         assert_eq!(
             admit_shape(&build, Some(learned), None, &cap),
             (10_000, Some(3))
