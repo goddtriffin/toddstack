@@ -26,6 +26,7 @@ pub fn print(state: &StateDir) -> Result<(), Error> {
     live.stopped = machine::stopped_ids(&jobs);
     let now = crate::run::now_ms();
     live.cpu_sustained_pct = admit::sustained_pct(live.cpu_pct, &busy, now);
+    live.cpu_recent_peak_pct = admit::recent_peak_pct(&busy, now);
     println!(
         "capacity   {} cores, {} ram, {} vram, {} disk here",
         cap.cpu,

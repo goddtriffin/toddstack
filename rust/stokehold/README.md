@@ -79,8 +79,10 @@ All of these must hold:
   with its whole process's RSS and CPU; before 0.3.2 a 16-thread rustc counted 17 times, so learned memory peaks were
   inflated about 17x and their reservations blocked idle machines on "mem").
 - Sustained level (0.4.8): each run also records its tree's best 10 s mean CPU (`sustained_centi_cores` in history),
-  and a learned size carries one picked like the peak (same tiers). A running job holds its full learned peak for
-  its first 10 s, then at most that sustained level. Learned peaks are the highest 500 ms sample: `make lint
+  and a learned size carries the median sustained/peak ratio of the runs that recorded one (at least 3 of them, or no
+  sustained level), applied to the picked peak: a fresh cached 1-core run cannot shrink a 14-core command's level. A
+  running job holds its full learned peak until its learned time to peak plus margin (at least 10 s), then at most
+  that sustained level, and never less than it for the whole run: a bursty job's later spikes stay reserved. Learned peaks are the highest 500 ms sample: `make lint
   test-changed` learned 10-11 cores (a spike about 15 s in) and averaged 1.2 cores over a 23-minute run, so its hold
   and its projected peak kept 6-core waiters out on a machine 20-40% busy. Cold, `--cpu` declared and Docker/VM sizes
   (whose CPU shows outside the tree) have no sustained level and keep the full peak.
@@ -97,8 +99,12 @@ All of these must hold:
 - Known limit: the memory and pressure guards only veto new starts. A gate cannot stop jobs already running, and
   stokehold does not kill them: if running jobs all grow past their learned peaks, memory can still run out. The unused
   reservation holds above are what protect against this, not the guards.
+- Pinned CPU (0.4.8): nothing starts, fast lane and a job alone included, while any shared CPU reading in the last
+  10 s is 98% busy or more. On 0.4.7 the Mac read over 95% CPU or 3 x cores of load in 80% of samples over 6 hours,
+  and 190 of 272 starts came at 95-100% busy, most in the dip between two spikes of bursty jobs.
 - Hard guards (veto only, they block even a job that would run alone): memory used at 95% or more (90% before 0.4.5, on Linux too), 1-minute load at or over 4 x cores
-  once the CPU confirms it: at least 50% busy, or Linux `/proc/pressure/cpu` `some avg10` at least 25 (runaway load:
+  once the CPU confirms it: at least 50% busy, or Linux `/proc/pressure/cpu` `some avg10` at least 25, and always where
+  PSI cannot be read (macOS, so the Mac keeps the 0.4.7 rule) (runaway load:
   120 on 16 cores, CPU pinned, killed Docker on 2026-11-19; before 0.4.8 it blocked whatever the CPU said, and a load
   of I/O-waiting threads at 8-15% CPU is no overload), 6 x cores whatever the CPU says, and critical memory
   pressure: macOS `kern.memorystatus_vm_pressure_level` 4, Linux `/proc/pressure/memory` (`some avg10` 25 or more, or
@@ -126,7 +132,9 @@ most the backfill share passes while the machine reads under 75% busy and the he
 strict FIFO past 60 s kept 1-2 core jobs queued up to 30 minutes behind an 11-16 core head at 40-60% CPU). 0.4.8
 lets any job no bigger than the head (cores, memory and VRAM) backfill there, not only small ones: with 0.4.7 on the
 Mac, 1-2 core jobs waited p50 42 s but 3-8 core jobs (`cargo clippy`, `cargo test` at 6 cores) p50 21 minutes, up to
-74, behind 11-core `make lint` heads, with the Mac idle 23% of the time jobs waited. Once the head has waited 5
+74, behind 11-core `make lint` heads, with the Mac idle 23% of the time jobs waited. Such a backfiller (bigger than
+tiny) passes only if its own learned p90 run time ends within 30 s of the head's 5 minutes; with no learned run time
+it waits, so a 70-minute job arriving at 4:59 cannot keep the head's room for 70 minutes. Once the head has waited 5
 minutes it holds the queue (only tiny jobs pass a head blocked by memory, VRAM or a guard, and only before that), so
 no stream of backfills can starve it: only the jobs already running stand before it. (Aging its projected peak away
 instead overran the machine 16% of the time in the bursty-builds test.)

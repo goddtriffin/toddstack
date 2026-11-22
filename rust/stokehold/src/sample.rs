@@ -143,6 +143,7 @@ mod tests {
             non_heavy_cpu_at_start: 0,
             fast: false,
             cpu_sustained: None,
+            run_p90_ms: None,
             blocked_by: by.map(Into::into),
         }
     }
