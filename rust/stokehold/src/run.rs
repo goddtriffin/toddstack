@@ -132,6 +132,8 @@ struct Resolved {
     /// A learned CPU size: when (ms after the start) its CPU may count as plateaued, the slowest time to peak. `None` for
     /// cold, declared (`--cpu`) and no-ramp-history sizes, whose hold is never released by a plateau.
     cpu_settle_after_ms: Option<u64>,
+    /// Learned short and small: may use the fast lane (`admit::fast_lane_eligible`).
+    fast: bool,
 }
 
 fn resolve_weights(
@@ -158,6 +160,8 @@ fn resolve_weights(
     });
     Resolved {
         weights,
+        fast: !hosts_vm_work(cmd)
+            && crate::admit::fast_lane_eligible(weights, cap, hist.and_then(|d| d.slowest_run_ms)),
         mem_peak_at_ms: hist
             .and_then(|d| d.mem_peak_at_ms)
             .and_then(|ms| i64::try_from(ms).ok()),
@@ -200,6 +204,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         mem_peak_at_ms,
         cpu_hold_ms,
         cpu_settle_after_ms,
+        fast,
     } = resolve_weights(state, flags, cmd, &cwd_str, &cap);
 
     let (tx, rx) = channel();
@@ -228,6 +233,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         cpu_hold_ms,
         cpu_settled: false,
         non_heavy_cpu_at_start: 0,
+        fast,
     };
     let _guard = JobGuard {
         state,
@@ -414,21 +420,39 @@ fn exit_code(status: ExitStatus) -> i32 {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
-/// Samples machine-wide GPU memory every 2 s while the job runs (monitoring); returns the peak.
-fn vram_sampler(cap: &Capacity) -> Option<(Sender<()>, std::thread::JoinHandle<u64>)> {
+/// A VRAM rise under this (256 MiB) is noise (the desktop's compositor, a browser tab), not the job's: it teaches 0.
+pub const VRAM_NOISE: u64 = 256 << 20;
+
+/// The job's own VRAM from the machine-wide numbers: the peak minus what was in use just before it started, 0 when
+/// that is under `VRAM_NOISE`. Other programs that grow while it runs count too, so it errs high, never low.
+#[must_use]
+pub fn vram_rise(baseline: u64, peak: u64) -> u64 {
+    Some(peak.saturating_sub(baseline))
+        .filter(|r| *r >= VRAM_NOISE)
+        .unwrap_or(0)
+}
+
+/// The VRAM in use just before the start and the peak while the job ran.
+type VramPeak = std::thread::JoinHandle<(u64, u64)>;
+
+/// Samples machine-wide GPU memory every 2 s while the job runs; returns the VRAM in use just before the start and
+/// the peak.
+fn vram_sampler(cap: &Capacity) -> Option<(Sender<()>, VramPeak)> {
     if cap.vram == 0 || cap.vram_is_ram {
         return None;
     }
+    // Taken here, before the child is spawned: what other programs already use is not the job's.
+    let baseline = vram().map(|(_, used)| used)?;
     let (stop_tx, stop_rx) = channel::<()>();
     let handle = std::thread::spawn(move || {
-        let mut peak = 0;
+        let mut peak = baseline;
         loop {
             peak = peak.max(vram().map_or(0, |(_, used)| used));
             if !matches!(
                 stop_rx.recv_timeout(Duration::from_secs(2)),
                 Err(RecvTimeoutError::Timeout)
             ) {
-                return peak;
+                return (baseline, peak);
             }
         }
     });
@@ -768,10 +792,13 @@ fn execute(
     stats.steal_ms = steal_before
         .zip(cpu_times())
         .map(|(a, b)| b.steal.saturating_sub(a) * 10);
-    stats.peak_vram = sampler.and_then(|(stop, h)| {
+    if let Some((baseline, peak)) = sampler.and_then(|(stop, h)| {
         drop(stop);
-        h.join().ok().filter(|v| *v > 0)
-    });
+        h.join().ok()
+    }) {
+        stats.peak_vram = Some(peak).filter(|v| *v > 0);
+        stats.vram_rise = Some(vram_rise(baseline, peak));
+    }
     let tree_peak = tree.and_then(|(stop, h)| {
         drop(stop);
         h.join().ok()
@@ -835,6 +862,7 @@ mod tests {
             cpu_hold_ms: Some(1),
             cpu_settled: false,
             non_heavy_cpu_at_start: 0,
+            fast: false,
         };
         dir.write_job(&mk("run", State::Running)).unwrap();
         dir.write_job(&mk("wait", State::Queued)).unwrap();
@@ -946,5 +974,19 @@ mod tests {
         // No ramp: live blockers re-sample every 10 s, the rest wait for events.
         assert_eq!(wait_timeout(true, None, 0), LIVE_RESAMPLE);
         assert_eq!(wait_timeout(false, None, 0), SWEEP);
+    }
+
+    #[test]
+    fn vram_rise_is_the_jobs_own_vram_not_the_desktops() {
+        // The rig, 2026-11-21: the desktop held 1.8G while `make lint` ran; the machine-wide peak was 1.7-1.9G.
+        const M: u64 = 1 << 20;
+        assert_eq!(vram_rise(1_774 * M, 1_774 * M), 0);
+        assert_eq!(vram_rise(1_774 * M, 1_776 * M), 0, "under the noise floor");
+        assert_eq!(
+            vram_rise(1_776 * M, 1_620 * M),
+            0,
+            "other programs freed VRAM"
+        );
+        assert_eq!(vram_rise(1_774 * M, 4_846 * M), 3_072 * M, "a real GPU job");
     }
 }

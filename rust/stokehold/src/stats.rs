@@ -52,8 +52,13 @@ pub struct Stats {
     /// Machine-wide, not just this job.
     pub net_in: u64,
     pub net_out: u64,
-    /// Machine-wide GPU memory in use, peak during the run.
+    /// Machine-wide GPU memory in use, peak during the run (monitoring only: it includes every other program's VRAM).
     pub peak_vram: Option<u64>,
+    /// The job's own GPU memory: the machine-wide peak minus the VRAM in use just before the job started, 0 under
+    /// `run::VRAM_NOISE`. The only VRAM that teaches a size (0.4.7). `None` without an NVIDIA GPU and in entries from
+    /// before 0.4.7, whose `peak_vram` alone counted other programs' VRAM as the job's.
+    #[serde(default)]
+    pub vram_rise: Option<u64>,
     /// Machine-wide CPU steal during the run (Linux).
     pub steal_ms: Option<u64>,
     pub timed_out: bool,
@@ -137,6 +142,9 @@ pub fn format_stats(s: &Stats) -> String {
     );
     if let Some(v) = s.peak_vram {
         let _ = write!(out, "\nstokehold: peak vram (machine-wide) {}", fmt_size(v));
+        if let Some(r) = s.vram_rise {
+            let _ = write!(out, ", {} above its start", fmt_size(r));
+        }
     }
     if let Some(v) = s.steal_ms {
         let _ = write!(out, "\nstokehold: cpu steal (machine-wide) {}", secs(v));
@@ -192,6 +200,7 @@ mod tests {
             net_in: 2048,
             net_out: 0,
             peak_vram: Some(1 << 30),
+            vram_rise: Some(0),
             steal_ms: Some(300),
             timed_out: true,
         };
@@ -207,7 +216,10 @@ mod tests {
             text.contains("network (machine-wide) in 2.0K out 0B"),
             "{text}"
         );
-        assert!(text.contains("peak vram (machine-wide) 1.0G"), "{text}");
+        assert!(
+            text.contains("peak vram (machine-wide) 1.0G, 0B above its start"),
+            "{text}"
+        );
         assert!(text.contains("steal (machine-wide) 0.3s"), "{text}");
         assert!(text.contains("TIMED OUT"), "{text}");
         assert!(text.ends_with(REVIEW_PROMPT), "{text}");

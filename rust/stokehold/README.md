@@ -26,6 +26,10 @@ sampled every 0.5 s while the job runs: peak cores at once and peak RSS) from
 the same repository (any worktree or clone sharing its git dir, so a fresh agent worktree is not cold); else for the
 same program and first argument there (`make ui-check`, `cargo test`); else the whole machine's cores and `--mem 4G` (so cold jobs, Docker commands included, start at least 10 s apart; after one run, history gives the real peak). A request larger than
 the machine is clamped, so that job runs alone. On macOS VRAM counts as RAM.
+VRAM is learned only from the job's own use (0.4.7): the machine-wide VRAM in use at its peak minus what was in use
+just before it started (`vram_rise` in history), 0 under 256M. Before 0.4.7 the machine-wide peak itself was learned,
+which is mostly the desktop's: on the rig every job learned about 1.9G, and a 1 s `make lint` waited 204 s on "vram".
+History entries without `vram_rise` teach no VRAM, so a job reserves VRAM only after it has used some, or with `--vram`.
 Successful runs count, and so do failed or killed runs that ran at least 30 s (0.4.6: `make lint test-changed`
 usually exits 2 after 5-25 minutes on 8-12 cores, so it learned 1 core and 0.1G from instant `make lint` no-ops, and
 several of these "tiny" jobs ran at once on a pinned Mac). A run that fails sooner teaches nothing.
@@ -111,6 +115,13 @@ most the backfill share passes while the machine reads under 75% busy and the he
 strict FIFO past 60 s kept 1-2 core jobs queued up to 30 minutes behind an 11-16 core head at 40-60% CPU); bigger
 jobs keep the 60 s rule, and the 5-minute bound keeps a stream of small jobs from starving a big one.
 
+Fast lane (0.4.7): a job whose own recent runs (at least 2 of this very command, never the pooled program tier) all
+finished within 10 s, and that reserves at most 2 cores, 1/32 of RAM and no VRAM (and is not Docker/VM work), skips
+the CPU band, ramp holds and the queue. At most 2 fast-lane jobs run at once, so the lane adds at most 4 cores to a
+busy machine; a fast-lane job that runs long keeps its slot until it ends, and its long run takes the command out of
+the lane from then on. Memory headroom, VRAM reservations and every guard (load, memory pressure, memory used) still
+apply. On 2026-11-21 a 1-core `make lint` that ran 1.2 s waited 204 s on the rig at 95-98% busy.
+
 `stokehold status` evaluates every waiter by these rules and prints why it waits, with the numbers (`cpu: needs 4.40
 cores, 4.20 free under the 95% band (machine 68% busy)`, `mem: needs 6.5G, 2.1G free under 95% of RAM after running
 jobs' holds`, a guard's reading), and the machine's CPU, sustained CPU and pressure level.
@@ -135,7 +146,7 @@ If `STOKEHOLD_JOB` names a live running job, `stokehold` execs the command direc
 ## Stats (stderr)
 
 Queued time (when it matters), run time, CPU user+sys and average cores, peak cores and peak RSS of the whole process tree plus the largest single process, disk blocks,
-machine-wide network bytes, peak VRAM and CPU steal where measurable, a TIMED OUT line when it applies, and a
+machine-wide network bytes, peak VRAM (machine-wide, and the rise above its start) and CPU steal where measurable, a TIMED OUT line when it applies, and a
 prompt to review the numbers. One JSON line per run is appended to `history.jsonl`.
 
 ## History: did stokehold leave the machine idle?

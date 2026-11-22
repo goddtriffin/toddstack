@@ -128,6 +128,15 @@ const PROJECTED_PEAK: (u64, u64) = (2, 5);
 /// jobs from starving the head. (Shrinking the head's projected peak after the window instead overran the machine 52%
 /// of the time in `bursty_big_jobs_start_one_at_a_time_without_pinning_the_machine`.)
 const UNDERUSED_CPU_PCT: u64 = 75;
+/// Fast lane (0.4.7): a command whose recent runs all finished within this long (and at least
+/// `history::FAST_MIN_RUNS` of them, of this very command) is short.
+pub const FAST_RUN_MS: u64 = 10_000;
+/// A fast-lane job reserves at most this many cores (and a tiny share of RAM, `TINY_MEM`, and no VRAM).
+pub const FAST_MAX_CPU: u32 = 2;
+/// At most this many fast-lane jobs run at once, so the lane adds at most `FAST_MAX_JOBS` x `FAST_MAX_CPU` cores to a
+/// busy machine. A fast-lane job that runs long keeps its slot until it ends (it is never forgotten), and its long run
+/// takes the command out of the lane from then on.
+pub const FAST_MAX_JOBS: usize = 2;
 
 /// Which check blocked a waiter (recorded in the history; a disk that is too full fails instead of waiting).
 #[derive(
@@ -785,6 +794,28 @@ fn blocker(
     guard_block(cap, live).map(|(why, block)| blocked(why, true, block))
 }
 
+/// Whether a job may use the fast lane: its slowest recent run (`history::Defaults::slowest_run_ms`) was at most
+/// `FAST_RUN_MS`, and it reserves at most `FAST_MAX_CPU` cores, a tiny share of RAM and no VRAM.
+#[must_use]
+pub fn fast_lane_eligible(w: Weights, cap: &Capacity, slowest_run_ms: Option<u64>) -> bool {
+    slowest_run_ms.is_some_and(|ms| ms <= FAST_RUN_MS)
+        && w.cpu <= FAST_MAX_CPU
+        && w.mem <= cap.mem / TINY_MEM.1 * TINY_MEM.0
+        && w.vram == 0
+}
+
+/// The fast lane: a fast job (`Job::fast`) starts past the CPU band, ramp holds and the queue while fewer than
+/// `FAST_MAX_JOBS` fast jobs run, its memory fits the measured headroom and no guard (load, memory pressure, memory
+/// used) vetoes. A 1 s, 1-core `make lint` otherwise waited 204 s on a rig at 95-98% busy that it would have added
+/// next to nothing to (2026-11-21). False when the lane does not apply; the normal checks decide then.
+fn fast_lane(job: &Job, running: &[&Job], cap: &Capacity, live: &Live, now_ms: i64) -> bool {
+    job.fast
+        && running.iter().filter(|j| j.fast).count() < FAST_MAX_JOBS
+        && guard_block(cap, live).is_none()
+        && fits_reservations(job.weights, running, cap)
+        && job.weights.mem <= headroom_for(running, cap, live, now_ms, true).mem
+}
+
 /// Can `job` start now, given every job file (already pruned of dead ones)?
 #[must_use]
 pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i64) -> Decision {
@@ -798,6 +829,9 @@ pub fn evaluate(job: &Job, jobs: &[Job], cap: &Capacity, live: &Live, now_ms: i6
 
     if let Some(why) = disk_full(job.weights, cap, live) {
         return Decision::Fail(why);
+    }
+    if fast_lane(job, &running, cap, live, now_ms) {
+        return Decision::Start;
     }
     if let Some(head) = queued.first().filter(|h| h.id != job.id) {
         let head_block = blocker(
@@ -934,6 +968,7 @@ mod tests {
             cpu_hold_ms: None,
             cpu_settled: false,
             non_heavy_cpu_at_start: 0,
+            fast: false,
         }
     }
     fn waits(d: &Decision) -> bool {
@@ -3963,5 +3998,181 @@ mod tests {
         let mid = job("check", 4, 4, State::Queued, 102_000);
         let all = [jobs[0].clone(), jobs[1].clone(), mid.clone()];
         assert!(waits(&evaluate(&mid, &all, &c, &live, past)));
+    }
+
+    /// The rig on 2026-11-21: 16 cores, 10G of VRAM, a 14-core test run and the desktop keeping it 97% busy.
+    fn busy_rig() -> (Capacity, Vec<Job>, Live) {
+        let c = Capacity {
+            cpu: 16,
+            mem: 64 * G,
+            vram: 10 * G,
+            disk_total: 1000 * G,
+            vram_is_ram: false,
+        };
+        let big = Job {
+            started_ms: Some(0),
+            cpu_hold_ms: Some(RAMP_MS),
+            ..job("tests", 14, 12, State::Running, 0)
+        };
+        let live = Live {
+            load1: 20.0,
+            load5: 20.0,
+            cpu_pct: 97,
+            cpu_sustained_pct: 97,
+            per_job: vec![(
+                "tests".into(),
+                Usage {
+                    cpu: 1_400,
+                    mem: 8 * G,
+                    vram: 0,
+                },
+            )],
+            non_heavy: Usage {
+                cpu: 150,
+                mem: 10 * G,
+                vram: 2 * G,
+            },
+            ..calm()
+        };
+        (c, vec![big], live)
+    }
+
+    fn lint(id: &str, enq: i64, fast: bool, state: State) -> Job {
+        let mut j = job(id, 1, 0, state, enq);
+        j.weights.mem = 72 << 20;
+        j.fast = fast;
+        if state == State::Running {
+            j.started_ms = Some(enq);
+        }
+        j
+    }
+
+    #[test]
+    fn a_learned_short_small_job_starts_in_the_fast_lane_on_a_busy_machine() {
+        // 2026-11-21 on the rig: `make lint` (1 core, 72M, ran 1.2 s) waited 204 s behind "cpu: needs 1.00 cores,
+        // 0.00 free under the 95% band (machine 95-98% busy)" with a bigger job queued ahead of it.
+        let (c, mut jobs, live) = busy_rig();
+        jobs.push(job("head", 8, 4, State::Queued, 50_000));
+        let now = 60_000;
+        let slow = lint("lint", 55_000, false, State::Queued);
+        let mut all = jobs.clone();
+        all.push(slow.clone());
+        assert!(
+            waits(&evaluate(&slow, &all, &c, &live, now)),
+            "no fast lane: it waits"
+        );
+        let quick = lint("lint", 55_000, true, State::Queued);
+        let mut all = jobs.clone();
+        all.push(quick.clone());
+        assert_eq!(evaluate(&quick, &all, &c, &live, now), Decision::Start);
+    }
+
+    #[test]
+    fn the_fast_lane_is_bounded_and_keeps_the_guards() {
+        let (c, jobs, live) = busy_rig();
+        let now = 60_000;
+        let with = |extra: &[Job]| {
+            let mut v = jobs.clone();
+            v.extend_from_slice(extra);
+            v
+        };
+        let me = lint("me", 59_000, true, State::Queued);
+        // `FAST_MAX_JOBS` fast jobs already running: a third waits, even one that ran long (never forgotten).
+        let running = [
+            lint("f1", 1_000, true, State::Running),
+            lint("f2", 58_000, true, State::Running),
+        ];
+        let all = with(&[running[0].clone(), running[1].clone(), me.clone()]);
+        assert!(waits(&evaluate(&me, &all, &c, &live, now)));
+        // One slot left: it starts.
+        let all = with(&[running[1].clone(), me.clone()]);
+        assert_eq!(evaluate(&me, &all, &c, &live, now), Decision::Start);
+        // Guards still veto: a runaway load, critical memory pressure, memory 95% used.
+        let all = with(std::slice::from_ref(&me));
+        for bad in [
+            Live {
+                load1: 64.0,
+                ..live.clone()
+            },
+            Live {
+                mem_pressure: true,
+                ..live.clone()
+            },
+            Live {
+                mem_used_pct: 96,
+                ..live.clone()
+            },
+        ] {
+            assert!(waits(&evaluate(&me, &all, &c, &bad, now)), "{bad:?}");
+        }
+        // Memory still has to fit the measured headroom.
+        let full = Live {
+            non_heavy: Usage {
+                mem: 52 * G,
+                ..live.non_heavy
+            },
+            ..live.clone()
+        };
+        assert!(waits(&evaluate(&me, &all, &c, &full, now)));
+    }
+
+    #[test]
+    fn only_short_small_jobs_without_vram_are_fast_lane_eligible() {
+        let c = Capacity {
+            cpu: 16,
+            mem: 64 * G,
+            vram: 10 * G,
+            disk_total: 1000 * G,
+            vram_is_ram: false,
+        };
+        let w = |cpu, mem, vram| Weights {
+            cpu,
+            mem,
+            vram,
+            disk: 0,
+        };
+        assert!(fast_lane_eligible(w(1, 72 << 20, 0), &c, Some(1_285)));
+        assert!(fast_lane_eligible(
+            w(FAST_MAX_CPU, 2 * G, 0),
+            &c,
+            Some(FAST_RUN_MS)
+        ));
+        assert!(!fast_lane_eligible(w(1, 0, 0), &c, None), "cold or pooled");
+        assert!(
+            !fast_lane_eligible(w(1, 0, 0), &c, Some(FAST_RUN_MS + 1)),
+            "one recent run was long"
+        );
+        assert!(!fast_lane_eligible(
+            w(FAST_MAX_CPU + 1, 0, 0),
+            &c,
+            Some(1_000)
+        ));
+        assert!(
+            !fast_lane_eligible(w(1, 3 * G, 0), &c, Some(1_000)),
+            "over 1/32 of RAM"
+        );
+        assert!(
+            !fast_lane_eligible(w(1, 0, 1 << 30), &c, Some(1_000)),
+            "uses VRAM"
+        );
+    }
+
+    #[test]
+    fn a_burst_of_fast_jobs_adds_at_most_the_lane_cap_to_a_pinned_machine() {
+        // Twelve fast jobs arrive at once on the busy rig: each start is written as running before the next decides.
+        let (c, jobs, live) = busy_rig();
+        let mut all = jobs.clone();
+        let mut started = 0;
+        for k in 0..12 {
+            let me = lint(&format!("l{k:02}"), 60_000 + k, true, State::Queued);
+            all.push(me.clone());
+            if evaluate(&me, &all, &c, &live, 61_000) == Decision::Start {
+                started += 1;
+                let last = all.len() - 1;
+                all[last].state = State::Running;
+                all[last].started_ms = Some(61_000);
+            }
+        }
+        assert_eq!(started, FAST_MAX_JOBS);
     }
 }
