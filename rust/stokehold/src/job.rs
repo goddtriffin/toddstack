@@ -142,4 +142,8 @@ pub struct Job {
     /// against the rise above it, so unrelated apps and always-on containers do not cancel the hold.
     #[serde(default)]
     pub non_heavy_cpu_at_start: u64,
+    /// Learned short and small (`admit::fast_lane_eligible`): it may start in the bounded fast lane past CPU room and
+    /// the queue (`admit::fast_lane`).
+    #[serde(default)]
+    pub fast: bool,
 }

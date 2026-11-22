@@ -95,7 +95,13 @@ pub struct Defaults {
     /// Median time (ms after the start) at which the CPU reached 3/4 of its peak: from then on a run whose CPU has
     /// stopped rising has shown its real use, and its hold is released (`admit::cpu_plateaued`).
     pub cpu_peak_median_ms: Option<u64>,
+    /// The slowest of the recent runs (ms), when they were this very command (not the pooled program tier) and there are
+    /// at least `FAST_MIN_RUNS` of them: what decides the fast lane (`admit::fast_lane`). `None` otherwise.
+    pub slowest_run_ms: Option<u64>,
 }
+
+/// A command needs this many counted runs of its own before its run time can put it in the fast lane.
+pub const FAST_MIN_RUNS: usize = 2;
 
 fn median(mut v: Vec<u64>) -> Option<u64> {
     if v.is_empty() {
@@ -152,6 +158,7 @@ pub fn defaults_with(
     if let Some(d) = aggregate(&pick(&|e| same_repo(e) && e.cmd == cmd), median) {
         return Some(d);
     }
+    // Other commands' run times say nothing about this one's: the pooled tier never reaches the fast lane.
     // Third tier pools different commands, so it takes the largest peak, never the median, and only for a real
     // program with a subcommand: not wrappers, not a bare program, not a flag first argument.
     if !program_pools(cmd) {
@@ -162,6 +169,10 @@ pub fn defaults_with(
         &pick(&|e| same_repo(e) && e.cmd.starts_with(program)),
         |v| v.into_iter().max(),
     )
+    .map(|d| Defaults {
+        slowest_run_ms: None,
+        ..d
+    })
 }
 
 /// A failed run counts once it ran this long: it did its real work before it failed.
@@ -225,7 +236,10 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
             .map(|e| e.measured.peak_tree_rss.max(e.measured.peak_rss))
             .collect(),
     )?;
-    let vram = pick(mine.iter().filter_map(|e| e.measured.peak_vram).collect());
+    // Only the job's own VRAM (the rise over its start) teaches a size. Before 0.4.7 the machine-wide peak did, which
+    // is mostly other programs' VRAM: on the rig every job learned the desktop's idle 1.8G, so a 1 s `make lint`
+    // reserved 1.9G and waited 204 s for "vram" (2026-11-21). Entries without the rise teach no VRAM.
+    let vram = pick(mine.iter().filter_map(|e| e.measured.vram_rise).collect());
     let mem_peak_at_ms = pick(
         mine.iter()
             .map(|e| e.measured.peak_mem_at_ms)
@@ -241,6 +255,9 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
         .collect();
     let cpu_peak_at_ms = ramps.iter().copied().max();
     let cpu_peak_median_ms = median(ramps);
+    let slowest_run_ms = (mine.len() >= FAST_MIN_RUNS)
+        .then(|| mine.iter().map(|e| e.measured.run_ms).max())
+        .flatten();
     Some(Defaults {
         cpu: u32::try_from(cores.div_ceil(100).max(1)).unwrap_or(u32::MAX),
         mem,
@@ -248,6 +265,7 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
         mem_peak_at_ms,
         cpu_peak_at_ms,
         cpu_peak_median_ms,
+        slowest_run_ms,
     })
 }
 
@@ -306,7 +324,8 @@ mod tests {
                 vram: None,
                 mem_peak_at_ms: None,
                 cpu_peak_at_ms: None,
-                cpu_peak_median_ms: None
+                cpu_peak_median_ms: None,
+                slowest_run_ms: Some(0)
             }
         );
         assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
@@ -347,7 +366,8 @@ mod tests {
                 vram: None,
                 mem_peak_at_ms: None,
                 cpu_peak_at_ms: None,
-                cpu_peak_median_ms: None
+                cpu_peak_median_ms: None,
+                slowest_run_ms: None
             }
         );
     }
@@ -573,5 +593,64 @@ mod tests {
         all.push(run("make lint test-changed", "/a", 50, 50, 2, 2_000));
         let d = defaults_from(&all, &cmd, "/c", Some("r")).unwrap();
         assert_eq!((d.cpu, d.mem), (1, 100), "the pooled tier, as before");
+    }
+
+    #[test]
+    fn machine_wide_vram_teaches_nothing_only_the_rise_does() {
+        // 2026-11-21 on the rig: every entry recorded the desktop's 1.86G as `peak_vram`, and every job learned it.
+        let run = |cwd: &str, peak: Option<u64>, rise: Option<u64>| {
+            let mut e = entry("make", cwd, 100, 72 << 20, 0);
+            e.cmd = vec!["make".into(), "lint".into()];
+            e.measured.peak_vram = peak;
+            e.measured.vram_rise = rise;
+            e
+        };
+        let cmd: Vec<String> = vec!["make".into(), "lint".into()];
+        let desktop = 1_862_270_976;
+        let old = [
+            run("/a", Some(desktop), None),
+            run("/a", Some(desktop), None),
+        ];
+        assert_eq!(defaults_from(&old, &cmd, "/a", None).unwrap().vram, None);
+        let new = [
+            run("/a", Some(desktop), Some(0)),
+            run("/a", Some(desktop), Some(0)),
+        ];
+        assert_eq!(defaults_from(&new, &cmd, "/a", None).unwrap().vram, Some(0));
+        let gpu = [run("/a", Some(5 << 30), Some(3 << 30))];
+        assert_eq!(
+            defaults_from(&gpu, &cmd, "/a", None).unwrap().vram,
+            Some(3 << 30)
+        );
+    }
+
+    #[test]
+    fn slowest_run_needs_two_runs_of_this_very_command() {
+        let run = |cmd: &str, run_ms: u64| {
+            let mut e = entry("x", "/a", 100, 50, 0);
+            e.cmd = cmd.split(' ').map(String::from).collect();
+            e.measured.run_ms = run_ms;
+            e.repo = Some("r".into());
+            e
+        };
+        let lint: Vec<String> = vec!["make".into(), "lint".into()];
+        let d = |all: &[Entry], cmd: &[String]| defaults_from(all, cmd, "/a", Some("r")).unwrap();
+        assert_eq!(
+            d(&[run("make lint", 1_285)], &lint).slowest_run_ms,
+            None,
+            "one run"
+        );
+        let two = [run("make lint", 1_285), run("make lint", 900)];
+        assert_eq!(d(&two, &lint).slowest_run_ms, Some(1_285));
+        // A run that turns out long takes the command out of the fast lane.
+        let long = [
+            run("make lint", 1_285),
+            run("make lint", 40_000),
+            run("make lint", 900),
+        ];
+        assert_eq!(d(&long, &lint).slowest_run_ms, Some(40_000));
+        // The pooled program tier never gives a run time: other commands' times say nothing about this one's.
+        let pooled: Vec<String> = ["make", "lint", "fix"].map(String::from).to_vec();
+        assert_eq!(d(&two, &pooled).slowest_run_ms, None);
     }
 }

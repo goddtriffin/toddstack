@@ -459,6 +459,7 @@ mod tests {
             cpu_hold_ms: None,
             cpu_settled: false,
             non_heavy_cpu_at_start: 0,
+            fast: false,
         }
     }
 
