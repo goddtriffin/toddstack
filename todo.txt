@@ -1,0 +1,35 @@
+toddstack-renderer 0.2.0 (rust/toddstack_renderer). Baseline: 0.1.0, wasm 2,205,571 raw / 683,190 brotli.
+
+Transparent output
+[ ] Options::with_transparent; surface alpha PreMultiplied (fallback Inherit, else first mode)
+[ ] GPU blends keep premultiplied alpha correct (alpha One/OneMinusSrcAlpha); clear alpha 0 works
+[ ] CPU glyph blit updates alpha
+[ ] CPU present: unpremultiply (transparent) / force opaque (opaque) before putImageData
+[ ] Readback documented as premultiplied; unpremultiply helper
+[ ] Parity test: half-transparent fill over clear 0, all backends vs CPU (alpha compared)
+
+Many canvases on one renderer
+[ ] Target::device_only, SurfaceId, attach, present_to, resize_surface, detach; single-target API unchanged
+[ ] WebGPU: one device, many surfaces
+[ ] WebGL2: one internal sheet surface + 2D drawImage per tile, alpha kept
+[ ] CPU: per-canvas 2D context + putImageData
+[ ] Backend still chosen on a probe before any real canvas is touched
+
+Sprite draws
+[ ] scene.image_rect(image, src, dst, rotation, tint); scene.image stays as shorthand
+[ ] Batched instanced draw per run of the same image
+[ ] CPU form (crop, tint, rotate); sub-rect clamped on GPU
+[ ] Parity tests: rotation and tint on every backend
+
+Also
+[ ] set_batch_instances check dropped and documented; test updated
+[ ] Version 0.2.0, README changelog with breaking changes, API/transparency/multi-canvas/sprites/sizes docs
+[ ] web demo: ?boards=24 (24 transparent board tiles, rotated tinted sprites, 24 canvases over a CSS gradient)
+[ ] Existing demos still render
+
+Verify
+[ ] clippy -D warnings -F clippy::allow_attributes: native --all-targets; wasm --lib; wasm --features web-demo; wasm --example web; x86_64-pc-windows-gnu --all-targets
+[ ] stokehold cargo test --release -p toddstack-renderer; cargo fmt --check
+[ ] cargo package -p toddstack-renderer (no publish)
+[ ] Chrome: ?boards=24 on webgpu, webgl2, cpu; existing demos
+[ ] delete todo.txt in the final commit
