@@ -72,6 +72,9 @@ pub struct Report {
     pub idle_ms: u64,
     /// Blocking reasons during the idle part, by time (a reason counts once per interval).
     pub idle_reasons: Vec<(String, u64)>,
+    /// Machine CPU % and memory-used % over every sample in the window, `(p50, p95)`; `None` with no samples.
+    pub cpu_pct: Option<(u64, u64)>,
+    pub mem_pct: Option<(u64, u64)>,
     pub repos: Vec<RepoRow>,
     pub buckets: Vec<Bucket>,
 }
@@ -87,11 +90,22 @@ struct Sample {
 
 /// Nearest-rank 95th percentile.
 fn p95(sorted: &[u64]) -> u64 {
+    nearest_rank(sorted, 95)
+}
+
+/// Nearest-rank `pct` percentile of sorted values; 0 when empty.
+fn nearest_rank(sorted: &[u64], pct: usize) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
-    let rank = (sorted.len() * 95).div_ceil(100).max(1);
+    let rank = (sorted.len() * pct).div_ceil(100).max(1);
     sorted.get(rank - 1).copied().unwrap_or(0)
+}
+
+/// `(p50, p95)` of the values, `None` when there are none.
+fn p50_p95(mut v: Vec<u64>) -> Option<(u64, u64)> {
+    v.sort_unstable();
+    (!v.is_empty()).then(|| (nearest_rank(&v, 50), nearest_rank(&v, 95)))
 }
 
 fn repo_row<'a>(repos: &'a mut BTreeMap<String, RepoRow>, repo: Option<&str>) -> &'a mut RepoRow {
@@ -209,6 +223,8 @@ pub fn compute(events: &[Event], since_ms: i64, until_ms: i64) -> Report {
         wait_cpu_avg: (waiting_span_ms > 0).then(|| cpu_ms / waiting_span_ms),
         idle_ms,
         idle_reasons,
+        cpu_pct: p50_p95(samples.iter().map(|s| s.cpu_pct.min(100)).collect()),
+        mem_pct: p50_p95(samples.iter().map(|s| s.mem_pct.min(100)).collect()),
         repos: repo_rows,
         buckets: buckets(&samples, since_ms, until_ms),
     }
@@ -358,6 +374,11 @@ fn write_timeline(o: &mut String, buckets: &[Bucket]) {
 }
 
 #[must_use]
+/// `(p50, p95)` as `41% / 88%`, or `-`.
+fn pair_pct(p: Option<(u64, u64)>) -> String {
+    p.map_or_else(|| "-".to_string(), |(a, b)| format!("{a}% / {b}%"))
+}
+
 pub fn render_text(r: &Report) -> String {
     let mut o = String::new();
     let _ = writeln!(
@@ -374,6 +395,12 @@ pub fn render_text(r: &Report) -> String {
         fmt_dur(r.wait_avg_ms),
         fmt_dur(r.wait_p95_ms)
     );
+    if let (Some((c50, c95)), Some((m50, m95))) = (r.cpu_pct, r.mem_pct) {
+        let _ = writeln!(
+            o,
+            "cpu p50 {c50}%, p95 {c95}%; ram p50 {m50}%, p95 {m95}% (all samples)"
+        );
+    }
     if let Some(avg) = r.wait_cpu_avg {
         let _ = writeln!(o, "avg cpu while jobs waited: {avg}%");
     }
@@ -568,7 +595,7 @@ pub fn render_html(r: &Report) -> String {
     );
     let _ = write!(
         h,
-        "<div class=\"tiles\"><div class=\"tile\"><b>{}</b>jobs</div><div class=\"tile\"><b>{}</b>wait total</div><div class=\"tile\"><b>{}</b>avg wait</div><div class=\"tile\"><b>{}</b>p95 wait</div><div class=\"tile\"><b>{}</b>avg cpu while jobs waited</div><div class=\"tile\"><b>{}</b>idle while waiting ({} of {})</div></div>",
+        "<div class=\"tiles\"><div class=\"tile\"><b>{}</b>jobs</div><div class=\"tile\"><b>{}</b>wait total</div><div class=\"tile\"><b>{}</b>avg wait</div><div class=\"tile\"><b>{}</b>p95 wait</div><div class=\"tile\"><b>{}</b>avg cpu while jobs waited</div><div class=\"tile\"><b>{}</b>idle while waiting ({} of {})</div><div class=\"tile\"><b>{}</b>cpu p50 / p95</div><div class=\"tile\"><b>{}</b>ram p50 / p95</div></div>",
         r.jobs,
         fmt_dur(r.wait_total_ms),
         fmt_dur(r.wait_avg_ms),
@@ -577,7 +604,9 @@ pub fn render_html(r: &Report) -> String {
             .map_or_else(|| "-".to_string(), |c| format!("{c}%")),
         pct(r.idle_ms, r.waiting_span_ms),
         fmt_dur(r.idle_ms),
-        fmt_dur(r.waiting_span_ms)
+        fmt_dur(r.waiting_span_ms),
+        pair_pct(r.cpu_pct),
+        pair_pct(r.mem_pct)
     );
     let _ = write!(
         h,
@@ -700,6 +729,25 @@ mod tests {
         // CPU over the waiting intervals: (80 + 30 + 30 + 10 + 10) / 5.
         assert_eq!(r.wait_cpu_avg, Some(32));
         assert!(render_text(&r).contains("avg cpu while jobs waited: 32%"));
+    }
+
+    #[test]
+    fn cpu_and_ram_percentiles_cover_every_sample_in_the_window() {
+        // 20 samples: cpu 5, 10, ..., 100; ram 1..=20. Outside the window one more that must not count.
+        let mut s: Vec<Event> = (1..=20u64)
+            .map(|i| sample(i64::try_from(i).unwrap() * 30_000, i * 5, i, 1.0, 0, &[]))
+            .collect();
+        s.push(sample(100 * MIN, 0, 0, 1.0, 0, &[]));
+        let r = compute(&s, 0, 20 * MIN);
+        assert_eq!(r.cpu_pct, Some((50, 95)));
+        assert_eq!(r.mem_pct, Some((10, 19)));
+        let text = render_text(&r);
+        assert!(
+            text.contains("cpu p50 50%, p95 95%; ram p50 10%, p95 19%"),
+            "{text}"
+        );
+        assert!(render_html(&r).contains("50% / 95%"));
+        assert_eq!(compute(&[], 0, MIN).cpu_pct, None);
     }
 
     #[test]
