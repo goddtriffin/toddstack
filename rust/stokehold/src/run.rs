@@ -136,6 +136,8 @@ struct Resolved {
     fast: bool,
     /// A learned sustained CPU level (`Job::cpu_sustained`); `None` for cold, declared and Docker/VM sizes.
     cpu_sustained: Option<u64>,
+    /// The learned p90 run time (`Job::run_p90_ms`).
+    run_p90_ms: Option<u64>,
 }
 
 fn resolve_weights(
@@ -177,6 +179,7 @@ fn resolve_weights(
         cpu_sustained: hist
             .filter(|_| flags.cpu.is_none() && !hosts_vm_work(cmd))
             .and_then(|d| d.cpu_sustained),
+        run_p90_ms: hist.and_then(|d| d.run_p90_ms),
     }
 }
 
@@ -211,6 +214,7 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         cpu_settle_after_ms,
         fast,
         cpu_sustained,
+        run_p90_ms,
     } = resolve_weights(state, flags, cmd, &cwd_str, &cap);
 
     let (tx, rx) = channel();
@@ -231,16 +235,13 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         started_ms: None,
         blocked_by: None,
         mem_declared: flags.mem.is_some(),
-        mem_peak_at_ms: if flags.mem.is_some() {
-            None
-        } else {
-            mem_peak_at_ms
-        },
+        mem_peak_at_ms: mem_peak_at_ms.filter(|_| flags.mem.is_none()),
         cpu_hold_ms,
         cpu_settled: false,
         non_heavy_cpu_at_start: 0,
         fast,
         cpu_sustained,
+        run_p90_ms,
     };
     let _guard = JobGuard {
         state,
@@ -357,8 +358,9 @@ fn acquire(
             live.stopped = machine::stopped_ids(&jobs);
             let now = now_ms();
             state.push_busy(now, live.cpu_pct, crate::admit::BUSY_WINDOW_MS);
-            live.cpu_sustained_pct =
-                crate::admit::sustained_pct(live.cpu_pct, &state.busy_readings(), now);
+            let readings = state.busy_readings();
+            live.cpu_sustained_pct = crate::admit::sustained_pct(live.cpu_pct, &readings, now);
+            live.cpu_recent_peak_pct = crate::admit::recent_peak_pct(&readings, now);
             let d = evaluate(job, &jobs, cap, &live, now);
             let by = match &d {
                 Decision::Wait { block, .. } => Some(block.name().to_string()),
@@ -877,6 +879,7 @@ mod tests {
             non_heavy_cpu_at_start: 0,
             fast: false,
             cpu_sustained: None,
+            run_p90_ms: None,
         };
         dir.write_job(&mk("run", State::Running)).unwrap();
         dir.write_job(&mk("wait", State::Queued)).unwrap();

@@ -520,6 +520,7 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         mem_used_pct,
         cpu_pct,
         cpu_sustained_pct: 0,
+        cpu_recent_peak_pct: 0,
         mem_pressure,
         mem_pressure_warn,
         cpu_pressure,

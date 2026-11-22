@@ -83,6 +83,9 @@ pub struct Live {
     /// The machine's sustained CPU busy, 0 to 100: max(latest, mean of every heavy process's readings in the last
     /// `admit::BUSY_WINDOW_MS`). 0 when unknown (then only the latest sample counts).
     pub cpu_sustained_pct: u64,
+    /// The highest machine CPU busy, 0 to 100, of every heavy process's readings in the last `admit::PINNED_WINDOW_MS`
+    /// (`admit::recent_peak_pct`). 0 when unknown. While it reads pinned nothing new starts (`admit::guard_block`).
+    pub cpu_recent_peak_pct: u64,
     /// The system reports critical memory pressure (macOS level 4, Linux PSI); false when it cannot be read.
     pub mem_pressure: bool,
     /// macOS level 2 ("warn"): common and sticky, so it blocks only with memory nearly used up (`admit::guard_block`).
@@ -155,4 +158,9 @@ pub struct Job {
     /// job files from before 0.4.8.
     #[serde(default)]
     pub cpu_sustained: Option<u64>,
+    /// The learned p90 run time (ms) of this very command (`history::Defaults::run_p90_ms`). A waiter bigger than tiny
+    /// passes a blocked head only when this ends within the head's backfill time (`admit::evaluate`); `None` (cold,
+    /// pooled history, job files from before 0.4.8) never backfills unless tiny.
+    #[serde(default)]
+    pub run_p90_ms: Option<u64>,
 }

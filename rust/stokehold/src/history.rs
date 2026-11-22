@@ -98,10 +98,20 @@ pub struct Defaults {
     /// The slowest of the recent runs (ms), when they were this very command (not the pooled program tier) and there are
     /// at least `FAST_MIN_RUNS` of them: what decides the fast lane (`admit::fast_lane`). `None` otherwise.
     pub slowest_run_ms: Option<u64>,
-    /// The sustained CPU level (centi-cores) of the recent runs that recorded one (`Stats::sustained_centi_cores`),
-    /// picked like the peak; `None` when none did.
+    /// The sustained CPU level (centi-cores): the picked peak (`cpu`'s centi-cores) times the median sustained/peak
+    /// ratio of the recent runs that recorded a sustained level (`Stats::sustained_centi_cores`). `None` unless at
+    /// least `SUSTAINED_MIN_RUNS` did: no run before 0.4.8 recorded one, and a median over only the newest runs (say one
+    /// cached 1-core run among 19 old 14-core ones) set beside a peak picked over all of them would size a 14-core job
+    /// at 1 core.
     pub cpu_sustained: Option<u64>,
+    /// The p90 run time (ms) of the recent runs, when they were this very command (not the pooled program tier): how
+    /// long a backfiller bigger than tiny keeps what the head waits for (`admit::evaluate`). `None` otherwise.
+    pub run_p90_ms: Option<u64>,
 }
+
+/// A command needs this many recent runs that recorded a sustained CPU level before it learns one
+/// (`Defaults::cpu_sustained`).
+pub const SUSTAINED_MIN_RUNS: usize = 3;
 
 /// A command needs this many counted runs of its own before its run time can put it in the fast lane.
 pub const FAST_MIN_RUNS: usize = 2;
@@ -113,6 +123,18 @@ fn median(mut v: Vec<u64>) -> Option<u64> {
     v.sort_unstable();
     v.get(v.len() / 2).copied()
 }
+
+/// The nearest-rank 90th percentile; `None` when empty.
+fn p90(mut v: Vec<u64>) -> Option<u64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    v.get((v.len() * 9).div_ceil(10).saturating_sub(1)).copied()
+}
+
+/// Per-mille resolution of the sustained/peak ratio.
+const RATIO_SCALE: u64 = 1_000;
 
 #[must_use]
 pub fn defaults_from(
@@ -180,6 +202,7 @@ pub fn defaults_with(
     )
     .map(|d| Defaults {
         slowest_run_ms: None,
+        run_p90_ms: None,
         ..d
     })
 }
@@ -252,17 +275,14 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
     let mine = &mine[mine.len().saturating_sub(KEEP)..];
     // Peaks of the whole process tree; runs too short to sample (or old entries) fall back to the average
     // cores and the largest single process.
-    let cores = pick(
-        mine.iter()
-            .map(|e| {
-                if e.measured.peak_centi_cores > 0 {
-                    e.measured.peak_centi_cores
-                } else {
-                    e.measured.centi_cores
-                }
-            })
-            .collect(),
-    )?;
+    let peak_of = |e: &Entry| {
+        if e.measured.peak_centi_cores > 0 {
+            e.measured.peak_centi_cores
+        } else {
+            e.measured.centi_cores
+        }
+    };
+    let cores = pick(mine.iter().map(|e| peak_of(e)).collect())?;
     let mem = pick(
         mine.iter()
             .map(|e| e.measured.peak_tree_rss.max(e.measured.peak_rss))
@@ -287,12 +307,18 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
         .collect();
     let cpu_peak_at_ms = ramps.iter().copied().max();
     let cpu_peak_median_ms = median(ramps);
-    let cpu_sustained = pick(
-        mine.iter()
-            .map(|e| e.measured.sustained_centi_cores)
-            .filter(|c| *c > 0)
-            .collect(),
-    );
+    // Each run's sustained/peak ratio, the median of those over the runs that have one, applied to the picked peak: the
+    // two levels then come from the same runs' shape, never a sustained median of new runs beside a peak of old ones.
+    let ratios: Vec<u64> = mine
+        .iter()
+        .filter(|e| e.measured.sustained_centi_cores > 0 && peak_of(e) > 0)
+        .map(|e| (e.measured.sustained_centi_cores * RATIO_SCALE / peak_of(e)).min(RATIO_SCALE))
+        .collect();
+    let cpu_sustained = (ratios.len() >= SUSTAINED_MIN_RUNS)
+        .then(|| median(ratios))
+        .flatten()
+        .map(|r| (cores * r).div_ceil(RATIO_SCALE).max(1));
+    let run_p90_ms = p90(mine.iter().map(|e| e.measured.run_ms).collect());
     let slowest_run_ms = (mine.len() >= FAST_MIN_RUNS)
         .then(|| mine.iter().map(|e| e.measured.run_ms).max())
         .flatten();
@@ -305,6 +331,7 @@ fn aggregate(mine: &[&Entry], pick: impl Fn(Vec<u64>) -> Option<u64>) -> Option<
         cpu_peak_median_ms,
         slowest_run_ms,
         cpu_sustained,
+        run_p90_ms,
     })
 }
 
@@ -365,7 +392,8 @@ mod tests {
                 cpu_peak_at_ms: None,
                 cpu_peak_median_ms: None,
                 slowest_run_ms: Some(0),
-                cpu_sustained: None
+                cpu_sustained: None,
+                run_p90_ms: Some(0)
             }
         );
         assert!(defaults_from(&all, &["other".to_string()], "/a", None).is_none());
@@ -408,7 +436,8 @@ mod tests {
                 cpu_peak_at_ms: None,
                 cpu_peak_median_ms: None,
                 slowest_run_ms: None,
-                cpu_sustained: None
+                cpu_sustained: None,
+                run_p90_ms: Some(0)
             }
         );
     }
@@ -703,5 +732,54 @@ mod tests {
         // The pooled program tier never gives a run time: other commands' times say nothing about this one's.
         let pooled: Vec<String> = ["make", "lint", "fix"].map(String::from).to_vec();
         assert_eq!(d(&two, &pooled).slowest_run_ms, None);
+    }
+
+    #[test]
+    fn the_sustained_level_is_a_learned_ratio_applied_to_the_picked_peak() {
+        let c = ["cargo".to_string()];
+        let run = |peak: u64, sustained: u64, run_ms: u64| {
+            let mut e = entry("cargo", "/a", 0, 50, 0);
+            e.measured.peak_centi_cores = peak;
+            e.measured.sustained_centi_cores = sustained;
+            e.measured.run_ms = run_ms;
+            e
+        };
+        // Right after the 0.4.8 upgrade: 19 old 14-core `cargo test` runs (no sustained level) and 1 new cached run on
+        // 1 core. A median of sustained levels over the one new run would say 1 core beside a 14-core peak, and
+        // `projected_peak` would admit a 14-core job as a 1-core one.
+        let mut all: Vec<Entry> = (0..19).map(|_| run(1_400, 0, 600_000)).collect();
+        all.push(run(100, 100, 5_000));
+        let d = defaults_from(&all, &c, "/a", None).unwrap();
+        assert_eq!(d.cpu, 14);
+        assert_eq!(d.cpu_sustained, None, "1 run with a level is too few");
+        // Two more new runs: still too few, then three with a level learn their median ratio (1/4) times the peak.
+        all.drain(..2);
+        all.push(run(1_400, 350, 600_000));
+        assert_eq!(
+            defaults_from(&all, &c, "/a", None).unwrap().cpu_sustained,
+            None
+        );
+        all.drain(..1);
+        all.push(run(1_200, 300, 600_000));
+        let d = defaults_from(&all, &c, "/a", None).unwrap();
+        assert_eq!(d.cpu, 14);
+        assert_eq!(
+            d.cpu_sustained,
+            Some(350),
+            "ratios 1/4, 1/4 and 1: the median 1/4 of the 14-core peak, not the cached run's 1 core"
+        );
+        assert_eq!(d.run_p90_ms, Some(600_000));
+    }
+
+    #[test]
+    fn run_p90_is_this_commands_own() {
+        let run = |ms: u64| {
+            let mut e = entry("t", "/a", 100, 50, 0);
+            e.measured.run_ms = ms;
+            e
+        };
+        let runs: Vec<Entry> = (1..=10).map(|i| run(i * 1_000)).collect();
+        let d = defaults_from(&runs, &["t".to_string()], "/a", None).unwrap();
+        assert_eq!(d.run_p90_ms, Some(9_000));
     }
 }
