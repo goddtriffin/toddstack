@@ -144,6 +144,8 @@ mod tests {
             fast: false,
             cpu_sustained: None,
             run_p90_ms: None,
+            cold: false,
+            vram_declared: false,
             blocked_by: by.map(Into::into),
         }
     }

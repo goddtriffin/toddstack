@@ -138,6 +138,8 @@ struct Resolved {
     cpu_sustained: Option<u64>,
     /// The learned p90 run time (`Job::run_p90_ms`).
     run_p90_ms: Option<u64>,
+    /// No history and no `--cpu` (`Job::cold`).
+    cold: bool,
 }
 
 fn resolve_weights(
@@ -180,6 +182,7 @@ fn resolve_weights(
             .filter(|_| flags.cpu.is_none() && !hosts_vm_work(cmd))
             .and_then(|d| d.cpu_sustained),
         run_p90_ms: hist.and_then(|d| d.run_p90_ms),
+        cold: hist.is_none() && flags.cpu.is_none(),
     }
 }
 
@@ -207,15 +210,8 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
     let cwd = std::env::current_dir()?;
     let cwd_str = cwd.to_string_lossy().into_owned();
     let cap = machine::capacity(&cwd)?;
-    let Resolved {
-        weights,
-        mem_peak_at_ms,
-        cpu_hold_ms,
-        cpu_settle_after_ms,
-        fast,
-        cpu_sustained,
-        run_p90_ms,
-    } = resolve_weights(state, flags, cmd, &cwd_str, &cap);
+    let r = resolve_weights(state, flags, cmd, &cwd_str, &cap);
+    let (weights, cpu_settle_after_ms) = (r.weights, r.cpu_settle_after_ms);
 
     let (tx, rx) = channel();
     let sig = spawn_signal_thread(tx.clone())?;
@@ -235,13 +231,15 @@ pub fn run(state: &StateDir, flags: &Flags, cmd: &[String]) -> Result<u8, Error>
         started_ms: None,
         blocked_by: None,
         mem_declared: flags.mem.is_some(),
-        mem_peak_at_ms: mem_peak_at_ms.filter(|_| flags.mem.is_none()),
-        cpu_hold_ms,
+        mem_peak_at_ms: r.mem_peak_at_ms.filter(|_| flags.mem.is_none()),
+        cpu_hold_ms: r.cpu_hold_ms,
         cpu_settled: false,
         non_heavy_cpu_at_start: 0,
-        fast,
-        cpu_sustained,
-        run_p90_ms,
+        fast: r.fast,
+        cpu_sustained: r.cpu_sustained,
+        run_p90_ms: r.run_p90_ms,
+        cold: r.cold,
+        vram_declared: flags.vram.is_some(),
     };
     let _guard = JobGuard {
         state,
@@ -880,6 +878,8 @@ mod tests {
             fast: false,
             cpu_sustained: None,
             run_p90_ms: None,
+            cold: false,
+            vram_declared: false,
         };
         dir.write_job(&mk("run", State::Running)).unwrap();
         dir.write_job(&mk("wait", State::Queued)).unwrap();

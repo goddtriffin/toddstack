@@ -113,6 +113,10 @@ pub enum State {
 
 /// One JSON file per job in the state dir.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent serialized flags of a job file, read by older and newer versions"
+)]
 pub struct Job {
     pub id: String,
     pub pid: u32,
@@ -163,4 +167,11 @@ pub struct Job {
     /// pooled history, job files from before 0.4.8) never backfills unless tiny.
     #[serde(default)]
     pub run_p90_ms: Option<u64>,
+    /// Cold: no history and no declared `--cpu`, so it holds the whole machine (`admit::cold_hold` shrinks that hold
+    /// on an idle machine past `admit::RAMP_MS`). False for job files from before 0.4.9.
+    #[serde(default)]
+    pub cold: bool,
+    /// The VRAM size was declared (`--vram`): its unused part is held for the whole run (`admit::vram_reserved`).
+    #[serde(default)]
+    pub vram_declared: bool,
 }
