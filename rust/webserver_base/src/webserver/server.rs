@@ -350,11 +350,25 @@ where
         )]
         let mut untraced_exact: Vec<String> = Vec::new();
 
-        #[cfg(feature = "pages")]
+        // Gated on `templates`, the gate of the `StateParts` fields that read
+        // them; only `pages` ever assigns them.
+        #[cfg(feature = "templates")]
+        #[cfg_attr(
+            not(feature = "pages"),
+            expect(unused_mut, reason = "only a frontend assigns it")
+        )]
         let mut frontend_runtime: Option<crate::templates::FrontendRuntime> = None;
-        #[cfg(feature = "pages")]
+        #[cfg(feature = "templates")]
+        #[cfg_attr(
+            not(feature = "pages"),
+            expect(unused_mut, reason = "only a frontend assigns it")
+        )]
         let mut base: Option<crate::templates::BaseTemplateData> = None;
-        #[cfg(feature = "pages")]
+        #[cfg(feature = "templates")]
+        #[cfg_attr(
+            not(feature = "pages"),
+            expect(unused_mut, reason = "only a frontend assigns it")
+        )]
         let mut templates: Option<crate::templates::TemplateRegistry<'static>> = None;
         #[cfg(feature = "pages")]
         let mut not_found: Option<super::not_found::NotFound<S>> = None;

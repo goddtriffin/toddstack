@@ -134,6 +134,9 @@ test: assets ## @factory runs tests; the template's tests serve the bin/ that as
 
 	cd $(RUST) && cargo fmt --check
 	cd $(RUST) && cargo check --all-features
+	# feature combinations a consumer can pick without pages (toddstack#16)
+	cd $(RUST) && cargo check -p webserver-base --no-default-features --features webserver,templates
+	cd $(RUST) && cargo check -p webserver-base --no-default-features --features webserver,preset
 	cd $(RUST) && cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 	cd $(RUST) && cargo test --all-features
