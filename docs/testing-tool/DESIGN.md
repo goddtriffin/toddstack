@@ -590,11 +590,17 @@ Built as designed, with these differences:
 `shakedown smoke` is built as section 10 describes, with these differences:
 
 - Step 5 (the sweep against the container) is wired. `smoke::sweep_container` calls `sweep::run` with
-  `base = http://127.0.0.1:{port}` (no world of its own, no pack, no rebase) on the project's `[sweep]` pages;
-  layout findings fail the step, pixel changes against the dev-server baseline stay reported by `shakedown sweep`
-  only. `run_on` takes the sweeper as a parameter, so the tests inject findings without Chrome. A config without a
-  `[sweep]` section reports `skip smoke.sweep` (a skip is not a pass: it is on the output line). A sweep that cannot
+  `base = http://127.0.0.1:{port}` (no world of its own, no pack) on the project's `[sweep]` pages, in its own directory
+  `target/shakedown/smoke/sweep` (`Options.out`) and with no baseline writes: smoke never touches the dev sweep's
+  baselines, `current/`, `diff/` or `server/`. Layout findings fail the step; pixel changes are not judged here (that
+  is `shakedown sweep`). `run_on` takes the sweeper as a parameter, so the tests inject findings without Chrome. `sweep = true` with no
+  `[sweep]` section is a config error (`Smoke::validate`). A sweep that cannot
   run (no Chrome) fails the step. `routes` of `[smoke]` do not select sweep pages: the whole `[sweep]` list is drawn.
+- Teardown: every request has a 30 s total deadline and a 32 MiB cap. After the first signal no further step runs (not
+  the checks, the sweep or the logs): the run goes straight to `down`, and later signals are only noted (a shielded
+  guard), so `down` always runs. A `down` that passes 180 s has its whole process group killed. The `logs` command's
+  exit status counts: a failing one fails the run. The log scan matches level tokens (`ERROR`, `FATAL`, `PANIC`,
+  `panicked at`, `Error:` at line start, `level=error`), not the word in ordinary text.
 - One extra optional key, `logs`: a third `make` target that prints the container's output. Docker stays behind the
   Makefile, and a container run with `--rm` that crashes at boot leaves nothing for `docker logs`, so the repo's
   `smoke_up` attaches the run to a log file and `smoke_logs` prints it. `down` and `logs` take `{port}` like `up`

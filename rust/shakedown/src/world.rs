@@ -43,6 +43,21 @@ fn kill_group(pid: u32, mut wait_for: impl FnMut() -> bool) {
 struct Hooks {
     /// True when the next signal must take its default action (no run is alive, or one signal was seen already).
     default_now: Arc<AtomicBool>,
+    /// The action that sets `default_now` after a signal; taken away while a run is shielded.
+    latch: Mutex<Option<signal_hook::SigId>>,
+    sig: i32,
+}
+
+impl Hooks {
+    /// Makes a signal set `default_now` again (or stops doing so, for a shielded run).
+    fn set_latch(&self, on: bool) {
+        let mut latch = self.latch.lock().unwrap_or_else(PoisonError::into_inner);
+        if on && latch.is_none() {
+            *latch = signal_hook::flag::register(self.sig, self.default_now.clone()).ok();
+        } else if !on && let Some(id) = latch.take() {
+            signal_hook::low_level::unregister(id);
+        }
+    }
 }
 
 fn hooks() -> &'static [Hooks; 2] {
@@ -55,8 +70,12 @@ fn hooks() -> &'static [Hooks; 2] {
             let default_now = Arc::new(AtomicBool::new(true));
             let _ = signal_hook::flag::register_conditional_default(sig, default_now.clone());
             let _ = signal_hook::flag::register(sig, SEEN.clone());
-            let _ = signal_hook::flag::register(sig, default_now.clone());
-            Hooks { default_now }
+            let latch = signal_hook::flag::register(sig, default_now.clone()).ok();
+            Hooks {
+                default_now,
+                latch: Mutex::new(latch),
+                sig,
+            }
         };
         [one(SIGINT), one(SIGTERM)]
     })
@@ -72,12 +91,14 @@ static EPOCH: AtomicU64 = AtomicU64::new(0);
 /// turns a caught signal into stopping all of those groups.
 struct Registry {
     live: usize,
+    shields: usize,
     groups: Vec<u32>,
     watcher: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
 }
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     live: 0,
+    shields: 0,
     groups: Vec::new(),
     watcher: None,
 });
@@ -92,6 +113,7 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 pub struct Signals {
     /// The signal count when this run started: a bigger count now means a signal arrived during this run.
     since: u64,
+    shielded: bool,
 }
 
 /// Listens for SIGINT and SIGTERM while a returned guard lives. Runs may overlap: the handling is installed when
@@ -101,8 +123,27 @@ pub struct Signals {
 /// action, so Ctrl-C always ends the process.
 #[must_use = "the signals are only watched while the guard lives"]
 pub fn watch_signals() -> Signals {
+    watch(false)
+}
+
+/// Like [`watch_signals`], but every signal during the run is only noted, never fatal: the run must still clean
+/// up (smoke stops its container) however often Ctrl-C arrives. Outside the run the default action is back.
+#[must_use = "the signals are only watched while the guard lives"]
+pub fn watch_signals_shielded() -> Signals {
+    watch(true)
+}
+
+fn watch(shielded: bool) -> Signals {
     let hooks = hooks();
     let mut reg = registry();
+    if shielded {
+        reg.shields += 1;
+        if reg.shields == 1 {
+            for h in hooks {
+                h.set_latch(false);
+            }
+        }
+    }
     let since = EPOCH.load(Ordering::SeqCst);
     if reg.live == 0 {
         SEEN.store(false, Ordering::SeqCst);
@@ -131,7 +172,7 @@ pub fn watch_signals() -> Signals {
         reg.watcher = Some((stop, handle));
     }
     reg.live += 1;
-    Signals { since }
+    Signals { since, shielded }
 }
 
 impl Signals {
@@ -146,6 +187,14 @@ impl Drop for Signals {
         let watcher = {
             let mut reg = registry();
             reg.live = reg.live.saturating_sub(1);
+            if self.shielded {
+                reg.shields = reg.shields.saturating_sub(1);
+                if reg.shields == 0 {
+                    for h in hooks() {
+                        h.set_latch(true);
+                    }
+                }
+            }
             if reg.live > 0 {
                 return;
             }

@@ -30,6 +30,9 @@ pub struct Options {
     pub pack: bool,
     /// Replace the baseline with this run's pictures.
     pub rebase: bool,
+    /// Work in this directory instead of the dev sweep's own, and never write a baseline (smoke runs use this,
+    /// so they leave the dev sweep's baselines and pictures alone).
+    pub out: Option<PathBuf>,
 }
 
 /// A page to draw: a route or a group.
@@ -453,7 +456,7 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
         root,
         ui::now_ms(now)?,
     )?;
-    let dir = out_dir(root);
+    let dir = opts.out.clone().unwrap_or_else(|| out_dir(root));
     for sub in ["current", "diff", "server"] {
         let _ = std::fs::remove_dir_all(dir.join(sub));
     }
@@ -507,7 +510,9 @@ pub fn run(config: &Config, root: &Path, opts: &Options) -> Result<Outcome, Erro
     let (records, pictures) = collect(judged, shots.len())?;
     // The run finished whole: only now do new pictures (or all of them, on `--rebase`) become the baseline, so a
     // failed or interrupted run never leaves a half-written one.
-    keep_baseline(&dir, &records, &pictures, opts.rebase)?;
+    if opts.out.is_none() {
+        keep_baseline(&dir, &records, &pictures, opts.rebase)?;
+    }
     outcome.new = records.iter().filter(|r| r.change == Change::New).count();
     outcome.changed = records.iter().filter(|r| r.change.line().is_some()).count();
     outcome.failed = records

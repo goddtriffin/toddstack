@@ -513,7 +513,7 @@ impl Config {
         }
         self.validate_ui()?;
         if let Some(s) = &self.smoke {
-            s.validate()?;
+            s.validate(self.sweep.is_some())?;
         }
         for (label, size) in &self.budgets.sizes {
             if size.strip && size.max.is_none() {
