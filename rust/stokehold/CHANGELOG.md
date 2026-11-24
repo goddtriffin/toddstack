@@ -7,6 +7,9 @@ Earlier releases are described in the git history and the README.
 - Size check uses the learned typical cores, at most `--cpu`. A declared `--cpu 12` is a ceiling: a lint that averaged
   1 core was held at 39% busy because 6 busy cores plus the declared 12 passed 95% (2026-11-24: 9m07s of waiting with
   the CPU idle). `--cpu` alone (a cold job) still counts as the typical size.
+- A Docker/VM job keeps `--cpu` as its typical size: its learned mean is only the docker client's, not the VM's work.
+- History lookups can fall back to a sibling command (same program and first 2 words), so a flagged job may inherit a
+  smaller learned typical. Overload stays bounded by the peak cap, the 80% line and the pinned guard.
 
 ## 0.4.10
 

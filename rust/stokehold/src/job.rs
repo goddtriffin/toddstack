@@ -148,7 +148,8 @@ pub struct Job {
     /// How long (ms) after its start this job settles (`admit::settle_window_ms`); `None` means `admit::SETTLE_MS`.
     #[serde(default)]
     pub settle_ms: Option<i64>,
-    /// The cores this job typically uses: the median of past runs' mean cores, or `--cpu`. `None` when cold (then
+    /// The cores this job typically uses: the median of past runs' mean cores, at most `--cpu` (a Docker/VM job keeps
+    /// `--cpu`: its learned mean misses the VM's work); `--cpu` alone when cold. `None` when no data (then
     /// `admit::typical_centi` assumes a quarter of the machine).
     #[serde(default)]
     pub typical_cpu: Option<u32>,
