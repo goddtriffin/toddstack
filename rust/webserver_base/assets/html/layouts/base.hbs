@@ -149,6 +149,9 @@
         dsn: "{{sentry_browser.dsn}}",
         environment: "{{sentry_browser.environment}}",
         tunnel: "{{sentry_browser.tunnel_path}}",
+        {{#if sentry_browser.release_js}}
+        release: {{{sentry_browser.release_js}}},
+        {{/if}}
         {{#if sentry_browser.traces_sample_rate}}
         tracesSampleRate: {{sentry_browser.traces_sample_rate}},
         integrations: [Sentry.browserTracingIntegration()],

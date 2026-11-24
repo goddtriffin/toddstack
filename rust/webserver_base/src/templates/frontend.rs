@@ -36,6 +36,10 @@ pub struct SentryBrowser {
     pub tunnel_path: String,
     /// The Sentry `environment` tag.
     pub environment: String,
+    /// The Sentry `release` as a ready-to-emit JavaScript string literal
+    /// (quotes included, `<` escaped so it cannot close the inline script);
+    /// `None` omits `release` from the init, as before.
+    pub release_js: Option<String>,
 }
 
 /// What the social card image actually is.

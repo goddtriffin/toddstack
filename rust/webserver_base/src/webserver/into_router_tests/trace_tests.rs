@@ -361,3 +361,42 @@ async fn the_page_script_order_puts_the_bundle_before_the_init_module() {
         .expect("the init module");
     assert!(bundle < init, "{body}");
 }
+
+async fn page_with_release(name: &str, release: Option<&str>) -> String {
+    let root: PathBuf = built_site(name);
+    let params: FrontendParams = match release {
+        Some(release) => frontend_with(analytics_home()).with_browser_release(release),
+        None => frontend_with(analytics_home()),
+    };
+    let router: Router = WebServer::new("127.0.0.1", 0, Environment::Local)
+        .root_dir(&root)
+        .frontend(params)
+        .into_router(Shutdown::manual())
+        .expect("the built site boots");
+    text(get(&router, "/").await).await
+}
+
+#[tokio::test]
+async fn without_a_browser_release_the_page_is_identical_and_has_no_release_key() {
+    let without: String = page_with_release("release-absent", None).await;
+    let plain: String = page_at("release-absent-plain", None).await;
+
+    assert_eq!(plain, without);
+    assert!(!without.contains("release:"), "{without}");
+
+    let with: String = page_with_release("release-present-plain", Some("site@1.2.3")).await;
+    let stripped: String = with.replace("        release: \"site@1.2.3\",\n", "");
+    assert_eq!(without, stripped);
+    assert!(with.contains("release: \"site@1.2.3\","), "{with}");
+}
+
+#[tokio::test]
+async fn a_browser_release_is_a_json_string_that_cannot_break_out_of_the_script() {
+    let body: String = page_with_release("release-hostile", Some("v\"1</script><b>\u{2028}")).await;
+
+    assert!(
+        body.contains("release: \"v\\\"1\\u003c/script>\\u003cb>\\u2028\","),
+        "{body}"
+    );
+    assert!(!body.contains("</script><b>"), "{body}");
+}

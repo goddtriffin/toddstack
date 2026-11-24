@@ -283,7 +283,9 @@ a share card.
 | `sentry_browser_dsn` | browser errors, separate from the server's DSN |
 
 Optional: `.with_browser_traces_sample_rate(rate)` (see
-[Tracing](#tracing)), `.with_not_found(..)`, `.with_helper(..)`.
+[Tracing](#tracing)), `.with_not_found(..)`, `.with_helper(..)`,
+`.with_browser_release(release)` (the Sentry `release` in the browser init, JSON-escaped; pass the string given to
+`bootstrap_with_release` so browser and server events share a release; omitted, the init has no `release`).
 
 Calling it gives you, with no further code: the embedded base layout, the
 generated icon set, `site.webmanifest`, `robots.txt`, the sitemap index and its
