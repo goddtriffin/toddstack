@@ -567,7 +567,8 @@ fn settle_of(j: &Job) -> i64 {
     j.settle_ms.unwrap_or(SETTLE_MS)
 }
 
-/// The cores (centi) `j` typically uses: its learned typical or `--cpu` (`Job::typical_cpu`), else a quarter of the
+/// The cores (centi) `j` typically uses: its learned typical, at most `--cpu`, or `--cpu` alone for a cold or
+/// Docker/VM job (`Job::typical_cpu`), else a quarter of the
 /// machine (a cold job: 4 of 16 cores is above the 90th percentile of the Mac's recorded mean cores, 3.0; half the
 /// machine replayed at 12% in band, because a cold job then waited for the machine to fall to 45%). Never more than
 /// its size.
@@ -2427,6 +2428,27 @@ mod tests {
             evaluate(&me, &jobs, &mac(), &live, SETTLE_VM_MS),
             Decision::Start
         );
+    }
+
+    #[test]
+    fn the_size_check_weighs_the_learned_typical_not_the_cpu_ceiling() {
+        // 6 of 16 cores busy (38%): a `--cpu 12` job that learned a typical of 1 core fits; one whose typical stays at
+        // 12 (a Docker/VM job keeps `--cpu`) is held by the size check.
+        let run = started("r", 1, 0);
+        let learned = Job {
+            typical_cpu: Some(1),
+            ..job("l", 12, 1, State::Queued, 1)
+        };
+        let vm = Job {
+            typical_cpu: Some(12),
+            ..job("v", 12, 1, State::Queued, 2)
+        };
+        let live = on_mac(38);
+        let at = |w: &Job| blocker(w, &[&run], &mac(), &live, 60_000);
+        assert!(at(&learned).is_none());
+        let held = at(&vm).expect("held");
+        assert_eq!(held.block, Block::Cpu);
+        assert!(held.by_size);
     }
 
     #[test]

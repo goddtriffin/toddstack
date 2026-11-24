@@ -132,7 +132,8 @@ struct Resolved {
 }
 
 /// How long a job settles (`admit::settle_window_ms`, from its learned time to CPU peak; cold and Docker/VM jobs at
-/// least 15 s, Docker 30 s) and the cores it typically uses (the learned typical, at most `--cpu`; `--cpu` alone when cold; `None` when no data).
+/// least 15 s, Docker 30 s) and the cores it typically uses (the learned typical, at most `--cpu`; `--cpu` alone when cold or for a Docker/VM job,
+/// whose learned mean misses the VM's work; `None` when no data).
 pub(crate) fn admit_shape(
     cmd: &[String],
     hist: Option<history::Defaults>,
@@ -143,8 +144,11 @@ pub(crate) fn admit_shape(
     // `--cpu` is a ceiling (peak) the caller declares, not what the job typically uses: a `--cpu 12` lint that averages
     // 1 core held jobs back at 39% busy (size check) on 2026-11-24. With history the smaller of the two is the typical
     // size; a cold job with only `--cpu` has nothing better than the declaration.
+    // A Docker/VM job is the exception: its learned mean is only the client's rusage (the work runs in the VM), so
+    // it learns about 1 core and would pass the size check at 70% busy; `--cpu` stays its typical size.
     let typical = match (cpu_flag, hist.map(|d| d.typical_cpu)) {
-        (Some(f), Some(h)) => Some(f.min(h)),
+        (Some(f), Some(h)) if !hosts_vm_work(cmd) => Some(f.min(h)),
+        (Some(f), Some(_)) => Some(f),
         (f, h) => f.or(h),
     }
     .map(|c| c.min(cap.cpu));
@@ -878,6 +882,11 @@ mod tests {
         assert_eq!(admit_shape(&build, Some(late), None, &cap).0, 45_000);
         let docker = c(&["docker", "build", "."]);
         assert_eq!(admit_shape(&docker, Some(learned), None, &cap).0, 30_000);
+        // A VM job's learned mean misses the VM's work: `--cpu` stays its typical size.
+        assert_eq!(
+            admit_shape(&docker, Some(learned), Some(12), &cap),
+            (30_000, Some(12))
+        );
         // Docker jobs run un-niced: nice cannot reach the VM.
         assert_eq!(niced("docker", &c(&["build"])).get_program(), "docker");
     }
