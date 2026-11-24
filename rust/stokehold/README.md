@@ -62,8 +62,8 @@ All of these must hold (a job with nothing running needs only the guards and the
   max(latest, mean of the last 20 s of readings in `~/.local/state/stokehold/busy`), which every stokehold process
   adds to, so a single window between build steps cannot admit onto a busy machine. Jobs start under 80% and their
   bursts fill the rest: the target is 80-90% busy while jobs wait. On Linux CPU includes steal time.
-- Size: the measured busy cores plus the new job's typical cores (`--cpu`, else the median of its past runs' mean
-  cores, else a quarter of the machine when cold) stay within 95% of the cores, settling or not, so a job that averages 16
+- Size: the measured busy cores plus the new job's typical cores (the median of its past runs' mean
+  cores, at most `--cpu`; `--cpu` alone when cold; else a quarter of the machine) stay within 95% of the cores, settling or not, so a job that averages 16
   cores does not start at 79% busy. A waiter blocked by this for 5 minutes holds the queue, like a memory wait.
 - Peak cap (a backstop that rarely binds): the expected peaks (learned peak, `--cpu`, or the whole machine when cold)
   of the jobs started under 60 s ago, plus the new one's, stay within 2.5 x cores. It stops cold builds that idle on
