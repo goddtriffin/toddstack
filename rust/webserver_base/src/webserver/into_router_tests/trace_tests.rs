@@ -379,10 +379,34 @@ async fn page_with_release(name: &str, release: Option<&str>) -> String {
 #[tokio::test]
 async fn without_a_browser_release_the_page_is_identical_and_has_no_release_key() {
     let without: String = page_with_release("release-absent", None).await;
-    let plain: String = page_at("release-absent-plain", None).await;
 
-    assert_eq!(plain, without);
-    assert!(!without.contains("release:"), "{without}");
+    let start: usize = without.find("Sentry.init({").expect("the init");
+    let end: usize = start + without[start..].find("});").expect("the init end");
+    let init: Vec<&str> = without[start..end].lines().map(str::trim).collect();
+    assert_eq!(init.len(), 7, "{init:?}");
+    assert_eq!(init[0], "Sentry.init({");
+    assert_eq!(
+        init[1],
+        "dsn: \"https://abc123@o4504844394627072.ingest.sentry.io/4504862450515968\","
+    );
+    assert_eq!(init[2], "environment: \"local\",");
+    assert!(
+        init[3].starts_with("tunnel: \"/api/v1/fixture-"),
+        "{init:?}"
+    );
+    assert!(init[3].ends_with("\","), "{init:?}");
+    assert_eq!(
+        init[4],
+        format!(
+            "tracesSampleRate: {},",
+            crate::DEFAULT_BROWSER_TRACES_SAMPLE_RATE
+        )
+    );
+    assert_eq!(
+        init[5],
+        "integrations: [Sentry.browserTracingIntegration()],"
+    );
+    assert_eq!(init[6], "");
 
     let with: String = page_with_release("release-present-plain", Some("site@1.2.3")).await;
     let stripped: String = with.replace("        release: \"site@1.2.3\",\n", "");
@@ -399,4 +423,19 @@ async fn a_browser_release_is_a_json_string_that_cannot_break_out_of_the_script(
         "{body}"
     );
     assert!(!body.contains("</script><b>"), "{body}");
+}
+
+#[tokio::test]
+async fn a_backslash_in_a_browser_release_is_escaped() {
+    let body: String = page_with_release("release-backslash", Some("a\\b")).await;
+
+    assert!(body.contains("release: \"a\\\\b\","), "{body}");
+}
+
+#[tokio::test]
+async fn an_html_comment_opener_in_a_browser_release_is_escaped() {
+    let body: String = page_with_release("release-comment", Some("<!--x")).await;
+
+    assert!(body.contains("release: \"\\u003c!--x\","), "{body}");
+    assert!(!body.contains("<!--x"), "{body}");
 }
