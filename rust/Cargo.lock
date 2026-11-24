@@ -4208,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "template-web-server"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
  "tokio",
@@ -5159,7 +5159,7 @@ dependencies = [
 
 [[package]]
 name = "webserver-base"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
  "axum-extra",

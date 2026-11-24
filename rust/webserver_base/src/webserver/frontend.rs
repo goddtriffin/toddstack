@@ -39,6 +39,8 @@ pub struct FrontendParams<S = ()> {
     pub(super) sentry_browser_dsn: String,
     /// The share of page loads that send a trace.
     pub(super) browser_traces_sample_rate: TracesSampleRate,
+    /// The browser Sentry `release`; `None` sends none.
+    pub(super) browser_release: Option<String>,
     /// The router-fallback 404's `{{app}}`.
     pub(super) not_found: NotFound<S>,
     /// The project's own Handlebars helpers.
@@ -63,6 +65,7 @@ where
             analytics,
             sentry_browser_dsn: sentry_browser_dsn.into(),
             browser_traces_sample_rate: TracesSampleRate::BROWSER_DEFAULT,
+            browser_release: None,
             not_found: NotFound::none(),
             helpers: Vec::new(),
         }
@@ -94,6 +97,15 @@ where
         browser_traces_sample_rate: TracesSampleRate,
     ) -> Self {
         self.browser_traces_sample_rate = browser_traces_sample_rate;
+        self
+    }
+
+    /// The Sentry `release` the browser reports, so browser events group with
+    /// the server's. Pass the same string given to `bootstrap_with_release`.
+    /// Defaults to none: the init carries no `release`.
+    #[must_use]
+    pub fn with_browser_release(mut self, release: impl Into<String>) -> Self {
+        self.browser_release = Some(release.into());
         self
     }
 
@@ -280,6 +292,7 @@ where
                 &sentry_dsn,
                 params.browser_traces_sample_rate,
                 environment,
+                params.browser_release.as_deref(),
             ),
             feed: feed_links,
         };
@@ -320,6 +333,7 @@ fn sentry_browser(
     dsn: &SentryDsn,
     rate: TracesSampleRate,
     environment: Environment,
+    release: Option<&str>,
 ) -> SentryBrowser {
     SentryBrowser {
         script_path: paths.sentry_script.clone(),
@@ -327,7 +341,20 @@ fn sentry_browser(
         traces_sample_rate: rate.is_on().then(|| rate.to_string()),
         tunnel_path: paths.sentry_tunnel.clone(),
         environment: environment.to_string(),
+        release_js: release.map(js_string),
     }
+}
+
+/// `value` as a JavaScript string literal safe inside an inline `<script>`.
+///
+/// JSON escapes quotes and control characters but not `<`, so `</script>` in a
+/// release would end the script; `<` and the line separators are `\u`-escaped.
+fn js_string(value: &str) -> String {
+    serde_json::to_string(value)
+        .expect("a string serializes")
+        .replace('<', "\\u003c")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 /// Where the first-party proxies live on this origin.
