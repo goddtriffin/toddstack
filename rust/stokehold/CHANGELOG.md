@@ -2,6 +2,12 @@
 
 Earlier releases are described in the git history and the README.
 
+## 0.4.11
+
+- Size check uses the learned typical cores, at most `--cpu`. A declared `--cpu 12` is a ceiling: a lint that averaged
+  1 core was held at 39% busy because 6 busy cores plus the declared 12 passed 95% (2026-11-24: 9m07s of waiting with
+  the CPU idle). `--cpu` alone (a cold job) still counts as the typical size.
+
 ## 0.4.10
 
 - Closed-loop admission: a job starts while the measured CPU is under 80%. Learned peak and floor reservations are gone.

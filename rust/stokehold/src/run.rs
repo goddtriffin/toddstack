@@ -132,7 +132,7 @@ struct Resolved {
 }
 
 /// How long a job settles (`admit::settle_window_ms`, from its learned time to CPU peak; cold and Docker/VM jobs at
-/// least 15 s, Docker 30 s) and the cores it typically uses (`--cpu`, else the learned typical; `None` when cold).
+/// least 15 s, Docker 30 s) and the cores it typically uses (the learned typical, at most `--cpu`; `--cpu` alone when cold; `None` when no data).
 pub(crate) fn admit_shape(
     cmd: &[String],
     hist: Option<history::Defaults>,
@@ -140,9 +140,14 @@ pub(crate) fn admit_shape(
     cap: &Capacity,
 ) -> (i64, Option<u32>) {
     let settle = crate::admit::settle_window_ms(hosts_vm_work(cmd), hist.map(|d| d.cpu_peak_at_ms));
-    let typical = cpu_flag
-        .or(hist.map(|d| d.typical_cpu))
-        .map(|c| c.min(cap.cpu));
+    // `--cpu` is a ceiling (peak) the caller declares, not what the job typically uses: a `--cpu 12` lint that averages
+    // 1 core held jobs back at 39% busy (size check) on 2026-11-24. With history the smaller of the two is the typical
+    // size; a cold job with only `--cpu` has nothing better than the declaration.
+    let typical = match (cpu_flag, hist.map(|d| d.typical_cpu)) {
+        (Some(f), Some(h)) => Some(f.min(h)),
+        (f, h) => f.or(h),
+    }
+    .map(|c| c.min(cap.cpu));
     (settle, typical)
 }
 
@@ -834,7 +839,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cold_and_docker_jobs_settle_longer_and_declared_cpu_is_the_typical_size() {
+    fn cold_and_docker_jobs_settle_longer_and_declared_cpu_caps_the_learned_typical() {
         let cap = Capacity {
             cpu: 16,
             mem: 64 << 30,
@@ -859,8 +864,13 @@ mod tests {
         );
         assert_eq!(
             admit_shape(&build, Some(learned), Some(6), &cap),
-            (10_000, Some(6))
+            (10_000, Some(3))
         );
+        assert_eq!(
+            admit_shape(&build, Some(learned), Some(2), &cap),
+            (10_000, Some(2))
+        );
+        assert_eq!(admit_shape(&build, None, Some(6), &cap), (15_000, Some(6)));
         let late = history::Defaults {
             cpu_peak_at_ms: 45_000,
             ..learned
