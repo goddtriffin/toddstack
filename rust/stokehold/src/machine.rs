@@ -226,6 +226,35 @@ fn tree_usage(
     total
 }
 
+/// Memory the machine really uses: total minus available (page cache and shared file mappings count as available).
+fn machine_used(sys: &System) -> u64 {
+    sys.total_memory().saturating_sub(sys.available_memory())
+}
+
+/// A tree's memory is the sum of its processes' RSS, which counts shared pages once per process: file-backed pages
+/// (rustc and clippy map the same crate metadata in every process), shared libraries and copy-on-write pages. On the
+/// rig a `make lint` learned a 17-19 GB peak while the machine never used more than 8 GB of its 32 GB (2026-11-25),
+/// and that reservation held waiters on "mem" for 4m37s at 9-22% RAM used; `cargo install` did the same on
+/// 2026-11-20. Nothing the tree uses can exceed what the whole machine uses, so the sum is capped there.
+#[must_use]
+pub fn cap_tree_mem(tree_rss: u64, machine_used: u64) -> u64 {
+    tree_rss.min(machine_used)
+}
+
+/// `cap_tree_mem` for several trees at once: when their RSS together exceeds what the machine uses, each is scaled
+/// down in proportion so that they add up to it.
+#[must_use]
+pub fn cap_trees_mem(trees: &[u64], machine_used: u64) -> Vec<u64> {
+    let sum: u128 = trees.iter().map(|t| u128::from(*t)).sum();
+    if sum <= u128::from(machine_used) {
+        return trees.to_vec();
+    }
+    trees
+        .iter()
+        .map(|t| u64::try_from(u128::from(*t) * u128::from(machine_used) / sum).unwrap_or(0))
+        .collect()
+}
+
 /// The root and every descendant process (what `tree_usage` sums).
 fn tree_pids(children: &HashMap<Pid, Vec<Pid>>, root: Pid) -> Vec<Pid> {
     let mut seen = Vec::new();
@@ -253,11 +282,14 @@ impl TreeSampler {
         })
     }
 
-    /// Current CPU (centi-cores) and RSS of the whole process tree.
+    /// Current CPU (centi-cores) and RSS of the whole process tree, the RSS at most the memory the machine uses.
     pub fn sample(&mut self) -> Usage {
+        self.sys.refresh_memory();
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
         let children = child_map(&self.sys);
-        tree_usage(&self.sys, &children, self.root, &[])
+        let mut u = tree_usage(&self.sys, &children, self.root, &[]);
+        u.mem = cap_tree_mem(u.mem, machine_used(&self.sys));
+        u
     }
 }
 
@@ -426,10 +458,17 @@ fn measure(
         },
     };
     let children = child_map(&sys);
-    let per_job = jobs
+    let mut per_job: Vec<(String, Usage)> = jobs
         .iter()
         .map(|j| (j.id.clone(), tree_usage(&sys, &children, j.pid, &gpu)))
         .collect();
+    let capped = cap_trees_mem(
+        &per_job.iter().map(|(_, u)| u.mem).collect::<Vec<_>>(),
+        machine.mem,
+    );
+    for ((_, u), mem) in per_job.iter_mut().zip(capped) {
+        u.mem = mem;
+    }
     Ok((machine, per_job))
 }
 
@@ -646,6 +685,21 @@ mod tests {
         // A native job: the tree peak wins. Never above the machine.
         assert_eq!(effective_mem_peak(8 * G, 3 * G, 64 * G), 8 * G);
         assert_eq!(effective_mem_peak(G, 99 * G, 64 * G), 64 * G);
+    }
+
+    #[test]
+    fn shared_pages_do_not_count_once_per_process() {
+        const G: u64 = 1 << 30;
+        // 2026-11-25 on the rig: a lint tree summed 18.7 GB of RSS while the whole machine used 7 GB of 32.
+        assert_eq!(cap_tree_mem(18 * G, 7 * G), 7 * G);
+        // An honest tree is untouched.
+        assert_eq!(cap_tree_mem(3 * G, 7 * G), 3 * G);
+        // Several trees that together claim more than the machine uses are scaled to what it uses.
+        let capped = cap_trees_mem(&[12 * G, 6 * G], 9 * G);
+        assert_eq!(capped, vec![6 * G, 3 * G]);
+        assert_eq!(cap_trees_mem(&[G, 2 * G], 9 * G), vec![G, 2 * G]);
+        assert_eq!(cap_trees_mem(&[], 9 * G), Vec::<u64>::new());
+        assert_eq!(cap_trees_mem(&[G], 0), vec![0]);
     }
 
     #[test]

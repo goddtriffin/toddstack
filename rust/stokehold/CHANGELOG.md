@@ -2,6 +2,14 @@
 
 Earlier releases are described in the git history and the README.
 
+## 0.4.12
+
+- Memory: a job's tree memory is capped at what the machine really uses (total minus available), live and when
+  learned. Summed RSS counts shared file mappings once per process: on the rig a `make lint` learned 17-19 GB while the
+  machine never used over 8 of 32 GB, and `c9-timeouts` waited 4m37s on "mem" at 9-22% RAM used (2026-11-25).
+- CPU: waiters blocked by the CPU (line, load, pinned, settle) re-sample every 2 s instead of 10 s. Waits of 23-30 s at
+  47-54% busy came from a 10 s timer and one reading per 10 s in the sustained mean.
+
 ## 0.4.11
 
 - Size check uses the learned typical cores, at most `--cpu`. A declared `--cpu 12` is a ceiling: a lint that averaged

@@ -1833,6 +1833,27 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_that_ended_releases_the_sustained_cpu_within_seconds_at_two_second_readings() {
+        // 2026-11-25 on the Mac: a waiter held 23 s at 47-54% busy. With one reading per 10 s the 20 s mean kept
+        // two bursts and the next look came 10 s late. Waiters now look every 2 s, so the readings after a burst
+        // pull the mean under the 80% line as soon as the machine is really idle.
+        let mut readings: Vec<(i64, u64)> = (0..5).map(|i| (i * 2_000, 100)).collect();
+        let at =
+            |readings: &[(i64, u64)], now: i64, latest: u64| sustained_pct(latest, readings, now);
+        assert!(at(&readings, 8_000, 100) >= CPU_ADMIT_PCT, "busy: blocked");
+        let mut admitted = None;
+        for now in (10..=30).step_by(2).map(|s| s * 1_000) {
+            readings.push((now, 50));
+            if at(&readings, now, 50) < CPU_ADMIT_PCT {
+                admitted = Some(now);
+                break;
+            }
+        }
+        // 10 s of 100% and 50% readings from then on: under 80% by the fourth idle reading, 8 s after the burst.
+        assert_eq!(admitted, Some(16_000));
+    }
+
+    #[test]
     fn sustained_overload_is_blocked_by_the_two_times_cores_rule() {
         let c = mac();
         let over = Live {
