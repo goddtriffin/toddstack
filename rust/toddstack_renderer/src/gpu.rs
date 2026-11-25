@@ -235,6 +235,14 @@ fn padded(bytes: &[u8]) -> Vec<u8> {
     v
 }
 
+/// Why `Gpu::create` failed, and whether the web canvas had already given this backend its context.
+pub struct CreateFailure {
+    /// The failure.
+    pub error: Error,
+    /// A canvas keeps one context type for life, so no later backend can use it.
+    pub taken: bool,
+}
+
 /// A GPU backend that passed every rejection rule, found before the real canvas was touched.
 pub struct Probe {
     backend: Backend,
@@ -369,19 +377,34 @@ impl Gpu {
     /// Builds the GPU renderer on an accepted probe, creating the surface on the real canvas.
     ///
     /// # Errors
-    /// `Surface` or `Device` if the real canvas still fails after acceptance. On the web the
-    /// canvas has then given this backend its context and cannot give another type, so the chain
-    /// ends here with the real reason (`Step::Stop`) instead of trying the next backend.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one linear device and pipeline setup"
-    )]
+    /// `Surface` or `Device` if the real canvas still fails after acceptance. On the web, once the
+    /// canvas has given this backend its context (`CreateFailure::taken`) it cannot give another
+    /// type, so the chain ends there (`Step::Stop`). A failure before any context was obtained
+    /// (`getContext` returning null) is a normal fallback.
     pub async fn create(
         probe: Probe,
         target: &Target,
         data_texture: Option<bool>,
         transparent: bool,
+    ) -> std::result::Result<Self, CreateFailure> {
+        let mut taken: bool = false;
+        Self::create_inner(probe, target, data_texture, transparent, &mut taken)
+            .await
+            .map_err(|error| CreateFailure { error, taken })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear device and pipeline setup"
+    )]
+    async fn create_inner(
+        probe: Probe,
+        target: &Target,
+        data_texture: Option<bool>,
+        transparent: bool,
+        taken: &mut bool,
     ) -> Result<Self> {
+        let _ = &taken;
         let (width, height): (u32, u32) = (target.width, target.height);
         let Probe {
             backend,
@@ -398,7 +421,11 @@ impl Gpu {
             a
         } else {
             #[cfg(target_arch = "wasm32")]
-            let real: wgpu::Surface<'static> = web_surface(&instance, &target.kind)?;
+            let real: wgpu::Surface<'static> = {
+                let real = web_surface(&instance, &target.kind)?;
+                *taken = target.is_canvas();
+                real
+            };
             #[cfg(target_arch = "wasm32")]
             let a: std::result::Result<Acquired, Unavailable> =
                 acquire(&instance, Some(&real), None).await;
@@ -457,6 +484,7 @@ impl Gpu {
         #[cfg(target_arch = "wasm32")]
         if surface.is_none() && target.is_canvas() {
             surface = Some(web_surface(&instance, &target.kind)?);
+            *taken = true;
         }
         let primary: Option<Slot> = match surface {
             Some(surface) if target.is_canvas() => {

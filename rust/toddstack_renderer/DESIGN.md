@@ -36,7 +36,8 @@ has no Sentry dependency; the host maps events to Sentry (warning for a step dow
 
 A web canvas keeps one context type for life. Once WebGPU or WebGL2 has taken the real canvas's context, a later
 surface or device failure ends the walk (`Step::Stop`): the final event (`to: None`) and `NoRendererAvailable` carry the
-real reason, since no later backend could get a context on that canvas. Retrying is the host's job: recreate the canvas
+real reason, since no later backend could get a context on that canvas. A failure before any context was obtained (for
+example `getContext` returning null) is a normal fallback: the next backend, and finally the CPU's 2D context, still work. Retrying is the host's job: recreate the canvas
 and build a new `Renderer`.
 
 ## Timeout

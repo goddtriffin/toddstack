@@ -320,6 +320,28 @@ mod tests {
     }
 
     #[test]
+    fn a_surface_failure_with_no_context_taken_falls_through() {
+        // The step that failed before the canvas gave a context is a `Fall`, so WebGL2 and then the
+        // CPU are still tried (only a `Stop` ends the walk).
+        let fail = [
+            (
+                Backend::WebGpu,
+                FallbackReason::Surface("getContext null".into()),
+            ),
+            (Backend::WebGl2, FallbackReason::Surface("no webgl2".into())),
+        ];
+        let (got, events, tried) = run(&WEB, &fail);
+        assert_eq!(got.expect("cpu works"), Backend::Cpu);
+        assert_eq!(tried, [Backend::WebGpu, Backend::WebGl2, Backend::Cpu]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].to, Some(Backend::WebGl2));
+        assert_eq!(
+            events[0].reason,
+            FallbackReason::Surface("getContext null".into())
+        );
+    }
+
+    #[test]
     fn a_fatal_error_stops_the_walk_without_an_event() {
         let events: RefCell<usize> = RefCell::new(0);
         let got = pollster::block_on(run_chain::<(), _, _>(

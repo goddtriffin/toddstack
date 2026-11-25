@@ -276,11 +276,12 @@ async fn attempt(
     Gpu::create(probe, target, options.data_texture, options.transparent)
         .await
         .map(|g| Inner::Gpu(Box::new(g)))
-        .map_err(|e| {
-            // On the web a canvas has now given this backend its context and keeps that type for
-            // life: the next backend cannot get one, so a failure here ends the walk.
-            let taken: bool = cfg!(target_arch = "wasm32") && target.is_canvas();
-            match into_step(e) {
+        .map_err(|f| {
+            // On the web, once the canvas has given this backend its context it keeps that type
+            // for life: the next backend cannot get one, so the walk ends. A failure before any
+            // context was obtained (`getContext` null) still falls to the next backend.
+            let taken: bool = cfg!(target_arch = "wasm32") && f.taken;
+            match into_step(f.error) {
                 Step::Fall(reason) if taken => Step::Stop(reason),
                 other => other,
             }
