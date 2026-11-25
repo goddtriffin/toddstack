@@ -312,6 +312,8 @@ impl Gpu {
     /// Decides whether `backend` can be used, without touching a canvas target's real canvas (it
     /// keeps one context type for life, so a GPU context taken and then rejected would leave the
     /// CPU fallback with none). A WebGL2 canvas target is probed on a 1x1 `OffscreenCanvas`.
+    ///
+    /// # Errors
     /// The reason when the backend has no usable (non-CPU) adapter here.
     pub async fn probe(
         backend: Backend,
@@ -367,8 +369,9 @@ impl Gpu {
     /// Builds the GPU renderer on an accepted probe, creating the surface on the real canvas.
     ///
     /// # Errors
-    /// `Surface` or `Device` if the real canvas still fails after acceptance: the one case the
-    /// fallback chain cannot recover from.
+    /// `Surface` or `Device` if the real canvas still fails after acceptance. On the web the
+    /// canvas has then given this backend its context and cannot give another type, so the chain
+    /// ends here with the real reason (`Step::Stop`) instead of trying the next backend.
     #[expect(
         clippy::too_many_lines,
         reason = "one linear device and pipeline setup"

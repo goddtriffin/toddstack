@@ -52,10 +52,17 @@ answer in 2 s counts as failed with `Timeout` and WebGL2 is tried.
 `renderer.backend().name()` per device, and next start pass `Backend::parse(stored)` to `with_preferred`. On the web
 use localStorage key `toddstack-renderer:backend:v1`, with the value `"{MEMORY_VERSION}:{backend}"`
 (`toddstack_renderer::MEMORY_VERSION` is `major.minor`, here `0.3`). Ignore a stored value whose version differs, so every
-device tries WebGPU again after an upgrade. A preferred backend that fails runs the whole chain from the top, with events.
+device tries WebGPU again after an upgrade. Store only when no attempt failed with `Timeout` (record that in your callback): a transient timeout would otherwise
+pin the device to WebGL2 or the CPU until `MEMORY_VERSION` changes. `Rejected` (a software adapter, or a surface that
+cannot take the render format) is a policy skip, not a runtime failure. A preferred backend that fails runs the whole chain from the top, with events.
 A stored backend that is not in this platform's chain is ignored.
 
-**Device loss.** A lost GPU device makes every draw return `Error::DeviceLost { reason, message }`
+**A canvas that took a context.** On the web a canvas keeps one context type for life. Once WebGPU or WebGL2 has taken
+the canvas's context and a later surface or device step fails, no other backend can get a context on that canvas, so
+the walk ends there: the callback gets the real reason with `to: None` and `with_options` returns
+`NoRendererAvailable` with that attempt last. To retry, the host creates a fresh canvas element and a new `Renderer`.
+
+**Device loss.** A lost GPU device makes every draw, kernel run and `add_batch` return `Error::DeviceLost { reason, message }`
 (`renderer.is_lost()` says so too) and sends one `FallbackEvent { to: None, reason: DeviceLost(..) }`. The renderer
 does not rebuild itself: fonts, images, batches and attached canvases would all have to be re-created, and only the
 host knows its scene. Build a new `Renderer` (and re-add them): if the reason is `destroyed`, with the same options; if
@@ -205,6 +212,18 @@ raw, 690,792 bytes brotli (0.1.0: 2,205,571 and 683,190). `web/renderer.ts` is t
 ### 0.3.0
 
 The fallback policy ([DESIGN.md](DESIGN.md)).
+
+Review fixes (same release):
+
+- Web canvas: after WebGPU or WebGL2 took the canvas's context, a later surface or device failure ends the walk with
+  the real reason (`NoRendererAvailable`, final `to: None` event) instead of falling to a misleading WebGL2 or CPU
+  "surface failed". The host recreates the canvas to retry.
+- `Error::DeviceLost` now also comes from `run_kernel`, `run_kernel_with`, `kernel_image`, `kernel_image_with` and
+  `add_batch`, not only render and present.
+- The parity tests skip a forced GPU backend only when it is absent (`NoAdapter` or `Rejected`); a real failure fails.
+- `DEFAULT_ADAPTER_TIMEOUT` is re-exported from the crate root.
+- `FallbackEvent` and `Attempt` are `#[non_exhaustive]`; use `FallbackEvent::new` and `Attempt::new`.
+- README: do not remember a winner reached after a `Timeout`; `Rejected` is a policy skip.
 
 Added: `FallbackEvent`, `FallbackReason`, `Attempt`, `MEMORY_VERSION`; `Options::with_fallback_callback`,
 `with_preferred`, `with_adapter_timeout` (default 2 s, WebGPU on the web); `Error::NoRendererAvailable`,

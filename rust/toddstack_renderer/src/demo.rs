@@ -693,7 +693,7 @@ async fn parity_with<F>(
 where
     F: AsyncFn(&mut Renderer) -> crate::Result<Scene>,
 {
-    use crate::{Backend, Diff, Error, Options};
+    use crate::{Backend, Diff, Error, FallbackReason, Options};
     let options = Options::new().with_transparent(transparent);
     let mut cpu: Renderer =
         Renderer::with_options(target.clone(), options.clone().with_force(Backend::Cpu)).await?;
@@ -702,7 +702,18 @@ where
     let mut gpu: Renderer = match Renderer::with_options(target, options.with_force(backend)).await
     {
         Ok(r) => r,
-        Err(Error::NoRendererAvailable { .. }) => return Ok(None),
+        // Skip only when the backend is absent here; a real Surface, Device or Timeout failure
+        // on a backend that exists must fail the test.
+        Err(Error::NoRendererAvailable { attempts })
+            if attempts.iter().all(|a| {
+                matches!(
+                    a.reason,
+                    FallbackReason::NoAdapter | FallbackReason::Rejected(_)
+                )
+            }) =>
+        {
+            return Ok(None);
+        }
         Err(e) => return Err(e),
     };
     let scene: Scene = build(&mut gpu).await?;

@@ -32,6 +32,13 @@ Bad input (an empty or oversized target) is not a backend failure: it is returne
 chain fails the last event has `to: None` and the call returns `Error::NoRendererAvailable { attempts }`. The crate
 has no Sentry dependency; the host maps events to Sentry (warning for a step down, high severity for `to: None`).
 
+## A canvas that took a context
+
+A web canvas keeps one context type for life. Once WebGPU or WebGL2 has taken the real canvas's context, a later
+surface or device failure ends the walk (`Step::Stop`): the final event (`to: None`) and `NoRendererAvailable` carry the
+real reason, since no later backend could get a context on that canvas. Retrying is the host's job: recreate the canvas
+and build a new `Renderer`.
+
 ## Timeout
 
 The WebGPU adapter request races a `setTimeout` promise (no new dependency; works in workers). Default 2 s,
@@ -41,7 +48,8 @@ The WebGPU adapter request races a `setTimeout` promise (no new dependency; work
 
 The crate persists nothing. `Options::with_preferred(b)` starts the chain at `b` if the platform has it; if it
 fails, the full chain runs from the top (`b` is not tried twice). The host stores `renderer.backend()` per device and
-drops it when `MEMORY_VERSION` (`major.minor`) changes. Key and format: README.
+drops it when `MEMORY_VERSION` (`major.minor`) changes. It does not store a winner reached after a `Timeout` attempt (a
+transient timeout would pin the device down the chain); `Rejected` is a policy skip, not a failure. Key and format: README.
 
 ## Device loss (#96)
 
