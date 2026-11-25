@@ -4,9 +4,11 @@ Earlier releases are described in the git history and the README.
 
 ## 0.4.12
 
-- Memory: a job's tree memory is capped at what the machine really uses (total minus available), live and when
-  learned. Summed RSS counts shared file mappings once per process: on the rig a `make lint` learned 17-19 GB while the
+- Memory: a job's tree memory is capped at what the machine really uses, live and when learned (Linux: total minus
+  available; macOS: app + wired + compressor from `vm_stat`, because sysinfo's available counts active anonymous
+  memory and left 20 GB out, so total minus available was 31.8 GB against 44.2 GB really used). Summed RSS counts shared file mappings once per process: on the rig a `make lint` learned 17-19 GB while the
   machine never used over 8 of 32 GB, and `c9-timeouts` waited 4m37s on "mem" at 9-22% RAM used (2026-11-25).
+- The machine's memory is read at the same moment as the trees (it was read before the 250 ms sleep).
 - CPU: waiters blocked by the CPU (line, load, pinned, settle) re-sample every 2 s instead of 10 s. Waits of 23-30 s at
   47-54% busy came from a 10 s timer and one reading per 10 s in the sustained mean.
 
