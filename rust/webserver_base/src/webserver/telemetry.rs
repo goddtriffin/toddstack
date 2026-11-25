@@ -74,6 +74,10 @@ pub(crate) fn handle() -> &'static PrometheusHandle {
             "webserver_base" => env!("CARGO_PKG_VERSION")
         )
         .set(1.0);
+        // Registered at 0, so the series exist before the first failure.
+        for listener in ["app", "metrics"] {
+            metrics::counter!("http_accept_errors_total", "listener" => listener).increment(0);
+        }
         handle
     })
 }
@@ -379,6 +383,15 @@ mod tests {
             "a histogram, not a summary"
         );
         assert!(rendered.contains("build_info{"), "{rendered}");
+    }
+
+    #[test]
+    fn accept_errors_are_zero_for_both_listeners_at_startup() {
+        let rendered: String = handle().render();
+        for listener in ["app", "metrics"] {
+            let series: String = format!(r#"http_accept_errors_total{{listener="{listener}"}} 0"#);
+            assert!(rendered.contains(&series), "{series} missing: {rendered}");
+        }
     }
 
     fn routes() -> TraceRoutes {
