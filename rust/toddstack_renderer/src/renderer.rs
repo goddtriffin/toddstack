@@ -10,6 +10,7 @@ use crate::gpu::Gpu;
 use crate::kernel::{Kernel, KernelOutput, KernelPath};
 use crate::scene::{BatchId, FontId, ImageId, Sampling, Scene};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Where a target draws.
@@ -275,7 +276,15 @@ async fn attempt(
     Gpu::create(probe, target, options.data_texture, options.transparent)
         .await
         .map(|g| Inner::Gpu(Box::new(g)))
-        .map_err(into_step)
+        .map_err(|e| {
+            // On the web a canvas has now given this backend its context and keeps that type for
+            // life: the next backend cannot get one, so a failure here ends the walk.
+            let taken: bool = cfg!(target_arch = "wasm32") && target.is_canvas();
+            match into_step(e) {
+                Step::Fall(reason) if taken => Step::Stop(reason),
+                other => other,
+            }
+        })
 }
 
 enum Inner {
@@ -303,7 +312,7 @@ pub struct Renderer {
     kinds: Vec<Option<Kind>>,
     on_fallback: Option<Callback>,
     /// The device-lost event has been sent.
-    lost_reported: bool,
+    lost_reported: AtomicBool,
 }
 
 /// A canvas attached to a renderer with [`Renderer::attach`].
@@ -363,7 +372,7 @@ impl Renderer {
             surfaces: Vec::new(),
             kinds: vec![Some(target.kind.clone())],
             on_fallback: options.on_fallback,
-            lost_reported: false,
+            lost_reported: AtomicBool::new(false),
         })
     }
 
@@ -375,22 +384,21 @@ impl Renderer {
     }
 
     /// `DeviceLost` if the device is gone, reporting the event the first time.
-    fn check_lost(&mut self) -> Result<()> {
+    fn check_lost(&self) -> Result<()> {
         let Inner::Gpu(g) = &self.inner else {
             return Ok(());
         };
         let Some((reason, message)) = g.lost() else {
             return Ok(());
         };
-        if !self.lost_reported {
-            self.lost_reported = true;
-            if let Some(cb) = &self.on_fallback {
-                cb(&FallbackEvent {
-                    from: self.caps.backend,
-                    to: None,
-                    reason: FallbackReason::DeviceLost(format!("{reason}: {message}")),
-                });
-            }
+        if !self.lost_reported.swap(true, Ordering::Relaxed)
+            && let Some(cb) = &self.on_fallback
+        {
+            cb(&FallbackEvent {
+                from: self.caps.backend,
+                to: None,
+                reason: FallbackReason::DeviceLost(format!("{reason}: {message}")),
+            });
         }
         Err(Error::DeviceLost { reason, message })
     }
@@ -576,6 +584,7 @@ impl Renderer {
     /// # Errors
     /// `Shader` if the GPU rejects the WGSL or the pipeline (async: the GPU reports it later).
     pub async fn add_batch(&mut self, desc: BatchDesc) -> Result<BatchId> {
+        self.check_lost()?;
         let state: BatchState = desc.into();
         if let Inner::Gpu(g) = &mut self.inner {
             g.add_batch(&state).await?;
@@ -704,6 +713,7 @@ impl Renderer {
     /// # Errors
     /// `KernelUnavailable` if no form can run here.
     pub async fn run_kernel(&self, kernel: &Kernel) -> Result<KernelOutput> {
+        self.check_lost()?;
         let path: KernelPath = self.best_path(kernel)?;
         self.run_kernel_with(kernel, path).await
     }
@@ -756,6 +766,7 @@ impl Renderer {
         kernel: &Kernel,
         sampling: Sampling,
     ) -> Result<(ImageId, KernelPath)> {
+        self.check_lost()?;
         let path: KernelPath = self.best_path(kernel)?;
         self.kernel_image_with(kernel, path, sampling).await
     }
@@ -770,6 +781,7 @@ impl Renderer {
         path: KernelPath,
         sampling: Sampling,
     ) -> Result<(ImageId, KernelPath)> {
+        self.check_lost()?;
         let unavailable = || Error::KernelUnavailable {
             kernel: kernel.name.clone(),
         };
@@ -823,6 +835,7 @@ impl Renderer {
     /// # Errors
     /// `KernelUnavailable` if the kernel lacks that form, or the backend cannot run it.
     pub async fn run_kernel_with(&self, kernel: &Kernel, path: KernelPath) -> Result<KernelOutput> {
+        self.check_lost()?;
         let rgba8: Vec<u8> = match (path, &self.inner) {
             (KernelPath::Cpu, _) => {
                 let f = kernel

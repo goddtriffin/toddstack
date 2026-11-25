@@ -78,6 +78,7 @@ impl fmt::Display for FallbackReason {
 ///   returns [`Error::NoRendererAvailable`]. Report it with high severity.
 /// - `to: None` with `DeviceLost`: the running renderer's device is gone; rebuild the renderer.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FallbackEvent {
     /// The backend that failed.
     pub from: Backend,
@@ -89,11 +90,28 @@ pub struct FallbackEvent {
 
 /// One failed backend, in [`Error::NoRendererAvailable`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Attempt {
     /// The backend tried.
     pub backend: Backend,
     /// Why it failed.
     pub reason: FallbackReason,
+}
+
+impl FallbackEvent {
+    /// An event, for a host that tests its own callback.
+    #[must_use]
+    pub const fn new(from: Backend, to: Option<Backend>, reason: FallbackReason) -> Self {
+        Self { from, to, reason }
+    }
+}
+
+impl Attempt {
+    /// An attempt, for a host that tests its own error handling.
+    #[must_use]
+    pub const fn new(backend: Backend, reason: FallbackReason) -> Self {
+        Self { backend, reason }
+    }
 }
 
 /// The callback type: shared, so the renderer keeps it for device-lost events. On the web it need
@@ -108,6 +126,10 @@ pub(crate) type Callback = Arc<dyn Fn(&FallbackEvent)>;
 pub(crate) enum Step {
     /// A real failure: report it and try the next backend.
     Fall(FallbackReason),
+    /// A real failure after the backend took the host's canvas context. A canvas keeps one
+    /// context type for life, so no later backend could get one: report it and end the walk with
+    /// this reason (a final event with `to: None`) instead of falling to a misleading failure.
+    Stop(FallbackReason),
     /// Not a backend failure (bad input, an internal error): stop and return it.
     Fatal(Error),
 }
@@ -156,6 +178,15 @@ where
                     reason: reason.clone(),
                 });
                 attempts.push(Attempt { backend, reason });
+            }
+            Err(Step::Stop(reason)) => {
+                emit(&FallbackEvent {
+                    from: backend,
+                    to: None,
+                    reason: reason.clone(),
+                });
+                attempts.push(Attempt { backend, reason });
+                break;
             }
         }
     }
@@ -253,6 +284,39 @@ mod tests {
         let last = events.last().expect("final event");
         assert_eq!(last.from, Backend::Cpu);
         assert_eq!(last.to, None);
+    }
+
+    #[test]
+    fn a_stop_ends_the_walk_with_the_real_reason_and_a_final_event() {
+        let events: RefCell<Vec<FallbackEvent>> = RefCell::new(Vec::new());
+        let tried: RefCell<Vec<Backend>> = RefCell::new(Vec::new());
+        let got = pollster::block_on(run_chain::<(), _, _>(
+            &WEB,
+            |b| {
+                tried.borrow_mut().push(b);
+                async { Err(Step::Stop(FallbackReason::Surface("ctx".into()))) }
+            },
+            &|e| events.borrow_mut().push(e.clone()),
+        ));
+        let Err(Error::NoRendererAvailable { attempts }) = got else {
+            panic!("expected NoRendererAvailable");
+        };
+        assert_eq!(
+            attempts,
+            [Attempt::new(
+                Backend::WebGpu,
+                FallbackReason::Surface("ctx".into())
+            )]
+        );
+        assert_eq!(
+            events.into_inner(),
+            [FallbackEvent::new(
+                Backend::WebGpu,
+                None,
+                FallbackReason::Surface("ctx".into())
+            )]
+        );
+        assert_eq!(tried.into_inner(), [Backend::WebGpu]);
     }
 
     #[test]
