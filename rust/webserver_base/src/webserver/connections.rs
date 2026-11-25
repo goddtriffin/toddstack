@@ -12,7 +12,9 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
@@ -22,8 +24,9 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 use tower::ServiceExt;
 use tracing::{debug, error, trace};
@@ -85,6 +88,80 @@ impl ConnectionLimits {
     pub const fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = if max == 0 { 1 } else { max };
         self
+    }
+}
+
+/// A connection's claim on the cap and the `http_open_connections` gauge.
+/// It rides inside the socket (see [`Held`]), so an upgraded connection
+/// (a `WebSocket`) keeps its claim after hyper's connection future has ended,
+/// and the claim ends when the socket itself is dropped.
+struct ConnectionClaim {
+    open: metrics::Gauge,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ConnectionClaim {
+    fn new(listener: &'static str, permit: OwnedSemaphorePermit) -> Self {
+        let open: metrics::Gauge = metrics::gauge!("http_open_connections", "listener" => listener);
+        open.increment(1.0);
+        Self {
+            open,
+            _permit: permit,
+        }
+    }
+}
+
+impl Drop for ConnectionClaim {
+    fn drop(&mut self) {
+        self.open.decrement(1.0);
+    }
+}
+
+/// A socket that owns its [`ConnectionClaim`]. Hyper moves the socket into the
+/// upgraded connection on an upgrade, so the claim lives exactly as long as the
+/// socket is open.
+struct Held {
+    stream: TcpStream,
+    _claim: ConnectionClaim,
+}
+
+impl AsyncRead for Held {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Held {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
     }
 }
 
@@ -152,8 +229,11 @@ fn is_connection_error(e: &io::Error) -> bool {
 
 /// Serves `router` on `listener` until `signal`, then drains: no new
 /// connections, every open one finishes its request and closes. Returns once
-/// the last connection has closed.
+/// the last connection has closed. An upgraded connection (a `WebSocket`) is
+/// not waited for, but keeps its cap slot and its gauge count until its socket
+/// closes. `name` is the `listener` metric label.
 pub(crate) async fn serve<F>(
+    name: &'static str,
     listener: TcpListener,
     router: Router,
     limits: ConnectionLimits,
@@ -192,7 +272,7 @@ pub(crate) async fn serve<F>(
             Err(e) if is_connection_error(&e) => continue,
             Err(e) => {
                 let verdict: AcceptVerdict = errors.failed(Instant::now());
-                metrics::counter!("http_accept_errors_total").increment(1);
+                metrics::counter!("http_accept_errors_total", "listener" => name).increment(1);
                 match verdict.report {
                     Some(0) => error!("accept error: {e}; backing off"),
                     Some(n) => {
@@ -217,14 +297,16 @@ pub(crate) async fn serve<F>(
         let mut drain_rx: watch::Receiver<()> = drain_rx.clone();
         let closed_rx: watch::Receiver<()> = closed_rx.clone();
         tokio::spawn(async move {
-            let open = metrics::gauge!("http_open_connections");
-            open.increment(1.0);
+            let held: Held = Held {
+                stream,
+                _claim: ConnectionClaim::new(name, permit),
+            };
             let mut builder: http1::Builder = http1::Builder::new();
             builder
                 .timer(TokioTimer::new())
                 .header_read_timeout(limits.header_read_timeout);
             let connection = builder
-                .serve_connection(TokioIo::new(stream), service)
+                .serve_connection(TokioIo::new(held), service)
                 .with_upgrades();
             tokio::pin!(connection);
             let result: Result<(), hyper::Error> = tokio::select! {
@@ -237,8 +319,8 @@ pub(crate) async fn serve<F>(
             if let Err(e) = result {
                 trace!("connection ended: {e}");
             }
-            open.decrement(1.0);
-            drop(permit);
+            // After an upgrade the socket, and with it the cap slot, is the
+            // upgraded connection's; it is released when that closes.
             drop(closed_rx);
         });
     }
@@ -261,15 +343,28 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
 
     async fn start(limits: ConnectionLimits) -> (SocketAddr, crate::webserver::Shutdown) {
+        start_with(limits, Router::new()).await
+    }
+
+    async fn start_with(
+        limits: ConnectionLimits,
+        extra: Router,
+    ) -> (SocketAddr, crate::webserver::Shutdown) {
         let listener: TcpListener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address: SocketAddr = listener.local_addr().expect("address");
-        let router: Router = Router::new().route("/", get(|| async { "ok" })).route(
-            "/peer",
-            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
-        );
+        let router: Router =
+            Router::new()
+                .route("/", get(|| async { "ok" }))
+                .route(
+                    "/peer",
+                    get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
+                        peer.ip().to_string()
+                    }),
+                )
+                .merge(extra);
         let shutdown = crate::webserver::Shutdown::manual();
         let signal = shutdown.clone();
-        tokio::spawn(serve(listener, router, limits, async move {
+        tokio::spawn(serve("app", listener, router, limits, async move {
             signal.recv().await;
         }));
         (address, shutdown)
@@ -399,6 +494,7 @@ mod tests {
         let shutdown = crate::webserver::Shutdown::manual();
         let signal = shutdown.clone();
         let serving = tokio::spawn(serve(
+            "app",
             listener,
             Router::new().route("/", get(|| async { "ok" })),
             ConnectionLimits::new(),
@@ -413,13 +509,110 @@ mod tests {
             .await
             .starts_with("HTTP/1.1 200")
         );
+        // The request is in flight when the signal arrives; it still gets its
+        // answer, and then the connection closes.
         idle.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
             .await
             .expect("write");
         shutdown.trigger();
+        let mut response: String = String::new();
+        timeout(WAIT, idle.read_to_string(&mut response))
+            .await
+            .expect("idle connection answered and closed")
+            .expect("read");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         timeout(WAIT, serving)
             .await
             .expect("drained")
             .expect("no panic");
+    }
+
+    #[tokio::test]
+    async fn the_header_timer_does_not_cut_off_a_slow_body() {
+        let limits: ConnectionLimits =
+            ConnectionLimits::new().header_read_timeout(Duration::from_millis(150));
+        let echo = Router::new().route(
+            "/echo",
+            axum::routing::post(|body: String| async move { body }),
+        );
+        let (address, _shutdown) = start_with(limits, echo).await;
+        let mut stream: TcpStream = TcpStream::connect(address).await.expect("connect");
+        stream
+            .write_all(
+                b"POST /echo HTTP/1.1\r\nhost: x\r\nconnection: close\r\ncontent-length: 4\r\n\r\nab",
+            )
+            .await
+            .expect("write");
+        // Longer than the header timeout, with the headers long since read.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stream.write_all(b"cd").await.expect("write");
+        let mut response: String = String::new();
+        timeout(WAIT, stream.read_to_string(&mut response))
+            .await
+            .expect("answered")
+            .expect("read");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("abcd"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_connection_keeps_its_slot_until_it_closes() {
+        use hyper::upgrade::OnUpgrade;
+        let upgrade = Router::new().route(
+            "/up",
+            get(|mut request: Request<axum::body::Body>| async move {
+                let on: OnUpgrade = hyper::upgrade::on(&mut request);
+                tokio::spawn(async move {
+                    let upgraded = on.await.expect("upgraded");
+                    let mut io = TokioIo::new(upgraded);
+                    let mut byte: [u8; 1] = [0];
+                    // Holds the upgraded socket until the client closes it.
+                    let _ignored: io::Result<usize> = io.read(&mut byte).await;
+                });
+                axum::http::Response::builder()
+                    .status(101)
+                    .header("connection", "upgrade")
+                    .header("upgrade", "test")
+                    .body(axum::body::Body::empty())
+                    .expect("response")
+            }),
+        );
+        let limits: ConnectionLimits = ConnectionLimits::new().max_connections(1);
+        let (address, _shutdown) = start_with(limits, upgrade).await;
+
+        let mut socket: TcpStream = TcpStream::connect(address).await.expect("connect");
+        socket
+            .write_all(
+                b"GET /up HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: test\r\n\r\n",
+            )
+            .await
+            .expect("write");
+        let mut head: [u8; 12] = [0; 12];
+        timeout(WAIT, socket.read_exact(&mut head))
+            .await
+            .expect("upgrade answered")
+            .expect("read");
+        assert_eq!(&head, b"HTTP/1.1 101", "upgraded");
+
+        // Hyper's connection future is over, but the only slot is still taken.
+        let mut waiting: TcpStream = TcpStream::connect(address).await.expect("connect");
+        waiting
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .expect("write");
+        let mut byte: [u8; 1] = [0];
+        assert!(
+            timeout(Duration::from_millis(300), waiting.read(&mut byte))
+                .await
+                .is_err(),
+            "served while an upgraded connection held the only slot"
+        );
+        drop(socket);
+        let mut rest: String = String::new();
+        timeout(WAIT, waiting.read_to_string(&mut rest))
+            .await
+            .expect("served once the upgraded connection closed")
+            .expect("read");
+        assert!(rest.starts_with("HTTP/1.1 200"), "{rest}");
     }
 }

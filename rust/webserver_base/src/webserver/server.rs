@@ -492,7 +492,8 @@ fn with_middleware(
 
 /// Tower-http's 5xx-is-failure rule, except a response marked
 /// [`UpstreamFailure`] (an analytics or Sentry proxy relaying its upstream's
-/// 5xx) is not a failure here: the relay already logged it at `warn`.
+/// 5xx) is not a failure here: the relay already logged it at `warn`. Nor is
+/// one marked [`DeliberateOverload`], an app's own load shedding.
 #[derive(Clone, Copy)]
 struct RelayAwareClassifier;
 
@@ -514,7 +515,12 @@ impl ClassifyResponse for RelayAwareClassifier {
         self,
         response: &axum::http::Response<B>,
     ) -> ClassifiedResponse<Self::FailureClass, Self::ClassifyEos> {
-        if response.extensions().get::<UpstreamFailure>().is_some() {
+        if response.extensions().get::<UpstreamFailure>().is_some()
+            || response
+                .extensions()
+                .get::<super::DeliberateOverload>()
+                .is_some()
+        {
             return ClassifiedResponse::Ready(Ok(()));
         }
         ServerErrorsAsFailures::new().classify_response(response)
@@ -630,7 +636,7 @@ where
 
     info!("listening on http://{address}");
 
-    let serving = connections::serve(listener, router, limits, shutdown.clone().recv());
+    let serving = connections::serve("app", listener, router, limits, shutdown.clone().recv());
     tokio::pin!(serving);
 
     // The drain window is a ceiling on the wait, not the wait itself, so the
@@ -1252,6 +1258,27 @@ mod tests {
             let actual: bool = has_overlong_segment(&format!("/js/{}", "a".repeat(256)));
             assert_eq!(expected, actual);
         }
+    }
+
+    #[test]
+    fn a_deliberate_overload_is_not_a_failure_but_a_plain_503_is() {
+        use axum::response::IntoResponse;
+        use tower_http::classify::{ClassifiedResponse, ClassifyResponse};
+
+        use super::RelayAwareClassifier;
+
+        let failed = |response: &axum::response::Response| {
+            matches!(
+                RelayAwareClassifier.classify_response(response),
+                ClassifiedResponse::Ready(Err(_))
+            )
+        };
+        assert!(!failed(&crate::webserver::overloaded(
+            std::time::Duration::from_secs(1)
+        )));
+        assert!(failed(
+            &axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+        ));
     }
 
     #[cfg(all(feature = "analytics", feature = "observability"))]

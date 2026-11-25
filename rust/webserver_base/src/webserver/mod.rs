@@ -17,6 +17,7 @@ mod frontend;
 mod into_router_tests;
 #[cfg(feature = "pages")]
 mod not_found;
+mod overload;
 #[cfg(feature = "pages")]
 mod pages;
 mod server;
@@ -29,6 +30,7 @@ pub use connections::{ConnectionLimits, DEFAULT_HEADER_READ_TIMEOUT, DEFAULT_MAX
 pub use error::WebServerError;
 #[cfg(feature = "pages")]
 pub use frontend::{Frontend, FrontendParams, WellKnown};
+pub use overload::{DeliberateOverload, overloaded};
 pub use server::{API_PREFIX, DEFAULT_BODY_LIMIT, DEFAULT_PORT, ENV_HOST, ENV_PORT, WebServer};
 pub use shutdown::{AppShutdown, DEFAULT_DRAIN_TIMEOUT, Shutdown};
 pub use state::WebServerState;
