@@ -2,7 +2,7 @@
 
 One GPU renderer on [wgpu](https://wgpu.rs) for Todd's apps, with a [tiny-skia](https://crates.io/crates/tiny-skia)
 CPU backend that is both the last fallback and the pixel reference. Part of
-[toddstack](https://github.com/goddtriffin/toddstack). Version 0.2.0 (0.1.0 is on crates.io).
+[toddstack](https://github.com/goddtriffin/toddstack). Version 0.3.0 (0.1.0 is on crates.io).
 
 Two layers share one `Renderer`:
 
@@ -22,9 +22,44 @@ buffers, limits) report what you got.
 | Android, Linux | Vulkan, GLES, CPU |
 | Windows | Vulkan, DX12, GLES, CPU |
 
+A backend is given up on only after a real failure: no adapter, a device request error, a surface that cannot be
+created or configured, a timed-out adapter request, or a lost device. Never on a preference or a guess about speed.
+See [DESIGN.md](DESIGN.md).
+
 A CPU-type adapter (a software Vulkan) is skipped: the tiny-skia path is the one CPU renderer.
 `Options::new().with_force(backend).with_data_texture(bool)` pins a backend (`Options`, `Error`, `Backend` and `Capabilities` are `#[non_exhaustive]`); `Options::from_env()` reads `WGPU_BACKEND`
 (`vulkan|dx12|metal|gl|cpu`). Tested: Metal and CPU (Apple M3 Max), WebGPU and WebGL2 in Chrome, Vulkan, DX12 and GLES (RTX 3080). `x86_64-pc-windows-gnu` is clippy-checked, not linked or run.
+
+## Fallback events, memory and device loss
+
+```rust
+let options = Options::new()
+    .with_preferred(stored_backend)              // Option<Backend>, from the device's memory
+    .with_adapter_timeout(Duration::from_secs(2)) // the default; WebGPU on the web
+    .with_fallback_callback(|e: &FallbackEvent| report_to_sentry(e));
+let renderer = Renderer::with_options(target, options).await?;
+store(renderer.backend());
+```
+
+**Events.** The callback runs for every step down: `FallbackEvent { from, to: Some(next), reason }`, with
+`reason` one of `NoAdapter`, `Timeout`, `RequestDevice(msg)`, `Surface(msg)`, `DeviceLost(msg)`, `Rejected(msg)`
+(`reason.tag()` is a stable string for a Sentry tag). When nothing works the callback gets a last event with
+`to: None` and `Renderer::with_options` returns `Error::NoRendererAvailable { attempts }`: report that one with high
+severity. The crate has no Sentry dependency; the host does the forwarding. A WebGPU adapter request that does not
+answer in 2 s counts as failed with `Timeout` and WebGL2 is tried.
+
+**Remembering the winner (the host's job).** The crate persists nothing. After `Renderer::with_options`, store
+`renderer.backend().name()` per device, and next start pass `Backend::parse(stored)` to `with_preferred`. On the web
+use localStorage key `toddstack-renderer:backend:v1`, with the value `"{MEMORY_VERSION}:{backend}"`
+(`toddstack_renderer::MEMORY_VERSION` is `major.minor`, here `0.3`). Ignore a stored value whose version differs, so every
+device tries WebGPU again after an upgrade. A preferred backend that fails runs the whole chain from the top, with events.
+A stored backend that is not in this platform's chain is ignored.
+
+**Device loss.** A lost GPU device makes every draw return `Error::DeviceLost { reason, message }`
+(`renderer.is_lost()` says so too) and sends one `FallbackEvent { to: None, reason: DeviceLost(..) }`. The renderer
+does not rebuild itself: fonts, images, batches and attached canvases would all have to be re-created, and only the
+host knows its scene. Build a new `Renderer` (and re-add them): if the reason is `destroyed`, with the same options; if
+`unknown` (a driver or GPU reset), `with_preferred` the next backend in `Backend::chain()` after `renderer.backend()`.
 
 ## API
 
@@ -166,6 +201,25 @@ raw, 690,792 bytes brotli (0.1.0: 2,205,571 and 683,190). `web/renderer.ts` is t
 `demo` (async), `resize`, `render` (presents to the canvas; `{ readback: true }` reads back and `putImageData`s instead); demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend, `?readback=1` times the readback path. `?boards=24` draws 24 transparent board-like tiles with rotated, tinted sprites onto 24 canvases over a CSS gradient on one renderer (`Boards` in `web/renderer.ts`) and prints the median frame time; on an Apple M3 Max in Chrome: WebGPU 1.9 ms, WebGL2 (sheet copy) 2.2 ms, CPU 282 ms per frame of 24 tiles (381 px).
 
 ## Changelog
+
+### 0.3.0
+
+The fallback policy ([DESIGN.md](DESIGN.md)).
+
+Added: `FallbackEvent`, `FallbackReason`, `Attempt`, `MEMORY_VERSION`; `Options::with_fallback_callback`,
+`with_preferred`, `with_adapter_timeout` (default 2 s, WebGPU on the web); `Error::NoRendererAvailable`,
+`Error::DeviceLost`; `Renderer::is_lost`; `REQUIRE_GPU=1` makes the parity test fail when no GPU backend ran.
+
+Breaking:
+
+- `Error::NoBackend { tried }` is replaced by `Error::NoRendererAvailable { attempts }`, which also covers a forced
+  backend that does not work.
+- `Options` is no longer `Copy` (it holds the callback); clone it.
+- A surface or device failure while building the chosen backend (previously returned as an error) now falls to the
+  next backend.
+
+Not yet: rebuilding a renderer after device loss (the host rebuilds; see above) and a browser test of the web fallbacks
+(the chain logic is unit-tested with injected failures).
 
 ### 0.2.0
 

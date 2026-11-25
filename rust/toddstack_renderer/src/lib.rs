@@ -18,6 +18,7 @@ mod cpu;
 pub mod demo;
 mod diff;
 mod error;
+mod fallback;
 mod glyphs;
 mod gpu;
 mod gpu_image;
@@ -26,6 +27,7 @@ mod kernel;
 mod paths;
 mod renderer;
 mod scene;
+mod timeout;
 #[cfg(all(target_arch = "wasm32", feature = "web-demo"))]
 #[expect(
     clippy::missing_errors_doc,
@@ -38,6 +40,7 @@ pub use backend::{Backend, Capabilities};
 pub use batch::{BatchDesc, CpuBatch};
 pub use diff::{Budget, Diff};
 pub use error::{Error, Result};
+pub use fallback::{Attempt, FallbackEvent, FallbackReason, MEMORY_VERSION};
 pub use kernel::{Binding, CpuKernel, Kernel, KernelOutput, KernelPath};
 pub use paths::rounded_rect;
 pub use renderer::{Options, Renderer, SurfaceId, Target, unpremultiply_rgba8};

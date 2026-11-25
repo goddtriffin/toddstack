@@ -1,13 +1,16 @@
 //! `Renderer`: backend selection, scenes, custom batches and kernels behind one type.
 
-use crate::backend::{self, Backend, Capabilities};
+use crate::backend::{Backend, Capabilities};
 use crate::batch::{BatchDesc, BatchState};
 use crate::cpu::Cpu;
 use crate::error::{Error, Result};
+use crate::fallback::{self, Callback, FallbackEvent, FallbackReason, Step};
 use crate::glyphs::Atlas;
 use crate::gpu::Gpu;
 use crate::kernel::{Kernel, KernelOutput, KernelPath};
 use crate::scene::{BatchId, FontId, ImageId, Sampling, Scene};
+use std::fmt;
+use std::time::Duration;
 
 /// Where a target draws.
 #[derive(Clone, Debug)]
@@ -107,13 +110,23 @@ pub(crate) fn check_size(width: u32, height: u32, max: u32) -> Result<()> {
     Ok(())
 }
 
+/// How long a WebGPU adapter request may take before it counts as failed.
+pub const DEFAULT_ADAPTER_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Overrides for backend selection.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Options {
-    /// Use only this backend (fails with `NoBackend` if it is missing, except `Cpu`).
-    /// `None` walks [`Backend::chain`].
+    /// Use only this backend (fails with `NoRendererAvailable` if it does not work, except
+    /// `Cpu`). `None` walks [`Backend::chain`].
     pub force: Option<Backend>,
+    /// Try this backend first (see [`Options::with_preferred`]); ignored if `force` is set or the
+    /// platform's chain does not have it.
+    pub preferred: Option<Backend>,
+    /// How long the WebGPU adapter request may take (web only); default 2 s.
+    pub adapter_timeout: Duration,
+    /// Called for every step down the chain and for a lost device.
+    pub(crate) on_fallback: Option<Callback>,
     /// Force batches onto data textures (`Some(true)`) or storage buffers (`Some(false)`);
     /// `None` picks by capability. Mostly for testing the WebGL2 path on a desktop GPU.
     pub data_texture: Option<bool>,
@@ -122,12 +135,37 @@ pub struct Options {
     pub transparent: bool,
 }
 
+impl fmt::Debug for Options {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Options")
+            .field("force", &self.force)
+            .field("preferred", &self.preferred)
+            .field("adapter_timeout", &self.adapter_timeout)
+            .field(
+                "on_fallback",
+                &self.on_fallback.as_ref().map(|_| "<callback>"),
+            )
+            .field("data_texture", &self.data_texture)
+            .field("transparent", &self.transparent)
+            .finish()
+    }
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Options {
     /// No overrides: the platform's fallback chain, capability-picked batch data.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             force: None,
+            preferred: None,
+            adapter_timeout: DEFAULT_ADAPTER_TIMEOUT,
+            on_fallback: None,
             data_texture: None,
             transparent: false,
         }
@@ -137,6 +175,46 @@ impl Options {
     #[must_use]
     pub fn with_force(mut self, force: impl Into<Option<Backend>>) -> Self {
         self.force = force.into();
+        self
+    }
+
+    /// Start the chain at this backend, for a device that remembered its winner. It is used only
+    /// if the platform's chain has it (otherwise ignored). If it fails, the whole chain runs from
+    /// the top, with the usual events. Store [`Renderer::backend`] per device and invalidate it
+    /// when [`MEMORY_VERSION`](crate::MEMORY_VERSION) changes.
+    #[must_use]
+    pub fn with_preferred(mut self, preferred: impl Into<Option<Backend>>) -> Self {
+        self.preferred = preferred.into();
+        self
+    }
+
+    /// How long the WebGPU adapter request may take before it counts as failed with
+    /// [`FallbackReason::Timeout`] and WebGL2 is tried (default 2 s). Web only: native adapter
+    /// requests answer or fail.
+    #[must_use]
+    pub const fn with_adapter_timeout(mut self, timeout: Duration) -> Self {
+        self.adapter_timeout = timeout;
+        self
+    }
+
+    /// Registers `callback`, called for every step down the chain, with `to: None` on the final
+    /// failure ([`Error::NoRendererAvailable`]), and with a `DeviceLost` event when the device is
+    /// lost. The crate has no error-reporting dependency: the host forwards events to Sentry.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_fallback_callback(
+        mut self,
+        callback: impl Fn(&FallbackEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_fallback = Some(std::sync::Arc::new(callback));
+        self
+    }
+
+    /// As on native, without the `Send + Sync` bound (JS values are not `Send`).
+    #[cfg(target_arch = "wasm32")]
+    #[must_use]
+    pub fn with_fallback_callback(mut self, callback: impl Fn(&FallbackEvent) + 'static) -> Self {
+        self.on_fallback = Some(std::sync::Arc::new(callback));
         self
     }
 
@@ -175,6 +253,31 @@ impl Options {
     }
 }
 
+/// Builds the renderer on one backend, or says why it cannot.
+async fn attempt(
+    backend: Backend,
+    target: &Target,
+    options: &Options,
+) -> core::result::Result<Inner, Step> {
+    let into_step = |e: Error| match e {
+        Error::Surface(m) => Step::Fall(FallbackReason::Surface(m)),
+        Error::Device(m) => Step::Fall(FallbackReason::RequestDevice(m)),
+        other => Step::Fatal(other),
+    };
+    if backend == Backend::Cpu {
+        return Cpu::new(target, options.transparent)
+            .map(Inner::Cpu)
+            .map_err(into_step);
+    }
+    let probe = Gpu::probe(backend, target, options.adapter_timeout)
+        .await
+        .map_err(Step::Fall)?;
+    Gpu::create(probe, target, options.data_texture, options.transparent)
+        .await
+        .map(|g| Inner::Gpu(Box::new(g)))
+        .map_err(into_step)
+}
+
 enum Inner {
     Gpu(Box<Gpu>),
     Cpu(Cpu),
@@ -198,6 +301,9 @@ pub struct Renderer {
     surfaces: Vec<Option<(u32, u32)>>,
     /// The primary canvas and each attached one, to refuse a canvas that is already in use.
     kinds: Vec<Option<Kind>>,
+    on_fallback: Option<Callback>,
+    /// The device-lost event has been sent.
+    lost_reported: bool,
 }
 
 /// A canvas attached to a renderer with [`Renderer::attach`].
@@ -208,15 +314,20 @@ impl Renderer {
     /// Picks the most capable backend and falls back down the chain, ending at the CPU.
     ///
     /// # Errors
-    /// `BadInput` for an empty or oversized target.
+    /// `BadInput` for an empty or oversized target; `NoRendererAvailable` if nothing works.
     pub async fn new(target: Target) -> Result<Self> {
         Self::with_options(target, Options::default()).await
     }
 
     /// As [`Renderer::new`], with overrides.
     ///
+    /// A backend is given up on only after a real failure (no adapter, a timed-out adapter
+    /// request, a device request or surface failure), each reported through
+    /// [`Options::with_fallback_callback`].
+    ///
     /// # Errors
-    /// `NoBackend` if a forced GPU backend is unavailable; `BadInput` for a bad target.
+    /// `NoRendererAvailable` if every backend failed (a forced one counts); `BadInput` for a bad
+    /// target.
     pub async fn with_options(target: Target, options: Options) -> Result<Self> {
         let (width, height): (u32, u32) = (target.width, target.height);
         let canvas: bool = target.is_canvas();
@@ -225,27 +336,16 @@ impl Renderer {
         if primary {
             check_size(width, height, u32::MAX)?;
         }
-        let chain: Vec<Backend> = options
-            .force
-            .map_or_else(|| Backend::chain().to_vec(), |b| vec![b]);
-        // Choose before touching a canvas: each GPU candidate is probed off the real canvas.
-        let picked = backend::select(&chain, |b| Gpu::probe(b, &target)).await?;
-        let transparent: bool = options.transparent;
-        let inner: Inner = match picked {
-            Some((Backend::Cpu, _)) => Inner::Cpu(Cpu::new(&target, transparent)?),
-            Some((_, Some(probe))) => Inner::Gpu(Box::new(
-                Gpu::create(probe, &target, options.data_texture, transparent).await?,
-            )),
-            _ => {
-                return Err(Error::NoBackend {
-                    tried: chain
-                        .iter()
-                        .map(|b| b.name())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                });
+        let order: Vec<Backend> =
+            fallback::plan(Backend::chain(), options.force, options.preferred);
+        let emit = |e: &FallbackEvent| {
+            if let Some(cb) = &options.on_fallback {
+                cb(e);
             }
         };
+        // Each GPU candidate is probed off the real canvas before it is built on it.
+        let (_, inner): (Backend, Inner) =
+            fallback::run_chain(&order, |b| attempt(b, &target, &options), &emit).await?;
         let caps: Capabilities = match &inner {
             Inner::Gpu(g) => g.caps.clone(),
             Inner::Cpu(_) => Capabilities::cpu(),
@@ -262,7 +362,37 @@ impl Renderer {
             primary,
             surfaces: Vec::new(),
             kinds: vec![Some(target.kind.clone())],
+            on_fallback: options.on_fallback,
+            lost_reported: false,
         })
+    }
+
+    /// Whether the GPU device has been lost: every draw then returns [`Error::DeviceLost`] (and a
+    /// `DeviceLost` event is reported once). Build a new `Renderer`; see the README.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        matches!(&self.inner, Inner::Gpu(g) if g.lost().is_some())
+    }
+
+    /// `DeviceLost` if the device is gone, reporting the event the first time.
+    fn check_lost(&mut self) -> Result<()> {
+        let Inner::Gpu(g) = &self.inner else {
+            return Ok(());
+        };
+        let Some((reason, message)) = g.lost() else {
+            return Ok(());
+        };
+        if !self.lost_reported {
+            self.lost_reported = true;
+            if let Some(cb) = &self.on_fallback {
+                cb(&FallbackEvent {
+                    from: self.caps.backend,
+                    to: None,
+                    reason: FallbackReason::DeviceLost(format!("{reason}: {message}")),
+                });
+            }
+        }
+        Err(Error::DeviceLost { reason, message })
     }
 
     /// The backend in use.
@@ -411,9 +541,10 @@ impl Renderer {
     /// [`Renderer::attach`].
     ///
     /// # Errors
-    /// `UnknownSurface`, `AtlasFull`, `UnknownFont`, or `Surface` if the canvas cannot be recovered.
+    /// `UnknownSurface`, `AtlasFull`, `UnknownFont`, `DeviceLost`, or `Surface` if the canvas cannot be recovered.
     pub fn present_to(&mut self, id: SurfaceId, scene: &Scene) -> Result<()> {
         self.surface_size(id)?;
+        self.check_lost()?;
         let flat = self.atlas.flatten(scene, &self.images)?;
         match &mut self.inner {
             Inner::Cpu(c) => {
@@ -521,6 +652,7 @@ impl Renderer {
     /// failure.
     pub async fn render(&mut self, scene: &Scene) -> Result<Vec<u8>> {
         self.need_primary()?;
+        self.check_lost()?;
         if self.canvas {
             return Err(Error::BadInput(
                 "a canvas target has no readback: use present, or an offscreen target".to_owned(),
@@ -550,6 +682,7 @@ impl Renderer {
     /// `AtlasFull`, `UnknownFont`, or `Surface` if the canvas surface cannot be recovered.
     pub fn present(&mut self, scene: &Scene) -> Result<()> {
         self.need_primary()?;
+        self.check_lost()?;
         let flat = self.atlas.flatten(scene, &self.images)?;
         match &mut self.inner {
             Inner::Cpu(c) => c.present(&flat, &self.atlas.pixels, scene.clear, &self.batches),

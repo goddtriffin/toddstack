@@ -110,6 +110,8 @@ pub struct Gpu {
     insts_cap: u64,
     batches: Vec<GpuBatch>,
     image_pipes: ImagePipes,
+    /// Set by wgpu's device-lost callback: the reason (`destroyed` or `unknown`) and message.
+    lost: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
     images: Vec<Option<GpuImage>>,
     /// Made on the first path; the layer and its composite bind group. The layer only grows, to
     /// the largest frame drawn, and each frame uses its top-left.
@@ -252,21 +254,40 @@ struct Acquired {
     queue: wgpu::Queue,
 }
 
-/// An adapter and device, or `None` if the backend has none worth using: no adapter, a software
-/// one, or a failed device request.
+/// Why an adapter or device could not be had.
+type Unavailable = crate::fallback::FallbackReason;
+
+/// How long the adapter request may take: only WebGPU on the web is bounded, because a stuck
+/// `requestAdapter` is the one failure there that never answers.
+fn adapter_timeout(
+    backend: Backend,
+    configured: std::time::Duration,
+) -> Option<std::time::Duration> {
+    (cfg!(target_arch = "wasm32") && backend == Backend::WebGpu).then_some(configured)
+}
+
+/// An adapter and device, or the reason there is none: no adapter, a timeout, a software
+/// adapter, or a failed device request.
 async fn acquire(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'static>>,
-) -> Option<Acquired> {
-    let adapter: wgpu::Adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: surface,
-            ..Default::default()
-        })
-        .await
-        .ok()?;
+    timeout: Option<std::time::Duration>,
+) -> std::result::Result<Acquired, Unavailable> {
+    let request = instance.request_adapter(&wgpu::RequestAdapterOptions {
+        compatible_surface: surface,
+        ..Default::default()
+    });
+    let adapter: std::result::Result<wgpu::Adapter, wgpu::RequestAdapterError> = match timeout {
+        Some(d) => crate::timeout::race(request, crate::timeout::sleep(d))
+            .await
+            .ok_or(Unavailable::Timeout)?,
+        None => request.await,
+    };
+    let adapter: wgpu::Adapter = adapter.map_err(|_| Unavailable::NoAdapter)?;
     if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
-        return None;
+        return Err(Unavailable::Rejected(
+            "software adapter: the tiny-skia path is the CPU renderer".to_owned(),
+        ));
     }
     let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
@@ -274,8 +295,8 @@ async fn acquire(
             ..Default::default()
         })
         .await
-        .ok()?;
-    Some(Acquired {
+        .map_err(|e| Unavailable::RequestDevice(e.to_string()))?;
+    Ok(Acquired {
         adapter,
         device,
         queue,
@@ -283,13 +304,22 @@ async fn acquire(
 }
 
 impl Gpu {
+    /// The reason and message if the device has been lost.
+    pub fn lost(&self) -> Option<(String, String)> {
+        self.lost.lock().ok().and_then(|l| l.clone())
+    }
+
     /// Decides whether `backend` can be used, without touching a canvas target's real canvas (it
     /// keeps one context type for life, so a GPU context taken and then rejected would leave the
     /// CPU fallback with none). A WebGL2 canvas target is probed on a 1x1 `OffscreenCanvas`.
-    /// `None` when the backend has no usable (non-CPU) adapter here.
-    pub async fn probe(backend: Backend, target: &Target) -> Result<Option<Probe>> {
+    /// The reason when the backend has no usable (non-CPU) adapter here.
+    pub async fn probe(
+        backend: Backend,
+        target: &Target,
+        adapter_timeout_for: std::time::Duration,
+    ) -> std::result::Result<Probe, Unavailable> {
         let Some(backends) = backend.wgpu_backends() else {
-            return Ok(None);
+            return Err(Unavailable::NoAdapter);
         };
         let mut desc: wgpu::InstanceDescriptor =
             wgpu::InstanceDescriptor::new_without_display_handle();
@@ -298,37 +328,40 @@ impl Gpu {
         // wgpu's web GL backend only finds an adapter for a given surface: an offscreen target
         // brings its own; a canvas target probes with a 1x1 one. WebGPU needs no surface.
         #[cfg(target_arch = "wasm32")]
-        let probe_canvas: Option<(wgpu::Surface<'static>, web_sys::OffscreenCanvas)> =
-            if backend == Backend::WebGl2 {
-                let Ok(throwaway) = throwaway_surface(&instance) else {
-                    return Ok(None);
-                };
-                Some(throwaway)
-            } else {
-                None
-            };
+        let probe_canvas: Option<(wgpu::Surface<'static>, web_sys::OffscreenCanvas)> = if backend
+            == Backend::WebGl2
+        {
+            Some(throwaway_surface(&instance).map_err(|e| Unavailable::Surface(e.to_string()))?)
+        } else {
+            None
+        };
         #[cfg(target_arch = "wasm32")]
         let surface: Option<&wgpu::Surface<'static>> = probe_canvas.as_ref().map(|(s, _)| s);
         #[cfg(not(target_arch = "wasm32"))]
         let surface: Option<&wgpu::Surface<'static>> = None;
-        let Some(acquired) = acquire(&instance, surface).await else {
-            return Ok(None);
-        };
+        let acquired: Acquired = acquire(
+            &instance,
+            surface,
+            adapter_timeout(backend, adapter_timeout_for),
+        )
+        .await?;
         #[cfg(target_arch = "wasm32")]
         if let Some(probe_surface) = surface
             && !surface_takes_format(probe_surface, &acquired.adapter)
         {
-            return Ok(None);
+            return Err(Unavailable::Rejected(format!(
+                "the surface cannot take {FORMAT:?}"
+            )));
         }
         let keep: bool =
             !(cfg!(target_arch = "wasm32") && backend == Backend::WebGl2 && target.is_canvas());
-        Ok(Some(Probe {
+        Ok(Probe {
             backend,
             instance,
             acquired: keep.then_some(acquired),
             #[cfg(target_arch = "wasm32")]
             sheet: probe_canvas.filter(|_| !target.is_canvas()),
-        }))
+        })
     }
 
     /// Builds the GPU renderer on an accepted probe, creating the surface on the real canvas.
@@ -364,20 +397,34 @@ impl Gpu {
             #[cfg(target_arch = "wasm32")]
             let real: wgpu::Surface<'static> = web_surface(&instance, &target.kind)?;
             #[cfg(target_arch = "wasm32")]
-            let a: Option<Acquired> = acquire(&instance, Some(&real)).await;
+            let a: std::result::Result<Acquired, Unavailable> =
+                acquire(&instance, Some(&real), None).await;
             #[cfg(not(target_arch = "wasm32"))]
-            let a: Option<Acquired> = acquire(&instance, None).await;
+            let a: std::result::Result<Acquired, Unavailable> =
+                acquire(&instance, None, None).await;
             #[cfg(target_arch = "wasm32")]
             {
                 surface = Some(real);
             }
-            a.ok_or_else(|| Error::Device("no usable adapter or device".to_owned()))?
+            a.map_err(|r| Error::Device(r.to_string()))?
         };
         let Acquired {
             adapter,
             device,
             queue,
         } = acquired;
+        let lost: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>> =
+            std::sync::Arc::default();
+        let lost_slot = std::sync::Arc::clone(&lost);
+        device.set_device_lost_callback(move |reason, message| {
+            let reason: &str = match reason {
+                wgpu::DeviceLostReason::Destroyed => "destroyed",
+                wgpu::DeviceLostReason::Unknown => "unknown",
+            };
+            if let Ok(mut slot) = lost_slot.lock() {
+                slot.get_or_insert((reason.to_owned(), message));
+            }
+        });
         let info: wgpu::AdapterInfo = adapter.get_info();
         let flags: wgpu::DownlevelFlags = adapter.get_downlevel_capabilities().flags;
         let limits: wgpu::Limits = adapter.limits();
@@ -573,6 +620,7 @@ impl Gpu {
             insts_cap,
             batches: Vec::new(),
             image_pipes,
+            lost,
             images: Vec::new(),
             path_pipes: None,
             layer: None,

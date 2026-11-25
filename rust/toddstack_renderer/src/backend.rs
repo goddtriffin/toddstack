@@ -1,7 +1,5 @@
 //! Backend names, the fallback chain per platform, and what the chosen one can do.
 
-use std::future::Future;
-
 use wgpu::Backends;
 
 /// A way to draw. The CPU backend is always available and is the pixel reference.
@@ -118,91 +116,12 @@ impl Capabilities {
     }
 }
 
-/// Walks `chain` in order and returns the first backend `probe` accepts, with what the probe
-/// produced. The CPU is always accepted (it needs no probe), so a chain ending in it always
-/// selects; a chain without it can select nothing.
-///
-/// # Errors
-/// The first error a probe returns; a rejection is `Ok(None)`, never an error.
-pub(crate) async fn select<T, F, Fut>(
-    chain: &[Backend],
-    mut probe: F,
-) -> crate::error::Result<Option<(Backend, Option<T>)>>
-where
-    F: FnMut(Backend) -> Fut,
-    Fut: Future<Output = crate::error::Result<Option<T>>>,
-{
-    for &b in chain {
-        if b == Backend::Cpu {
-            return Ok(Some((b, None)));
-        }
-        if let Some(t) = probe(b).await? {
-            return Ok(Some((b, Some(t))));
-        }
-    }
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Backend, select};
-    use crate::error::Error;
-
-    fn run(chain: &[Backend], accept: &[Backend]) -> Option<(Backend, bool)> {
-        pollster::block_on(select(chain, |b| {
-            let ok = accept.contains(&b);
-            async move { Ok(ok.then_some(())) }
-        }))
-        .expect("no error")
-        .map(|(b, t)| (b, t.is_some()))
-    }
-
-    #[test]
-    fn first_accepted_wins() {
-        let c = [Backend::WebGpu, Backend::WebGl2, Backend::Cpu];
-        assert_eq!(
-            run(&c, &[Backend::WebGpu, Backend::WebGl2]),
-            Some((Backend::WebGpu, true))
-        );
-        assert_eq!(run(&c, &[Backend::WebGl2]), Some((Backend::WebGl2, true)));
-    }
-
-    #[test]
-    fn all_rejected_reaches_the_cpu() {
-        let c = [Backend::WebGpu, Backend::WebGl2, Backend::Cpu];
-        assert_eq!(run(&c, &[]), Some((Backend::Cpu, false)));
-        assert_eq!(run(&[Backend::Cpu], &[]), Some((Backend::Cpu, false)));
-    }
-
-    #[test]
-    fn forced_gpu_rejected_selects_nothing() {
-        assert_eq!(run(&[Backend::WebGpu], &[]), None);
-    }
+    use super::Backend;
 
     #[test]
     fn every_platform_chain_ends_at_the_cpu() {
         assert_eq!(Backend::chain().last(), Some(&Backend::Cpu));
-    }
-
-    #[test]
-    fn probes_run_in_order_and_stop_at_the_winner() {
-        let seen = std::cell::RefCell::new(Vec::new());
-        let c = [Backend::Vulkan, Backend::Dx12, Backend::Gles, Backend::Cpu];
-        let got = pollster::block_on(select(&c, |b| {
-            seen.borrow_mut().push(b);
-            async move { Ok((b == Backend::Dx12).then_some(())) }
-        }))
-        .expect("no error");
-        assert_eq!(got.map(|(b, _)| b), Some(Backend::Dx12));
-        assert_eq!(*seen.borrow(), [Backend::Vulkan, Backend::Dx12]);
-    }
-
-    #[test]
-    fn a_probe_error_stops_the_walk() {
-        let c = [Backend::WebGpu, Backend::Cpu];
-        let got = pollster::block_on(select::<(), _, _>(&c, |_| async {
-            Err(Error::BadInput("x".to_owned()))
-        }));
-        assert!(got.is_err());
     }
 }
