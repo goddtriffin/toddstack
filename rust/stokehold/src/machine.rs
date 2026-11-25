@@ -245,7 +245,7 @@ fn machine_used(sys: &System) -> u64 {
 
 /// macOS used memory as Activity Monitor shows it: app memory (anonymous pages minus purgeable) + wired + compressor,
 /// from the page counts of `vm_stat`. Measured 2026-11-25 on the 64 GB Mac: total minus sysinfo's available was 31.8
-/// GB while this was 44.2 GB (20 GB of anonymous pages were counted as available).
+/// GB while this was 50.8 GB (the anonymous pages sysinfo counts as available).
 #[must_use]
 pub fn mac_used_memory(
     page_size: u64,
