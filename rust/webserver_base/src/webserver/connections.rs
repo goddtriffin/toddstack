@@ -496,7 +496,13 @@ mod tests {
         let serving = tokio::spawn(serve(
             "app",
             listener,
-            Router::new().route("/", get(|| async { "ok" })),
+            Router::new().route("/", get(|| async { "ok" })).route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    "slow"
+                }),
+            ),
             ConnectionLimits::new(),
             async move { signal.recv().await },
         ));
@@ -511,9 +517,11 @@ mod tests {
         );
         // The request is in flight when the signal arrives; it still gets its
         // answer, and then the connection closes.
-        idle.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        idle.write_all(b"GET /slow HTTP/1.1\r\nhost: x\r\n\r\n")
             .await
             .expect("write");
+        // Long enough for the server to have read it and started the handler.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         shutdown.trigger();
         let mut response: String = String::new();
         timeout(WAIT, idle.read_to_string(&mut response))
