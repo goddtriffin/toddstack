@@ -226,9 +226,68 @@ fn tree_usage(
     total
 }
 
-/// Memory the machine really uses: total minus available (page cache and shared file mappings count as available).
+/// Memory the machine really uses. Linux: total minus available (page cache and shared file mappings count as
+/// available). macOS: sysinfo's available is active + inactive + free, which counts active anonymous memory (rustc
+/// heaps) as available, so used is computed like Activity Monitor from `vm_stat` (`mac_used_memory`); total minus
+/// available only when `vm_stat` cannot be read.
 fn machine_used(sys: &System) -> u64 {
+    if cfg!(target_os = "macos")
+        && let Some(used) = Command::new("vm_stat")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| mac_used_from_vm_stat(&String::from_utf8_lossy(&o.stdout)))
+    {
+        return used.min(sys.total_memory());
+    }
     sys.total_memory().saturating_sub(sys.available_memory())
+}
+
+/// macOS used memory as Activity Monitor shows it: app memory (anonymous pages minus purgeable) + wired + compressor,
+/// from the page counts of `vm_stat`. Measured 2026-11-25 on the 64 GB Mac: total minus sysinfo's available was 31.8
+/// GB while this was 44.2 GB (20 GB of anonymous pages were counted as available).
+#[must_use]
+pub fn mac_used_memory(
+    page_size: u64,
+    anonymous: u64,
+    purgeable: u64,
+    wired: u64,
+    compressor: u64,
+) -> u64 {
+    anonymous
+        .saturating_sub(purgeable)
+        .saturating_add(wired)
+        .saturating_add(compressor)
+        .saturating_mul(page_size)
+}
+
+/// `mac_used_memory` from `vm_stat` output; `None` when a figure is missing.
+#[must_use]
+pub fn mac_used_from_vm_stat(text: &str) -> Option<u64> {
+    let page_size = text
+        .lines()
+        .next()?
+        .split("page size of ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    let pages = |key: &str| -> Option<u64> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))?
+            .trim()
+            .trim_end_matches('.')
+            .parse()
+            .ok()
+    };
+    Some(mac_used_memory(
+        page_size,
+        pages("Anonymous pages:")?,
+        pages("Pages purgeable:")?,
+        pages("Pages wired down:")?,
+        pages("Pages occupied by compressor:")?,
+    ))
 }
 
 /// A tree's memory is the sum of its processes' RSS, which counts shared pages once per process: file-backed pages
@@ -286,9 +345,15 @@ impl TreeSampler {
     pub fn sample(&mut self) -> Usage {
         self.sys.refresh_memory();
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        let used = machine_used(&self.sys);
+        self.tree_capped(used)
+    }
+
+    /// The tree's usage, its memory capped at `machine_used`.
+    fn tree_capped(&self, machine_used: u64) -> Usage {
         let children = child_map(&self.sys);
         let mut u = tree_usage(&self.sys, &children, self.root, &[]);
-        u.mem = cap_tree_mem(u.mem, machine_used(&self.sys));
+        u.mem = cap_tree_mem(u.mem, machine_used);
         u
     }
 }
@@ -393,10 +458,7 @@ impl OtherSampler {
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
         let machine = Usage {
             cpu: whole(self.sys.global_cpu_usage()) * self.cores,
-            mem: self
-                .sys
-                .total_memory()
-                .saturating_sub(self.sys.available_memory()),
+            mem: machine_used(&self.sys),
             vram: 0,
         };
         let children = child_map(&self.sys);
@@ -442,6 +504,8 @@ fn measure(
     std::thread::sleep(Duration::from_millis(250));
     sys.refresh_processes(ProcessesToUpdate::All, true);
     sys.refresh_cpu_usage();
+    // The machine's memory is read now, with the trees, not before the sleep.
+    sys.refresh_memory();
     // Linux: /proc/stat, which includes steal time (WSL2 and VMs hide it from the usual fields).
     let pct = match (before, cpu_times()) {
         (Some(a), Some(b)) => busy_pct(a, b),
@@ -450,7 +514,7 @@ fn measure(
     let gpu = if want_vram { vram_by_pid() } else { Vec::new() };
     let machine = Usage {
         cpu: pct * u64::from(cpu_count),
-        mem: sys.total_memory().saturating_sub(sys.available_memory()),
+        mem: machine_used(&sys),
         vram: if want_vram {
             vram().map_or(0, |(_, used)| used)
         } else {
@@ -462,14 +526,19 @@ fn measure(
         .iter()
         .map(|j| (j.id.clone(), tree_usage(&sys, &children, j.pid, &gpu)))
         .collect();
+    cap_jobs_mem(&mut per_job, machine.mem);
+    Ok((machine, per_job))
+}
+
+/// Caps the jobs' memory together at what the machine uses (`cap_trees_mem`).
+fn cap_jobs_mem(per_job: &mut [(String, Usage)], machine_used: u64) {
     let capped = cap_trees_mem(
         &per_job.iter().map(|(_, u)| u.mem).collect::<Vec<_>>(),
-        machine.mem,
+        machine_used,
     );
     for ((_, u), mem) in per_job.iter_mut().zip(capped) {
         u.mem = mem;
     }
-    Ok((machine, per_job))
 }
 
 /// Takes one live sample. `running` are the running jobs whose trees are measured and subtracted.
@@ -495,7 +564,7 @@ pub fn live(cwd: &Path, cap: &Capacity, running: &[Job]) -> Result<Live, Error> 
         let mut sys = System::new()?;
         sys.refresh_memory();
         let total = sys.total_memory().max(1);
-        total.saturating_sub(sys.available_memory()) * 100 / total
+        machine_used(&sys) * 100 / total
     };
     let disk_free = match get(&o, "disk_free") {
         Some(v) => parse_size(v)?,
@@ -685,6 +754,54 @@ mod tests {
         // A native job: the tree peak wins. Never above the machine.
         assert_eq!(effective_mem_peak(8 * G, 3 * G, 64 * G), 8 * G);
         assert_eq!(effective_mem_peak(G, 99 * G, 64 * G), 64 * G);
+    }
+
+    #[test]
+    fn mac_used_memory_is_app_wired_and_compressor() {
+        // `vm_stat` on the 64 GB Mac, 2026-11-25 (16 KiB pages).
+        let vm_stat = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 136986.\nPages wired down: 543602.\nPages purgeable: 15658.\nAnonymous pages: 1312786.\nPages occupied by compressor: 1487084.\n";
+        let want = (1_312_786 - 15_658 + 543_602 + 1_487_084) * 16_384;
+        assert_eq!(mac_used_from_vm_stat(vm_stat), Some(want));
+        assert_eq!(mac_used_memory(16_384, 100, 10, 20, 30), 140 * 16_384);
+        assert_eq!(
+            mac_used_memory(4096, 5, 9, 1, 1),
+            2 * 4096,
+            "purgeable cannot go negative"
+        );
+        assert_eq!(mac_used_from_vm_stat("garbage"), None);
+        assert_eq!(
+            mac_used_from_vm_stat("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn tree_sampler_applies_the_cap_and_leaves_light_trees_alone() {
+        let mut s = TreeSampler::new(std::process::id()).expect("probe");
+        s.sys.refresh_memory();
+        s.sys.refresh_processes(ProcessesToUpdate::All, true);
+        let raw = s.tree_capped(u64::MAX).mem;
+        assert!(raw > 0, "this test process has RSS");
+        assert_eq!(s.tree_capped(raw + 1).mem, raw, "under the cap: unchanged");
+        assert_eq!(s.tree_capped(raw / 2).mem, raw / 2, "over the cap: capped");
+        assert_eq!(s.tree_capped(0).mem, 0);
+    }
+
+    #[test]
+    fn measure_cap_scales_jobs_and_keeps_light_ones() {
+        const G: u64 = 1 << 30;
+        let u = |mem| Usage {
+            cpu: 7,
+            mem,
+            vram: 0,
+        };
+        let mut jobs = vec![("a".to_owned(), u(12 * G)), ("b".to_owned(), u(6 * G))];
+        cap_jobs_mem(&mut jobs, 9 * G);
+        assert_eq!((jobs[0].1.mem, jobs[1].1.mem), (6 * G, 3 * G));
+        assert_eq!(jobs[0].1.cpu, 7, "only memory changes");
+        let mut light = vec![("a".to_owned(), u(G)), ("b".to_owned(), u(2 * G))];
+        cap_jobs_mem(&mut light, 9 * G);
+        assert_eq!((light[0].1.mem, light[1].1.mem), (G, 2 * G));
     }
 
     #[test]

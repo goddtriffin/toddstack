@@ -54,8 +54,10 @@ All of these must hold (a job with nothing running needs only the guards and the
   size's is held until the job's learned time to peak (history records when memory peaked; 60 s when unknown, at
   least 10 s), then shrinks to nothing over 60 s; those learned holds together take at most 3/4 of the memory still
   free. Reservations that merely sum high never block, but a burst of late-peaking jobs cannot all start either (12
-  jobs of a 12G peak on a 64G Mac: 3 start, not 12). A tree's memory (live and learned) is capped at what the machine really uses, total minus available (0.4.12: summed RSS counts shared file mappings once per process; the rig learned 17-19 GB for a lint while it used 8 of 32 GB). Docker and WSL VM memory is outside the job's process tree, so for
-  docker jobs the learned peak also counts the machine-wide memory rise over the pre-start baseline. Non-heavy usage
+  jobs of a 12G peak on a 64G Mac: 3 start, not 12). A tree's memory (live and learned) is capped at what the machine really uses (0.4.12: summed RSS
+  counts shared file mappings once per process; the rig learned 17-19 GB for a lint while it used 8 of 32 GB). Used is total minus
+  available on Linux and app + wired + compressor from `vm_stat` on macOS, where sysinfo's available counts active
+  anonymous memory. Docker and WSL VM memory is outside the job's process tree, so for docker jobs the learned peak also counts the machine-wide memory rise over the pre-start baseline. Non-heavy usage
   is machine-wide use minus the process trees of stokehold's own jobs, smoothed as max(latest sample, mean of the last
   3, 10 s apart): a rise blocks at once, a fall is released slowly.
 - CPU line: the machine's CPU, max(latest reading, sustained reading), is under 80%. The sustained reading is
