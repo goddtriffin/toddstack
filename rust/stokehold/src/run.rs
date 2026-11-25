@@ -16,7 +16,7 @@ use nix::unistd::Pid;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGTSTP};
 use signal_hook::iterator::Signals;
 
-use crate::admit::{Decision, Smoother, evaluate};
+use crate::admit::{Block, Decision, Smoother, evaluate};
 use crate::cli::Flags;
 use crate::error::Error;
 use crate::history::{self, Entry};
@@ -34,6 +34,10 @@ use crate::tty::{Terminal, TerminalGuard};
 const DEFAULT_MEM: u64 = 4 << 30;
 /// Re-sample live data this often while live data is what blocks a job (monitoring).
 const LIVE_RESAMPLE: Duration = Duration::from_secs(10);
+/// Re-sample this often while the CPU (its line, the load or the pinned guard) blocks a job (0.4.12). CPU bursts last
+/// seconds: a 10 s timer noticed a dip up to 10 s late and fed the sustained mean one reading per 10 s, so waits of
+/// 23-30 s happened at 47-54% busy (2026-11-25, Mac and rig). Each look costs a 250 ms measurement.
+const CPU_RESAMPLE: Duration = Duration::from_secs(2);
 /// A safety sweep for jobs killed with SIGKILL, which leave a file but cause no event.
 const SWEEP: Duration = Duration::from_secs(30);
 /// A waiter never sleeps less than this between looks.
@@ -346,12 +350,22 @@ fn watch(dir: &Path, tx: Sender<WaitEvent>) -> Result<notify::RecommendedWatcher
 /// leave room, as admission names it. The waiter sleeps until then, capped at `LIVE_RESAMPLE` and never a busy spin.
 /// Other live blockers re-sample every `LIVE_RESAMPLE`; anything else waits for a file event, with the safety sweep as
 /// the backstop.
-fn wait_timeout(live_blocked: bool, ramp_end_ms: Option<i64>, now_ms: i64) -> Duration {
+fn wait_timeout(
+    live_blocked: bool,
+    block: Block,
+    ramp_end_ms: Option<i64>,
+    now_ms: i64,
+) -> Duration {
+    let resample = if matches!(block, Block::Cpu | Block::Load1 | Block::Ramp) {
+        CPU_RESAMPLE
+    } else {
+        LIVE_RESAMPLE
+    };
     if let Some(end) = ramp_end_ms {
         let left = u64::try_from(end - now_ms + 1).unwrap_or(0);
-        return Duration::from_millis(left.max(RAMP_MIN_SLEEP_MS)).min(LIVE_RESAMPLE);
+        return Duration::from_millis(left.max(RAMP_MIN_SLEEP_MS)).min(resample);
     }
-    if live_blocked { LIVE_RESAMPLE } else { SWEEP }
+    if live_blocked { resample } else { SWEEP }
 }
 
 /// Waits in the queue. Wakes on job-file changes; re-samples on a timer only when live data blocks.
@@ -417,7 +431,7 @@ fn acquire(
             eprintln!("stokehold: waiting ({reason})");
             said = reason;
         }
-        let mut event = rx.recv_timeout(wait_timeout(live_blocked, ramp_end_ms, now_ms()));
+        let mut event = rx.recv_timeout(wait_timeout(live_blocked, block, ramp_end_ms, now_ms()));
         // A burst of file events needs one re-check; drain it, but never drop a Stop or a signal behind it.
         while matches!(event, Ok(WaitEvent::Fs)) {
             match rx.try_recv() {
@@ -941,22 +955,35 @@ mod tests {
     #[test]
     fn a_ramp_sleeps_until_its_end_not_a_fixed_ten_seconds() {
         let ms = Duration::from_millis;
-        // Ramp ends in 3 s: sleep 3 s (plus a millisecond so the ramp is over when we look).
-        assert_eq!(wait_timeout(true, Some(13_000), 10_000), ms(3001));
-        // Ramp ends in a minute: capped at the live re-sample.
-        assert_eq!(wait_timeout(true, Some(70_000), 10_000), LIVE_RESAMPLE);
+        // Ramp ends in 1.5 s: sleep 1.5 s (plus a millisecond so the ramp is over when we look).
+        assert_eq!(
+            wait_timeout(true, Block::Ramp, Some(11_500), 10_000),
+            ms(1501)
+        );
+        // Ramp ends in 3 s: look again after the 2 s CPU re-sample.
+        assert_eq!(
+            wait_timeout(true, Block::Ramp, Some(13_000), 10_000),
+            CPU_RESAMPLE
+        );
+        // Ramp ends in a minute: capped at the CPU re-sample.
+        assert_eq!(
+            wait_timeout(true, Block::Ramp, Some(70_000), 10_000),
+            CPU_RESAMPLE
+        );
         // Already over (or about to be): a short sleep, never a spin.
         assert_eq!(
-            wait_timeout(true, Some(10_000), 10_000),
+            wait_timeout(true, Block::Ramp, Some(10_000), 10_000),
             ms(RAMP_MIN_SLEEP_MS)
         );
         assert_eq!(
-            wait_timeout(true, Some(9_000), 10_000),
+            wait_timeout(true, Block::Ramp, Some(9_000), 10_000),
             ms(RAMP_MIN_SLEEP_MS)
         );
-        // No ramp: live blockers re-sample every 10 s, the rest wait for events.
-        assert_eq!(wait_timeout(true, None, 0), LIVE_RESAMPLE);
-        assert_eq!(wait_timeout(false, None, 0), SWEEP);
+        // No ramp: a CPU block re-samples every 2 s (0.4.12), other live blockers every 10 s, the rest wait for events.
+        assert_eq!(wait_timeout(true, Block::Cpu, None, 0), CPU_RESAMPLE);
+        assert_eq!(wait_timeout(true, Block::Load1, None, 0), CPU_RESAMPLE);
+        assert_eq!(wait_timeout(true, Block::Mem, None, 0), LIVE_RESAMPLE);
+        assert_eq!(wait_timeout(false, Block::Queue, None, 0), SWEEP);
     }
 
     #[test]
