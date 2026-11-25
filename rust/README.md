@@ -113,6 +113,7 @@ opt-in, so a sidecar serving one health check is a valid server.
 | `from_env` / `from_env_with_state` | reads `WSB_ENVIRONMENT` (required), `WSB_HOST` (defaults `127.0.0.1` locally, `0.0.0.0` in production) and `WSB_PORT` (defaults `8080`) |
 | `body_limit` | request body cap, default 256 KiB — raise it for uploads |
 | `without_compression` | turns response compression off; see [Response compression](#response-compression) |
+| `connection_limits` | `ConnectionLimits::new().header_read_timeout(..).max_connections(..)`, default 30 s and 4096; see [Connections](#connections) |
 | `root_dir` | where `html/`, `static/` and `cache-buster.json` are read from, default the working directory — see [Testing](#testing-with-into_router) |
 | `nest` / `merge` / `nest_service` | your own routes |
 | `frontend` | declares this server a website; see below |
@@ -121,6 +122,26 @@ opt-in, so a sidecar serving one health check is a valid server.
 
 Always on, no method to enable them: response compression (opt out with `without_compression`), `GET /api/v1/health`, the `/api/v1` prefix
 itself, and the graceful-drain window.
+
+### Connections
+
+Every server (and the metrics listener) runs its own accept loop instead of `axum::serve`, which gives hyper no
+timer and so enforces no timeout at all:
+
+- **Header read timeout, default 30 s** (`DEFAULT_HEADER_READ_TIMEOUT`). A connection that has not sent a request's
+  headers this long after the server is ready for them is closed. That covers the idle time between two requests on
+  a keep-alive connection, so it is also the idle timeout. It does not limit how long a handler or a response
+  stream (server-sent events, a `WebSocket`) runs.
+- **Connection cap, default 4096** (`DEFAULT_MAX_CONNECTIONS`). At the cap the server stops accepting until a
+  connection closes; new ones wait in the kernel's backlog. Long-lived streams count. Keep it below the process's
+  open-file limit (`ulimit -n`), with room for the app's own files and outbound connections.
+- **A failed accept backs off and reports once a minute.** Out of file descriptors (`EMFILE`, `ENFILE`), the loop
+  waits 10 ms, doubling to 1 s, and logs `accept error: {e}; backing off` at `error` once per 60 s window, with
+  `({n} more since the last report)` when it held some back; the rest go to `debug`. Every failure counts in the
+  `http_accept_errors_total` metric, and `http_open_connections` is the gauge of open connections.
+
+HTTP/1 only, as before (axum's `http2` feature is off). `ConnectInfo<SocketAddr>` and upgrades work as with
+`axum::serve`.
 
 On the shutdown signal the server stops accepting connections and returns as
 soon as the last in-flight request finishes — with nothing in flight, that is
