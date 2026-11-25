@@ -271,12 +271,13 @@ pub(crate) async fn serve_metrics(shutdown: Shutdown) {
     });
 
     info!("metrics on http://{address}/metrics");
-    if let Err(source) = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown.recv())
-        .await
-    {
-        error!(error = %source, "metrics listener stopped");
-    }
+    super::connections::serve(
+        listener,
+        router,
+        super::connections::ConnectionLimits::new(),
+        shutdown.recv(),
+    )
+    .await;
 }
 
 #[cfg(test)]

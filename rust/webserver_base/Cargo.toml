@@ -55,6 +55,8 @@ telegram = ["dep:reqwest", "dep:tokio"]
 webserver = [
   "dep:axum",
   "dep:axum-extra",
+  "dep:hyper",
+  "dep:hyper-util",
   "dep:tower",
   "dep:tower-http",
   "dep:tokio",
@@ -100,6 +102,10 @@ axum = { workspace = true, optional = true }
 
 # webserver
 axum-extra = { workspace = true, optional = true }
+# The accept loop (`webserver/connections.rs`): axum::serve gives hyper no timer,
+# so no header read or idle timeout runs there.
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 

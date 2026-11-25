@@ -3,7 +3,7 @@ members = ["webserver_base", "template_web_server", "flyball", "toddstack_accoun
 resolver = "3"
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.100"
 authors = ["Todd Everett Griffin <tgriffin115@gmail.com>"]
@@ -63,6 +63,8 @@ axum = { version = "0.8.9", features = [
   "tokio",
 ] }
 axum-extra = { version = "0.12.6", features = ["routing"] }
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["server", "service", "tokio"] }
 tower = { version = "0.5.3", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["full"] }
 reqwest = { version = "0.13.5", default-features = false, features = [

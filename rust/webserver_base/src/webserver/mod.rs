@@ -9,6 +9,7 @@
 mod bootstrap;
 #[cfg(test)]
 mod compression_tests;
+mod connections;
 mod error;
 #[cfg(feature = "pages")]
 mod frontend;
@@ -24,6 +25,7 @@ mod state;
 mod telemetry;
 
 pub use bootstrap::{bootstrap_with_release, bootstrap_with_release_and};
+pub use connections::{ConnectionLimits, DEFAULT_HEADER_READ_TIMEOUT, DEFAULT_MAX_CONNECTIONS};
 pub use error::WebServerError;
 #[cfg(feature = "pages")]
 pub use frontend::{Frontend, FrontendParams, WellKnown};

@@ -1,16 +1,16 @@
 //! The web server builder.
 
-use std::future::{Future, IntoFuture};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::traces::UpstreamFailure;
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Router, serve};
 use tokio::net::TcpListener;
 use tower_http::CompressionLevel;
 use tower_http::LatencyUnit;
@@ -26,6 +26,7 @@ use tracing::{Level, error, info, instrument, warn};
 use crate::env;
 use crate::environment::Environment;
 
+use super::connections::{self, ConnectionLimits};
 use super::error::WebServerError;
 use super::shutdown::{AppShutdown, DEFAULT_DRAIN_TIMEOUT, Shutdown};
 use super::state::{StateParts, WebServerState};
@@ -67,6 +68,7 @@ pub struct WebServer<S = ()> {
 
     body_limit: usize,
     compression: bool,
+    limits: ConnectionLimits,
     root_dir: PathBuf,
     router: Router<WebServerState<S>>,
     /// Prefixes of the project's own [`Self::nest_service`] services, never traced.
@@ -121,6 +123,7 @@ where
             app,
             body_limit: DEFAULT_BODY_LIMIT,
             compression: true,
+            limits: ConnectionLimits::new(),
             // Empty joins to the bare relative path: the working directory.
             root_dir: PathBuf::new(),
             router: Router::new(),
@@ -174,6 +177,17 @@ where
     #[must_use]
     pub const fn without_compression(mut self) -> Self {
         self.compression = false;
+        self
+    }
+
+    /// The header read (and keep-alive idle) timeout and the connection cap.
+    /// Defaults to [`ConnectionLimits::new`]: 30 seconds and 4096 connections.
+    ///
+    /// Without them a slow or silent client holds its socket forever, and a
+    /// burst of slow requests runs the process out of file descriptors.
+    #[must_use]
+    pub const fn connection_limits(mut self, limits: ConnectionLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -289,13 +303,14 @@ where
             host,
             port,
             environment,
+            limits,
         } = self.assemble(shutdown.clone())?;
 
         if environment.is_production() {
             tokio::spawn(telemetry::serve_metrics(shutdown.clone()));
         }
 
-        serve_on(router, &host, port, shutdown, async move {
+        serve_on(router, &host, port, limits, shutdown, async move {
             state.app().on_shutdown().await;
         })
         .await
@@ -318,6 +333,7 @@ where
             app,
             body_limit,
             compression,
+            limits,
             root_dir,
             router,
             nested,
@@ -434,6 +450,7 @@ where
             host,
             port,
             environment,
+            limits,
         })
     }
 }
@@ -549,6 +566,7 @@ struct Assembled<S> {
     host: String,
     port: u16,
     environment: Environment,
+    limits: ConnectionLimits,
 }
 
 /// Attaches the 404 fallback.
@@ -590,6 +608,7 @@ async fn serve_on<F>(
     router: Router,
     host: &str,
     port: u16,
+    limits: ConnectionLimits,
     shutdown: Shutdown,
     on_shutdown: F,
 ) -> Result<(), WebServerError>
@@ -611,23 +630,18 @@ where
 
     info!("listening on http://{address}");
 
-    // The one binding in the crate with no written type: `WithGracefulShutdown`
-    // is generic over the listener, the make-service, the service and the
-    // shutdown future, and rustc itself elides it when printing.
-    let serving = serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown.clone().recv())
-    .into_future();
+    let serving = connections::serve(listener, router, limits, shutdown.clone().recv());
     tokio::pin!(serving);
 
     // The drain window is a ceiling on the wait, not the wait itself, so the
     // clock cannot start until the drain does — and `serving` resolves the
     // moment the last connection closes, which for an idle server is at once.
+    // `serving` ends only once the signal has arrived, so the signal is polled
+    // first: otherwise both are ready and a random pick could skip the cleanup.
     tokio::select! {
-        result = &mut serving => return result.map_err(WebServerError::Serve),
+        biased;
         () = shutdown.recv() => {}
+        () = &mut serving => return Ok(()),
     }
 
     // Two ceilings started at one instant, not one after the other: the drain
@@ -649,7 +663,7 @@ where
     }
 
     match served {
-        Ok(result) => result.map_err(WebServerError::Serve),
+        Ok(()) => Ok(()),
         // Expected of anything holding a socket open, not a misconfiguration:
         // the ceiling exists precisely because such a connection never ends.
         Err(_elapsed) => {
@@ -1419,8 +1433,8 @@ mod tests {
 
     use super::super::shutdown::Shutdown;
     use super::{
-        API_PREFIX, AppShutdown, DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_TIMEOUT, WebServerError, health,
-        serve_on,
+        API_PREFIX, AppShutdown, ConnectionLimits, DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_TIMEOUT,
+        WebServerError, health, serve_on,
     };
 
     /// Records whether cleanup ran, and can be made slow enough to overrun the
@@ -1457,9 +1471,16 @@ mod tests {
         let router: Router = Router::new().route("/health", get(health));
         let cleanup: RecordingState = state.clone();
         // Port 0 asks the OS for a free one; nothing here connects to it.
-        serve_on(router, "127.0.0.1", 0, shutdown, async move {
-            cleanup.on_shutdown().await;
-        })
+        serve_on(
+            router,
+            "127.0.0.1",
+            0,
+            ConnectionLimits::new(),
+            shutdown,
+            async move {
+                cleanup.on_shutdown().await;
+            },
+        )
         .await
     }
 
@@ -1496,9 +1517,16 @@ mod tests {
         let router: Router = Router::new().route("/health", get(health));
         let result: Result<(), WebServerError> = timeout(
             Duration::from_secs(1),
-            serve_on(router, "not-an-ip", 0, shutdown, async move {
-                cleanup.on_shutdown().await;
-            }),
+            serve_on(
+                router,
+                "not-an-ip",
+                0,
+                ConnectionLimits::new(),
+                shutdown,
+                async move {
+                    cleanup.on_shutdown().await;
+                },
+            ),
         )
         .await
         .expect("a bind failure returns immediately, it does not wait for cleanup");
@@ -1543,7 +1571,17 @@ mod tests {
         // Port 0 asks the OS for a free one; nothing here connects to it.
         let serving: tokio::task::JoinHandle<Result<(), WebServerError>> = tokio::spawn({
             let shutdown: Shutdown = shutdown.clone();
-            async move { serve_on(router, "127.0.0.1", 0, shutdown, async {}).await }
+            async move {
+                serve_on(
+                    router,
+                    "127.0.0.1",
+                    0,
+                    ConnectionLimits::new(),
+                    shutdown,
+                    async {},
+                )
+                .await
+            }
         });
 
         shutdown.trigger();
