@@ -2,7 +2,7 @@
 
 One GPU renderer on [wgpu](https://wgpu.rs) for Todd's apps, with a [tiny-skia](https://crates.io/crates/tiny-skia)
 CPU backend that is both the last fallback and the pixel reference. Part of
-[toddstack](https://github.com/goddtriffin/toddstack). Version 0.3.0 (0.1.0 is on crates.io).
+[toddstack](https://github.com/goddtriffin/toddstack). Version 0.3.1 (0.1.0 is on crates.io).
 
 Two layers share one `Renderer`:
 
@@ -60,7 +60,8 @@ A stored backend that is not in this platform's chain is ignored.
 **A canvas that took a context.** On the web a canvas keeps one context type for life. Once WebGPU or WebGL2 has taken
 the canvas's context and a later surface or device step fails, no other backend can get a context on that canvas, so
 the walk ends there: the callback gets the real reason with `to: None` and `with_options` returns
-`NoRendererAvailable` with that attempt last. To retry, the host creates a fresh canvas element and a new `Renderer`.
+`NoRendererAvailable` with that attempt last. A failure before any context was obtained (for example `getContext`
+returning null) is a normal fall to the next backend, and the CPU can still take the canvas's 2D context. To retry, the host creates a fresh canvas element and a new `Renderer`.
 
 **Device loss.** A lost GPU device makes every draw, kernel run and `add_batch` return `Error::DeviceLost { reason, message }`
 (`renderer.is_lost()` says so too) and sends one `FallbackEvent { to: None, reason: DeviceLost(..) }`. The renderer
@@ -208,6 +209,11 @@ raw, 690,792 bytes brotli (0.1.0: 2,205,571 and 683,190). `web/renderer.ts` is t
 `demo` (async), `resize`, `render` (presents to the canvas; `{ readback: true }` reads back and `putImageData`s instead); demos `board chart grid images paths texture`); `web/index.html` is the example page. `?backend=cpu|webgl2|webgpu` forces a backend, `?readback=1` times the readback path. `?boards=24` draws 24 transparent board-like tiles with rotated, tinted sprites onto 24 canvases over a CSS gradient on one renderer (`Boards` in `web/renderer.ts`) and prints the median frame time; on an Apple M3 Max in Chrome: WebGPU 1.9 ms, WebGL2 (sheet copy) 2.2 ms, CPU 282 ms per frame of 24 tiles (381 px).
 
 ## Changelog
+
+### 0.3.1
+
+- Web canvas: a surface failure before the canvas gave any context (for example `getContext("webgpu")` returning
+  null) falls to the next backend (WebGL2, then the CPU) again. Only a failure after a context was taken ends the walk.
 
 ### 0.3.0
 
