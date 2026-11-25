@@ -272,6 +272,7 @@ pub(crate) async fn serve_metrics(shutdown: Shutdown) {
 
     info!("metrics on http://{address}/metrics");
     super::connections::serve(
+        "metrics",
         listener,
         router,
         super::connections::ConnectionLimits::new(),

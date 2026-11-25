@@ -133,12 +133,21 @@ timer and so enforces no timeout at all:
   a keep-alive connection, so it is also the idle timeout. It does not limit how long a handler or a response
   stream (server-sent events, a `WebSocket`) runs.
 - **Connection cap, default 4096** (`DEFAULT_MAX_CONNECTIONS`). At the cap the server stops accepting until a
-  connection closes; new ones wait in the kernel's backlog. Long-lived streams count. Keep it below the process's
-  open-file limit (`ulimit -n`), with room for the app's own files and outbound connections.
+  connection closes; new ones wait in the kernel's backlog. Long-lived streams count, and so do upgraded
+  connections (a `WebSocket`): an upgrade ends hyper's connection future, but the socket keeps its slot and its
+  `http_open_connections` count until it closes. Keep the cap below the process's open-file limit (`ulimit -n`),
+  with room for the app's own files and outbound connections.
 - **A failed accept backs off and reports once a minute.** Out of file descriptors (`EMFILE`, `ENFILE`), the loop
   waits 10 ms, doubling to 1 s, and logs `accept error: {e}; backing off` at `error` once per 60 s window, with
   `({n} more since the last report)` when it held some back; the rest go to `debug`. Every failure counts in the
-  `http_accept_errors_total` metric, and `http_open_connections` is the gauge of open connections.
+  `http_accept_errors_total` metric, and `http_open_connections` is the gauge of open connections. Both carry a
+  `listener` label: `app` for the site, `metrics` for the `/metrics` listener.
+
+**Shedding load on purpose.** The trace layer files every 5xx as a failed response at `error`, which reaches
+Sentry, so an app that answers `503` while it is overloaded would flood Sentry exactly when it is busiest. Reply
+with `webserver_base::webserver::overloaded(retry_after)` (a `503` with `Retry-After`), or insert the public
+`DeliberateOverload` marker into any response's extensions: the trace layer then counts it a success. The request
+still logs at `info` and counts in `http_requests_total` under its status, so the shedding stays visible.
 
 HTTP/1 only, as before (axum's `http2` feature is off). `ConnectInfo<SocketAddr>` and upgrades work as with
 `axum::serve`.
@@ -1045,6 +1054,8 @@ at once would collide. Every server exports:
 | `http_requests_total` | `method`, `route`, `status` |
 | `http_request_duration_seconds` (histogram, 5 ms to 10 s) | `method`, `route` |
 | `http_requests_in_flight` | |
+| `http_open_connections` (gauge; upgraded connections count until they close) | `listener` (`app`, `metrics`) |
+| `http_accept_errors_total` | `listener` (`app`, `metrics`) |
 | `build_info` (always 1) | `release` (`my-project@1.2.3`), `webserver_base` |
 
 `route` is the **route pattern** (`/blog/{slug}`), never the raw path, and every

@@ -10,7 +10,10 @@ Earlier releases are described in the git history and the README.
   accepting until one closes. Both are set with `WebServer::connection_limits(ConnectionLimits)`.
 - A failed accept (out of file descriptors) backs off from 10 ms to 1 s and logs `accept error: {e}; backing off`
   once per minute, instead of `accept error: {e}` at `error` every second. New metrics: `http_accept_errors_total`
-  and `http_open_connections`.
+  and `http_open_connections`, both with a `listener` label (`app` or `metrics`). An upgraded connection (a
+  `WebSocket`) keeps its cap slot and gauge count until its socket closes.
+- `DeliberateOverload` and `overloaded(retry_after)`: mark a deliberate `503` so the trace layer does not log it
+  as an error (and so Sentry gets no event for it).
 - `WebServerError::Serve` is no longer returned (serving cannot fail once bound); the variant stays.
 
 ## 0.4.2

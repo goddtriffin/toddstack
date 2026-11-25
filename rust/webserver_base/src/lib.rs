@@ -55,8 +55,8 @@ pub mod webserver;
 
 #[cfg(feature = "webserver")]
 pub use webserver::{
-    AppShutdown, ConnectionLimits, Shutdown, WebServer, WebServerError, WebServerState,
-    bootstrap_with_release, bootstrap_with_release_and,
+    AppShutdown, ConnectionLimits, DeliberateOverload, Shutdown, WebServer, WebServerError,
+    WebServerState, bootstrap_with_release, bootstrap_with_release_and, overloaded,
 };
 
 // Every crate whose types appear in this library's API, re-exported so a
