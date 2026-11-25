@@ -1,15 +1,26 @@
 //! The one error type.
 
+use crate::fallback::Attempt;
+
 /// Everything the renderer can refuse to do.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// No backend in the chain produced a usable adapter; the CPU backend is always last, so this
-    /// only happens when the caller forced a GPU backend that is not there.
-    #[error("no usable backend (tried: {tried}); drop the forced backend to fall back to the CPU")]
-    NoBackend {
-        /// The backends attempted, in order.
-        tried: String,
+    /// Every backend in the chain failed (the CPU last); the final fallback event, with
+    /// `to: None`, was reported too. Also the result of a forced backend that is unavailable.
+    #[error("no renderer works here (tried: {})", tried(.attempts))]
+    NoRendererAvailable {
+        /// Each backend tried, in order, and why it failed.
+        attempts: Vec<Attempt>,
+    },
+    /// The GPU device was lost (the renderer reported a `DeviceLost` event). It cannot draw any
+    /// more: build a new `Renderer`. See the README ("Device loss").
+    #[error("the GPU device was lost ({reason}): {message}")]
+    DeviceLost {
+        /// `destroyed` (someone destroyed the device) or `unknown` (a driver or GPU reset).
+        reason: String,
+        /// The platform's message.
+        message: String,
     },
     /// The adapter refused the device request.
     #[error("the GPU device request failed: {0}")]
@@ -56,3 +67,11 @@ pub enum Error {
 
 /// `Result` with the crate error.
 pub type Result<T> = core::result::Result<T, Error>;
+
+fn tried(attempts: &[Attempt]) -> String {
+    attempts
+        .iter()
+        .map(|a| format!("{}: {}", a.backend.name(), a.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}

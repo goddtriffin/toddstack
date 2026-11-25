@@ -31,6 +31,10 @@ fn every_available_gpu_backend_matches_the_cpu_within_the_arena_budget() {
         ran += 1;
     }
     println!("{ran} GPU backend(s) compared");
+    // CI on a machine with a GPU sets REQUIRE_GPU=1 so "skipped, no adapter" cannot pass silently.
+    if std::env::var_os("REQUIRE_GPU").is_some_and(|v| v == "1") {
+        assert!(ran > 0, "REQUIRE_GPU=1 but no GPU backend had an adapter");
+    }
 }
 
 #[test]
@@ -732,4 +736,36 @@ fn a_sprite_with_a_zero_or_negative_destination_draws_nothing_on_every_backend()
             b.name()
         );
     }
+}
+
+#[test]
+fn a_forced_cpu_renderer_reports_no_fallback_events() {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&events);
+    let r: Renderer = pollster::block_on(Renderer::with_options(
+        Target::offscreen(8, 8),
+        Options::new()
+            .with_force(Backend::Cpu)
+            .with_fallback_callback(move |e| sink.lock().expect("lock").push(e.clone())),
+    ))
+    .expect("cpu renderer");
+    assert_eq!(Backend::Cpu, r.backend());
+    assert!(events.lock().expect("lock").is_empty());
+    assert!(!r.is_lost());
+}
+
+#[test]
+fn a_preferred_backend_outside_the_chain_is_ignored() {
+    // Metal is not in a Linux chain and DX12 is not in an Apple one: either way the chain runs.
+    let outside = if cfg!(target_vendor = "apple") {
+        Backend::Dx12
+    } else {
+        Backend::Metal
+    };
+    let r: Renderer = pollster::block_on(Renderer::with_options(
+        Target::offscreen(8, 8),
+        Options::new().with_preferred(outside),
+    ))
+    .expect("renderer");
+    assert!(Backend::chain().contains(&r.backend()));
 }

@@ -696,13 +696,13 @@ where
     use crate::{Backend, Diff, Error, Options};
     let options = Options::new().with_transparent(transparent);
     let mut cpu: Renderer =
-        Renderer::with_options(target.clone(), options.with_force(Backend::Cpu)).await?;
+        Renderer::with_options(target.clone(), options.clone().with_force(Backend::Cpu)).await?;
     let scene: Scene = build(&mut cpu).await?;
     let reference: Vec<u8> = cpu.render(&scene).await?;
     let mut gpu: Renderer = match Renderer::with_options(target, options.with_force(backend)).await
     {
         Ok(r) => r,
-        Err(Error::NoBackend { .. }) => return Ok(None),
+        Err(Error::NoRendererAvailable { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
     let scene: Scene = build(&mut gpu).await?;
