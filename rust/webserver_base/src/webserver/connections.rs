@@ -493,14 +493,20 @@ mod tests {
         let address: SocketAddr = listener.local_addr().expect("address");
         let shutdown = crate::webserver::Shutdown::manual();
         let signal = shutdown.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_started = Arc::clone(&started);
         let serving = tokio::spawn(serve(
             "app",
             listener,
             Router::new().route("/", get(|| async { "ok" })).route(
                 "/slow",
-                get(|| async {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    "slow"
+                get(move || {
+                    let started = Arc::clone(&handler_started);
+                    async move {
+                        started.notify_one();
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        "slow"
+                    }
                 }),
             ),
             ConnectionLimits::new(),
@@ -520,8 +526,10 @@ mod tests {
         idle.write_all(b"GET /slow HTTP/1.1\r\nhost: x\r\n\r\n")
             .await
             .expect("write");
-        // Long enough for the server to have read it and started the handler.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The handler is running: the request is in flight.
+        timeout(WAIT, started.notified())
+            .await
+            .expect("the handler started");
         shutdown.trigger();
         let mut response: String = String::new();
         timeout(WAIT, idle.read_to_string(&mut response))

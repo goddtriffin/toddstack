@@ -2,6 +2,12 @@
 
 Earlier releases are described in the git history and the README.
 
+## 0.4.4
+
+- `http_accept_errors_total{listener="app"}` and `{listener="metrics"}` are registered at 0 when the metrics
+  recorder starts, so the series exist before the first accept error.
+- The startup line `listening on http://{address}` now ends with `(webserver-base {version})`.
+
 ## 0.4.3
 
 - The server's own accept loop replaces `axum::serve`, which ran hyper with no timer and so with no timeout. A

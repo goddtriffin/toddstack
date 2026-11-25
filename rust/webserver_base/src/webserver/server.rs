@@ -634,7 +634,7 @@ where
                 source,
             })?;
 
-    info!("listening on http://{address}");
+    info!("{}", listening_message(address));
 
     let serving = connections::serve("app", listener, router, limits, shutdown.clone().recv());
     tokio::pin!(serving);
@@ -1225,8 +1225,23 @@ fn strip_api_prefix(path: &str) -> String {
         .map_or_else(|| path.to_string(), String::from)
 }
 
+/// The startup log line: the crate version beside the listen address.
+fn listening_message(address: SocketAddr) -> String {
+    format!(
+        "listening on http://{address} (webserver-base {})",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_startup_line_names_the_address_and_the_crate_version() {
+        let message: String = super::listening_message(([127, 0, 0, 1], 8080).into());
+        assert!(message.contains("http://127.0.0.1:8080"), "{message}");
+        assert!(message.contains(env!("CARGO_PKG_VERSION")), "{message}");
+    }
+
     #[cfg(feature = "pages")]
     #[test]
     fn the_last_modified_header_is_an_http_date_in_gmt() {
