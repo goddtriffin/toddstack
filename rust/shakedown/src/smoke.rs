@@ -488,10 +488,38 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     true
 }
 
-/// Is the text just before `at` a URL authority marker (`//`, also as `\/\/` in JSON or `%2F%2F` in a query)?
-fn in_url_context(before: &str) -> bool {
+/// Is a needle with `before` and `after` around it a URL host? True after `//` (also `\/\/` in JSON or `%2F%2F`
+/// in a query), after `user@` or `user:pw@` of such a URL, or when a port follows (`localhost:3000`); and only
+/// when the needle ends at a host boundary (so `localhost.example.com` is not it).
+fn in_url_context(before: &str, after: &str) -> bool {
     let b = before.to_ascii_lowercase();
-    b.ends_with("//") || b.ends_with("\\/\\/") || b.ends_with("%2f%2f")
+    let ends_host = after.chars().next().is_none_or(|c| {
+        matches!(c, ':' | '/' | '"' | '\'' | ']' | '?' | '#' | '\\') || c.is_whitespace()
+    });
+    if !ends_host {
+        return false;
+    }
+    let has_slashes = |t: &str| t.contains("//") || t.contains("\\/\\/") || t.contains("%2f%2f");
+    if b.ends_with("//") || b.ends_with("\\/\\/") || b.ends_with("%2f%2f") {
+        return true;
+    }
+    if let Some(userinfo) = b.strip_suffix('@') {
+        let token = userinfo
+            .rsplit(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+            .next()
+            .unwrap_or("");
+        if has_slashes(token) {
+            return true;
+        }
+    }
+    let port = after
+        .strip_prefix(':')
+        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+    let prev_ok = b
+        .chars()
+        .next_back()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
+    port && prev_ok
 }
 
 /// Where a served page names this machine or a dev server in a URL (`http://localhost:3000`, `//127.0.0.1/`,
@@ -505,7 +533,7 @@ fn dev_urls(text: &str) -> Vec<String> {
         let Some(i) = lower
             .match_indices(n)
             .map(|(i, _)| i)
-            .find(|i| in_url_context(&lower[..*i]))
+            .find(|i| in_url_context(&lower[..*i], &lower[*i + n.len()..]))
         else {
             continue;
         };
@@ -529,7 +557,8 @@ fn dev_urls(text: &str) -> Vec<String> {
 
 /// Dev URLs in a response's headers and, for text (HTML, JSON, XML, JavaScript, CSS), its body.
 fn scan_dev_urls(path: &str, allow: &[String], r: &Response, problems: &mut Vec<String>) {
-    if allow.iter().any(|g| glob_match(g, path)) {
+    let bare = path.split(['?', '#']).next().unwrap_or(path);
+    if allow.iter().any(|g| glob_match(g, bare)) {
         return;
     }
     let mut head = String::new();
@@ -1614,6 +1643,41 @@ mod tests {
         assert_eq!(dev_urls("ws://[::1]:5555/x").len(), 1);
         assert_eq!(dev_urls("{\"u\":\"http:\\/\\/localhost\"}").len(), 1);
         assert_eq!(dev_urls("//127.0.0.1:80/").len(), 1);
+        assert_eq!(dev_urls("HTTP://LOCALHOST/x").len(), 1);
+        assert_eq!(dev_urls("?u=http%3A%2F%2Flocalhost").len(), 1);
+        assert_eq!(dev_urls("http://0.0.0.0:8080").len(), 1);
+        assert_eq!(dev_urls("http://user@localhost/").len(), 1);
+        assert_eq!(dev_urls("http://u:p@127.0.0.1/").len(), 1);
+        assert_eq!(dev_urls("mail me@localhost now"), none());
+        assert_eq!(dev_urls("x=\"localhost:3000\"").len(), 1);
+        assert_eq!(dev_urls("x=\"127.0.0.1:8080\"").len(), 1);
+        assert_eq!(dev_urls("https://localhost.example.com/"), none());
+        assert_eq!(dev_urls("https://localhostfoo"), none());
+        assert_eq!(dev_urls("\"sentry.is_localhost\""), none());
+        assert_eq!(dev_urls("\"[::1]\"===i").len(), 0);
+        assert!(glob_match("/a*b*c", "/aXXbYYc") && !glob_match("/a*b*c", "/aXXcYYb"));
+        assert!(glob_match("/a*b*c", "/abc") && !glob_match("/a*b*c", "/ab"));
+    }
+
+    #[test]
+    fn http_allow_glob_ignores_query_string() {
+        let js = "fetch(\"http://localhost:3000/api\")";
+        let port = serve(vec![
+            (
+                "/",
+                200,
+                with(&[HTML]),
+                "<script src=\"/s.js?v=1#x\"></script>",
+            ),
+            (
+                "/s.js?v=1",
+                200,
+                with(&[LONG, ("content-type", "text/javascript")]),
+                js,
+            ),
+        ]);
+        let allowed = smoke("http_allow = [\"/s.js\"]");
+        assert_eq!(problems(&allowed, port), none());
     }
 
     #[test]
