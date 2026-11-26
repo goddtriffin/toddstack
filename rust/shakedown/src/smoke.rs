@@ -494,7 +494,24 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 fn in_url_context(before: &str, after: &str) -> bool {
     let b = before.to_ascii_lowercase();
     let ends_host = after.chars().next().is_none_or(|c| {
-        matches!(c, ':' | '/' | '"' | '\'' | ']' | '?' | '#' | '\\') || c.is_whitespace()
+        matches!(
+            c,
+            ':' | '/'
+                | '"'
+                | '\''
+                | ']'
+                | '?'
+                | '#'
+                | '\\'
+                | '%'
+                | ')'
+                | ','
+                | ';'
+                | '<'
+                | '>'
+                | '&'
+                | '`'
+        ) || c.is_whitespace()
     });
     if !ends_host {
         return false;
@@ -1653,6 +1670,9 @@ mod tests {
         assert_eq!(dev_urls("x=\"127.0.0.1:8080\"").len(), 1);
         assert_eq!(dev_urls("https://localhost.example.com/"), none());
         assert_eq!(dev_urls("https://localhostfoo"), none());
+        assert_eq!(dev_urls("q=http%3A%2F%2Flocalhost%2Fapi").len(), 1);
+        assert_eq!(dev_urls("url(http://localhost)").len(), 1);
+        assert_eq!(dev_urls("<a href=http://localhost>x</a>").len(), 1);
         assert_eq!(dev_urls("\"sentry.is_localhost\""), none());
         assert_eq!(dev_urls("\"[::1]\"===i").len(), 0);
         assert!(glob_match("/a*b*c", "/aXXbYYc") && !glob_match("/a*b*c", "/aXXcYYb"));
