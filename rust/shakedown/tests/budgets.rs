@@ -31,7 +31,7 @@ fn text(o: &Output) -> String {
     )
 }
 
-const HEAD: &str = "shakedown = \"0.4.3\"\nproject = \"p\"\n";
+const HEAD: &str = "shakedown = \"0.4.4\"\nproject = \"p\"\n";
 const SIZES: &str = "[budgets.sizes]\n\"web raw\" = { file = \"web/app.js\", raw = 2000 }\n\"ios raw\" = { file = \"ios/App\", raw = 2000 }\n";
 
 #[test]

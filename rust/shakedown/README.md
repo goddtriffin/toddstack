@@ -235,6 +235,7 @@ checks = [
 ]
 headers   = ["content-security-policy", "x-content-type-options", "referrer-policy"]  # the default; [] turns off
 min_cache = 86400                       # least max-age an asset must grant (default; 0 turns off)
+http_allow = ["/script/accounts-*.js"]  # paths (`*` = any characters) whose local-host URLs the smoke.http scan skips
 log_ignore = ["known noisy text"]       # log lines (substrings) left out of the error scan
 sweep = true                            # the layout sweep against the container (the `[sweep]` pages); skipped when there is no `[sweep]` section
 ```
@@ -248,7 +249,9 @@ Steps, one output line each: `smoke.up` (records the digest), `smoke.ready`, `sm
   so the production image must serve that path (or keep those pages out of `[sweep]`).
 
 - `smoke.http`, on every route and every `checks` path: no 5xx; the `headers` present; no `localhost`, `127.0.0.1`,
-  `0.0.0.0` or `[::1]` in served HTML, JSON or XML; and every script, stylesheet, icon, image and media file the
+  `0.0.0.0` or `[::1]` used as a URL (`http://localhost:3000`, `//127.0.0.1/`, `ws://[::1]`; a bare `"localhost"`
+  string such as a hostname comparison in a vendored SDK is not a URL and passes; `http_allow` skips whole paths) in
+  served HTML, JSON, XML, JavaScript or CSS; and every script, stylesheet, icon, image and media file the
   HTML loads from the container answers 200 with `max-age` of at least `min_cache` (or `immutable`).
   Assets on other hosts are not fetched.
 - `smoke.checks`: `status` (default 200; redirects are not followed), `contains` (body), `location` (the

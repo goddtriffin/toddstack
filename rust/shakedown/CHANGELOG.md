@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.4
+
+- `smoke.http` flags `localhost`, `127.0.0.1`, `0.0.0.0` and `[::1]` only in URL context (after `//`), no longer as a
+  bare string, so hostname comparisons in vendored bundles (the Sentry browser SDK's `"localhost"===i`) pass. A real
+  `http://localhost:3000/api` still fails.
+- `[smoke].http_allow = ["<path glob>"]`: paths whose local-host URLs the scan skips (`*` matches any characters).
+
 ## 0.4.3
 
 - `budgets sizes --skip-unbuilt` (also on `check`) and `[budgets].skip_unbuilt = true`: a budget whose artifact does

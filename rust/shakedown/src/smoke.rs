@@ -55,6 +55,10 @@ pub struct Smoke {
     /// Lines of the container logs to leave out of the error scan (substrings).
     #[serde(default)]
     pub log_ignore: Vec<String>,
+    /// Paths (globs; `*` matches any run of characters, `/` included) whose local-host URLs are left out of the
+    /// `smoke.http` scan, e.g. `["/script/accounts-*.js"]`. A bare `"localhost"` string is never flagged anyway.
+    #[serde(default)]
+    pub http_allow: Vec<String>,
     /// Run the layout sweep against the container (the `[sweep]` pages drawn against the container).
     #[serde(default)]
     pub sweep: bool,
@@ -464,34 +468,70 @@ fn cache_age(value: Option<&str>) -> u64 {
     }
 }
 
-/// Where a served page names this machine or a dev server: the matching text with a little around it.
+/// Does `path` match `pattern`, where `*` stands for any run of characters (`/` included)?
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == path;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !path.starts_with(first) || path.len() < first.len() + last.len() || !path.ends_with(last) {
+        return false;
+    }
+    let mut rest = &path[first.len()..path.len() - last.len()];
+    for mid in &parts[1..parts.len() - 1] {
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Is the text just before `at` a URL authority marker (`//`, also as `\/\/` in JSON or `%2F%2F` in a query)?
+fn in_url_context(before: &str) -> bool {
+    let b = before.to_ascii_lowercase();
+    b.ends_with("//") || b.ends_with("\\/\\/") || b.ends_with("%2f%2f")
+}
+
+/// Where a served page names this machine or a dev server in a URL (`http://localhost:3000`, `//127.0.0.1/`,
+/// `ws://[::1]`): the matching text with a little around it. A bare string such as `"localhost"` is a hostname
+/// comparison (the vendored Sentry SDK has them), not a leaked URL, and is not reported.
 fn dev_urls(text: &str) -> Vec<String> {
     const NEEDLES: [&str; 4] = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"];
     let lower = text.to_ascii_lowercase();
     let mut out = Vec::new();
     for n in NEEDLES {
-        if let Some(i) = lower.find(n) {
-            let from = lower[..i]
-                .char_indices()
-                .rev()
-                .nth(20)
-                .map_or(0, |(p, _)| p);
-            let to = (i + n.len() + 20).min(lower.len());
-            let to = (to..=lower.len())
-                .find(|t| lower.is_char_boundary(*t))
-                .unwrap_or(lower.len());
-            let snippet: String = text[from..to]
-                .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect();
-            out.push(format!("names {n}: ...{snippet}..."));
-        }
+        let Some(i) = lower
+            .match_indices(n)
+            .map(|(i, _)| i)
+            .find(|i| in_url_context(&lower[..*i]))
+        else {
+            continue;
+        };
+        let from = lower[..i]
+            .char_indices()
+            .rev()
+            .nth(20)
+            .map_or(0, |(p, _)| p);
+        let to = (i + n.len() + 20).min(lower.len());
+        let to = (to..=lower.len())
+            .find(|t| lower.is_char_boundary(*t))
+            .unwrap_or(lower.len());
+        let snippet: String = text[from..to]
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        out.push(format!("names {n}: ...{snippet}..."));
     }
     out
 }
 
 /// Dev URLs in a response's headers and, for text (HTML, JSON, XML, JavaScript, CSS), its body.
-fn scan_dev_urls(path: &str, r: &Response, problems: &mut Vec<String>) {
+fn scan_dev_urls(path: &str, allow: &[String], r: &Response, problems: &mut Vec<String>) {
+    if allow.iter().any(|g| glob_match(g, path)) {
+        return;
+    }
     let mut head = String::new();
     for (k, v) in &r.headers {
         let _ = writeln!(head, "{k}: {v}");
@@ -578,7 +618,7 @@ pub fn builtin(
             http.problems
                 .push(format!("{route}: missing headers {}", missing.join(", ")));
         }
-        scan_dev_urls(route, &r, &mut http.problems);
+        scan_dev_urls(route, &smoke.http_allow, &r, &mut http.problems);
         if r.status == 200 && r.is_html() {
             for url in asset_refs(&r.text()) {
                 if let Some(p) = local_path(&url, route)
@@ -601,7 +641,7 @@ pub fn builtin(
                 r.status
             )),
             Ok(r) => {
-                scan_dev_urls(&asset, &r, &mut http.problems);
+                scan_dev_urls(&asset, &smoke.http_allow, &r, &mut http.problems);
                 let age = cache_age(r.header("cache-control"));
                 if age < smoke.min_cache {
                     http.problems.push(format!(
@@ -1525,6 +1565,55 @@ mod tests {
             let p = problems(&smoke(""), port);
             assert!(p.iter().any(|l| l.contains("names ")), "{bad}: {p:?}");
         }
+    }
+
+    #[test]
+    fn sentry_like_hostname_comparisons_pass() {
+        let js = r#"var i=location.hostname;e["sentry.is_localhost"]="localhost"===i||"127.0.0.1"===i||"[::1]"===i;"#;
+        let port = serve(vec![
+            ("/", 200, with(&[HTML]), "<script src=\"/s.js\"></script>"),
+            (
+                "/s.js",
+                200,
+                with(&[LONG, ("content-type", "text/javascript")]),
+                js,
+            ),
+        ]);
+        assert_eq!(problems(&smoke(""), port), none());
+    }
+
+    #[test]
+    fn leaked_url_in_js_still_fails_unless_allowed() {
+        let js = "fetch(\"http://localhost:3000/api\")";
+        let page = || {
+            vec![
+                ("/", 200, with(&[HTML]), "<script src=\"/s.js\"></script>"),
+                (
+                    "/s.js",
+                    200,
+                    with(&[LONG, ("content-type", "text/javascript")]),
+                    js,
+                ),
+            ]
+        };
+        let p = problems(&smoke(""), serve(page()));
+        assert!(p.iter().any(|l| l.contains("names localhost")), "{p:?}");
+        let allowed = smoke("http_allow = [\"/s.*\"]");
+        assert_eq!(problems(&allowed, serve(page())), none());
+    }
+
+    #[test]
+    fn glob_and_url_context() {
+        assert!(glob_match(
+            "/script/accounts-*.js",
+            "/script/accounts-8b221d79.js"
+        ));
+        assert!(!glob_match("/script/accounts-*.js", "/script/other.js"));
+        assert!(glob_match("/a", "/a") && !glob_match("/a", "/ab"));
+        assert_eq!(dev_urls("\"localhost\"===i"), none());
+        assert_eq!(dev_urls("ws://[::1]:5555/x").len(), 1);
+        assert_eq!(dev_urls("{\"u\":\"http:\\/\\/localhost\"}").len(), 1);
+        assert_eq!(dev_urls("//127.0.0.1:80/").len(), 1);
     }
 
     #[test]
